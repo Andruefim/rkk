@@ -1,15 +1,19 @@
 // src/hooks/useRKKStream.ts
-// Улучшение 1: WebSocket вместо fetch — получаем дельты графа в реальном времени
-
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ── Types (matching Python schemas) ──────────────────────────────────────────
 export interface EdgeData {
   from_:              string;
   to:                 string;
   weight:             number;
   alpha_trust:        number;
   intervention_count: number;
+}
+
+export interface NOTEARSInfo {
+  steps: number;
+  loss:  number;
+  h_W:   number;
+  l_int: number;
 }
 
 export interface AgentData {
@@ -26,6 +30,9 @@ export interface AgentData {
   total_interventions: number;
   last_do:             string;
   discovery_rate:      number;
+  peak_discovery_rate: number;
+  h_W:                 number;   // DAG constraint: 0 = perfect DAG
+  notears:             NOTEARSInfo | null;
   edges:               EdgeData[];
 }
 
@@ -58,7 +65,6 @@ export interface StreamFrame {
   graph_deltas:  Record<number, EdgeData[]>;
 }
 
-// ── Default state ─────────────────────────────────────────────────────────────
 const DEFAULT_FRAME: StreamFrame = {
   tick: 0, phase: 1, entropy: 100,
   agents: [0, 1, 2].map(i => ({
@@ -68,17 +74,17 @@ const DEFAULT_FRAME: StreamFrame = {
     graph_mdl: 0, compression_gain: 0, alpha_mean: 0.05,
     phi: 0.1, node_count: 6, edge_count: 0,
     total_interventions: 0, last_do: "—",
-    discovery_rate: 0, edges: [],
+    discovery_rate: 0, peak_discovery_rate: 0,
+    h_W: 0, notears: null, edges: [],
   })),
   demon: { energy: 1, cooldown: 0, last_target: 0, last_action_complexity: 0 },
   tom_links: [], events: [], graph_deltas: {},
 };
 
-// ── Hook ──────────────────────────────────────────────────────────────────────
 export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
-  const [frame,     setFrame]     = useState<StreamFrame>(DEFAULT_FRAME);
-  const [connected, setConnected] = useState(false);
-  const [speed,     setSpeedState] = useState(1);
+  const [frame,      setFrame]      = useState<StreamFrame>(DEFAULT_FRAME);
+  const [connected,  setConnected]  = useState(false);
+  const [speed,      setSpeedState] = useState(1);
   const wsRef = useRef<WebSocket | null>(null);
 
   const setSpeed = useCallback((s: number) => {
@@ -98,48 +104,32 @@ export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
       ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
-      ws.onopen = () => {
-        setConnected(true);
-        console.log("[RKK] WebSocket connected");
+      ws.onopen  = () => { setConnected(true);  console.log("[RKK] WS connected"); };
+      ws.onclose = () => {
+        setConnected(false);
+        console.log("[RKK] WS closed, reconnecting…");
+        reconnectTimer = setTimeout(connect, 2000);
       };
+      ws.onerror = () => ws.close();
 
       ws.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data) as StreamFrame;
           setFrame(prev => {
-            // Merge graph deltas into agent edges
-            const agents = data.agents.map((a, i) => {
-              if (data.graph_deltas[i]) {
-                return { ...a, edges: data.graph_deltas[i] };
-              }
-              // No delta → keep previous edges (bandwidth saving)
-              return { ...a, edges: prev.agents[i]?.edges ?? a.edges };
-            });
+            const agents = data.agents.map((a, i) => ({
+              ...a,
+              edges: data.graph_deltas[i] ?? prev.agents[i]?.edges ?? a.edges,
+            }));
             return { ...data, agents };
           });
         } catch (e) {
           console.error("[RKK] Parse error", e);
         }
       };
-
-      ws.onclose = () => {
-        setConnected(false);
-        console.log("[RKK] WebSocket closed, reconnecting in 2s…");
-        reconnectTimer = setTimeout(connect, 2000);
-      };
-
-      ws.onerror = (e) => {
-        console.error("[RKK] WebSocket error", e);
-        ws.close();
-      };
     }
 
     connect();
-
-    return () => {
-      clearTimeout(reconnectTimer);
-      ws?.close();
-    };
+    return () => { clearTimeout(reconnectTimer); ws?.close(); };
   }, [wsUrl]);
 
   return { frame, connected, speed, setSpeed, reset };

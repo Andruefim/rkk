@@ -1,20 +1,14 @@
-
-
 """
-RKKAgent — Python/PyTorch.
+agent.py — RKKAgent с NOTEARS-ядром.
 
-Улучшение 5 (Seed Diversity): каждый агент получает разную активацию.
-  Agent 0: ReLU  — жёсткие логические связи
-  Agent 1: GELU  — вероятностные мягкие связи
-  Agent 2: Tanh  — насыщаемые связи
-
-Улучшение 4: pinned memory для буферов наблюдений.
-
-Исправления:
-  - peak_discovery_rate: монотонно растёт, никогда не снижается
-  - activation корректно передаётся в snapshot
+Изменения:
+  - После каждого do() записываем obs_before/obs_after в граф (record_intervention)
+  - Каждые TRAIN_EVERY шагов вызываем graph.train_step() → NOTEARS backprop
+  - Alpha-trust теперь производная от градиентной уверенности матрицы W
+  - Epistemic scoring использует edge_uncertainty из NOTEARS
 """
 from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -28,24 +22,27 @@ ACTIVATION_MAP = {
     "gelu": nn.GELU(),
     "tanh": nn.Tanh(),
 }
-
 ACTIVATIONS = ["relu", "gelu", "tanh"]
+
+# Каждые N интервенций запускаем NOTEARS train_step
+TRAIN_EVERY = 8
 
 
 class System1(nn.Module):
     """
     Амортизированный эпистемический скорер.
-    Предсказывает E[IG] для пары (variable, target) без полного перебора.
-    Input:  [edge_weight, alpha_trust, node_value_from, node_value_to, uncertainty]
-    Output: ожидаемый information gain [0, 1]
+    Предсказывает E[IG] для пары (variable, target).
+    Теперь принимает на вход alpha_trust из NOTEARS (не только uncertainty).
+    Input:  [w_ij, alpha_trust, val_from, val_to, uncertainty, h_W_norm]
+    Output: E[IG] ∈ [0, 1]
     """
     def __init__(self, activation: str = "relu"):
         super().__init__()
         act = ACTIVATION_MAP.get(activation, nn.ReLU())
         self.net = nn.Sequential(
-            nn.Linear(5, 32), act,
-            nn.Linear(32, 16), act,
-            nn.Linear(16, 1), nn.Sigmoid(),
+            nn.Linear(6, 48), act,
+            nn.Linear(48, 24), act,
+            nn.Linear(24, 1), nn.Sigmoid(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -62,24 +59,31 @@ class RKKAgent:
 
         self.graph   = CausalGraph(device)
         self.system1 = System1(self.activation).to(device)
-        self.optim   = torch.optim.Adam(self.system1.parameters(), lr=3e-4)
+        self.s1_optim = torch.optim.Adam(self.system1.parameters(), lr=3e-4)
 
         self._cg_history:  deque[float] = deque(maxlen=20)
         self._phi_history: deque[float] = deque(maxlen=30)
         self._total_interventions = 0
         self._last_do             = "—"
         self._last_result: dict | None = None
-
-        # ── Peak discovery rate: монотонно растёт, никогда не снижается ──────
         self._peak_discovery_rate: float = 0.0
+
+        # NOTEARS training stats
+        self._last_notears_loss: dict | None = None
+        self._notears_steps = 0
 
         self._bootstrap()
 
     # ── Bootstrap ─────────────────────────────────────────────────────────────
     def _bootstrap(self):
+        """Инициализируем узлы и сеем text priors в матрицу W."""
         for var_id, val in self.env.variables.items():
             self.graph.set_node(var_id, val)
 
+        # Записываем начальное наблюдение в буфер
+        self.graph.record_observation(dict(self.env.variables))
+
+        # Text priors: первые 2 GT-ребра с шумом + spurious
         gt = self.env.gt_edges()
         for e in gt[:2]:
             noisy_w = e["weight"] * 0.3 + (np.random.rand() - 0.5) * 0.4
@@ -87,12 +91,22 @@ class RKKAgent:
 
         var_ids = self.env.variable_ids
         if len(var_ids) >= 4:
+            # Spurious correlations — выгорят через L_intervention
             self.graph.set_edge(var_ids[1], var_ids[3],  0.35, alpha=0.05)
             self.graph.set_edge(var_ids[2], var_ids[0], -0.20, alpha=0.04)
 
-    # ── Epistemic scoring (System 1) ───────────────────────────────────────────
+    # ── h(W) getter ──────────────────────────────────────────────────────────
+    def _get_h_W(self) -> float:
+        if self.graph._core is None:
+            return 0.0
+        return float(self.graph._core.dag_constraint().item())
+
+    # ── Epistemic scoring ─────────────────────────────────────────────────────
     def score_interventions(self) -> list[dict]:
-        var_ids = self.env.variable_ids
+        """System 1 предсказывает E[IG] с учётом текущего h(W)."""
+        var_ids   = self.env.variable_ids
+        h_W_norm  = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
+
         features_list: list[torch.Tensor] = []
         candidates:    list[dict]         = []
 
@@ -101,19 +115,23 @@ class RKKAgent:
                 if v_from == v_to:
                     continue
                 uncertainty = self.graph.edge_uncertainty(v_from, v_to)
-                edge_w      = next(
-                    (e.weight      for e in self.graph.edges if e.from_ == v_from and e.to == v_to),
-                    0.0
-                )
-                alpha = next(
-                    (e.alpha_trust for e in self.graph.edges if e.from_ == v_from and e.to == v_to),
-                    0.05
-                )
+
+                # Достаём вес из матрицы W
+                w_ij = 0.0
+                if (self.graph._core is not None
+                        and v_from in self.graph._node_ids
+                        and v_to   in self.graph._node_ids):
+                    i = self.graph._node_ids.index(v_from)
+                    j = self.graph._node_ids.index(v_to)
+                    w_ij = self.graph._core.W_masked()[i, j].item()
+
+                # Alpha-trust напрямую из NOTEARS
+                alpha = 1.0 - uncertainty
                 val_from = self.graph.nodes.get(v_from, 0.5)
                 val_to   = self.graph.nodes.get(v_to,   0.5)
 
                 feat = torch.tensor(
-                    [edge_w, alpha, val_from, val_to, uncertainty],
+                    [w_ij, alpha, val_from, val_to, uncertainty, h_W_norm],
                     dtype=torch.float32, device=self.device
                 )
                 features_list.append(feat)
@@ -122,6 +140,7 @@ class RKKAgent:
                     "target":      v_to,
                     "value":       0.9 if np.random.rand() > 0.5 else 0.1,
                     "uncertainty": uncertainty,
+                    "expected_ig": 0.0,
                 })
 
         if not features_list:
@@ -147,89 +166,74 @@ class RKKAgent:
         value = best["value"]
 
         mdl_before = self.graph.mdl_size
-        predicted  = self.graph.propagate(var, value)
-        observed   = self.env.intervene(var, value)
 
-        updated_edges: list[str] = []
-        pruned_edges:  list[str] = []
+        # Снимок ПЕРЕД интервенцией
+        obs_before = dict(self.env.observe())
 
+        # Предсказание из NOTEARS-графа
+        predicted = self.graph.propagate(var, value)
+
+        # Ground truth (интервенционная жёсткость)
+        observed = self.env.intervene(var, value)
+
+        # Записываем в буферы NOTEARS
+        self.graph.record_observation(obs_before)
+        self.graph.record_observation(observed)
+        self.graph.record_intervention(var, value, obs_before, observed)
+
+        # ── NOTEARS train_step каждые TRAIN_EVERY интервенций ──────────────
+        notears_result = None
+        if self._total_interventions % TRAIN_EVERY == 0:
+            notears_result = self.graph.train_step()
+            if notears_result is not None:
+                self._notears_steps += 1
+                self._last_notears_loss = notears_result
+
+        # ── Обновляем узлы ────────────────────────────────────────────────
         for node_id, obs_val in observed.items():
-            if node_id == var:
-                continue
-
-            input_delta = value - self.graph.nodes.get(var, value)
-            if abs(input_delta) < 1e-3:
-                continue
-
-            empirical_w = float(
-                np.tanh(
-                    (obs_val - self.graph.nodes.get(node_id, obs_val))
-                    / (input_delta + 1e-4)
-                )
-            )
-
-            if abs(empirical_w) > 0.08:
-                existing  = next(
-                    (e for e in self.graph.edges if e.from_ == var and e.to == node_id),
-                    None
-                )
-                prev_alpha = existing.alpha_trust if existing else 0.0
-                new_alpha  = min(0.98, prev_alpha + 0.12 * (1 - prev_alpha))
-                self.graph.set_edge(var, node_id, empirical_w, new_alpha)
-                updated_edges.append(f"{var}→{node_id}")
-            else:
-                existing = next(
-                    (e for e in self.graph.edges if e.from_ == var and e.to == node_id),
-                    None
-                )
-                if existing and existing.alpha_trust < 0.3:
-                    existing.alpha_trust = max(0, existing.alpha_trust - 0.08)
-                    if existing.alpha_trust < 0.02:
-                        self.graph.remove_edge(var, node_id)
-                        pruned_edges.append(f"PRUNED:{var}→{node_id}")
-
             self.graph.nodes[node_id] = obs_val
-
-        self.graph.nodes[var] = value
 
         mdl_after         = self.graph.mdl_size
         compression_delta = mdl_before - mdl_after
         self._cg_history.append(compression_delta)
 
-        # Обучаем System 1
+        # ── Обучаем System 1 ──────────────────────────────────────────────
         pred_val  = predicted.get(list(observed.keys())[-1], 0.5)
         obs_val_  = list(observed.values())[-1]
         actual_ig = float(abs(pred_val - obs_val_))
+        h_W_norm  = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
 
         s1_input = torch.tensor(
-            [best.get("expected_ig", 0), best["uncertainty"], 0.0, 0.0, best["uncertainty"]],
+            [best.get("expected_ig", 0), 0.5, 0.0, 0.0, best["uncertainty"], h_W_norm],
             dtype=torch.float32, device=self.device
         ).unsqueeze(0)
         s1_target = torch.tensor([[actual_ig]], dtype=torch.float32, device=self.device)
 
-        self.optim.zero_grad()
+        self.s1_optim.zero_grad()
         s1_pred = self.system1(s1_input)
         s1_loss = nn.functional.mse_loss(s1_pred, s1_target)
         s1_loss.backward()
-        self.optim.step()
+        self.s1_optim.step()
 
         self._total_interventions += 1
         self._last_do = f"do({var}={value:.2f})"
 
-        # ── Обновляем peak discovery rate ──────────────────────────────────
         current_dr = self.discovery_rate
         if current_dr > self._peak_discovery_rate:
             self._peak_discovery_rate = current_dr
+
+        updated_edges = [f"{e.from_}→{e.to}" for e in self.graph.edges[:4]]
 
         self._last_result = {
             "variable":           var,
             "value":              value,
             "compression_delta":  compression_delta,
             "updated_edges":      updated_edges,
-            "pruned_edges":       pruned_edges,
+            "pruned_edges":       [],
             "prediction_error":   float(np.mean([
                 abs(predicted.get(k, 0) - v) for k, v in observed.items()
             ])),
+            "notears":            notears_result,
         }
         return self._last_result
 
@@ -237,23 +241,31 @@ class RKKAgent:
     def phi_approx(self) -> float:
         if len(self._phi_history) < 4:
             return 0.1
-        hist    = torch.tensor(list(self._phi_history), device=self.device).unsqueeze(-1)
+        hist    = torch.tensor(list(self._phi_history), device=self.device)
         var_self = hist.var().item()
         return float(np.clip(var_self * 10, 0, 1))
 
     def record_phi(self, val: float):
         self._phi_history.append(val)
 
-    # ── Demon disruption ──────────────────────────────────────────────────────
+    # ── Demon disruption — теперь портит матрицу W ────────────────────────────
     def demon_disrupt(self) -> str:
-        vulnerable = [e for e in self.graph.edges if e.alpha_trust < 0.5]
-        if not vulnerable:
-            return "no vulnerable edges"
-        edge = vulnerable[int(np.random.randint(len(vulnerable)))]
-        edge.alpha_trust = max(0.02, edge.alpha_trust - 0.12)
-        edge.weight     += (np.random.rand() - 0.5) * 0.2
-        self.graph._mdl_cache = None
-        return f"corrupted {edge.from_}→{edge.to}"
+        if self.graph._core is None:
+            return "no core"
+        with torch.no_grad():
+            # Добавляем шум к случайному ненулевому ребру
+            W   = self.graph._core.W
+            sig = (W.abs() > 0.05).nonzero(as_tuple=False)
+            if len(sig) == 0:
+                return "no significant edges"
+            idx  = sig[np.random.randint(len(sig))]
+            i, j = idx[0].item(), idx[1].item()
+            noise = (np.random.rand() - 0.5) * 0.3
+            W[i, j] += noise
+            from_name = self.graph._node_ids[i] if i < len(self.graph._node_ids) else f"v{i}"
+            to_name   = self.graph._node_ids[j] if j < len(self.graph._node_ids) else f"v{j}"
+        self.graph._invalidate_cache()
+        return f"corrupted W[{from_name}→{to_name}] +{noise:.3f}"
 
     # ── Properties ────────────────────────────────────────────────────────────
     @property
@@ -264,7 +276,6 @@ class RKKAgent:
 
     @property
     def discovery_rate(self) -> float:
-        """Текущий discovery rate (может флуктуировать)."""
         return self.env.discovery_rate([
             {"from_": e.from_, "to": e.to, "weight": e.weight}
             for e in self.graph.edges
@@ -272,16 +283,25 @@ class RKKAgent:
 
     @property
     def peak_discovery_rate(self) -> float:
-        """Монотонно растущий максимум — никогда не снижается."""
         return self._peak_discovery_rate
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
     def snapshot(self) -> dict:
         current_dr = self.discovery_rate
-
-        # Обновляем peak здесь тоже на случай если step() не вызвался
         if current_dr > self._peak_discovery_rate:
             self._peak_discovery_rate = current_dr
+
+        # h(W): идеально = 0 (DAG). Нормализуем для UI.
+        h_W = self._get_h_W()
+
+        notears_info = None
+        if self._last_notears_loss:
+            notears_info = {
+                "steps":   self._notears_steps,
+                "loss":    self._last_notears_loss.get("loss", 0),
+                "h_W":     round(h_W, 4),
+                "l_int":   self._last_notears_loss.get("l_int", 0),
+            }
 
         return {
             "id":                    self.id,
@@ -296,18 +316,9 @@ class RKKAgent:
             "edge_count":            len(self.graph.edges),
             "total_interventions":   self._total_interventions,
             "last_do":               self._last_do,
-            # ── Оба нужны simulation.py ──────────────────────────────────────
             "discovery_rate":        round(current_dr, 3),
             "peak_discovery_rate":   round(self._peak_discovery_rate, 3),
-            # ── Рёбра для визуализации ───────────────────────────────────────
-            "edges": [
-                {
-                    "from_":              e.from_,
-                    "to":                 e.to,
-                    "weight":             round(e.weight, 3),
-                    "alpha_trust":        round(e.alpha_trust, 3),
-                    "intervention_count": e.intervention_count,
-                }
-                for e in self.graph.edges
-            ],
+            "h_W":                   round(h_W, 4),        # DAG constraint
+            "notears":               notears_info,
+            "edges": [e.as_dict() for e in self.graph.edges],
         }
