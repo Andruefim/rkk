@@ -1,3 +1,5 @@
+
+
 """
 RKKAgent — Python/PyTorch.
 
@@ -7,6 +9,10 @@ RKKAgent — Python/PyTorch.
   Agent 2: Tanh  — насыщаемые связи
 
 Улучшение 4: pinned memory для буферов наблюдений.
+
+Исправления:
+  - peak_discovery_rate: монотонно растёт, никогда не снижается
+  - activation корректно передаётся в snapshot
 """
 from __future__ import annotations
 import torch
@@ -28,14 +34,14 @@ ACTIVATIONS = ["relu", "gelu", "tanh"]
 
 class System1(nn.Module):
     """
-    Амортизированный эпистемический скорер (улучшение из v5).
+    Амортизированный эпистемический скорер.
     Предсказывает E[IG] для пары (variable, target) без полного перебора.
     Input:  [edge_weight, alpha_trust, node_value_from, node_value_to, uncertainty]
-    Output: ожидаемый information gain
+    Output: ожидаемый information gain [0, 1]
     """
     def __init__(self, activation: str = "relu"):
         super().__init__()
-        act = ACTIVATION_MAP[activation]
+        act = ACTIVATION_MAP.get(activation, nn.ReLU())
         self.net = nn.Sequential(
             nn.Linear(5, 32), act,
             nn.Linear(32, 16), act,
@@ -58,21 +64,22 @@ class RKKAgent:
         self.system1 = System1(self.activation).to(device)
         self.optim   = torch.optim.Adam(self.system1.parameters(), lr=3e-4)
 
-        self._cg_history: deque[float] = deque(maxlen=20)
+        self._cg_history:  deque[float] = deque(maxlen=20)
         self._phi_history: deque[float] = deque(maxlen=30)
         self._total_interventions = 0
-        self._last_do = "—"
+        self._last_do             = "—"
         self._last_result: dict | None = None
+
+        # ── Peak discovery rate: монотонно растёт, никогда не снижается ──────
+        self._peak_discovery_rate: float = 0.0
 
         self._bootstrap()
 
-    # ── Bootstrap с текстовыми прiorами ───────────────────────────────────────
+    # ── Bootstrap ─────────────────────────────────────────────────────────────
     def _bootstrap(self):
-        # Инициализируем узлы
         for var_id, val in self.env.variables.items():
             self.graph.set_node(var_id, val)
 
-        # Текстовые priors: первые 2 GT-рёбра с шумом + 2 spurious
         gt = self.env.gt_edges()
         for e in gt[:2]:
             noisy_w = e["weight"] * 0.3 + (np.random.rand() - 0.5) * 0.4
@@ -80,30 +87,30 @@ class RKKAgent:
 
         var_ids = self.env.variable_ids
         if len(var_ids) >= 4:
-            # Spurious correlations — должны выгореть через Epistemic Annealing
             self.graph.set_edge(var_ids[1], var_ids[3],  0.35, alpha=0.05)
             self.graph.set_edge(var_ids[2], var_ids[0], -0.20, alpha=0.04)
 
     # ── Epistemic scoring (System 1) ───────────────────────────────────────────
     def score_interventions(self) -> list[dict]:
-        """Возвращает список (variable, value, expected_ig) отсортированный по E[IG]."""
         var_ids = self.env.variable_ids
-        scores  = []
-
-        features_list = []
-        candidates    = []
+        features_list: list[torch.Tensor] = []
+        candidates:    list[dict]         = []
 
         for v_from in var_ids:
             for v_to in var_ids:
                 if v_from == v_to:
                     continue
                 uncertainty = self.graph.edge_uncertainty(v_from, v_to)
-                edge_w      = next((e.weight for e in self.graph.edges
-                                    if e.from_ == v_from and e.to == v_to), 0.0)
-                alpha       = next((e.alpha_trust for e in self.graph.edges
-                                    if e.from_ == v_from and e.to == v_to), 0.05)
-                val_from    = self.graph.nodes.get(v_from, 0.5)
-                val_to      = self.graph.nodes.get(v_to,   0.5)
+                edge_w      = next(
+                    (e.weight      for e in self.graph.edges if e.from_ == v_from and e.to == v_to),
+                    0.0
+                )
+                alpha = next(
+                    (e.alpha_trust for e in self.graph.edges if e.from_ == v_from and e.to == v_to),
+                    0.05
+                )
+                val_from = self.graph.nodes.get(v_from, 0.5)
+                val_to   = self.graph.nodes.get(v_to,   0.5)
 
                 feat = torch.tensor(
                     [edge_w, alpha, val_from, val_to, uncertainty],
@@ -129,25 +136,20 @@ class RKKAgent:
 
         return sorted(candidates, key=lambda x: -x["expected_ig"])
 
-    # ── Один шаг агента ───────────────────────────────────────────────────────
+    # ── Один шаг ──────────────────────────────────────────────────────────────
     def step(self) -> dict:
         scores = self.score_interventions()
         if not scores:
             return {}
 
-        best   = scores[0]
-        var    = best["variable"]
-        value  = best["value"]
+        best  = scores[0]
+        var   = best["variable"]
+        value = best["value"]
 
         mdl_before = self.graph.mdl_size
+        predicted  = self.graph.propagate(var, value)
+        observed   = self.env.intervene(var, value)
 
-        # Предсказываем
-        predicted = self.graph.propagate(var, value)
-
-        # Получаем ground truth (интервенционная жёсткость)
-        observed = self.env.intervene(var, value)
-
-        # Обновляем граф
         updated_edges: list[str] = []
         pruned_edges:  list[str] = []
 
@@ -159,43 +161,48 @@ class RKKAgent:
             if abs(input_delta) < 1e-3:
                 continue
 
-            empirical_w = float(np.tanh((obs_val - self.graph.nodes.get(node_id, obs_val))
-                                        / (input_delta + 1e-4)))
+            empirical_w = float(
+                np.tanh(
+                    (obs_val - self.graph.nodes.get(node_id, obs_val))
+                    / (input_delta + 1e-4)
+                )
+            )
 
             if abs(empirical_w) > 0.08:
-                existing = next((e for e in self.graph.edges
-                                 if e.from_ == var and e.to == node_id), None)
+                existing  = next(
+                    (e for e in self.graph.edges if e.from_ == var and e.to == node_id),
+                    None
+                )
                 prev_alpha = existing.alpha_trust if existing else 0.0
-                # Epistemic Annealing: alpha нарастает при каждом подтверждении
-                new_alpha = min(0.98, prev_alpha + 0.12 * (1 - prev_alpha))
+                new_alpha  = min(0.98, prev_alpha + 0.12 * (1 - prev_alpha))
                 self.graph.set_edge(var, node_id, empirical_w, new_alpha)
                 updated_edges.append(f"{var}→{node_id}")
             else:
-                # Нет эффекта → выжигаем spurious priors
-                existing = next((e for e in self.graph.edges
-                                 if e.from_ == var and e.to == node_id), None)
+                existing = next(
+                    (e for e in self.graph.edges if e.from_ == var and e.to == node_id),
+                    None
+                )
                 if existing and existing.alpha_trust < 0.3:
                     existing.alpha_trust = max(0, existing.alpha_trust - 0.08)
                     if existing.alpha_trust < 0.02:
                         self.graph.remove_edge(var, node_id)
                         pruned_edges.append(f"PRUNED:{var}→{node_id}")
 
-            # Обновляем значения узлов
             self.graph.nodes[node_id] = obs_val
 
         self.graph.nodes[var] = value
 
-        mdl_after = self.graph.mdl_size
+        mdl_after         = self.graph.mdl_size
         compression_delta = mdl_before - mdl_after
         self._cg_history.append(compression_delta)
 
-        # Обучаем System 1: если мы удивились — IG был высокий (реальный)
+        # Обучаем System 1
         pred_val  = predicted.get(list(observed.keys())[-1], 0.5)
         obs_val_  = list(observed.values())[-1]
         actual_ig = float(abs(pred_val - obs_val_))
 
         s1_input = torch.tensor(
-            [best.get("expected_ig", 0), best["uncertainty"], 0, 0, best["uncertainty"]],
+            [best.get("expected_ig", 0), best["uncertainty"], 0.0, 0.0, best["uncertainty"]],
             dtype=torch.float32, device=self.device
         ).unsqueeze(0)
         s1_target = torch.tensor([[actual_ig]], dtype=torch.float32, device=self.device)
@@ -207,7 +214,13 @@ class RKKAgent:
         self.optim.step()
 
         self._total_interventions += 1
-        self._last_do   = f"do({var}={value:.2f})"
+        self._last_do = f"do({var}={value:.2f})"
+
+        # ── Обновляем peak discovery rate ──────────────────────────────────
+        current_dr = self.discovery_rate
+        if current_dr > self._peak_discovery_rate:
+            self._peak_discovery_rate = current_dr
+
         self._last_result = {
             "variable":           var,
             "value":              value,
@@ -224,9 +237,7 @@ class RKKAgent:
     def phi_approx(self) -> float:
         if len(self._phi_history) < 4:
             return 0.1
-        hist = torch.tensor(list(self._phi_history), device=self.device).unsqueeze(-1)
-        # Простая аппроксимация: автономия = дисперсия собственного состояния
-        # нормализованная к внешним воздействиям
+        hist    = torch.tensor(list(self._phi_history), device=self.device).unsqueeze(-1)
         var_self = hist.var().item()
         return float(np.clip(var_self * 10, 0, 1))
 
@@ -238,49 +249,63 @@ class RKKAgent:
         vulnerable = [e for e in self.graph.edges if e.alpha_trust < 0.5]
         if not vulnerable:
             return "no vulnerable edges"
-        edge = np.random.choice(vulnerable)
+        edge = vulnerable[int(np.random.randint(len(vulnerable)))]
         edge.alpha_trust = max(0.02, edge.alpha_trust - 0.12)
-        edge.weight      += (np.random.rand() - 0.5) * 0.2
+        edge.weight     += (np.random.rand() - 0.5) * 0.2
         self.graph._mdl_cache = None
         return f"corrupted {edge.from_}→{edge.to}"
 
-    # ── Compression gain ──────────────────────────────────────────────────────
+    # ── Properties ────────────────────────────────────────────────────────────
     @property
     def compression_gain(self) -> float:
         if not self._cg_history:
             return 0.0
         return float(np.mean(list(self._cg_history)))
 
-    # ── Discovery rate ────────────────────────────────────────────────────────
     @property
     def discovery_rate(self) -> float:
+        """Текущий discovery rate (может флуктуировать)."""
         return self.env.discovery_rate([
             {"from_": e.from_, "to": e.to, "weight": e.weight}
             for e in self.graph.edges
         ])
 
+    @property
+    def peak_discovery_rate(self) -> float:
+        """Монотонно растущий максимум — никогда не снижается."""
+        return self._peak_discovery_rate
+
     # ── Snapshot ──────────────────────────────────────────────────────────────
     def snapshot(self) -> dict:
+        current_dr = self.discovery_rate
+
+        # Обновляем peak здесь тоже на случай если step() не вызвался
+        if current_dr > self._peak_discovery_rate:
+            self._peak_discovery_rate = current_dr
+
         return {
-            "id":                   self.id,
-            "name":                 self.name,
-            "env_type":             self.env.preset,
-            "activation":           self.activation,
-            "graph_mdl":            round(self.graph.mdl_size, 3),
-            "compression_gain":     round(self.compression_gain, 4),
-            "alpha_mean":           round(self.graph.alpha_mean, 3),
-            "phi":                  round(self.phi_approx(), 3),
-            "node_count":           len(self.graph.nodes),
-            "edge_count":           len(self.graph.edges),
-            "total_interventions":  self._total_interventions,
-            "last_do":              self._last_do,
-            "discovery_rate":       round(self.discovery_rate, 3),
+            "id":                    self.id,
+            "name":                  self.name,
+            "env_type":              self.env.preset,
+            "activation":            self.activation,
+            "graph_mdl":             round(self.graph.mdl_size, 3),
+            "compression_gain":      round(self.compression_gain, 4),
+            "alpha_mean":            round(self.graph.alpha_mean, 3),
+            "phi":                   round(self.phi_approx(), 3),
+            "node_count":            len(self.graph.nodes),
+            "edge_count":            len(self.graph.edges),
+            "total_interventions":   self._total_interventions,
+            "last_do":               self._last_do,
+            # ── Оба нужны simulation.py ──────────────────────────────────────
+            "discovery_rate":        round(current_dr, 3),
+            "peak_discovery_rate":   round(self._peak_discovery_rate, 3),
+            # ── Рёбра для визуализации ───────────────────────────────────────
             "edges": [
                 {
-                    "from_":             e.from_,
-                    "to":                e.to,
-                    "weight":            round(e.weight, 3),
-                    "alpha_trust":       round(e.alpha_trust, 3),
+                    "from_":              e.from_,
+                    "to":                 e.to,
+                    "weight":             round(e.weight, 3),
+                    "alpha_trust":        round(e.alpha_trust, 3),
                     "intervention_count": e.intervention_count,
                 }
                 for e in self.graph.edges
