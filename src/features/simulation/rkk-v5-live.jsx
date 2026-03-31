@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import * as THREE from "three";
 import { useRKKStream } from "../../hooks/useRKKStream";
-import { Simulation }   from "../../engine/Simulation";
 
 // ─── CONSTANTS ────────────────────────────────────────────────────────────────
 const WORLD            = 14;
@@ -12,10 +11,9 @@ const DEMON_COLOR      = 0xff2244;
 const PHASE_NAMES      = ["", "Causal Crib", "Robotic Explorer", "Social Sandbox", "Value Lock", "Open Reality"];
 const GRAPH_LINES      = 14;
 
-// ─── Adapter: normalize backend frame OR local snapshot to common shape ───────
+// ─── Adapter: normalize backend frame (snake_case) to UI shape ───────────────
 function normalizeFrame(raw) {
   // Backend frame already has agent.phi, agent.alpha_mean etc. (snake_case)
-  // Local TS snapshot has agent.alphaMean, agent.phi etc. (camelCase)
   const agents = (raw.agents ?? []).map(a => ({
     id:                  a.id                  ?? 0,
     name:                a.name                ?? "?",
@@ -44,47 +42,31 @@ function normalizeFrame(raw) {
   };
 }
 
-// ─── Local fallback simulation (TypeScript engine) ────────────────────────────
-function useLocalSim(active) {
-  const simRef   = useRef(null);
-  const stateRef = useRef(null);
-
-  if (active && !simRef.current) {
-    simRef.current   = new Simulation();
-    stateRef.current = simRef.current.tick_step();
-  }
-
-  return { simRef, stateRef };
-}
-
 // ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
 export default function RKKv5() {
   const mountRef = useRef(null);
   const rafRef   = useRef(null);
 
-  // Try WebSocket backend first
-  const { frame: wsFrame, connected, speed: wsSpeed, setSpeed: wsSetSpeed } = useRKKStream();
-
-  // Local TS fallback (used when WS not connected)
-  const { simRef, stateRef } = useLocalSim(!connected);
+  const { frame: wsFrame, connected, setSpeed: wsSetSpeed } = useRKKStream();
+  const wsFrameRef = useRef(wsFrame);
+  wsFrameRef.current = wsFrame;
 
   const [speed,   setSpeedLocal] = useState(1);
   const [ui,      setUI]         = useState(() => normalizeFrame(wsFrame));
   const [backend, setBackend]    = useState(false);
 
-  // Speed control: routes to WS or local
   const setSpeed = (s) => {
     setSpeedLocal(s);
     if (connected) wsSetSpeed(s);
   };
 
-  // Update UI from WS when connected
   useEffect(() => {
-    if (connected) {
-      setBackend(true);
-      setUI(normalizeFrame(wsFrame));
-    }
-  }, [wsFrame, connected]);
+    setUI(normalizeFrame(wsFrame));
+  }, [wsFrame]);
+
+  useEffect(() => {
+    if (connected) setBackend(true);
+  }, [connected]);
 
   // ── Three.js setup ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -201,37 +183,18 @@ export default function RKKv5() {
     // ── Animation loop ──
     let frame    = 0;
     let camAngle = 0;
-    let uiTick   = 0;
-
-    // currentState держит последнее нормализованное состояние
-    // обновляется либо из WS (через setUI), либо из локального движка
-    let localSpeedRef = { val: 1 };
 
     function loop() {
       rafRef.current = requestAnimationFrame(loop);
       frame++;
-      uiTick++;
 
-      // ── Если нет WS — тикаем локально ──
-      let state = null;
-      if (!connected && simRef.current) {
-        if (frame % Math.max(1, Math.round(8 / localSpeedRef.val)) === 0) {
-          stateRef.current = simRef.current.tick_step();
-        }
-        state = normalizeFrame(stateRef.current);
-      }
+      const uiData = normalizeFrame(wsFrameRef.current);
 
       // ── Camera orbit ──
       camAngle += 0.0012;
       camera.position.x = Math.sin(camAngle) * 28;
       camera.position.z = Math.cos(camAngle) * 28;
       camera.lookAt(0, 2, 0);
-
-      // ── Pull latest UI state ──
-      // В WS-режиме state приходит через useEffect → setUI
-      // В локальном режиме берём только что вычисленный state
-      const uiData = state ?? null;
-      if (!uiData && !connected) return;
 
       const displayState = uiData;
 
@@ -322,19 +285,10 @@ export default function RKKv5() {
           line.material.opacity = link ? link.strength * 0.65 : 0;
         });
 
-        // ── UI update every 24 frames (local mode only) ──
-        if (!connected && uiTick >= 24) {
-          uiTick = 0;
-          setUI(displayState);
-        }
       }
 
       renderer.render(scene, camera);
     }
-
-    // Expose speed ref so loop can read it without closure staleness
-    const speedProxy = { val: 1 };
-    Object.assign(localSpeedRef, speedProxy);
 
     loop();
 
@@ -369,7 +323,7 @@ export default function RKKv5() {
         padding: "4px 10px", borderRadius: 2, fontSize: 9,
         color: connected ? "#00ff88" : "#ff8844",
       }}>
-        {connected ? "● PYTHON BACKEND" : "○ LOCAL ENGINE"}
+        {connected ? "● PYTHON BACKEND" : "○ OFFLINE"}
       </div>
 
       {/* ── Header ── */}
@@ -532,7 +486,7 @@ export default function RKKv5() {
         padding: "10px 14px", borderRadius: 2, maxHeight: 140, overflow: "hidden",
       }}>
         <div style={{ color: "#113344", fontSize: 9, letterSpacing: "0.15em", marginBottom: 6 }}>
-          CAUSAL EVENT STREAM {connected ? "— PYTHON/HIP" : "— LOCAL ENGINE"}
+          CAUSAL EVENT STREAM {connected ? "— PYTHON/HIP" : "— OFFLINE"}
         </div>
         {ui.events.length === 0 && (
           <div style={{ color: "#1a3344", fontSize: 10 }}>Bootstrapping agents from text priors…</div>
