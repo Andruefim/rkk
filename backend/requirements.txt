@@ -1,0 +1,11 @@
+# rkk-backend dependencies
+# Install: pip install -r requirements.txt
+# PyTorch: pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm6.2
+
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+pydantic==2.8.0
+websockets==13.0
+numpy==1.26.4
+scipy==1.13.0
+networkx==3.3
