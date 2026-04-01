@@ -1,4 +1,4 @@
-import RKKv5 from "./features/simulation/rkk-v5-notears.jsx";
+import RKKv5 from "./features/simulation/rkk-v5.jsx";
 
 function App() {
 
