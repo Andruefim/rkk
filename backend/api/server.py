@@ -55,7 +55,7 @@ def get_seeder() -> RAGSeeder:
     if _seeder is None:
         # По умолчанию без LLM (только Wikipedia + regex)
         # Для LLM: RAGSeeder(llm_url="http://localhost:11434/api/generate", llm_model="qwen2.5:3b")
-        _seeder = RAGSeeder(llm_url="http://localhost:11434/api/generate", llm_model="qwen3.5:9b")
+        _seeder = RAGSeeder(llm_url="http://localhost:11434/api/generate", llm_model="qwen3.5:4b")
     return _seeder
 
 
@@ -98,14 +98,14 @@ def demon_stats():
 def get_variables(agent_id: int):
     """Возвращает список переменных агента для корректного заполнения seeds."""
     sim = get_sim()
-    if agent_id >= len(sim.agents):
+    ctx = sim.agent_seed_context(agent_id)
+    if ctx is None:
         return {"error": "invalid agent_id"}
-    agent = sim.agents[agent_id]
     return {
         "agent_id":   agent_id,
-        "agent_name": agent.name,
-        "env_preset": agent.env.preset,
-        "variables":  list(agent.graph.nodes.keys()),
+        "agent_name": ctx["name"],
+        "env_preset": ctx["preset"],
+        "variables":  ctx["variables"],
     }
 
 
@@ -149,12 +149,12 @@ async def rag_generate(req: RAGRequest):
     global _rag_status
     sim = get_sim()
 
-    if req.agent_id >= len(sim.agents):
+    ctx = sim.agent_seed_context(req.agent_id)
+    if ctx is None:
         return {"error": "invalid agent_id"}
 
-    agent  = sim.agents[req.agent_id]
-    preset = agent.env.preset
-    vars_  = list(agent.graph.nodes.keys())
+    preset = ctx["preset"]
+    vars_  = ctx["variables"]
 
     # Настраиваем seeder
     seeder = RAGSeeder(
@@ -212,9 +212,13 @@ async def rag_auto_seed_all():
     _rag_status["running"] = True
     results = []
 
-    for i, agent in enumerate(sim.agents):
-        preset = agent.env.preset
-        vars_  = list(agent.graph.nodes.keys())
+    for i in range(3):
+        ctx = sim.agent_seed_context(i)
+        if ctx is None:
+            continue
+        preset = ctx["preset"]
+        vars_  = ctx["variables"]
+        name   = ctx["name"]
 
         try:
             hypotheses = await seeder.generate(
@@ -227,11 +231,11 @@ async def rag_auto_seed_all():
         except Exception as e:
             edges  = HARDCODED_SEEDS.get(preset, [])
             source = "hardcoded"
-            print(f"[RAG] Fallback to hardcoded for {agent.name}: {e}")
+            print(f"[RAG] Fallback to hardcoded for {name}: {e}")
 
         result = sim.inject_seeds(agent_id=i, edges=edges)
         results.append({
-            "agent":    agent.name,
+            "agent":    name,
             "preset":   preset,
             "injected": result.get("injected", 0),
             "source":   source,
@@ -275,10 +279,12 @@ async def causal_stream(websocket: WebSocket):
                         edges=msg.get("edges", [])
                     )
                 elif cmd == "rag_auto":
-                    # Быстрый хардкодный сид через WS
-                    for i, agent in enumerate(sim.agents):
-                        preset = agent.env.preset
-                        edges  = HARDCODED_SEEDS.get(preset, [])
+                    # Быстрый хардкодный сид через WS (и в multiprocess)
+                    for i in range(3):
+                        ctx = sim.agent_seed_context(i)
+                        if not ctx:
+                            continue
+                        edges = HARDCODED_SEEDS.get(ctx["preset"], [])
                         if edges:
                             sim.inject_seeds(agent_id=i, edges=edges)
             except asyncio.TimeoutError:

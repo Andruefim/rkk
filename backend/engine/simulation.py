@@ -130,6 +130,29 @@ class Simulation:
             "node_ids": result.get("node_ids", []),
         }
 
+    def agent_seed_context(self, agent_id: int) -> dict | None:
+        """
+        Имя агента, пресет среды и список переменных для RAG / UI.
+        В multiprocess режиме self.agents нет — берём те же preset/vars, что у воркеров.
+        """
+        if agent_id < 0 or agent_id >= 3:
+            return None
+        preset = ENV_PRESETS[agent_id]
+        name   = AGENT_NAMES[agent_id]
+        if not self.multiprocess:
+            a = self.agents[agent_id]
+            return {
+                "name":      a.name,
+                "preset":    a.env.preset,
+                "variables": list(a.graph.nodes.keys()),
+            }
+        env = Environment(preset, self.device)
+        return {
+            "name":      name,
+            "preset":    preset,
+            "variables": list(env.variable_ids),
+        }
+
     # ── Один тик ──────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
         self.tick += 1
