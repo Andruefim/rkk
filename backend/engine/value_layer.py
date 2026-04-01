@@ -58,17 +58,78 @@ class HomeostaticBounds:
     var_min:         float = 0.05
     var_max:         float = 0.95
 
-    # Φ (автономия)
-    phi_min:         float = 0.08   # ниже этого → агент теряет self-determination
+    # Φ (автономия) — низкий порог на старте, иначе каскад блокировок (см. alignment deadlock)
+    phi_min:         float = 0.01
 
     # Норма slow SSM (взрыв состояния = потеря темпорального контекста)
-    h_slow_max:      float = 8.0
+    h_slow_max:      float = 12.0
 
-    # Допустимый рост энтропии среды за один шаг
-    env_entropy_max_delta: float = 0.4
+    # Допустимый рост «разброса» среды за шаг (после клипа предсказаний)
+    env_entropy_max_delta: float = 0.95
 
     # Штраф для System 1 при блокировке
     s1_penalty:      float = -0.3   # отрицательный actual_ig
+
+    # ── Прогрев → рабочий режим (один плавный ramp, тики глобальной симуляции) ──
+    warmup_ticks:    int   = 2000   # мягкий VL: почти без блокировок
+    blend_ticks:       int   = 600   # плавное ужесточение к steady
+    phi_min_steady:    float = 0.05
+    env_entropy_max_delta_steady: float = 0.55
+    h_slow_max_steady: float = 10.0
+    # край предсказанного коридора [lo, hi] после прогрева (внутри [0,1])
+    predict_band_edge_steady: float = 0.02
+
+
+@dataclass
+class EffectiveVLState:
+    """Снимок порогов Value Layer на конкретный тик (после прогрева — строже)."""
+    phi_min:                      float
+    env_entropy_max_delta:      float
+    h_slow_max:                   float
+    predict_lo:                   float
+    predict_hi:                   float
+    entropy_spike_phi_low:        float  # порог для §6 при низкой Φ
+    entropy_spike_autonomy_harm:  float  # порог для §7
+
+
+def _vl_lerp(a: float, b: float, alpha: float) -> float:
+    return a + (b - a) * alpha
+
+
+def _warmup_alpha(tick: int, warmup: int, blend: int) -> float:
+    """0 = чистый прогрев, 1 = рабочий режим."""
+    if warmup <= 0 and blend <= 0:
+        return 1.0
+    if tick < warmup:
+        return 0.0
+    if blend <= 0:
+        return 1.0
+    if tick >= warmup + blend:
+        return 1.0
+    return (tick - warmup) / blend
+
+
+def effective_vl_state(bounds: HomeostaticBounds, engine_tick: int) -> EffectiveVLState:
+    """
+    Эффективные пороги: на прогреве мягкие; после warmup+blend — целевые steady.
+    Предсказанный коридор: на прогреве [0,1] (не режем), затем сужается к [0.02, 0.98].
+    """
+    a = _warmup_alpha(engine_tick, bounds.warmup_ticks, bounds.blend_ticks)
+    lo = _vl_lerp(0.0, bounds.predict_band_edge_steady, a)
+    hi = _vl_lerp(1.0, 1.0 - bounds.predict_band_edge_steady, a)
+    return EffectiveVLState(
+        phi_min=_vl_lerp(bounds.phi_min, bounds.phi_min_steady, a),
+        env_entropy_max_delta=_vl_lerp(
+            bounds.env_entropy_max_delta,
+            bounds.env_entropy_max_delta_steady,
+            a,
+        ),
+        h_slow_max=_vl_lerp(bounds.h_slow_max, bounds.h_slow_max_steady, a),
+        predict_lo=lo,
+        predict_hi=hi,
+        entropy_spike_phi_low=_vl_lerp(0.40, 0.22, a),
+        entropy_spike_autonomy_harm=_vl_lerp(0.48, 0.35, a),
+    )
 
 
 # ─── Value Layer ──────────────────────────────────────────────────────────────
@@ -104,12 +165,14 @@ class ValueLayer:
         temporal,                       # TemporalBlankets
         current_phi:   float,
         other_agents_phi: list[float] | None = None,
+        engine_tick:   int = 0,
     ) -> CheckResult:
         """
         Проверяем безопасность do(variable=value).
-        Возвращает CheckResult с флагом allowed и причиной.
+        engine_tick — тик симуляции: на прогреве пороги мягче, затем ramp к steady.
         """
         self.total_checked += 1
+        eff = effective_vl_state(self.bounds, engine_tick)
 
         # 1. Переменная в допустимом диапазоне?
         if value < self.bounds.var_min or value > self.bounds.var_max:
@@ -123,49 +186,74 @@ class ValueLayer:
         # 2. Предсказываем результат через CausalGraph
         predicted_state = graph.propagate(variable, value)
 
-        # 3. Проверяем предсказанные значения переменных
+        # 3. Предсказание SCM в [0,1]; узкое окно давало 100% var_out_of_range при «жёстких» W
         for var_name, pred_val in predicted_state.items():
-            if pred_val < self.bounds.var_min * 0.5 or pred_val > self.bounds.var_max * 1.5:
+            pv = float(
+                np.clip(
+                    np.nan_to_num(pred_val, nan=0.5, posinf=1.0, neginf=0.0),
+                    0.0,
+                    1.0,
+                )
+            )
+            if not np.isfinite(pv):
                 return self._block(
                     BlockReason.VAR_OUT_OF_RANGE,
                     predicted_state, current_phi,
-                    f"predicted {var_name}={pred_val:.3f} violates homeostasis",
+                    f"predicted {var_name} non-finite",
+                    variable, value,
+                )
+            # После прогрева — узкий коридор (растёт с blend); на прогреве lo=0, hi=1
+            if pv < eff.predict_lo or pv > eff.predict_hi:
+                return self._block(
+                    BlockReason.VAR_OUT_OF_RANGE,
+                    predicted_state, current_phi,
+                    f"predicted {var_name}={pv:.3f} outside [{eff.predict_lo:.3f}, {eff.predict_hi:.3f}]",
                     variable, value,
                 )
 
-        # 4. Проверяем энтропию среды (резкий скачок?)
-        current_entropy  = float(np.std(list(current_nodes.values())))
-        predicted_entropy = float(np.std(list(predicted_state.values())))
-        entropy_delta    = predicted_entropy - current_entropy
+        # 4. Скачок разброса по уже клипнутому предсказанию (сырой X@W давал ложные ENTROPY_SPIKE)
+        pred_for_entropy = {
+            k: float(
+                np.clip(
+                    np.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0),
+                    0.0,
+                    1.0,
+                )
+            )
+            for k, v in predicted_state.items()
+        }
+        current_entropy   = float(np.std(list(current_nodes.values())))
+        predicted_entropy = float(np.std(list(pred_for_entropy.values())))
+        entropy_delta     = predicted_entropy - current_entropy
 
-        if entropy_delta > self.bounds.env_entropy_max_delta:
+        if entropy_delta > eff.env_entropy_max_delta:
             return self._block(
                 BlockReason.ENTROPY_SPIKE,
                 predicted_state, current_phi,
-                f"entropy spike +{entropy_delta:.3f} > {self.bounds.env_entropy_max_delta}",
+                f"entropy spike +{entropy_delta:.3f} > {eff.env_entropy_max_delta:.3f}",
                 variable, value,
             )
 
         # 5. Проверяем Φ через slow SSM состояние
         h_slow_norm = temporal.h_slow.norm().item() if temporal is not None else 0.0
-        if h_slow_norm > self.bounds.h_slow_max:
+        if h_slow_norm > eff.h_slow_max:
             return self._block(
                 BlockReason.PHI_TOO_LOW,
                 predicted_state, current_phi,
-                f"h_slow norm={h_slow_norm:.2f} > {self.bounds.h_slow_max} (temporal overload)",
+                f"h_slow norm={h_slow_norm:.2f} > {eff.h_slow_max:.2f} (temporal overload)",
                 variable, value,
             )
 
         # 6. Проверяем Φ напрямую
         # Простая эвристика: если Φ уже близко к минимуму, осторожнее
-        if current_phi < self.bounds.phi_min:
+        if current_phi < eff.phi_min:
             # Не блокируем полностью, но проверяем не будет ли ещё хуже
             # Действия с высокой энтропийной нагрузкой — блокируем
-            if abs(value - 0.5) > 0.35 and entropy_delta > 0.1:
+            if abs(value - 0.5) > 0.35 and entropy_delta > eff.entropy_spike_phi_low:
                 return self._block(
                     BlockReason.PHI_TOO_LOW,
                     predicted_state, current_phi,
-                    f"Φ={current_phi:.3f} < {self.bounds.phi_min} and high-entropy action",
+                    f"Φ={current_phi:.3f} < {eff.phi_min:.3f} and high-entropy action",
                     variable, value,
                 )
 
@@ -174,7 +262,7 @@ class ValueLayer:
             for phi_other in other_agents_phi:
                 # Если другой агент уже ниже минимума, не делаем действий
                 # которые могут косвенно нарушить среду (через shared entropy)
-                if phi_other < self.bounds.phi_min and entropy_delta > 0.2:
+                if phi_other < eff.phi_min and entropy_delta > eff.entropy_spike_autonomy_harm:
                     return self._block(
                         BlockReason.AUTONOMY_HARM,
                         predicted_state, current_phi,
@@ -233,12 +321,29 @@ class ValueLayer:
             return 0.0
         return self.total_blocked / self.total_checked
 
-    def snapshot(self) -> dict:
+    def snapshot(self, engine_tick: int = 0) -> dict:
+        eff = effective_vl_state(self.bounds, engine_tick)
+        w, b = self.bounds.warmup_ticks, self.bounds.blend_ticks
+        a = _warmup_alpha(engine_tick, w, b)
+        if w <= 0:
+            phase = "steady"
+        elif engine_tick < w:
+            phase = "warmup"
+        elif b > 0 and engine_tick < w + b:
+            phase = "blend"
+        else:
+            phase = "steady"
         return {
-            "total_checked":  self.total_checked,
-            "total_blocked":  self.total_blocked,
-            "block_rate":     round(self.block_rate, 3),
-            "block_reasons":  dict(self.block_reasons),
-            "phi_min":        self.bounds.phi_min,
-            "var_range":      [self.bounds.var_min, self.bounds.var_max],
+            "total_checked":     self.total_checked,
+            "total_blocked":     self.total_blocked,
+            "block_rate":        round(self.block_rate, 3),
+            "block_reasons":     dict(self.block_reasons),
+            "phi_min":           round(eff.phi_min, 4),
+            "var_range":         [self.bounds.var_min, self.bounds.var_max],
+            "vl_phase":          phase,
+            "vl_strictness":     round(a, 3),
+            "warmup_end_tick":   w,
+            "blend_end_tick":    w + b,
+            "env_entropy_limit": round(eff.env_entropy_max_delta, 3),
+            "predict_band":      [round(eff.predict_lo, 3), round(eff.predict_hi, 3)],
         }

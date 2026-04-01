@@ -34,12 +34,19 @@ class Simulation:
         )
         print(f"[RKK] Device: {self.device}")
 
-        # Гомеостатические ограничения — чуть мягче для Phase I
+        # Гомеостатические ограничения: прогрев (мягко) → blend → рабочий режим (steady).
+        # Пороги по тику: см. effective_vl_state() в value_layer.py
         bounds = HomeostaticBounds(
             var_min=0.05, var_max=0.95,
-            phi_min=0.06,
-            h_slow_max=10.0,
-            env_entropy_max_delta=0.45,
+            phi_min=0.01,
+            h_slow_max=12.0,
+            env_entropy_max_delta=0.95,
+            warmup_ticks=2000,
+            blend_ticks=600,
+            phi_min_steady=0.05,
+            env_entropy_max_delta_steady=0.55,
+            h_slow_max_steady=10.0,
+            predict_band_edge_steady=0.02,
         )
 
         self.envs   = [Environment(p, self.device) for p in ENV_PRESETS]
@@ -73,12 +80,18 @@ class Simulation:
         if agent_id >= len(self.agents):
             return {"error": "invalid agent_id"}
 
-        count = self.agents[agent_id].inject_text_priors(edges)
+        result = self.agents[agent_id].inject_text_priors(edges)
+        n = result["injected"]
         self._add_event(
-            f"💉 Seeds injected → {AGENT_NAMES[agent_id]}: {count} edges (α=0.05)",
+            f"💉 Seeds injected → {AGENT_NAMES[agent_id]}: {n} edges (α=0.05)",
             "#886600", "discovery"
         )
-        return {"injected": count, "agent": AGENT_NAMES[agent_id]}
+        return {
+            "injected": n,
+            "agent":    AGENT_NAMES[agent_id],
+            "skipped":  result["skipped"],
+            "node_ids": result["node_ids"],
+        }
 
     # ── Один тик ──────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
@@ -89,9 +102,9 @@ class Simulation:
         for i, agent in enumerate(self.agents):
             agent.other_agents_phi = [p for j, p in enumerate(phis) if j != i]
 
-        # 1. Шаги агентов
+        # 1. Шаги агентов (тик симуляции — для фазы прогрева Value Layer)
         for agent in self.agents:
-            result = agent.step()
+            result = agent.step(engine_tick=self.tick)
 
             if result.get("blocked"):
                 # Все кандидаты заблокированы Value Layer

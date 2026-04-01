@@ -22,7 +22,7 @@ from engine.value_layer  import ValueLayer, HomeostaticBounds, BlockReason
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
 NOTEARS_EVERY = 8
-MAX_FALLBACK_TRIES = 6   # если действие заблокировано — пробуем следующее
+MAX_FALLBACK_TRIES = 12  # больше кандидатов, чтобы пройти Value Layer в начале обучения
 
 
 class RKKAgent:
@@ -59,6 +59,7 @@ class RKKAgent:
 
         # Φ других агентов (заполняется Simulation-ом перед step())
         self.other_agents_phi: list[float] = []
+        self._last_engine_tick = 0
 
         self._bootstrap()
 
@@ -82,7 +83,7 @@ class RKKAgent:
             self.graph.set_edge(var_ids[1], var_ids[3],  0.35, alpha=0.05)
             self.graph.set_edge(var_ids[2], var_ids[0], -0.20, alpha=0.04)
 
-    def inject_text_priors(self, edges: list[dict]) -> int:
+    def inject_text_priors(self, edges: list[dict]) -> dict:
         """
         LLM/RAG seed interface.
 
@@ -91,25 +92,36 @@ class RKKAgent:
         Все рёбра загружаются с alpha=0.05 (низкое доверие).
         Epistemic Annealing + NOTEARS выжгут ошибочные за N интервенций.
 
-        Возвращает количество успешно загруженных рёбер.
+        Узлы from_/to должны совпадать с id переменных окружения (env.variable_ids).
+
+        Возвращает {"injected": n, "skipped": [причины...]}.
         """
-        count = 0
+        count   = 0
+        skipped: list[str] = []
+        valid   = set(self.graph.nodes.keys())
+
         for e in edges:
             from_ = e.get("from_") or e.get("from")
             to    = e.get("to")
             w     = float(e.get("weight", 0.3))
 
             if not from_ or not to:
+                skipped.append(f"нет from_/to: {e!r}")
                 continue
-            if from_ not in self.graph.nodes or to not in self.graph.nodes:
+            if from_ not in self.graph.nodes:
+                skipped.append(f"неизвестный узел «{from_}» (доступны: {sorted(valid)})")
+                continue
+            if to not in self.graph.nodes:
+                skipped.append(f"неизвестный узел «{to}» (доступны: {sorted(valid)})")
                 continue
 
-            # Добавляем с минимальным доверием — как "прочитал в книге"
             alpha = float(e.get("alpha", 0.05))
-            self.graph.set_edge(from_, to, w * 0.4, alpha=alpha)
+            # Слабые семена по умолчанию (0.2–0.3 экв.) — не «пугают» граф и VL
+            w_scaled = min(0.3, max(0.08, float(w) * 0.28))
+            self.graph.set_edge(from_, to, w_scaled, alpha=alpha)
             count += 1
 
-        return count
+        return {"injected": count, "skipped": skipped, "node_ids": sorted(valid)}
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _get_h_W(self) -> float:
@@ -164,10 +176,11 @@ class RKKAgent:
                     discovery_rate=disc_rate,
                 )
                 features_batch.append(feat)
+                # Умеренные интервенции ближе к 0.5 — меньше скачков propagate и entropy (anti-deadlock)
                 candidates.append({
                     "variable":    v_from,
                     "target":      v_to,
-                    "value":       0.9 if np.random.rand() > 0.5 else 0.1,
+                    "value":       float(np.clip(np.random.uniform(0.22, 0.78), 0.06, 0.94)),
                     "uncertainty": uncertainty,
                     "features":    feat,
                     "expected_ig": 0.0,
@@ -183,7 +196,8 @@ class RKKAgent:
         return sorted(candidates, key=lambda x: -x["expected_ig"])
 
     # ── Один шаг с Value Layer ────────────────────────────────────────────────
-    def step(self) -> dict:
+    def step(self, engine_tick: int = 0) -> dict:
+        self._last_engine_tick = engine_tick
         scores = self.score_interventions()
         if not scores:
             return {"blocked": False, "skipped": True}
@@ -206,6 +220,7 @@ class RKKAgent:
                 temporal=self.temporal,
                 current_phi=current_phi,
                 other_agents_phi=self.other_agents_phi,
+                engine_tick=engine_tick,
             )
 
             if check_result.allowed:
@@ -361,7 +376,7 @@ class RKKAgent:
             "buffer_size": len(self.system1.buffer),
             "mean_loss":   round(self.system1.mean_loss, 6),
         }
-        vl_info = self.value_layer.snapshot()
+        vl_info = self.value_layer.snapshot(self._last_engine_tick)
 
         notears_info = None
         if self._last_notears_loss:

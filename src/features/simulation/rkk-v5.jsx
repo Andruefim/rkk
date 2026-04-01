@@ -90,7 +90,10 @@ export default function RKKv5() {
         body: JSON.stringify({ agent_id: seedAgent, edges, source: "manual" }),
       });
       const data = await res.json();
-      setSeedStatus(`✓ Injected ${data.injected} edges → ${data.agent}`);
+      const skipNote = (data.skipped?.length)
+        ? ` | skipped ${data.skipped.length}: ${data.skipped.slice(0, 2).join("; ")}${data.skipped.length > 2 ? "…" : ""}`
+        : "";
+      setSeedStatus(`✓ Injected ${data.injected} edges → ${data.agent}${skipNote}`);
     } catch (e) {
       setSeedStatus(`✗ Error: ${e.message}`);
     }
