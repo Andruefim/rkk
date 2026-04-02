@@ -1,6 +1,6 @@
 # rkk-backend dependencies
 # Install: pip install -r requirements.txt
-# PyTorch: pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm6.2
+# PyTorch ROCm: pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm6.2
 
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
@@ -9,3 +9,9 @@ websockets==13.0
 numpy==1.26.4
 scipy==1.13.0
 networkx==3.3
+httpx>=0.27.0
+pybullet            # Фаза 9+: pip install pybullet
+
+# Фаза 10+: GNN (опционально — без него pure PyTorch fallback в causal_gnn.py)
+# pip install torch-geometric
+# или: pip install torch-geometric -f https://data.pyg.org/whl/torch-2.6.0+rocm6.2.html
