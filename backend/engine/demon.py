@@ -205,12 +205,12 @@ class AdversarialDemon:
                 self.target = mem.agent_id
                 return
 
-        # Атакуем самого уязвимого (при ничьей — случайный выбор, не всегда id=0)
+        # Цель с лучшим score (Φ-drop минус штраф за промахи); при ничьей — случайно
         key_fn = lambda m: m.best_phi_drop - m.failed_attacks * 0.1
-        mv      = min(key_fn(m) for m in self.memory)
-        weakest = random.choice([m for m in self.memory if key_fn(m) == mv])
+        mv      = max(key_fn(m) for m in self.memory)
+        best = random.choice([m for m in self.memory if key_fn(m) == mv])
         self.mode   = AttackMode.TARGETED
-        self.target = weakest.agent_id
+        self.target = best.agent_id
 
     def _build_state(self, snapshots: list[dict]) -> list[float]:
         phis    = [s.get("phi", 0.1) for s in snapshots]
@@ -246,9 +246,10 @@ class AdversarialDemon:
             mem.best_phi_drop = max(mem.best_phi_drop, phi_drop)
         else:
             mem.failed_attacks += 1
-            # Сбрасываем siege если много промахов
+            # Сбрасываем siege и «фрустрацию» если много промахов подряд
             if mem.failed_attacks > 5:
                 mem.successful_attacks = max(0, mem.successful_attacks - 2)
+                mem.failed_attacks = 0
 
         mem.last_attack_tick = self.tick
 
