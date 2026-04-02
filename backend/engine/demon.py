@@ -53,17 +53,19 @@ class DemonExperience:
 class DemonPolicyNet(nn.Module):
     """
     Нейросетевая политика Демона.
-    Input:  [phi_0, phi_1, phi_2, alpha_0, alpha_1, alpha_2,
-             h_W_0, h_W_1, h_W_2, demon_energy, byz_round_norm, tick_norm]
-    Output: [target_logits(3), strength, variable_idx_norm]
+    Input:  [phi_i..., alpha_i..., h_W_i..., demon_energy, tick_norm, byz_round_norm]
+            размер = 3 * n_agents + 3
+    Output: [target_logits(n_agents), strength, variable_idx_norm]
     """
-    def __init__(self):
+    def __init__(self, n_agents: int):
         super().__init__()
+        self.n_agents = n_agents
+        in_dim = 3 * n_agents + 3
         self.backbone = nn.Sequential(
-            nn.Linear(12, 64), nn.GELU(),
+            nn.Linear(in_dim, 64), nn.GELU(),
             nn.Linear(64, 32), nn.GELU(),
         )
-        self.target_head   = nn.Linear(32, 3)    # logits для выбора цели
+        self.target_head   = nn.Linear(32, n_agents)
         self.strength_head = nn.Sequential(nn.Linear(32, 1), nn.Sigmoid())
         self.var_head      = nn.Sequential(nn.Linear(32, 1), nn.Sigmoid())
 
@@ -100,7 +102,7 @@ class AdversarialDemon:
             DemonMemory(agent_id=i) for i in range(n_agents)
         ]
 
-        self.policy = DemonPolicyNet().to(device)
+        self.policy = DemonPolicyNet(n_agents).to(device)
         self.optim  = torch.optim.Adam(self.policy.parameters(), lr=5e-4)
 
         self._buffer: deque[DemonExperience] = deque(maxlen=256)

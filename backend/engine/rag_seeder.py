@@ -389,4 +389,12 @@ HARDCODED_SEEDS = {
         {"from_": "Branch_A",  "to": "Output",    "weight": 0.25, "alpha": 0.05},
         {"from_": "Condition", "to": "Branch_B",  "weight":-0.28, "alpha": 0.05},
     ],
+    "pybullet": [
+        {"from_": "obj0_vx", "to": "obj0_x", "weight": 0.25, "alpha": 0.05},
+        {"from_": "obj0_vy", "to": "obj0_y", "weight": 0.25, "alpha": 0.05},
+        {"from_": "obj1_vx", "to": "obj1_x", "weight": 0.25, "alpha": 0.05},
+        {"from_": "obj1_vy", "to": "obj1_y", "weight": 0.25, "alpha": 0.05},
+        {"from_": "obj2_vx", "to": "obj2_x", "weight": 0.25, "alpha": 0.05},
+        {"from_": "obj2_vy", "to": "obj2_y", "weight": 0.25, "alpha": 0.05},
+    ],
 }

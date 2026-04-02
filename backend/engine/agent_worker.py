@@ -1,33 +1,21 @@
 """
-agent_worker.py — Windows-safe multiprocessing worker.
+agent_worker.py — Windows-safe multiprocessing worker (v2 + PyBullet).
 
-Архитектура:
-  Главный процесс (FastAPI):
-    - Держит WebSocket, собирает снапшоты
-    - Посылает AgentCommand в in_q каждого воркера
-    - Читает AgentResult из out_q
-
-  Воркер-процесс (AgentWorker):
-    - Держит один RKKAgent на своём GPU-контексте
-    - Блокируется на in_q.get()
-    - Делает step() / inject() / snapshot()
-    - Кладёт результат в out_q
-
-Windows-специфика:
-  - spawn (не fork): torch.multiprocessing работает через spawn
-  - GPU: каждый процесс получает собственный HIP-контекст
-  - Данные между процессами — только JSON-сериализуемые dict
-    (тензоры НЕ передаём, только числа/строки)
-  - if __name__ == "__main__" — обязательно в точке входа
+Изменения v2:
+  - preset "pybullet" → EnvironmentPyBullet вместо Environment
+  - AgentPool теперь поддерживает 4 агентов: Nova/Aether/Lyra/Ignis
+  - "get_variable_ids" команда → нужна для RAG context без Environment re-init
 
 Команды (dict):
-  {"cmd": "step", "tick": int}
+  {"cmd": "step", "tick": int, "other_phi": list}
   {"cmd": "inject", "edges": [...]}
   {"cmd": "snapshot"}
-  {"cmd": "graph_dict"}          → agent.graph.to_dict() для REST
-  {"cmd": "consensus_data"}      → возвращает W как list[list[float]]
-  {"cmd": "apply_alpha_decay", "from_": str, "to": str, "decay": float}
-  {"cmd": "apply_s1_weights", "state_dict": dict}  → Motif Transfer
+  {"cmd": "graph_dict"}
+  {"cmd": "consensus_data"}
+  {"cmd": "get_variable_ids"}          ← новая
+  {"cmd": "apply_alpha_decay", ...}
+  {"cmd": "apply_s1_weights", ...}
+  {"cmd": "demon_disrupt"}
   {"cmd": "stop"}
 """
 from __future__ import annotations
@@ -35,10 +23,6 @@ from __future__ import annotations
 import torch
 import multiprocessing as mp
 import numpy as np
-from typing import Any
-
-# Важно: импорты тяжёлых модулей ВНУТРИ функции воркера,
-# иначе spawn скопирует всё в дочерний процесс до инициализации.
 
 
 def _agent_worker_fn(
@@ -50,26 +34,27 @@ def _agent_worker_fn(
     in_q:        mp.Queue,
     out_q:       mp.Queue,
 ):
-    """
-    Точка входа дочернего процесса.
-    Импортируем тяжёлые модули здесь — после spawn.
-    """
-    # ── Инициализация ──
     import torch
-    from engine.causal_graph import CausalGraph
-    from engine.environment  import Environment
-    from engine.agent        import RKKAgent
-    from engine.value_layer  import HomeostaticBounds
+    from engine.value_layer import HomeostaticBounds
+    from engine.agent       import RKKAgent
 
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
     bounds = HomeostaticBounds(**bounds_dict)
-    env    = Environment(env_preset, device)
-    agent  = RKKAgent(agent_id, agent_name, env, device, bounds)
 
-    print(f"[Worker {agent_name}] Started on {device}")
+    # ── Создаём среду ─────────────────────────────────────────────────────────
+    if env_preset == "pybullet":
+        from engine.environment_pybullet import EnvironmentPyBullet
+        env = EnvironmentPyBullet(n_objects=3, device=device, use_pybullet=True)
+    else:
+        from engine.environment import Environment
+        env = Environment(env_preset, device)
+
+    agent = RKKAgent(agent_id, agent_name, env, device, bounds)
+
+    print(f"[Worker {agent_name}] Started on {device}, env={env_preset}")
     out_q.put({"status": "ready", "agent_id": agent_id})
 
-    # ── Основной цикл ──
+    # ── Основной цикл ──────────────────────────────────────────────────────────
     while True:
         try:
             cmd_dict: dict = in_q.get(timeout=5.0)
@@ -83,7 +68,7 @@ def _agent_worker_fn(
             break
 
         elif cmd == "step":
-            tick   = cmd_dict.get("tick", 0)
+            tick       = cmd_dict.get("tick", 0)
             phi_others = cmd_dict.get("other_phi", [])
             agent.other_agents_phi = phi_others
             result = agent.step(engine_tick=tick)
@@ -117,21 +102,28 @@ def _agent_worker_fn(
                 "data":     agent.graph.to_dict(),
             })
 
+        elif cmd == "get_variable_ids":
+            out_q.put({
+                "status":    "variable_ids",
+                "agent_id":  agent_id,
+                "preset":    env_preset,
+                "variables": list(env.variable_ids),
+            })
+
         elif cmd == "consensus_data":
-            # Возвращаем W как list[list[float]] (JSON-safe)
             W_list   = None
             node_ids = []
             if agent.graph._core is not None:
                 W_list   = agent.graph._core.W_masked().detach().cpu().tolist()
                 node_ids = list(agent.graph._node_ids)
             out_q.put({
-                "status":      "consensus_data",
-                "agent_id":    agent_id,
-                "phi":         agent.phi_approx(),
-                "cg":          agent.compression_gain,
-                "block_rate":  agent.value_layer.block_rate,
-                "W":           W_list,
-                "node_ids":    node_ids,
+                "status":     "consensus_data",
+                "agent_id":   agent_id,
+                "phi":        agent.phi_approx(),
+                "cg":         agent.compression_gain,
+                "block_rate": agent.value_layer.block_rate,
+                "W":          W_list,
+                "node_ids":   node_ids,
             })
 
         elif cmd == "apply_alpha_decay":
@@ -148,7 +140,6 @@ def _agent_worker_fn(
         elif cmd == "apply_s1_weights":
             state_list = cmd_dict.get("state_dict", {})
             try:
-                # Восстанавливаем тензоры из list
                 state_dict = {
                     k: torch.tensor(v, device=device)
                     for k, v in state_list.items()
@@ -158,7 +149,7 @@ def _agent_worker_fn(
                 ema = float(cmd_dict.get("ema", 0.15))
                 for key in current:
                     if key in state_dict and current[key].shape == state_dict[key].shape:
-                        new_state[key] = (1 - ema) * current[key].float() + ema * state_dict[key].float()
+                        new_state[key] = (1-ema)*current[key].float() + ema*state_dict[key].float()
                     else:
                         new_state[key] = current[key]
                 agent.system1.net.load_state_dict(new_state, strict=False)
@@ -175,7 +166,6 @@ def _agent_worker_fn(
 
 
 def _safe_result(result: dict) -> dict:
-    """Убираем нессериализуемые объекты."""
     safe = {}
     for k, v in result.items():
         if isinstance(v, (int, float, str, bool, list, type(None))):
@@ -187,40 +177,29 @@ def _safe_result(result: dict) -> dict:
     return safe
 
 
-# ─── AgentPool ───────────────────────────────────────────────────────────────
+# ─── AgentPool (4 агента) ────────────────────────────────────────────────────
 class AgentPool:
     """
-    Пул из N воркеров-агентов.
-    Управляет запуском, остановкой и синхронным обменом сообщениями.
-
-    Использование:
-      pool = AgentPool(...)
-      pool.start()
-      ...
-      results = pool.step_all(tick=100)
-      ...
-      pool.stop()
+    Пул из 4 воркеров: Nova (physics), Aether (chemistry), Lyra (logic), Ignis (pybullet).
     """
 
-    AGENT_NAMES = ["Nova", "Aether", "Lyra"]
-    ENV_PRESETS = ["physics", "chemistry", "logic"]
+    AGENT_NAMES = ["Nova", "Aether", "Lyra", "Ignis"]
+    ENV_PRESETS = ["physics", "chemistry", "logic", "pybullet"]
 
-    def __init__(self, device_str: str, bounds_dict: dict):
+    def __init__(self, device_str: str, bounds_dict: dict, n_agents: int = 4):
         self.device_str  = device_str
         self.bounds_dict = bounds_dict
-        self.n           = 3
+        self.n           = n_agents   # 3 или 4
 
-        self.procs:   list[mp.Process] = []
-        self.in_qs:   list[mp.Queue]   = []
-        self.out_qs:  list[mp.Queue]   = []
-        self._ready   = False
+        self.procs:  list[mp.Process] = []
+        self.in_qs:  list[mp.Queue]   = []
+        self.out_qs: list[mp.Queue]   = []
+        self._ready  = False
 
-        # Последние снапшоты (обновляются после каждого step)
         self.snapshots: list[dict] = [{} for _ in range(self.n)]
 
     def start(self) -> bool:
-        """Запускаем воркеры. Возвращает True если все стартовали."""
-        ctx = mp.get_context("spawn")   # Windows-safe
+        ctx = mp.get_context("spawn")
 
         for i in range(self.n):
             in_q  = ctx.Queue(maxsize=4)
@@ -244,17 +223,21 @@ class AgentPool:
             p.start()
             self.procs.append(p)
 
-        # Ждём "ready" от всех воркеров
         import time
-        deadline = time.time() + 30.0
+        deadline    = time.time() + 45.0   # PyBullet требует чуть больше времени на старт
         ready_count = 0
+        ready_set   = set()
+
         while ready_count < self.n and time.time() < deadline:
             for i, q in enumerate(self.out_qs):
+                if i in ready_set:
+                    continue
                 try:
                     msg = q.get(timeout=0.5)
                     if msg.get("status") == "ready":
                         ready_count += 1
-                        print(f"[Pool] Worker {self.AGENT_NAMES[i]} ready")
+                        ready_set.add(i)
+                        print(f"[Pool] Worker {self.AGENT_NAMES[i]} ready ({ready_count}/{self.n})")
                 except Exception:
                     pass
 
@@ -264,14 +247,11 @@ class AgentPool:
         return self._ready
 
     def step_all(self, tick: int) -> list[dict]:
-        """Посылаем step всем воркерам, ждём результаты."""
         if not self._ready:
             return []
 
-        # Собираем phi до шага (для ΔΦ≥0)
         phis = [s.get("phi", 0.1) for s in self.snapshots]
 
-        # Рассылаем команды
         for i in range(self.n):
             other_phi = [p for j, p in enumerate(phis) if j != i]
             self.in_qs[i].put({
@@ -280,27 +260,20 @@ class AgentPool:
                 "other_phi": other_phi,
             })
 
-        # Собираем результаты (с таймаутом)
         results = []
         for i in range(self.n):
             try:
-                msg = self.out_qs[i].get(timeout=10.0)
+                msg = self.out_qs[i].get(timeout=15.0)   # PyBullet может быть медленнее
                 if msg.get("status") == "step_done":
                     self.snapshots[i] = msg.get("snapshot", {})
                 results.append(msg)
             except Exception as e:
-                results.append({
-                    "status":   "timeout",
-                    "agent_id": i,
-                    "error":    str(e),
-                })
+                results.append({"status": "timeout", "agent_id": i, "error": str(e)})
         return results
 
     def get_consensus_data(self) -> list[dict]:
-        """Запрашиваем W-матрицы для Byzantine консенсуса."""
         for i in range(self.n):
             self.in_qs[i].put({"cmd": "consensus_data"})
-
         data = []
         for i in range(self.n):
             try:
@@ -311,24 +284,26 @@ class AgentPool:
                 pass
         return data
 
+    def get_variable_ids(self, agent_id: int) -> dict:
+        """Запрашиваем переменные среды у воркера (для RAG context)."""
+        self.in_qs[agent_id].put({"cmd": "get_variable_ids"})
+        try:
+            msg = self.out_qs[agent_id].get(timeout=5.0)
+            if msg.get("status") == "variable_ids":
+                return msg
+        except Exception:
+            pass
+        return {"preset": "unknown", "variables": []}
+
     def apply_alpha_decay(self, agent_id: int, from_: str, to: str, decay: float = 0.12):
-        self.in_qs[agent_id].put({
-            "cmd":   "apply_alpha_decay",
-            "from_": from_,
-            "to":    to,
-            "decay": decay,
-        })
+        self.in_qs[agent_id].put({"cmd": "apply_alpha_decay", "from_": from_, "to": to, "decay": decay})
         try:
             self.out_qs[agent_id].get(timeout=3.0)
         except Exception:
             pass
 
     def apply_s1_weights(self, agent_id: int, state_dict_list: dict, ema: float = 0.15):
-        self.in_qs[agent_id].put({
-            "cmd":        "apply_s1_weights",
-            "state_dict": state_dict_list,
-            "ema":        ema,
-        })
+        self.in_qs[agent_id].put({"cmd": "apply_s1_weights", "state_dict": state_dict_list, "ema": ema})
         try:
             self.out_qs[agent_id].get(timeout=5.0)
         except Exception:
@@ -351,7 +326,6 @@ class AgentPool:
             return "timeout"
 
     def get_graph_dict(self, agent_id: int) -> dict:
-        """Полный to_dict() графа для REST /graph/{id} (только multiprocess)."""
         self.in_qs[agent_id].put({"cmd": "graph_dict"})
         try:
             msg = self.out_qs[agent_id].get(timeout=5.0)
