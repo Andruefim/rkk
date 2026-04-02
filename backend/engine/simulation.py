@@ -1,21 +1,8 @@
 """
-simulation_v3.py — оркестратор с Byzantine консенсусом и Motif Transfer.
+simulation_v3.py — оркестратор: только multiprocess (AgentPool).
 
-Два режима работы (переключается в __init__):
-
-  SINGLE_PROCESS (по умолчанию):
-    Все агенты в одном процессе — как раньше.
-    Byzantine и Motif Transfer работают напрямую через объекты.
-
-  MULTI_PROCESS (опционально):
-    AgentPool запускает 3 дочерних процесса.
-    Byzantine консенсус работает через JSON-обмен W-матрицами.
-    Включается через Simulation(multiprocess=True).
-    Требует Windows spawn-context.
-
-В обоих режимах публичный интерфейс одинаков:
-  sim.tick_step() → dict
-  sim.inject_seeds(agent_id, edges) → dict
+Три воркера-агента, Byzantine / Motif / Demon в главном процессе.
+Требует Windows spawn + успешный старт пула.
 """
 from __future__ import annotations
 
@@ -24,12 +11,11 @@ import numpy as np
 from collections import deque
 
 from engine.environment  import Environment
-from engine.agent        import RKKAgent
 from engine.demon        import AdversarialDemon
 from engine.value_layer  import HomeostaticBounds
 from engine.byzantine    import (
     ByzantineConsensus, MotifTransfer,
-    gather_consensus_data, CONSENSUS_EVERY, MOTIF_EVERY,
+    CONSENSUS_EVERY, MOTIF_EVERY,
 )
 
 PHASE_THRESHOLDS = [0.0, 0.18, 0.38, 0.58, 0.76, 0.92]
@@ -57,39 +43,25 @@ def _default_bounds() -> HomeostaticBounds:
 
 
 class Simulation:
-    def __init__(self, device_str: str = "cuda", multiprocess: bool = True):
+    def __init__(self, device_str: str = "cuda"):
         self.device = torch.device(
             device_str if torch.cuda.is_available() else "cpu"
         )
-        self.multiprocess = multiprocess
-        print(f"[RKK] Device: {self.device} | Multiprocess: {multiprocess}")
+        print(f"[RKK] Device: {self.device} | AgentPool (multiprocess only)")
 
         bounds = _default_bounds()
+        import dataclasses
+        from engine.agent_worker import AgentPool
 
-        # ── Single-process агенты ────────────────────────────────────────────
-        self._pool: "AgentPool | None" = None
-
-        if multiprocess:
-            from engine.agent_worker import AgentPool
-            import dataclasses
-            bounds_dict = dataclasses.asdict(bounds)
-            self._pool = AgentPool(device_str=device_str, bounds_dict=bounds_dict)
-            ok = self._pool.start()
-            if not ok:
-                print("[RKK] Multiprocess start failed, falling back to single-process")
-                self.multiprocess = False
-                self._pool = None
-
-        if not self.multiprocess:
-            self.envs   = [Environment(p, self.device) for p in ENV_PRESETS]
-            self.agents = [
-                RKKAgent(i, AGENT_NAMES[i], self.envs[i], self.device, bounds)
-                for i in range(3)
-            ]
+        bounds_dict = dataclasses.asdict(bounds)
+        self._pool = AgentPool(device_str=device_str, bounds_dict=bounds_dict)
+        if not self._pool.start():
+            raise RuntimeError(
+                "AgentPool failed to start. Check GPU/worker logs; single-process mode removed."
+            )
 
         self.demon = AdversarialDemon(3, self.device)
 
-        # ── Byzantine консенсус ──────────────────────────────────────────────
         self.byzantine = ByzantineConsensus(n_agents=3)
         self.motif     = MotifTransfer(n_agents=3)
 
@@ -105,7 +77,6 @@ class Simulation:
         self.tom: list[list[float]] = [[0.0] * 3 for _ in range(3)]
         self._prev_edge_counts = [0, 0, 0]
 
-        # Кэш снапшотов для multi-process режима
         self._mp_snapshots: list[dict] = [{} for _ in range(3)]
 
     # ── Seed injection ────────────────────────────────────────────────────────
@@ -113,10 +84,7 @@ class Simulation:
         if agent_id >= 3:
             return {"error": "invalid agent_id"}
 
-        if self.multiprocess and self._pool:
-            result = self._pool.inject_seeds(agent_id, edges)
-        else:
-            result = self.agents[agent_id].inject_text_priors(edges)
+        result = self._pool.inject_seeds(agent_id, edges)
 
         n = result.get("injected", 0)
         self._add_event(
@@ -131,22 +99,12 @@ class Simulation:
         }
 
     def agent_seed_context(self, agent_id: int) -> dict | None:
-        """
-        Имя агента, пресет среды и список переменных для RAG / UI.
-        В multiprocess режиме self.agents нет — берём те же preset/vars, что у воркеров.
-        """
+        """Имя, пресет и переменные среды (как у воркеров)."""
         if agent_id < 0 or agent_id >= 3:
             return None
         preset = ENV_PRESETS[agent_id]
         name   = AGENT_NAMES[agent_id]
-        if not self.multiprocess:
-            a = self.agents[agent_id]
-            return {
-                "name":      a.name,
-                "preset":    a.env.preset,
-                "variables": list(a.graph.nodes.keys()),
-            }
-        env = Environment(preset, self.device)
+        env    = Environment(preset, self.device)
         return {
             "name":      name,
             "preset":    preset,
@@ -157,56 +115,6 @@ class Simulation:
     def tick_step(self) -> dict:
         self.tick += 1
 
-        if self.multiprocess:
-            return self._tick_multiprocess()
-        else:
-            return self._tick_single()
-
-    # ── Single-process тик ────────────────────────────────────────────────────
-    def _tick_single(self) -> dict:
-        # Phi других агентов для ΔΦ≥0
-        phis = [a.phi_approx() for a in self.agents]
-        for i, agent in enumerate(self.agents):
-            agent.other_agents_phi = [p for j, p in enumerate(phis) if j != i]
-
-        # Шаги агентов
-        for agent in self.agents:
-            result = agent.step(engine_tick=self.tick)
-            self._log_step_result(agent, result)
-            if result and not result.get("blocked") and not result.get("skipped"):
-                self.demon.learn(
-                    result.get("prediction_error", 0),
-                    self.demon._last_action_complexity,
-                )
-
-        # Demon
-        snapshots   = [a.snapshot() for a in self.agents]
-        self._step_demon(snapshots)
-
-        # ToM
-        if self.tick % 25 == 0 and self.phase >= 3:
-            self._update_tom_single()
-
-        # Byzantine консенсус (каждые CONSENSUS_EVERY тиков)
-        if self.tick % CONSENSUS_EVERY == 0:
-            self._run_byzantine_single()
-
-        # Motif Transfer (каждые MOTIF_EVERY тиков)
-        if self.tick % MOTIF_EVERY == 0:
-            self._run_motif_single()
-
-        # Phase progression
-        snapshots   = [a.snapshot() for a in self.agents]
-        smoothed_dr = self._update_phase(snapshots)
-
-        # Graph deltas
-        graph_deltas = self._compute_deltas_single()
-
-        return self._snapshot(snapshots, graph_deltas, smoothed_dr)
-
-    # ── Multi-process тик ─────────────────────────────────────────────────────
-    def _tick_multiprocess(self) -> dict:
-        # Шаги всех агентов параллельно
         results = self._pool.step_all(tick=self.tick)
         snapshots = []
         for msg in results:
@@ -214,52 +122,54 @@ class Simulation:
             snap = msg.get("snapshot", {})
             self._mp_snapshots[aid] = snap
             snapshots.append(snap)
-            # Логируем
             result = msg.get("result", {})
             self._log_step_result_mp(aid, result)
 
-        # Demon (в главном процессе)
-        self._step_demon(snapshots)
+        # Упорядоченные снапшоты [0,1,2] для демона и Value Layer
+        ordered_snaps = [self._mp_snapshots[i] for i in range(3)]
 
-        # Byzantine (каждые CONSENSUS_EVERY тиков)
+        # Обратная связь демона за прошлый тик (всегда снимаем _last_action)
+        if self.demon._last_action is not None:
+            tid = self.demon._last_action["target_agent"]
+            pe  = 0.0
+            res = None
+            for msg in results:
+                if msg.get("status") != "step_done":
+                    continue
+                if msg.get("agent_id") != tid:
+                    continue
+                res = msg.get("result", {})
+                break
+            if res is not None:
+                if not res.get("blocked") and not res.get("skipped"):
+                    pe = float(res.get("prediction_error", 0))
+                self.demon.learn(
+                    pe,
+                    self.demon._last_action_complexity,
+                    ordered_snaps,
+                )
+
+        self._step_demon(ordered_snaps)
+
+        if self.tick % 25 == 0 and self.phase >= 3:
+            self._update_tom_from_snapshots(ordered_snaps)
+
         if self.tick % CONSENSUS_EVERY == 0:
             self._run_byzantine_multiprocess()
 
-        # Motif Transfer (каждые MOTIF_EVERY тиков)
         if self.tick % MOTIF_EVERY == 0:
             self._run_motif_multiprocess()
 
-        # Phase
-        smoothed_dr = self._update_phase(snapshots)
+        smoothed_dr = self._update_phase(ordered_snaps)
 
-        # Graph deltas — берём из снапшотов (уже содержат edges)
         graph_deltas = {}
-        for i, snap in enumerate(snapshots):
+        for i, snap in enumerate(ordered_snaps):
             edge_cnt = snap.get("edge_count", 0)
             if edge_cnt != self._prev_edge_counts[i]:
                 graph_deltas[i] = snap.get("edges", [])
                 self._prev_edge_counts[i] = edge_cnt
 
-        return self._snapshot(snapshots, graph_deltas, smoothed_dr)
-
-    # ── Byzantine (single) ────────────────────────────────────────────────────
-    def _run_byzantine_single(self):
-        data   = gather_consensus_data(self.agents)
-        result = self.byzantine.run(self.agents, data, self.device)
-
-        if result["type"] == "consensus_ok":
-            n  = result["updates_applied"]
-            md = result["mean_deviance"]
-            self._add_event(
-                f"🗳 Byzantine round {result['round']}: "
-                f"{n} edges updated · dev={md:.4f}",
-                "#004466", "tom"
-            )
-        elif result["type"] == "consensus_skip":
-            self._add_event(
-                f"🗳 Byzantine skip: {result['reason']}",
-                "#223344", "tom"
-            )
+        return self._snapshot(ordered_snaps, graph_deltas, smoothed_dr)
 
     # ── Byzantine (multi) ─────────────────────────────────────────────────────
     def _run_byzantine_multiprocess(self):
@@ -267,12 +177,10 @@ class Simulation:
         if len(raw_data) < 2:
             return
 
-        # Строим Byzantine данные из JSON
         eligible = [d for d in raw_data if d.get("phi", 0) > 0.05 and d.get("W")]
         if len(eligible) < 2:
             return
 
-        phi_total = sum(d["phi"] for d in eligible)
         total_updates = 0
 
         for target in eligible:
@@ -314,19 +222,6 @@ class Simulation:
         )
         self.byzantine.round += 1
 
-    # ── Motif Transfer (single) ───────────────────────────────────────────────
-    def _run_motif_single(self):
-        data   = gather_consensus_data(self.agents)
-        result = self.motif.run(self.agents, data, self.device)
-
-        if result["type"] == "motif_transfer":
-            donor_name = AGENT_NAMES[result["donor_id"]]
-            self._add_event(
-                f"🧬 Motif Transfer: {donor_name} → others "
-                f"(CG={result['donor_cg']:.4f}, EMA={result['ema']})",
-                "#224466", "tom"
-            )
-
     # ── Motif Transfer (multi) ────────────────────────────────────────────────
     def _run_motif_multiprocess(self):
         raw_data = self._pool.get_consensus_data()
@@ -337,9 +232,6 @@ class Simulation:
             return
 
         donor = max(eligible, key=lambda d: d["cg"])
-        donor_snap = self._mp_snapshots[donor["agent_id"]]
-        # s1 state_dict недоступен напрямую в multi — пропускаем
-        # (в полной версии нужно добавить cmd "get_s1_weights")
         self._add_event(
             f"🧬 Motif Transfer MP: {AGENT_NAMES[donor['agent_id']]} → others",
             "#224466", "tom"
@@ -355,11 +247,7 @@ class Simulation:
             return
 
         tid = demon_action["target_agent"]
-
-        if self.multiprocess:
-            corrupted = self._pool.demon_disrupt(tid)
-        else:
-            corrupted = self.agents[tid].demon_disrupt()
+        corrupted = self._pool.demon_disrupt(tid)
 
         self._add_event(
             f"⚠ Demon [C={demon_action['action_complexity']:.2f}] "
@@ -367,27 +255,18 @@ class Simulation:
             "#ff2244", "demon"
         )
 
-        # Phase IV: ΔΦ≥0 защита
         if self.phase >= 4:
-            if not self.multiprocess:
-                for i, agent in enumerate(self.agents):
-                    if i != tid:
-                        for edge in sorted(
-                            self.agents[tid].graph.edges,
-                            key=lambda e: e.alpha_trust, reverse=True
-                        )[:2]:
-                            edge.alpha_trust = min(0.98, edge.alpha_trust + 0.05)
             self._add_event(
                 f"🛡 Phase IV: ΔΦ≥0 protection → {AGENT_NAMES[tid]}",
                 "#00ccff", "value"
             )
 
-    # ── ToM (single) ──────────────────────────────────────────────────────────
-    def _update_tom_single(self):
+    # ── ToM из снапшотов воркеров ─────────────────────────────────────────────
+    def _update_tom_from_snapshots(self, snapshots: list[dict]):
         for i in range(3):
             for j in range(i + 1, 3):
-                phi_i    = self.agents[i].phi_approx()
-                phi_j    = self.agents[j].phi_approx()
+                phi_i    = snapshots[i].get("phi", 0.1)
+                phi_j    = snapshots[j].get("phi", 0.1)
                 strength = (phi_i + phi_j) / 2
                 self.tom[i][j] = strength
                 self.tom[j][i] = strength
@@ -431,38 +310,6 @@ class Simulation:
 
         self.phase = self.max_phase
         return smoothed_dr
-
-    # ── Graph deltas (single) ─────────────────────────────────────────────────
-    def _compute_deltas_single(self) -> dict:
-        deltas = {}
-        for i, agent in enumerate(self.agents):
-            cnt = len(agent.graph.edges)
-            if cnt != self._prev_edge_counts[i]:
-                deltas[i] = [e.as_dict() for e in agent.graph.edges]
-                self._prev_edge_counts[i] = cnt
-        return deltas
-
-    # ── Логирование ───────────────────────────────────────────────────────────
-    def _log_step_result(self, agent, result: dict):
-        if result.get("blocked"):
-            reason = result.get("reason", "?")
-            self._add_event(
-                f"🛡 [BLOCKED] {agent.name}: {reason} "
-                f"(tried {result.get('blocked_count', 0)})",
-                "#884400", "value"
-            )
-        elif result.get("blocked_count", 0) > 0:
-            self._add_event(
-                f"⚡ {agent.name}: {agent._last_do} "
-                f"(skipped {result['blocked_count']})",
-                AGENT_COLORS[agent.id], "discovery"
-            )
-        elif result.get("updated_edges"):
-            cg = result["compression_delta"]
-            self._add_event(
-                f"{agent.name}: {agent._last_do} → CG {'+' if cg>=0 else ''}{cg:.3f}",
-                AGENT_COLORS[agent.id], "discovery"
-            )
 
     def _log_step_result_mp(self, agent_id: int, result: dict):
         name = AGENT_NAMES[agent_id]
@@ -519,12 +366,17 @@ class Simulation:
                     for s in snapshots
                 ],
             },
-            "byzantine": self.byzantine.snapshot(),
-            "motif":     self.motif.snapshot(),
-            "multiprocess": self.multiprocess,
+            "byzantine":    self.byzantine.snapshot(),
+            "motif":        self.motif.snapshot(),
+            "multiprocess": True,
         }
 
+    def public_state(self) -> dict:
+        """Снимок для GET /state без выполнения тика."""
+        snaps = [self._mp_snapshots[i] for i in range(3)]
+        smoothed = float(np.mean(self._dr_window)) if self._dr_window else 0.0
+        return self._snapshot(snaps, {}, smoothed)
+
     def shutdown(self):
-        """Корректно останавливаем пул (если multiprocess)."""
         if self._pool:
             self._pool.stop()

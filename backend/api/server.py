@@ -70,7 +70,7 @@ def health():
 
 @app.get("/state")
 def state():
-    return get_sim()._snapshot({})
+    return get_sim().public_state()
 
 @app.post("/step")
 def step():
@@ -79,14 +79,17 @@ def step():
 @app.get("/graph/{agent_id}")
 def graph(agent_id: int):
     sim = get_sim()
-    if agent_id >= len(sim.agents):
+    if agent_id < 0 or agent_id >= 3:
         return {"error": "invalid agent_id"}
-    return sim.agents[agent_id].graph.to_dict()
+    return sim._pool.get_graph_dict(agent_id)
 
 @app.get("/value-layer")
 def value_layer_stats():
     sim = get_sim()
-    return {a.name: a.value_layer.snapshot(sim.tick) for a in sim.agents}
+    return {
+        AGENT_NAMES[i]: sim._mp_snapshots[i].get("value_layer", {})
+        for i in range(3)
+    }
 
 @app.get("/demon/stats")
 def demon_stats():

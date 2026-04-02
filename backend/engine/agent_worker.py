@@ -24,6 +24,7 @@ Windows-специфика:
   {"cmd": "step", "tick": int}
   {"cmd": "inject", "edges": [...]}
   {"cmd": "snapshot"}
+  {"cmd": "graph_dict"}          → agent.graph.to_dict() для REST
   {"cmd": "consensus_data"}      → возвращает W как list[list[float]]
   {"cmd": "apply_alpha_decay", "from_": str, "to": str, "decay": float}
   {"cmd": "apply_s1_weights", "state_dict": dict}  → Motif Transfer
@@ -107,6 +108,13 @@ def _agent_worker_fn(
                 "status":   "injected",
                 "agent_id": agent_id,
                 "result":   result,
+            })
+
+        elif cmd == "graph_dict":
+            out_q.put({
+                "status":   "graph_dict",
+                "agent_id": agent_id,
+                "data":     agent.graph.to_dict(),
             })
 
         elif cmd == "consensus_data":
@@ -341,6 +349,17 @@ class AgentPool:
             return msg.get("result", "")
         except Exception:
             return "timeout"
+
+    def get_graph_dict(self, agent_id: int) -> dict:
+        """Полный to_dict() графа для REST /graph/{id} (только multiprocess)."""
+        self.in_qs[agent_id].put({"cmd": "graph_dict"})
+        try:
+            msg = self.out_qs[agent_id].get(timeout=5.0)
+            if msg.get("status") == "graph_dict":
+                return msg.get("data", {})
+        except Exception:
+            pass
+        return {"error": "timeout"}
 
     def stop(self):
         for q in self.in_qs:
