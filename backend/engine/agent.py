@@ -387,7 +387,7 @@ class RKKAgent:
                 "l_int":  self._last_notears_loss.get("l_int", 0),
             }
 
-        return {
+        snap: dict = {
             "id":                    self.id,
             "name":                  self.name,
             "env_type":              self.env.preset,
@@ -411,3 +411,8 @@ class RKKAgent:
             "value_layer":           vl_info,
             "edges": [e.as_dict() for e in self.graph.edges],
         }
+        if self.env.preset == "pybullet":
+            pos_fn = getattr(self.env, "object_positions_world", None)
+            if callable(pos_fn):
+                snap["physics_objects"] = pos_fn()
+        return snap

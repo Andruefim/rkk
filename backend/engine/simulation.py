@@ -348,6 +348,7 @@ class Simulation:
             "edge_count":     ignis_snap.get("edge_count", 0),
             "h_W":            ignis_snap.get("h_W", 0),
             "compression_gain": ignis_snap.get("compression_gain", 0),
+            "objects":        ignis_snap.get("physics_objects") or [],
         }
 
         return {

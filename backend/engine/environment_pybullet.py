@@ -373,6 +373,14 @@ class EnvironmentPyBullet:
     def variables(self) -> dict[str, float]:
         return self.observe()
 
+    def object_positions_world(self) -> list[dict[str, float]]:
+        """Сырые xyz из физики для 3D-визуализации (метры симуляции)."""
+        raw = self._physics.get_state()
+        return [
+            {"x": float(raw[i, 0]), "y": float(raw[i, 1]), "z": float(raw[i, 2])}
+            for i in range(self.n_objects)
+        ]
+
     def gt_edges(self) -> list[dict]:
         """Ground truth рёбра для bootstrap priors."""
         edges = []
