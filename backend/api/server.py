@@ -1,25 +1,35 @@
 """
-server_v3.py — FastAPI с RAG pipeline, агрессивным Demon и auto-seed.
+server_singleton.py — FastAPI для Singleton AGI (Фаза 11).
 
 Новые endpoints:
-  POST /rag/generate       — генерируем seeds из Wikipedia для агента
-  POST /rag/auto-seed-all  — автоматически сидируем всех агентов при старте
-  GET  /demon/stats        — статистика атак Демона
-  GET  /rag/status         — статус последних RAG операций
-  GET  /variables/{agent}  — список переменных агента (для UI seeds panel)
+  GET  /camera/frame          — base64 PNG кадр из PyBullet робота
+  POST /world/switch          — переключить среду без сброса агента
+  GET  /world/list            — доступные миры
+  GET  /skeleton              — позиции суставов для Three.js
+  POST /bootstrap/robot       — сиды для робота (hardcoded + optional LLM)
+  POST /bootstrap/llm         — LLM генерирует гипотезы для текущего мира
+
+Всё остальное совместимо с предыдущим server.py:
+  POST /inject-seeds
+  POST /rag/auto-seed-all
+  GET  /rag/status
+  GET  /demon/stats
+  GET  /variables/{agent_id}
+  WS   /ws/causal-stream
 """
 from __future__ import annotations
 import asyncio
 import json
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from engine.simulation import Simulation
 from engine.rag_seeder import RAGSeeder, HARDCODED_SEEDS
 
-app = FastAPI(title="RKK v5 Backend")
+app = FastAPI(title="RKK Singleton AGI")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -31,41 +41,38 @@ app.add_middleware(
 )
 
 _sim:    Simulation | None = None
-_seeder: RAGSeeder | None  = None
+_seeder: RAGSeeder  | None = None
 
-# RAG статус (для UI)
-_rag_status: dict = {
-    "last_run": None,
-    "results":  [],
-    "running":  False,
-}
-
-ENV_PRESETS = ["physics", "chemistry", "logic"]
-AGENT_NAMES = ["Nova", "Aether", "Lyra"]
+_rag_status: dict = {"last_run": None, "results": [], "running": False}
 
 
 def get_sim() -> Simulation:
     global _sim
     if _sim is None:
-        _sim = Simulation(device_str="cuda")
+        _sim = Simulation(device_str="cuda", start_world="robot")
     return _sim
 
 def get_seeder() -> RAGSeeder:
     global _seeder
     if _seeder is None:
-        # По умолчанию без LLM (только Wikipedia + regex)
-        # Для LLM: RAGSeeder(llm_url="http://localhost:11434/api/generate", llm_model="qwen2.5:3b")
-        _seeder = RAGSeeder(llm_url="http://localhost:11434/api/generate", llm_model="qwen3.5:4b")
+        _seeder = RAGSeeder(
+            llm_url="http://localhost:11434/api/generate",
+            llm_model="gemma4:e4b"
+        )
     return _seeder
 
 
-# ── REST ──────────────────────────────────────────────────────────────────────
+# ── Health ───────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
+    sim = get_sim()
     return {
-        "status":   "ok",
-        "device":   str(torch.device("cuda" if torch.cuda.is_available() else "cpu")),
-        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
+        "status":       "ok",
+        "singleton":    True,
+        "device":       str(sim.device),
+        "gpu":          torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
+        "current_world":sim.current_world,
+        "gnn_d":        sim.agent.graph._d,
     }
 
 @app.get("/state")
@@ -76,43 +83,50 @@ def state():
 def step():
     return get_sim().tick_step()
 
-@app.get("/graph/{agent_id}")
-def graph(agent_id: int):
-    sim = get_sim()
-    if agent_id < 0 or agent_id >= 3:
-        return {"error": "invalid agent_id"}
-    return sim._pool.get_graph_dict(agent_id)
 
-@app.get("/value-layer")
-def value_layer_stats():
+# ── Camera ────────────────────────────────────────────────────────────────────
+@app.get("/camera/frame")
+def camera_frame():
+    """Base64 PNG кадр из PyBullet. Используется UI для overlay."""
+    frame = get_sim().get_camera_frame()
+    if frame is None:
+        return JSONResponse({"frame": None, "available": False})
+    return JSONResponse({"frame": frame, "available": True})
+
+@app.get("/skeleton")
+def skeleton():
+    """Позиции суставов + цель для Three.js скелетона."""
     sim = get_sim()
     return {
-        AGENT_NAMES[i]: sim._mp_snapshots[i].get("value_layer", {})
-        for i in range(3)
+        "joints": sim.get_robot_skeleton() or [],
+        "target": sim.get_robot_target() or {},
+        "world":  sim.current_world,
     }
 
-@app.get("/demon/stats")
-def demon_stats():
-    return get_sim().demon.snapshot
+
+# ── World switching ───────────────────────────────────────────────────────────
+class WorldSwitchRequest(BaseModel):
+    world: str
+
+@app.post("/world/switch")
+def world_switch(req: WorldSwitchRequest):
+    """Переключаем мир без сброса агента."""
+    return get_sim().switch_world(req.world)
+
+@app.get("/world/list")
+def world_list():
+    from engine.simulation import WORLDS
+    return {"worlds": WORLDS, "current": get_sim().current_world}
 
 
-# ── Variable discovery (для seeds UI) ────────────────────────────────────────
+# ── Variables / Seeds ─────────────────────────────────────────────────────────
 @app.get("/variables/{agent_id}")
 def get_variables(agent_id: int):
-    """Возвращает список переменных агента для корректного заполнения seeds."""
-    sim = get_sim()
-    ctx = sim.agent_seed_context(agent_id)
+    ctx = get_sim().agent_seed_context(agent_id)
     if ctx is None:
-        return {"error": "invalid agent_id"}
-    return {
-        "agent_id":   agent_id,
-        "agent_name": ctx["name"],
-        "env_preset": ctx["preset"],
-        "variables":  ctx["variables"],
-    }
+        return {"error": "invalid"}
+    return ctx
 
-
-# ── Manual seed injection ─────────────────────────────────────────────────────
 class SeedEdge(BaseModel):
     from_:  str
     to:     str
@@ -120,14 +134,13 @@ class SeedEdge(BaseModel):
     alpha:  float = 0.05
 
 class SeedRequest(BaseModel):
-    agent_id: int
+    agent_id: int = 0
     edges:    list[SeedEdge]
     source:   str = "manual"
 
 @app.post("/inject-seeds")
 def inject_seeds(req: SeedRequest):
-    sim    = get_sim()
-    result = sim.inject_seeds(
+    result = get_sim().inject_seeds(
         agent_id=req.agent_id,
         edges=[e.model_dump() for e in req.edges]
     )
@@ -135,125 +148,92 @@ def inject_seeds(req: SeedRequest):
     return result
 
 
-# ── RAG endpoints ─────────────────────────────────────────────────────────────
-class RAGRequest(BaseModel):
-    agent_id: int
-    topic:    str | None = None    # если None — автоматически из preset
-    max_hypotheses: int = 8
-    use_llm:  bool = False
-    llm_url:  str | None = None
-    llm_model: str = "qwen2.5:3b"
+# ── Bootstrap ─────────────────────────────────────────────────────────────────
+@app.post("/bootstrap/robot")
+def bootstrap_robot():
+    """Инжектируем hardcoded seeds для робота (кинематика суставов)."""
+    from engine.environment_robot import robot_hardcoded_seeds
+    seeds  = robot_hardcoded_seeds()
+    result = get_sim().inject_seeds(agent_id=0, edges=seeds)
+    return {"source": "robot_hardcoded", **result}
 
-@app.post("/rag/generate")
-async def rag_generate(req: RAGRequest):
+
+class LLMBootstrapRequest(BaseModel):
+    world:      str | None = None
+    llm_model:  str        = "qwen3.5:4b"
+    llm_url:    str        = "http://localhost:11434/api/generate"
+
+@app.post("/bootstrap/llm")
+async def bootstrap_llm(req: LLMBootstrapRequest):
     """
-    Генерируем seeds из Wikipedia для агента и сразу инжектируем.
+    LLM генерирует начальные гипотезы для текущего мира.
+    Это 'cultural memory' — агент получает знания без опыта.
     """
-    global _rag_status
-    sim = get_sim()
+    sim  = get_sim()
+    ctx  = sim.agent_seed_context(0)
+    if not ctx:
+        return {"error": "no context"}
 
-    ctx = sim.agent_seed_context(req.agent_id)
-    if ctx is None:
-        return {"error": "invalid agent_id"}
-
-    preset = ctx["preset"]
+    preset = req.world or sim.current_world
     vars_  = ctx["variables"]
 
-    # Настраиваем seeder
-    seeder = RAGSeeder(
-        llm_url=req.llm_url if req.use_llm else None,
-        llm_model=req.llm_model,
-    )
-
-    _rag_status["running"] = True
+    seeder = RAGSeeder(llm_url=req.llm_url, llm_model=req.llm_model)
     try:
         hypotheses = await seeder.generate(
             env_preset=preset,
             available_vars=vars_,
-            max_hypotheses=req.max_hypotheses,
+            max_hypotheses=8,
         )
-
-        if not hypotheses:
-            # Fallback на hardcoded seeds
-            edges = HARDCODED_SEEDS.get(preset, [])
-            source = "hardcoded"
+        if hypotheses:
+            edges = [h.to_dict() for h in hypotheses]
         else:
-            edges  = [h.to_dict() for h in hypotheses]
-            source = hypotheses[0].source if hypotheses else "rag"
+            edges = HARDCODED_SEEDS.get(preset, [])
 
-        # Инжектируем
-        inject_result = sim.inject_seeds(agent_id=req.agent_id, edges=edges)
-        inject_result["source"] = source
-        inject_result["hypotheses_count"] = len(hypotheses)
-
-        _rag_status["last_run"] = sim.tick
-        _rag_status["results"].append({
-            "agent":  AGENT_NAMES[req.agent_id],
-            "preset": preset,
-            "n":      inject_result["injected"],
-            "source": source,
-        })
-        if len(_rag_status["results"]) > 10:
-            _rag_status["results"].pop(0)
-
-        return inject_result
-
-    finally:
-        _rag_status["running"] = False
+        result = sim.inject_seeds(agent_id=0, edges=edges)
+        return {"source": "llm", "preset": preset, **result}
+    except Exception as e:
+        return {"error": str(e)}
 
 
+# ── RAG ───────────────────────────────────────────────────────────────────────
 @app.post("/rag/auto-seed-all")
 async def rag_auto_seed_all():
-    """
-    Автоматически сидируем всех трёх агентов при старте.
-    Использует hardcoded seeds как fallback если Wikipedia недоступна.
-    """
     global _rag_status
     sim    = get_sim()
     seeder = get_seeder()
+    ctx    = sim.agent_seed_context(0)
+    if not ctx:
+        return {"error": "no context"}
+
+    preset = ctx["preset"]
+    vars_  = ctx["variables"]
 
     _rag_status["running"] = True
-    results = []
+    try:
+        hypotheses = await seeder.generate(
+            env_preset=preset, available_vars=vars_, max_hypotheses=6
+        )
+        edges  = [h.to_dict() for h in hypotheses] if hypotheses else HARDCODED_SEEDS.get(preset, [])
+        source = hypotheses[0].source if hypotheses else "hardcoded"
+    except Exception as e:
+        edges  = HARDCODED_SEEDS.get(preset, [])
+        source = "hardcoded"
+    finally:
+        _rag_status["running"] = False
 
-    for i in range(3):
-        ctx = sim.agent_seed_context(i)
-        if ctx is None:
-            continue
-        preset = ctx["preset"]
-        vars_  = ctx["variables"]
-        name   = ctx["name"]
-
-        try:
-            hypotheses = await seeder.generate(
-                env_preset=preset,
-                available_vars=vars_,
-                max_hypotheses=6,
-            )
-            edges  = [h.to_dict() for h in hypotheses] if hypotheses else HARDCODED_SEEDS.get(preset, [])
-            source = hypotheses[0].source if hypotheses else "hardcoded"
-        except Exception as e:
-            edges  = HARDCODED_SEEDS.get(preset, [])
-            source = "hardcoded"
-            print(f"[RAG] Fallback to hardcoded for {name}: {e}")
-
-        result = sim.inject_seeds(agent_id=i, edges=edges)
-        results.append({
-            "agent":    name,
-            "preset":   preset,
-            "injected": result.get("injected", 0),
-            "source":   source,
-        })
-
-    _rag_status["running"]  = False
+    result = sim.inject_seeds(agent_id=0, edges=edges)
     _rag_status["last_run"] = sim.tick
-    _rag_status["results"]  = results
-
-    return {"status": "ok", "results": results}
-
+    _rag_status["results"]  = [{"agent": "Nova", "preset": preset,
+                                  "injected": result.get("injected", 0), "source": source}]
+    return {"status": "ok", "results": _rag_status["results"]}
 
 @app.get("/rag/status")
 def rag_status():
     return _rag_status
+
+@app.get("/demon/stats")
+def demon_stats():
+    return get_sim().demon.snapshot
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -262,7 +242,7 @@ async def causal_stream(websocket: WebSocket):
     await websocket.accept()
     sim   = get_sim()
     speed = 1
-    print(f"[WS] Connected. Device: {sim.device}")
+    print(f"[WS] Singleton connected. Device: {sim.device}")
 
     try:
         while True:
@@ -270,36 +250,47 @@ async def causal_stream(websocket: WebSocket):
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
                 msg = json.loads(raw)
                 cmd = msg.get("cmd")
+
                 if cmd == "set_speed":
                     speed = int(msg.get("value", 1))
+
                 elif cmd == "reset":
                     global _sim
-                    _sim = Simulation(device_str="cuda")
+                    _sim = Simulation(device_str="cuda", start_world="robot")
                     sim  = get_sim()
+
                 elif cmd == "inject_seeds":
                     sim.inject_seeds(
-                        agent_id=int(msg.get("agent_id", 0)),
+                        agent_id=0,
                         edges=msg.get("edges", [])
                     )
+
+                elif cmd == "switch_world":
+                    world = msg.get("world", "robot")
+                    sim.switch_world(world)
+
                 elif cmd == "rag_auto":
-                    # Быстрый хардкодный сид через WS (и в multiprocess)
-                    for i in range(3):
-                        ctx = sim.agent_seed_context(i)
-                        if not ctx:
-                            continue
-                        edges = HARDCODED_SEEDS.get(ctx["preset"], [])
+                    ctx = sim.agent_seed_context(0)
+                    if ctx:
+                        preset = ctx["preset"]
+                        edges  = HARDCODED_SEEDS.get(preset, [])
                         if edges:
-                            sim.inject_seeds(agent_id=i, edges=edges)
+                            sim.inject_seeds(agent_id=0, edges=edges)
+
+                elif cmd == "bootstrap_robot":
+                    from engine.environment_robot import robot_hardcoded_seeds
+                    sim.inject_seeds(agent_id=0, edges=robot_hardcoded_seeds())
+
             except asyncio.TimeoutError:
                 pass
             except Exception:
                 pass
 
-            state = None
+            state_data = None
             for _ in range(max(1, speed)):
-                state = sim.tick_step()
+                state_data = sim.tick_step()
 
-            await websocket.send_json(state)
+            await websocket.send_json(state_data)
             await asyncio.sleep(0.05)
 
     except WebSocketDisconnect:

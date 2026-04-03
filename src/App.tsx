@@ -1,11 +1,11 @@
-import RKKv5 from "./features/simulation/rkk-v5.jsx";
+import RKKSingleton from "./features/simulation/rkk-singleton.jsx";
 
 function App() {
 
 
   return (
     <>
-      <RKKv5 />
+      <RKKSingleton />
     </>
   )
 }

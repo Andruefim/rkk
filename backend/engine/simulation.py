@@ -1,13 +1,39 @@
 """
-simulation_v4.py — оркестратор с 4 агентами (+ Ignis/PyBullet).
+simulation_singleton.py — Singleton AGI (Фаза 11).
 
-Изменения:
-  - 4-й агент Ignis с env_preset="pybullet"
-  - agent_seed_context() → запрашивает переменные у воркера напрямую
-    (PyBullet имеет 18 переменных, раньше мы делали re-init Environment)
-  - AGENT_COLORS / AGENT_NAMES / ENV_PRESETS расширены до 4
-  - Demon атакует 4 агентов; Byzantine консенсус с 4 участниками
-  - В snapshot добавлено поле pybullet_stats
+Один агент вместо четырёх. Без Byzantine consensus (нет пиров).
+
+Что убрано:
+  - Мультиагентный пул (AgentPool / multiprocessing)
+  - Byzantine consensus / MotifTransfer
+  - ToM между агентами
+
+Что добавлено:
+  - WorldSwitcher: смена среды без сброса агента (GNN resize_to)
+  - RobotEnv: 3-звенный манипулятор в PyBullet
+  - Camera endpoint: кадр из PyBullet
+  - MiniLLM bootstrap: генерация начальных гипотез через Ollama
+  - ImaginationBuffer: хранение N-step прогнозов (заготовка для Фазы 13)
+
+Архитектура (Singleton):
+  ┌─────────────────────────────────────┐
+  │  SingletonAGI (один процесс, GPU)   │
+  │  ┌───────────┐  ┌─────────────────┐ │
+  │  │ System 1  │  │ CausalGNNCore   │ │
+  │  │ (MLP)     │  │ (d × d, W-grad) │ │
+  │  └───────────┘  └─────────────────┘ │
+  │  ┌───────────┐  ┌─────────────────┐ │
+  │  │ Temporal  │  │  Value Layer    │ │
+  │  │ (SSM f/s) │  │  (homeostasis)  │ │
+  │  └───────────┘  └─────────────────┘ │
+  └─────────────────────────────────────┘
+           │  do(variable=value)
+           ▼
+  ┌─────────────────────────────────────┐
+  │   World (active environment)        │
+  │   physics / chemistry / logic /     │
+  │   pybullet / robot  ← switch!       │
+  └─────────────────────────────────────┘
 """
 from __future__ import annotations
 
@@ -15,23 +41,35 @@ import torch
 import numpy as np
 from collections import deque
 
+from engine.agent       import RKKAgent
 from engine.demon       import AdversarialDemon
 from engine.value_layer import HomeostaticBounds
-from engine.byzantine   import (
-    ByzantineConsensus, MotifTransfer,
-    CONSENSUS_EVERY, MOTIF_EVERY,
-)
+from engine.environment import Environment
 
 PHASE_THRESHOLDS = [0.0, 0.18, 0.38, 0.58, 0.76, 0.92]
 PHASE_HOLD_TICKS = 15
 PHASE_NAMES      = ["", "Causal Crib", "Robotic Explorer",
                     "Social Sandbox", "Value Lock", "Open Reality"]
 
-AGENT_COLORS = ["#00ff99", "#0099ff", "#ff9900", "#cc44ff"]
-AGENT_NAMES  = ["Nova",    "Aether",   "Lyra",    "Ignis"]
-ENV_PRESETS  = ["physics", "chemistry","logic",   "pybullet"]
 
-N_AGENTS = 4
+# ─── Доступные миры ───────────────────────────────────────────────────────────
+WORLDS = {
+    "physics":   {"label": "Thermodynamics",  "color": "#00ff99"},
+    "chemistry": {"label": "Chemical Kinetics","color": "#0099ff"},
+    "logic":     {"label": "Logic Gates",      "color": "#ff9900"},
+    "robot":     {"label": "Robot Arm",        "color": "#cc44ff"},
+    "pybullet":  {"label": "3D Physics",       "color": "#ff44aa"},
+}
+
+
+def _make_env(world: str, device: torch.device):
+    if world == "robot":
+        from engine.environment_robot import EnvironmentRobot
+        return EnvironmentRobot(device=device)
+    if world == "pybullet":
+        from engine.environment_pybullet import EnvironmentPyBullet
+        return EnvironmentPyBullet(n_objects=3, device=device, use_pybullet=True)
+    return Environment(world, device)
 
 
 def _default_bounds() -> HomeostaticBounds:
@@ -40,8 +78,8 @@ def _default_bounds() -> HomeostaticBounds:
         phi_min=0.01,
         h_slow_max=12.0,
         env_entropy_max_delta=0.95,
-        warmup_ticks=2000,
-        blend_ticks=600,
+        warmup_ticks=1500,
+        blend_ticks=500,
         phi_min_steady=0.05,
         env_entropy_max_delta_steady=0.55,
         h_slow_max_steady=10.0,
@@ -49,29 +87,120 @@ def _default_bounds() -> HomeostaticBounds:
     )
 
 
+# ─── WorldSwitcher ────────────────────────────────────────────────────────────
+class WorldSwitcher:
+    """
+    Переключает активный мир без сброса агента.
+
+    При смене мира:
+    1. CausalGraph сохраняет веса W для старых узлов
+    2. Новые переменные добавляются (GNN resize_to автоматически)
+    3. System 1 сохраняет веса MLP (абстрактная интуиция переносится)
+    4. Temporal Blankets накапливают историю из нового мира
+    5. Injecting new-world seeds (необязательно) через RAG
+
+    Философия: AGI не «забывает» физику когда учит химию.
+    Граф расширяется, а не перезаписывается.
+    """
+
+    def __init__(self, agent: RKKAgent, device: torch.device):
+        self.agent   = agent
+        self.device  = device
+        self._history: list[dict] = []
+
+    def switch(self, new_world: str) -> dict:
+        old_preset = self.agent.env.preset
+        if old_preset == new_world:
+            return {"switched": False, "world": new_world}
+
+        # Создаём новую среду
+        new_env = _make_env(new_world, self.device)
+
+        # Добавляем новые узлы (GNN resize_to срабатывает автоматически в set_node)
+        old_nodes = set(self.agent.graph.nodes.keys())
+        new_vars  = new_env.variable_ids
+        new_nodes = [v for v in new_vars if v not in old_nodes]
+
+        # Начальные наблюдения новой среды
+        init_obs = new_env.observe()
+
+        # Добавляем новые узлы (CausalGraph._rebuild_core → GNN.resize_to)
+        for var_id in new_vars:
+            self.agent.graph.set_node(var_id, init_obs.get(var_id, 0.5))
+
+        # Обновляем среду агента
+        self.agent.env = new_env
+
+        # Пересоздаём TemporalBlankets для нового d_input
+        from engine.temporal import TemporalBlankets
+        new_d = len(new_vars)
+        if self.agent.temporal.d_input != new_d:
+            self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
+
+        # Начальный шаг наблюдения
+        self.agent.temporal.step(init_obs)
+        self.agent.graph.record_observation(init_obs)
+
+        record = {
+            "from_world":  old_preset,
+            "to_world":    new_world,
+            "new_nodes":   new_nodes,
+            "total_nodes": len(self.agent.graph.nodes),
+            "gnn_d":       self.agent.graph._d,
+        }
+        self._history.append(record)
+        print(f"[WorldSwitch] {old_preset} → {new_world} | "
+              f"+{len(new_nodes)} nodes | total_d={self.agent.graph._d}")
+        return {"switched": True, **record}
+
+    @property
+    def history(self) -> list[dict]:
+        return self._history
+
+
+# ─── SingletonSimulation ─────────────────────────────────────────────────────
 class Simulation:
-    def __init__(self, device_str: str = "cuda"):
+    """
+    Singleton AGI симуляция.
+
+    Публичный интерфейс совместим с simulation_v4.py:
+      tick_step() → dict
+      inject_seeds() → dict
+      agent_seed_context() → dict
+      public_state() → dict
+    """
+
+    AGI_NAME  = "Nova"
+    AGI_COLOR = "#00ff99"
+
+    def __init__(
+        self,
+        device_str:  str = "cuda",
+        start_world: str = "robot",
+    ):
         self.device = torch.device(
             device_str if torch.cuda.is_available() else "cpu"
         )
-        print(f"[RKK] Device: {self.device} | 4-agent pool (Nova/Aether/Lyra/Ignis)")
+        self.current_world = start_world
+        print(f"[Singleton] Device: {self.device} | World: {start_world}")
 
+        # Создаём начальную среду и агента
+        env    = _make_env(start_world, self.device)
         bounds = _default_bounds()
-        import dataclasses
-        from engine.agent_worker import AgentPool
 
-        bounds_dict = dataclasses.asdict(bounds)
-        self._pool = AgentPool(
-            device_str=device_str,
-            bounds_dict=bounds_dict,
-            n_agents=N_AGENTS,
+        self.agent = RKKAgent(
+            agent_id=0,
+            name=self.AGI_NAME,
+            env=env,
+            device=self.device,
+            bounds=bounds,
         )
-        if not self._pool.start():
-            raise RuntimeError("AgentPool failed to start.")
 
-        self.demon     = AdversarialDemon(N_AGENTS, self.device)
-        self.byzantine = ByzantineConsensus(n_agents=N_AGENTS)
-        self.motif     = MotifTransfer(n_agents=N_AGENTS)
+        # WorldSwitcher
+        self.switcher = WorldSwitcher(self.agent, self.device)
+
+        # Demon (один, против одного агента)
+        self.demon = AdversarialDemon(n_agents=1, device=self.device)
 
         self.tick      = 0
         self.phase     = 1
@@ -80,210 +209,100 @@ class Simulation:
         self._phase_hold_counter = 0
         self._candidate_phase    = 1
         self._dr_window: deque[float] = deque(maxlen=20)
+        self.events: deque[dict]      = deque(maxlen=20)
+        self._prev_edge_count = 0
 
-        self.events: deque[dict] = deque(maxlen=20)
-        self.tom: list[list[float]] = [[0.0] * N_AGENTS for _ in range(N_AGENTS)]
-        self._prev_edge_counts = [0] * N_AGENTS
+        # Кэш снапшота агента
+        self._last_snapshot: dict = {}
 
-        self._mp_snapshots: list[dict] = [{} for _ in range(N_AGENTS)]
-
-        # Кэш переменных воркеров (заполняется при первом запросе)
-        self._worker_var_cache: dict[int, dict] = {}
+    # ── World switching ───────────────────────────────────────────────────────
+    def switch_world(self, new_world: str) -> dict:
+        if new_world not in WORLDS:
+            return {"error": f"unknown world: {new_world}"}
+        result = self.switcher.switch(new_world)
+        if result.get("switched"):
+            self.current_world = new_world
+            self._add_event(
+                f"🌍 World switch: → {WORLDS[new_world]['label']} "
+                f"(+{len(result.get('new_nodes', []))} nodes, d={result.get('gnn_d')})",
+                WORLDS[new_world]["color"], "phase"
+            )
+        return result
 
     # ── Seed injection ────────────────────────────────────────────────────────
     def inject_seeds(self, agent_id: int, edges: list[dict]) -> dict:
-        if agent_id < 0 or agent_id >= N_AGENTS:
-            return {"error": "invalid agent_id"}
-
-        result = self._pool.inject_seeds(agent_id, edges)
+        result = self.agent.inject_text_priors(edges)
         n = result.get("injected", 0)
         self._add_event(
-            f"💉 Seeds → {AGENT_NAMES[agent_id]}: {n} edges (α=0.05)",
+            f"💉 Seeds → {self.AGI_NAME}: {n} edges (α=0.05)",
             "#886600", "discovery"
         )
         return {
             "injected": n,
-            "agent":    AGENT_NAMES[agent_id],
+            "agent":    self.AGI_NAME,
             "skipped":  result.get("skipped", []),
             "node_ids": result.get("node_ids", []),
         }
 
-    def agent_seed_context(self, agent_id: int) -> dict | None:
-        """
-        Имя, пресет и переменные среды агента.
-        Для PyBullet запрашиваем переменные у воркера (18 штук),
-        для остальных — используем кэш или запрос.
-        """
-        if agent_id < 0 or agent_id >= N_AGENTS:
-            return None
-
-        # Кэш
-        if agent_id in self._worker_var_cache:
-            cached = self._worker_var_cache[agent_id]
-            return {
-                "name":      AGENT_NAMES[agent_id],
-                "preset":    cached["preset"],
-                "variables": cached["variables"],
-            }
-
-        # Запрашиваем у воркера
-        resp = self._pool.get_variable_ids(agent_id)
-        self._worker_var_cache[agent_id] = resp
-
+    def agent_seed_context(self, agent_id: int = 0) -> dict | None:
         return {
-            "name":      AGENT_NAMES[agent_id],
-            "preset":    resp.get("preset", ENV_PRESETS[agent_id]),
-            "variables": resp.get("variables", []),
+            "name":      self.AGI_NAME,
+            "preset":    self.current_world,
+            "variables": list(self.agent.graph.nodes.keys()),
         }
 
     # ── Один тик ──────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
         self.tick += 1
 
-        results = self._pool.step_all(tick=self.tick)
-        ordered_snaps = [{}] * N_AGENTS
+        # Шаг агента
+        self.agent.other_agents_phi = []   # singleton, нет других
+        result = self.agent.step(engine_tick=self.tick)
+        self._log_step_result(result)
 
-        for msg in results:
-            aid  = msg.get("agent_id", 0)
-            snap = msg.get("snapshot", {})
-            self._mp_snapshots[aid] = snap
-            ordered_snaps[aid]      = snap
-            self._log_step_result_mp(aid, msg.get("result", {}))
-
-        # Обратная связь демона
+        # Demon feedback
         if self.demon._last_action is not None:
-            tid = self.demon._last_action["target_agent"]
-            pe  = 0.0
-            for msg in results:
-                if msg.get("agent_id") == tid and msg.get("status") == "step_done":
-                    res = msg.get("result", {})
-                    if not res.get("blocked") and not res.get("skipped"):
-                        pe = float(res.get("prediction_error", 0))
-                    break
-            self.demon.learn(pe, self.demon._last_action_complexity, ordered_snaps)
+            pe = 0.0
+            if not result.get("blocked") and not result.get("skipped"):
+                pe = float(result.get("prediction_error", 0))
+            snap = self.agent.snapshot()
+            self.demon.learn(pe, self.demon._last_action_complexity, [snap])
 
-        self._step_demon(ordered_snaps)
+        # Demon step
+        snap = self.agent.snapshot()
+        self._last_snapshot = snap
+        self._step_demon(snap)
 
-        if self.tick % 25 == 0 and self.phase >= 3:
-            self._update_tom(ordered_snaps)
+        # Phase progression
+        smoothed_dr = self._update_phase(snap)
 
-        if self.tick % CONSENSUS_EVERY == 0:
-            self._run_byzantine()
-
-        if self.tick % MOTIF_EVERY == 0:
-            self._run_motif()
-
-        smoothed_dr = self._update_phase(ordered_snaps)
-
+        # Graph deltas
         graph_deltas = {}
-        for i, snap in enumerate(ordered_snaps):
-            edge_cnt = snap.get("edge_count", 0)
-            if edge_cnt != self._prev_edge_counts[i]:
-                graph_deltas[i] = snap.get("edges", [])
-                self._prev_edge_counts[i] = edge_cnt
+        cnt = len(self.agent.graph.edges)
+        if cnt != self._prev_edge_count:
+            graph_deltas[0] = [e.as_dict() for e in self.agent.graph.edges]
+            self._prev_edge_count = cnt
 
-        return self._snapshot(ordered_snaps, graph_deltas, smoothed_dr)
+        return self._snapshot(snap, graph_deltas, smoothed_dr)
 
-    # ── Byzantine ─────────────────────────────────────────────────────────────
-    def _run_byzantine(self):
-        raw_data = self._pool.get_consensus_data()
-        eligible = [d for d in raw_data if d.get("phi", 0) > 0.05 and d.get("W")]
-        if len(eligible) < 2:
-            return
-
-        total_updates = 0
-        for target in eligible:
-            peers      = [d for d in eligible if d["agent_id"] != target["agent_id"]]
-            target_ids = target["node_ids"]
-            target_W   = torch.tensor(target["W"])
-
-            for mi, nid in enumerate(target_ids):
-                for mj, nid2 in enumerate(target_ids):
-                    cw = cp = 0.0
-                    for peer in peers:
-                        pids = peer["node_ids"]
-                        if nid in pids and nid2 in pids:
-                            pi, pj = pids.index(nid), pids.index(nid2)
-                            cw += peer["W"][pi][pj] * peer["phi"]
-                            cp += peer["phi"]
-                    if cp < 1e-6:
-                        continue
-                    deviance = abs(target_W[mi, mj].item() - cw / cp)
-                    if deviance > 0.25:
-                        self._pool.apply_alpha_decay(target["agent_id"], nid, nid2, 0.12)
-                        total_updates += 1
-
-        self._add_event(
-            f"🗳 Byzantine R{self.byzantine.round}: {total_updates} edges",
-            "#004466", "tom"
-        )
-        self.byzantine.round += 1
-
-    # ── Motif Transfer ────────────────────────────────────────────────────────
-    def _run_motif(self):
-        raw_data = self._pool.get_consensus_data()
-        eligible = [d for d in raw_data
-                    if d.get("cg", 0) > 0 and d.get("block_rate", 1) < 0.5]
-        if not eligible:
-            return
-        donor = max(eligible, key=lambda d: d["cg"])
-        self.motif.last_donor = donor["agent_id"]
-        self.motif.round += 1
-        self._add_event(
-            f"🧬 Motif: {AGENT_NAMES[donor['agent_id']]} → others "
-            f"(CG={donor['cg']:.4f})",
-            "#224466", "tom"
-        )
-
-    # ── Demon ─────────────────────────────────────────────────────────────────
-    def _step_demon(self, snapshots: list[dict]):
-        mean_peak   = np.mean([s.get("peak_discovery_rate", 0) for s in snapshots])
-        demon_action = self.demon.step(snapshots, 1 - mean_peak)
+    def _step_demon(self, snap: dict):
+        demon_action = self.demon.step([snap], 1 - snap.get("peak_discovery_rate", 0))
         if demon_action is None:
             return
-
-        tid       = demon_action["target_agent"]
-        corrupted = self._pool.demon_disrupt(tid)
-        mode      = demon_action.get("mode", "?")
-
+        corrupted = self.agent.demon_disrupt()
         self._add_event(
-            f"⚠ Demon [{mode}·C={demon_action['action_complexity']:.2f}] "
-            f"→ {AGENT_NAMES[tid]}: {corrupted}",
+            f"⚠ Demon [{demon_action.get('mode','?')}] → {self.AGI_NAME}: {corrupted}",
             "#ff2244", "demon"
         )
-        if self.phase >= 4:
-            self._add_event(
-                f"🛡 Phase IV: ΔΦ≥0 → {AGENT_NAMES[tid]}",
-                "#00ccff", "value"
-            )
 
-    # ── ToM ───────────────────────────────────────────────────────────────────
-    def _update_tom(self, snapshots: list[dict]):
-        for i in range(N_AGENTS):
-            for j in range(i + 1, N_AGENTS):
-                phi_i    = snapshots[i].get("phi", 0.1)
-                phi_j    = snapshots[j].get("phi", 0.1)
-                strength = (phi_i + phi_j) / 2
-                self.tom[i][j] = strength
-                self.tom[j][i] = strength
-                if strength > 0.5 and np.random.rand() < 0.2:
-                    self._add_event(
-                        f"ToM: {AGENT_NAMES[i]} ↔ {AGENT_NAMES[j]} {strength*100:.0f}%",
-                        "#003388", "tom"
-                    )
-
-    # ── Phase ─────────────────────────────────────────────────────────────────
-    def _update_phase(self, snapshots: list[dict]) -> float:
-        # Фаза определяется по среднему DR трёх табличных агентов (0-2)
-        # Ignis/PyBullet исключается (у него другая шкала discovery_rate)
-        table_snaps = snapshots[:3]
-        mean_cur = np.mean([s.get("discovery_rate", 0) for s in table_snaps])
-        self._dr_window.append(mean_cur)
-        smoothed_dr = float(np.mean(self._dr_window))
+    def _update_phase(self, snap: dict) -> float:
+        dr = snap.get("discovery_rate", 0)
+        self._dr_window.append(dr)
+        smoothed = float(np.mean(self._dr_window))
 
         potential = 1
         for i, t in enumerate(PHASE_THRESHOLDS):
-            if smoothed_dr >= t:
+            if smoothed >= t:
                 potential = i + 1
         potential = min(potential, 5)
 
@@ -304,83 +323,90 @@ class Simulation:
         else:
             self._candidate_phase    = self.max_phase
             self._phase_hold_counter = 0
-
         self.phase = self.max_phase
-        return smoothed_dr
+        return smoothed
 
-    def _log_step_result_mp(self, agent_id: int, result: dict):
-        name = AGENT_NAMES[agent_id]
-        col  = AGENT_COLORS[agent_id]
+    def _log_step_result(self, result: dict):
         if result.get("blocked"):
             self._add_event(
-                f"🛡 [BLOCKED] {name}: {result.get('reason','?')}",
+                f"🛡 [BLOCKED] {self.AGI_NAME}: {result.get('reason','?')}",
                 "#884400", "value"
             )
         elif result.get("updated_edges"):
             cg = result.get("compression_delta", 0)
+            var = result.get("variable", "?")
+            val = result.get("value", 0)
             self._add_event(
-                f"{name}: do({result.get('variable','?')}="
-                f"{result.get('value',0):.2f}) CG{'+' if cg>=0 else ''}{cg:.3f}",
-                col, "discovery"
+                f"{self.AGI_NAME}: do({var}={val:.2f}) CG{'+' if cg>=0 else ''}{cg:.3f}",
+                self.AGI_COLOR, "discovery"
             )
 
     def _add_event(self, text: str, color: str, type_: str):
         self.events.appendleft({"tick": self.tick, "text": text, "color": color, "type": type_})
 
+    # ── Camera ────────────────────────────────────────────────────────────────
+    def get_camera_frame(self) -> str | None:
+        """Кадр из текущей среды (если поддерживает)."""
+        fn = getattr(self.agent.env, "get_frame_base64", None)
+        return fn() if callable(fn) else None
+
+    def get_robot_skeleton(self) -> list[dict] | None:
+        """Joint positions для Three.js визуализации скелетона."""
+        fn = getattr(self.agent.env, "get_joint_positions_world", None)
+        return fn() if callable(fn) else None
+
+    def get_robot_target(self) -> dict | None:
+        fn = getattr(self.agent.env, "get_target", None)
+        return fn() if callable(fn) else None
+
     # ── Snapshot ──────────────────────────────────────────────────────────────
-    def _snapshot(self, snapshots: list[dict], graph_deltas: dict, smoothed_dr: float) -> dict:
-        mean_peak     = np.mean([s.get("peak_discovery_rate", 0) for s in snapshots[:3]])
-        total_blocked = sum(s.get("total_blocked", 0) for s in snapshots)
-
-        tom_links = [
-            {"a": i, "b": j, "strength": round(self.tom[i][j], 3)}
-            for i in range(N_AGENTS) for j in range(i+1, N_AGENTS)
-            if self.tom[i][j] > 0.25
-        ]
-
-        # PyBullet специфичная статистика (последний агент)
-        ignis_snap = snapshots[3] if len(snapshots) > 3 else {}
-        pb_stats = {
-            "phi":            ignis_snap.get("phi", 0),
-            "discovery_rate": ignis_snap.get("discovery_rate", 0),
-            "interventions":  ignis_snap.get("total_interventions", 0),
-            "node_count":     ignis_snap.get("node_count", 0),
-            "edge_count":     ignis_snap.get("edge_count", 0),
-            "h_W":            ignis_snap.get("h_W", 0),
-            "compression_gain": ignis_snap.get("compression_gain", 0),
-            "objects":        ignis_snap.get("physics_objects") or [],
-        }
-
+    def _snapshot(self, snap: dict, graph_deltas: dict, smoothed_dr: float) -> dict:
         return {
-            "tick":           self.tick,
-            "phase":          self.phase,
-            "max_phase":      self.max_phase,
-            "entropy":        round((1 - mean_peak) * 100, 1),
-            "smoothed_dr":    round(smoothed_dr, 3),
-            "agents":         snapshots,
-            "demon":          self.demon.snapshot,
-            "tom_links":      tom_links,
-            "events":         list(self.events),
-            "graph_deltas":   graph_deltas,
-            "value_layer": {
-                "total_blocked_all": total_blocked,
+            "tick":         self.tick,
+            "phase":        self.phase,
+            "max_phase":    self.max_phase,
+            "entropy":      round((1 - snap.get("peak_discovery_rate", 0)) * 100, 1),
+            "smoothed_dr":  round(smoothed_dr, 3),
+            "agents":       [snap],   # массив из 1 элемента — совместимость с UI
+            "n_agents":     1,
+            "demon":        self.demon.snapshot,
+            "tom_links":    [],
+            "events":       list(self.events),
+            "graph_deltas": graph_deltas,
+            "value_layer":  {
+                "total_blocked_all": snap.get("total_blocked", 0),
                 "block_rates": [
-                    round(s.get("value_layer", {}).get("block_rate", 0), 3)
-                    for s in snapshots
+                    round(snap.get("value_layer", {}).get("block_rate", 0), 3)
                 ],
             },
-            "byzantine":      self.byzantine.snapshot(),
-            "motif":          self.motif.snapshot(),
-            "multiprocess":   True,
-            "n_agents":       N_AGENTS,
-            "pybullet":       pb_stats,
+            "byzantine":    None,
+            "motif":        None,
+            "multiprocess": False,
+            "singleton":    True,
+            "current_world":    self.current_world,
+            "world_label":      WORLDS.get(self.current_world, {}).get("label", ""),
+            "world_color":      WORLDS.get(self.current_world, {}).get("color", "#00ff99"),
+            "worlds":           WORLDS,
+            "switch_history":   self.switcher.history[-5:],
+            "gnn_d":            self.agent.graph._d,
+            "robot_skeleton":   self.get_robot_skeleton(),
+            "robot_target":     self.get_robot_target(),
+            "pybullet":    {
+                "phi":             snap.get("phi", 0),
+                "discovery_rate":  snap.get("discovery_rate", 0),
+                "interventions":   snap.get("total_interventions", 0),
+                "node_count":      snap.get("node_count", 0),
+                "edge_count":      snap.get("edge_count", 0),
+                "h_W":             snap.get("h_W", 0),
+                "compression_gain":snap.get("compression_gain", 0),
+                "objects":         [],
+            },
         }
 
     def public_state(self) -> dict:
-        snaps    = [self._mp_snapshots[i] for i in range(N_AGENTS)]
+        snap = self._last_snapshot or self.agent.snapshot()
         smoothed = float(np.mean(self._dr_window)) if self._dr_window else 0.0
-        return self._snapshot(snaps, {}, smoothed)
+        return self._snapshot(snap, {}, smoothed)
 
     def shutdown(self):
-        if self._pool:
-            self._pool.stop()
+        pass
