@@ -90,25 +90,31 @@ def _forward_kinematics_skeleton(
     cx: float, cy: float, cz: float, joints: dict[str, float]
 ) -> list[dict]:
     """
-    15 точек в том же порядке, что SKELETON_BONES на фронте (rkk-humanoid.jsx):
-    0 голова, 1 шея, 2 торс, 3–8 руки, 9–14 ноги.
-    Оси: x, y — горизонталь, z — вверх (как в PyBullet / fallback).
+    15 точек в том же порядке, что rkk-humanoid.jsx:
+    0 голова, 1 шея (хаб рук), 2 таз/root (хаб ног), 3–8 руки, 9–14 ноги.
+    Отдельного узла «грудь» нет — плечи у шеи. Оси: x,y горизонталь, z вверх.
     """
     j = joints
-    head = [cx, cy, cz + 0.22]
-    neck = [cx, cy, cz + 0.15]
-    torso_b = [cx, cy, cz - 0.20]
-    lshld = [cx - 0.22, cy, cz + 0.10]
-    rshld = [cx + 0.22, cy, cz + 0.10]
+    pelvis_z = cz - 0.12
+    neck_z = cz + 0.17
+    head_z = cz + 0.29
+    sh_z = neck_z - 0.02  # плечи у шейного узла
+    hip_z = pelvis_z - 0.08
+
+    head = [cx, cy, head_z]
+    neck = [cx, cy, neck_z]
+    pelvis = [cx, cy, pelvis_z]
+    lshld = [cx - 0.26, cy, sh_z]
+    rshld = [cx + 0.26, cy, sh_z]
     lelbow = [
-        cx - 0.22 - np.sin(j.get("lshoulder", 0)) * 0.28,
+        cx - 0.26 - np.sin(j.get("lshoulder", 0)) * 0.28,
         cy,
-        cz + 0.10 - np.cos(j.get("lshoulder", 0)) * 0.28,
+        sh_z - np.cos(j.get("lshoulder", 0)) * 0.28,
     ]
     relbow = [
-        cx + 0.22 + np.sin(j.get("rshoulder", 0)) * 0.28,
+        cx + 0.26 + np.sin(j.get("rshoulder", 0)) * 0.28,
         cy,
-        cz + 0.10 - np.cos(j.get("rshoulder", 0)) * 0.28,
+        sh_z - np.cos(j.get("rshoulder", 0)) * 0.28,
     ]
     lhand = [
         lelbow[0] - np.sin(j.get("lelbow", 0)) * 0.22,
@@ -120,17 +126,17 @@ def _forward_kinematics_skeleton(
         cy,
         relbow[2] - np.cos(j.get("relbow", 0)) * 0.22,
     ]
-    lhip_p = [cx - 0.12, cy, cz - 0.20]
-    rhip_p = [cx + 0.12, cy, cz - 0.20]
+    lhip_p = [cx - 0.12, cy, hip_z]
+    rhip_p = [cx + 0.12, cy, hip_z]
     lknee_p = [
         cx - 0.12 + np.sin(j.get("lhip", 0)) * 0.35,
         cy,
-        cz - 0.20 - np.cos(j.get("lhip", 0)) * 0.35,
+        hip_z - np.cos(j.get("lhip", 0)) * 0.35,
     ]
     rknee_p = [
         cx + 0.12 + np.sin(j.get("rhip", 0)) * 0.35,
         cy,
-        cz - 0.20 - np.cos(j.get("rhip", 0)) * 0.35,
+        hip_z - np.cos(j.get("rhip", 0)) * 0.35,
     ]
     lfoot = [
         lknee_p[0] + np.sin(j.get("lknee", 0)) * 0.30,
@@ -143,8 +149,9 @@ def _forward_kinematics_skeleton(
         rknee_p[2] - np.cos(j.get("rknee", 0)) * 0.30,
     ]
     pts = [
-        head, neck, torso_b, lshld, rshld, lelbow, relbow,
-        lhand, rhand, lhip_p, rhip_p, lknee_p, rknee_p, lfoot, rfoot,
+        head, neck, pelvis,
+        lshld, rshld, lelbow, relbow, lhand, rhand,
+        lhip_p, rhip_p, lknee_p, rknee_p, lfoot, rfoot,
     ]
     return [{"x": float(p[0]), "y": float(p[1]), "z": float(p[2])} for p in pts]
 
@@ -191,7 +198,7 @@ class _FallbackHumanoid:
         return (max(0, 0.1 - k_l * 0.05), max(0, 0.1 - k_r * 0.05))
 
     def get_all_link_positions(self) -> list[dict]:
-        """Скелетон для Three.js: 15 точек, порядок как у SKELETON_BONES на фронте."""
+        """Скелетон для Three.js: 15 точек, порядок как на фронте (без узла грудь)."""
         cx, cy, cz = float(self.com[0]), float(self.com[1]), float(self.com[2])
         return _forward_kinematics_skeleton(cx, cy, cz, self.joints)
 
@@ -541,21 +548,30 @@ class _PyBulletHumanoid:
             up = up / ln
         head_v = neck_v + 0.26 * up
 
+        # chest только для направления головы; в скелет не попадает (руки от шеи)
         order = [
-            head_v, neck_v, vec("root"),
-            vec("left_shoulder"), vec("right_shoulder"),
-            vec("left_elbow"), vec("right_elbow"),
-            vec("left_wrist"), vec("right_wrist"),
-            vec("left_hip"), vec("right_hip"),
-            vec("left_knee"), vec("right_knee"),
-            vec("left_ankle"), vec("right_ankle"),
+            head_v,
+            neck_v,
+            vec("root"),
+            vec("left_shoulder"),
+            vec("right_shoulder"),
+            vec("left_elbow"),
+            vec("right_elbow"),
+            vec("left_wrist"),
+            vec("right_wrist"),
+            vec("left_hip"),
+            vec("right_hip"),
+            vec("left_knee"),
+            vec("right_knee"),
+            vec("left_ankle"),
+            vec("right_ankle"),
         ]
         return [{"x": float(v[0]), "y": float(v[1]), "z": float(v[2])} for v in order]
 
     def get_all_link_positions(self) -> list[dict]:
         """
-        15 точек в каноническом порядке (как rkk-humanoid.jsx SKELETON_BONES).
-        Для URDF humanoid — реальные getLinkState; иначе FK от базы (кастомный multi-body).
+        15 точек (как rkk-humanoid.jsx): голова, шея, таз; руки от шеи, ноги от таза.
+        Для URDF humanoid — getLinkState; иначе FK от базы (кастомный multi-body).
         """
         urdf_pts = self._skeleton_from_urdf_links()
         if urdf_pts is not None:

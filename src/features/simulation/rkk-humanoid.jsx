@@ -63,14 +63,14 @@ const PHASE_NAMES = ["","Causal Crib","Robotic Explorer","Social Sandbox","Value
 const sep = {borderTop:"1px solid #0a1a2e",marginTop:4,paddingTop:4};
 const mono = {fontFamily:"'Courier New',monospace"};
 
-// ── Humanoid skeleton connectivity (parent→children для рисования костей) ─────
-// Индексы соответствуют position array из backend
+// ── Скелет: 15 точек с бэка — без отдельного шара «грудь» для рук ────────────
+// 0 голова, 1 шея (отсюда ключицы → плечи), 2 таз/root (ноги). Руки от шеи, не от лишнего узла под ней.
 const SKELETON_BONES = [
-  [0,1],[1,2],          // голова-шея-торс
-  [0,3],[3,5],[5,7],    // левая рука
-  [0,4],[4,6],[6,8],    // правая рука
-  [2,9],[9,11],[11,13], // левая нога
-  [2,10],[10,12],[12,14],// правая нога
+  [0,1],[1,2],              // голова — шея — таз (ствол)
+  [1,3],[3,5],[5,7],        // левая рука от шеи
+  [1,4],[4,6],[6,8],        // правая рука от шеи
+  [2,9],[9,11],[11,13],     // левая нога от таза
+  [2,10],[10,12],[12,14],   // правая нога от таза
 ];
 
 export default function RKKHumanoid() {
@@ -207,7 +207,7 @@ export default function RKKHumanoid() {
       scene.add(m); return m;
     });
 
-    // Кости (cylinders) — SKELETON_BONES.length = 15
+    // Кости (cylinders) — по одному на каждое ребро SKELETON_BONES
     const boneMeshes = SKELETON_BONES.map(([,]) => {
       const m = new THREE.Mesh(
         new THREE.CylinderGeometry(0.025, 0.025, 1, 6),
@@ -291,7 +291,7 @@ export default function RKKHumanoid() {
       const sk = ds.scene?.skeleton;
       if (sk && sk.length >= 3) {
         let sx = 0, sz = 0, n = 0;
-        for (let j = 0; j < Math.min(sk.length, 15); j++) {
+        for (let j = 0; j < Math.min(sk.length, JOINT_COUNT); j++) {
           const pt = sk[j];
           if (!pt) continue;
           sx += (pt.x ?? 0) * WORLD_SCALE;
@@ -343,21 +343,21 @@ export default function RKKHumanoid() {
         const phi = ag.phi ?? 0.1;
         const comH = 1.2 + (fallen ? -0.8 : 0) + Math.sin(t*0.5)*0.03;
         const poses = [
-          [0, comH+0.25, 0],          // 0 голова
-          [0, comH+0.12, 0],           // 1 шея
-          [0, comH-0.15, 0],           // 2 торс низ
-          [-0.25, comH+0.10, 0],       // 3 левое плечо
-          [ 0.25, comH+0.10, 0],       // 4 правое плечо
-          [-0.45, comH-0.10+Math.sin(t+1)*0.08, 0], // 5 левый локоть
-          [ 0.45, comH-0.10+Math.sin(t+2)*0.08, 0], // 6 правый локоть
-          [-0.55, comH-0.35, 0],       // 7 левая кисть
-          [ 0.55, comH-0.35, 0],       // 8 правая кисть
-          [-0.13, comH-0.25, 0],       // 9 левое бедро
-          [ 0.13, comH-0.25, 0],       // 10 правое бедро
-          [-0.13, comH-0.60+Math.sin(t)*0.06, 0], // 11 левое колено
-          [ 0.13, comH-0.60+Math.sin(t+Math.PI)*0.06, 0], // 12 правое колено
-          [-0.13+Math.sin(t)*0.04, comH-0.90, 0.05], // 13 левая стопа
-          [ 0.13+Math.sin(t+Math.PI)*0.04, comH-0.90, 0.05], // 14 правая стопа
+          [0, comH+0.26, 0],           // 0 голова
+          [0, comH+0.13, 0],           // 1 шея — хаб плеч
+          [0, comH-0.10, 0],           // 2 таз — хаб ног
+          [-0.26, comH+0.11, 0],       // 3 левое плечо (у шеи по высоте)
+          [ 0.26, comH+0.11, 0],       // 4 правое плечо
+          [-0.42, comH+0.05+Math.sin(t+1)*0.06, 0], // 5 локоть
+          [ 0.42, comH+0.05+Math.sin(t+2)*0.06, 0],
+          [-0.50, comH-0.18, 0],       // 7 кисть
+          [ 0.50, comH-0.18, 0],
+          [-0.11, comH-0.22, 0],       // 9 бедро
+          [ 0.11, comH-0.22, 0],
+          [-0.11, comH-0.56+Math.sin(t)*0.05, 0], // 11 колено
+          [ 0.11, comH-0.56+Math.sin(t+Math.PI)*0.05, 0],
+          [-0.11+Math.sin(t)*0.04, comH-0.86, 0.05], // 13 стопа
+          [ 0.11+Math.sin(t+Math.PI)*0.04, comH-0.86, 0.05],
         ];
         poses.forEach(([x,y,z],i) => {
           const v = new THREE.Vector3(x,y,z);
