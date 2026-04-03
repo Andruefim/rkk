@@ -1,11 +1,11 @@
-import RKKSingleton from "./features/simulation/rkk-singleton.jsx";
+import RKKHumanoid from "./features/simulation/rkk-humanoid";
 
 function App() {
 
 
   return (
     <>
-      <RKKSingleton />
+      <RKKHumanoid />
     </>
   )
 }

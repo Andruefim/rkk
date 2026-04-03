@@ -41,6 +41,7 @@ import numpy as np
 import torch
 import base64
 from io import BytesIO
+from pathlib import Path
 
 try:
     import pybullet as pb
@@ -80,6 +81,72 @@ for v in CUBE_VARS:
 
 FALLEN_Z     = 0.25   # ниже этой высоты = упал
 STAND_Z      = 0.85   # нормальная высота стоя
+
+# humanoid.urdf из PyBullet: звенья вытянуты ~5m по цепочке — для UI/fallback (~1.8m) уменьшаем модель.
+HUMANOID_URDF_GLOBAL_SCALING = 0.36
+
+
+def _forward_kinematics_skeleton(
+    cx: float, cy: float, cz: float, joints: dict[str, float]
+) -> list[dict]:
+    """
+    15 точек в том же порядке, что SKELETON_BONES на фронте (rkk-humanoid.jsx):
+    0 голова, 1 шея, 2 торс, 3–8 руки, 9–14 ноги.
+    Оси: x, y — горизонталь, z — вверх (как в PyBullet / fallback).
+    """
+    j = joints
+    head = [cx, cy, cz + 0.22]
+    neck = [cx, cy, cz + 0.15]
+    torso_b = [cx, cy, cz - 0.20]
+    lshld = [cx - 0.22, cy, cz + 0.10]
+    rshld = [cx + 0.22, cy, cz + 0.10]
+    lelbow = [
+        cx - 0.22 - np.sin(j.get("lshoulder", 0)) * 0.28,
+        cy,
+        cz + 0.10 - np.cos(j.get("lshoulder", 0)) * 0.28,
+    ]
+    relbow = [
+        cx + 0.22 + np.sin(j.get("rshoulder", 0)) * 0.28,
+        cy,
+        cz + 0.10 - np.cos(j.get("rshoulder", 0)) * 0.28,
+    ]
+    lhand = [
+        lelbow[0] - np.sin(j.get("lelbow", 0)) * 0.22,
+        cy,
+        lelbow[2] - np.cos(j.get("lelbow", 0)) * 0.22,
+    ]
+    rhand = [
+        relbow[0] + np.sin(j.get("relbow", 0)) * 0.22,
+        cy,
+        relbow[2] - np.cos(j.get("relbow", 0)) * 0.22,
+    ]
+    lhip_p = [cx - 0.12, cy, cz - 0.20]
+    rhip_p = [cx + 0.12, cy, cz - 0.20]
+    lknee_p = [
+        cx - 0.12 + np.sin(j.get("lhip", 0)) * 0.35,
+        cy,
+        cz - 0.20 - np.cos(j.get("lhip", 0)) * 0.35,
+    ]
+    rknee_p = [
+        cx + 0.12 + np.sin(j.get("rhip", 0)) * 0.35,
+        cy,
+        cz - 0.20 - np.cos(j.get("rhip", 0)) * 0.35,
+    ]
+    lfoot = [
+        lknee_p[0] + np.sin(j.get("lknee", 0)) * 0.30,
+        cy,
+        lknee_p[2] - np.cos(j.get("lknee", 0)) * 0.30,
+    ]
+    rfoot = [
+        rknee_p[0] + np.sin(j.get("rknee", 0)) * 0.30,
+        cy,
+        rknee_p[2] - np.cos(j.get("rknee", 0)) * 0.30,
+    ]
+    pts = [
+        head, neck, torso_b, lshld, rshld, lelbow, relbow,
+        lhand, rhand, lhip_p, rhip_p, lknee_p, rknee_p, lfoot, rfoot,
+    ]
+    return [{"x": float(p[0]), "y": float(p[1]), "z": float(p[2])} for p in pts]
 
 
 # ─── Fallback гуманоид (аналитический) ───────────────────────────────────────
@@ -124,36 +191,9 @@ class _FallbackHumanoid:
         return (max(0, 0.1 - k_l * 0.05), max(0, 0.1 - k_r * 0.05))
 
     def get_all_link_positions(self) -> list[dict]:
-        """Скелетон для Three.js (22 точки)."""
-        cx, cy, cz = self.com
-        rl, rp = self.torso_euler[0], self.torso_euler[1]
-        j = self.joints
-        # Упрощённая FK
-        head    = [cx, cy, cz + 0.22]
-        neck    = [cx, cy, cz + 0.15]
-        torso_b = [cx, cy, cz - 0.20]
-        # Плечи
-        lshld   = [cx - 0.22, cy, cz + 0.10]
-        rshld   = [cx + 0.22, cy, cz + 0.10]
-        # Локти
-        lelbow  = [cx - 0.22 - np.sin(j.get("lshoulder",0))*0.28, cy, cz + 0.10 - np.cos(j.get("lshoulder",0))*0.28]
-        relbow  = [cx + 0.22 + np.sin(j.get("rshoulder",0))*0.28, cy, cz + 0.10 - np.cos(j.get("rshoulder",0))*0.28]
-        # Кисти
-        lhand   = [lelbow[0] - np.sin(j.get("lelbow",0))*0.22, cy, lelbow[2] - np.cos(j.get("lelbow",0))*0.22]
-        rhand   = [relbow[0] + np.sin(j.get("relbow",0))*0.22, cy, relbow[2] - np.cos(j.get("relbow",0))*0.22]
-        # Бёдра
-        lhip_p  = [cx - 0.12, cy, cz - 0.20]
-        rhip_p  = [cx + 0.12, cy, cz - 0.20]
-        # Колени
-        lknee_p = [cx - 0.12 + np.sin(j.get("lhip",0))*0.35, cy, cz - 0.20 - np.cos(j.get("lhip",0))*0.35]
-        rknee_p = [cx + 0.12 + np.sin(j.get("rhip",0))*0.35, cy, cz - 0.20 - np.cos(j.get("rhip",0))*0.35]
-        # Стопы
-        lfoot   = [lknee_p[0] + np.sin(j.get("lknee",0))*0.30, cy, lknee_p[2] - np.cos(j.get("lknee",0))*0.30]
-        rfoot   = [rknee_p[0] + np.sin(j.get("rknee",0))*0.30, cy, rknee_p[2] - np.cos(j.get("rknee",0))*0.30]
-
-        pts = [head, neck, torso_b, lshld, rshld, lelbow, relbow,
-               lhand, rhand, lhip_p, rhip_p, lknee_p, rknee_p, lfoot, rfoot]
-        return [{"x":float(p[0]),"y":float(p[1]),"z":float(p[2])} for p in pts]
+        """Скелетон для Three.js: 15 точек, порядок как у SKELETON_BONES на фронте."""
+        cx, cy, cz = float(self.com[0]), float(self.com[1]), float(self.com[2])
+        return _forward_kinematics_skeleton(cx, cy, cz, self.joints)
 
     def get_state(self) -> dict:
         lf_z, rf_z = self.get_foot_z()
@@ -182,13 +222,6 @@ class _FallbackHumanoid:
 
 # ─── PyBullet гуманоид ────────────────────────────────────────────────────────
 class _PyBulletHumanoid:
-
-    # Список URDF путей для попытки загрузки
-    _HUMANOID_URDFS = [
-        "humanoid/humanoid.urdf",
-        "humanoid.urdf",
-        "atlas/atlas.urdf",
-    ]
 
     # Joint name → наш variable name (частичное совпадение)
     _JOINT_MAP = {
@@ -304,17 +337,27 @@ class _PyBulletHumanoid:
         )
 
     def _load_humanoid(self) -> int:
-        data_path = pbd.getDataPath()
-        for rel in self._HUMANOID_URDFS:
+        # Локальная копия humanoid.urdf: у сферических суставов добавлен <axis> — иначе urdfdom
+        # пишет b3Warning «no axis element… defaulting to (1,0,0)».
+        local = Path(__file__).resolve().parent / "data" / "humanoid" / "humanoid.urdf"
+        candidates: list[str] = []
+        if local.is_file():
+            candidates.append(str(local))
+        candidates.extend(["humanoid/humanoid.urdf", "humanoid.urdf", "atlas/atlas.urdf"])
+
+        for rel in candidates:
             try:
+                rel_l = rel.replace("\\", "/").lower()
+                gs = 1.0 if "atlas" in rel_l else HUMANOID_URDF_GLOBAL_SCALING
                 robot = pb.loadURDF(
                     rel,
                     basePosition=[0, 0, 1.0],
                     baseOrientation=pb.getQuaternionFromEuler([0, 0, 0]),
                     flags=pb.URDF_USE_SELF_COLLISION,
+                    globalScaling=gs,
                     physicsClientId=self.client,
                 )
-                print(f"[HumanoidEnv] Loaded: {rel}")
+                print(f"[HumanoidEnv] Loaded: {rel}" + (f" (globalScaling={gs})" if gs != 1.0 else ""))
                 return robot
             except Exception as e:
                 print(f"[HumanoidEnv] Could not load {rel}: {e}")
@@ -456,26 +499,71 @@ class _PyBulletHumanoid:
             s[f"cube{i}_z"] = float(cp[2])
         return s
 
-    def get_all_link_positions(self) -> list[dict]:
-        """Все link positions для Three.js скелетона."""
-        result = []
-        # База (торс)
-        pos, _ = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
-        result.append({"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2]), "name": "base"})
+    def _named_link_world_positions(self) -> dict[str, np.ndarray]:
+        """Мировые позиции звеньев (child link каждого joint)."""
+        out: dict[str, np.ndarray] = {}
         for i in range(self.n_joints):
-            try:
-                st   = pb.getLinkState(self.robot_id, i, physicsClientId=self.client)
-                name = self.joint_map.get(i, f"link{i}")
-                result.append({
-                    "x": float(st[4][0]),
-                    "y": float(st[4][1]),
-                    "z": float(st[4][2]),
-                    "name": str(name),
-                    "idx": i,
-                })
-            except Exception:
-                pass
-        return result
+            name = self.link_names[i]
+            st = pb.getLinkState(
+                self.robot_id, i,
+                computeForwardKinematics=1,
+                physicsClientId=self.client,
+            )
+            out[name] = np.array(st[4][:3], dtype=float)
+        return out
+
+    def _skeleton_from_urdf_links(self) -> list[dict] | None:
+        """
+        Stock humanoid.urdf: тело вытянуто вдоль локальной оси Y, не Z.
+        Аналитический FK от (cx,cy,cz) базы давал «комок» в одной точке.
+        """
+        need = {
+            "neck", "chest", "root",
+            "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+            "left_wrist", "right_wrist",
+            "left_hip", "right_hip", "left_knee", "right_knee",
+            "left_ankle", "right_ankle",
+        }
+        if not need.issubset(set(self.link_names)):
+            return None
+        p = self._named_link_world_positions()
+
+        def vec(name: str) -> np.ndarray:
+            return p[name].copy()
+
+        neck_v = vec("neck")
+        chest_v = vec("chest")
+        up = neck_v - chest_v
+        ln = float(np.linalg.norm(up))
+        if ln < 1e-5:
+            up = np.array([0.0, 0.0, 1.0], dtype=float)
+        else:
+            up = up / ln
+        head_v = neck_v + 0.26 * up
+
+        order = [
+            head_v, neck_v, vec("root"),
+            vec("left_shoulder"), vec("right_shoulder"),
+            vec("left_elbow"), vec("right_elbow"),
+            vec("left_wrist"), vec("right_wrist"),
+            vec("left_hip"), vec("right_hip"),
+            vec("left_knee"), vec("right_knee"),
+            vec("left_ankle"), vec("right_ankle"),
+        ]
+        return [{"x": float(v[0]), "y": float(v[1]), "z": float(v[2])} for v in order]
+
+    def get_all_link_positions(self) -> list[dict]:
+        """
+        15 точек в каноническом порядке (как rkk-humanoid.jsx SKELETON_BONES).
+        Для URDF humanoid — реальные getLinkState; иначе FK от базы (кастомный multi-body).
+        """
+        urdf_pts = self._skeleton_from_urdf_links()
+        if urdf_pts is not None:
+            return urdf_pts
+        pos, _ = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
+        cx, cy, cz = float(pos[0]), float(pos[1]), float(pos[2])
+        j = {v: self.get_joint_angle(v) for v in LEG_VARS + ARM_VARS}
+        return _forward_kinematics_skeleton(cx, cy, cz, j)
 
     def get_cube_positions(self) -> list[dict]:
         result = []
