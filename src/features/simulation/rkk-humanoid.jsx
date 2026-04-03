@@ -259,10 +259,22 @@ export default function RKKHumanoid() {
     pGeom.setAttribute("position",new THREE.BufferAttribute(pPos,3));
     scene.add(new THREE.Points(pGeom,new THREE.PointsMaterial({color:0x220044,size:0.06,transparent:true,opacity:0.4})));
 
-    let frame=0, camAngle=0;
+    let frame = 0;
     // Метры из API (FK skeleton + кубы) — без доп. масштаба; 3.5 ломал позы и тянул кости.
     const WORLD_SCALE = 1;
-    const camTarget = new THREE.Vector3(0,1,0);
+    const camTarget = new THREE.Vector3(0, 1, 0);
+    // Орбита: азимут вокруг Y, угол от горизонтали, расстояние (как раньше ~5.5 м)
+    let camAzim = 0;
+    let camElev = Math.asin(0.3 / 5.5);
+    let camRadius = 5.5;
+    let camDrag = false;
+    let camPtrX = 0;
+    let camPtrY = 0;
+    const CAM_ROT = 0.005;
+    const CAM_ELEV_MIN = 0.08;
+    const CAM_ELEV_MAX = Math.PI / 2 - 0.06;
+    const CAM_R_MIN = 2;
+    const CAM_R_MAX = 24;
 
     function updateBone(boneMesh, posA, posB) {
       const mid = new THREE.Vector3().addVectors(posA, posB).multiplyScalar(0.5);
@@ -284,13 +296,14 @@ export default function RKKHumanoid() {
       const wCol = parseInt((ds.worldColor||"#cc44ff").replace("#",""), 16);
       const fallen = ds.fallen || ds.scene?.fallen;
 
-      // Камера: орбита; центр — среднее по скелетону (онлайн), иначе начало координат
-      camAngle += 0.0005;
-      const camR = 5.5;
-      let comX = 0, comZ = 0;
+      // Центр орбиты — среднее по скелетону (PyBullet x,z → xz сцены)
+      let comX = 0;
+      let comZ = 0;
       const sk = ds.scene?.skeleton;
       if (sk && sk.length >= 3) {
-        let sx = 0, sz = 0, n = 0;
+        let sx = 0;
+        let sz = 0;
+        let n = 0;
         for (let j = 0; j < Math.min(sk.length, JOINT_COUNT); j++) {
           const pt = sk[j];
           if (!pt) continue;
@@ -300,10 +313,13 @@ export default function RKKHumanoid() {
         }
         if (n > 0) { comX = sx / n; comZ = sz / n; }
       }
-      camera.position.x = comX + Math.sin(camAngle) * camR;
-      camera.position.z = comZ + Math.cos(camAngle) * camR;
-      camera.position.y = 1.35 + 0.28 * Math.sin(camAngle * 0.5);
-      camTarget.lerp(new THREE.Vector3(comX, 1.05, comZ), 0.04);
+      camTarget.lerp(new THREE.Vector3(comX, 1.05, comZ), 0.06);
+      const ch = Math.cos(camElev);
+      camera.position.set(
+        camTarget.x + camRadius * ch * Math.sin(camAzim),
+        camTarget.y + camRadius * Math.sin(camElev),
+        camTarget.z + camRadius * ch * Math.cos(camAzim)
+      );
       camera.lookAt(camTarget);
 
       // Fallen indicator
@@ -398,6 +414,47 @@ export default function RKKHumanoid() {
     }
     loop();
 
+    const el = renderer.domElement;
+    el.style.cursor = "grab";
+    el.style.touchAction = "none";
+
+    const onPointerDown = e => {
+      if (e.button !== 0) return;
+      camDrag = true;
+      camPtrX = e.clientX;
+      camPtrY = e.clientY;
+      el.setPointerCapture(e.pointerId);
+      el.style.cursor = "grabbing";
+    };
+    const onPointerMove = e => {
+      if (!camDrag) return;
+      const dx = e.clientX - camPtrX;
+      const dy = e.clientY - camPtrY;
+      camPtrX = e.clientX;
+      camPtrY = e.clientY;
+      camAzim -= dx * CAM_ROT;
+      camElev -= dy * CAM_ROT;
+      camElev = Math.max(CAM_ELEV_MIN, Math.min(CAM_ELEV_MAX, camElev));
+    };
+    const endDrag = e => {
+      if (!camDrag) return;
+      camDrag = false;
+      try { el.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+      el.style.cursor = "grab";
+    };
+    const onWheel = e => {
+      e.preventDefault();
+      if (e.deltaY > 0) camRadius *= 1.1;
+      else camRadius /= 1.1;
+      camRadius = Math.max(CAM_R_MIN, Math.min(CAM_R_MAX, camRadius));
+    };
+
+    el.addEventListener("pointerdown", onPointerDown);
+    el.addEventListener("pointermove", onPointerMove);
+    el.addEventListener("pointerup", endDrag);
+    el.addEventListener("pointercancel", endDrag);
+    el.addEventListener("wheel", onWheel, { passive: false });
+
     const onResize = () => {
       if (!mount) return;
       camera.aspect = mount.clientWidth/mount.clientHeight;
@@ -407,6 +464,11 @@ export default function RKKHumanoid() {
     window.addEventListener("resize", onResize);
     return () => {
       cancelAnimationFrame(rafRef.current);
+      el.removeEventListener("pointerdown", onPointerDown);
+      el.removeEventListener("pointermove", onPointerMove);
+      el.removeEventListener("pointerup", endDrag);
+      el.removeEventListener("pointercancel", endDrag);
+      el.removeEventListener("wheel", onWheel);
       window.removeEventListener("resize", onResize);
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
       renderer.dispose();
