@@ -10,6 +10,7 @@ simulation_singleton_v2.py — Singleton AGI с гуманоидом (Фаза 1
 """
 from __future__ import annotations
 
+import os
 import torch
 import numpy as np
 from collections import deque
@@ -23,6 +24,35 @@ PHASE_THRESHOLDS = [0.0, 0.15, 0.30, 0.50, 0.70, 0.88]
 PHASE_HOLD_TICKS = 12
 PHASE_NAMES      = ["", "Causal Crib", "Robotic Explorer",
                     "Social Sandbox", "Value Lock", "Open Reality"]
+
+
+def resolve_torch_device(requested: str | None = None) -> torch.device:
+    """
+    Выбор устройства для GNN, демона, temporal и CausalVisualCortex.
+    Переменная окружения RKK_DEVICE перекрывает аргумент (например cuda, cuda:0, mps, cpu).
+    """
+    req = (os.environ.get("RKK_DEVICE") or requested or "cuda").strip().lower()
+    if req in ("mps", "mps:0"):
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        print("[RKK] RKK_DEVICE=mps, но MPS недоступен → CPU")
+        return torch.device("cpu")
+    if req == "cpu":
+        return torch.device("cpu")
+    if req.startswith("cuda"):
+        if torch.cuda.is_available():
+            dev = torch.device(req)
+            return dev
+        print(
+            f"[RKK] Запрошено {req}, но torch.cuda.is_available()=False "
+            "(поставьте PyTorch с CUDA или задайте RKK_DEVICE=cpu) → CPU"
+        )
+        return torch.device("cpu")
+    try:
+        return torch.device(req)
+    except Exception:
+        print(f"[RKK] Неизвестное RKK_DEVICE={req!r} → CPU")
+        return torch.device("cpu")
 
 WORLDS = {
     "humanoid":  {"label": "Humanoid",          "color": "#cc44ff"},
@@ -111,9 +141,9 @@ class Simulation:
     AGI_COLOR = "#cc44ff"
 
     def __init__(self, device_str: str = "cuda", start_world: str = "humanoid"):
-        self.device = torch.device(
-            device_str if torch.cuda.is_available() else "cpu"
-        )
+        self.device = resolve_torch_device(device_str)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
         self.current_world = start_world
         print(f"[Singleton v2] Device: {self.device} | World: {start_world}")
 
@@ -231,7 +261,11 @@ class Simulation:
             f"👁 Visual Cortex ENABLED: {n_slots} slots · {mode} mode",
             "#44ffcc", "phase"
         )
-        print(f"[Simulation] Visual mode ON: {n_slots} slots, d={self.agent.graph._d}")
+        cd = str(next(vis_env.cortex.parameters()).device)
+        print(
+            f"[Simulation] Visual mode ON: {n_slots} slots, d={self.agent.graph._d}, "
+            f"cortex={cd}"
+        )
 
         return {
             "visual": True,
@@ -239,6 +273,7 @@ class Simulation:
             "mode": mode,
             "new_vars": new_vars,
             "gnn_d": self.agent.graph._d,
+            "cortex_device": cd,
         }
 
     def _disable_visual_internal(self):

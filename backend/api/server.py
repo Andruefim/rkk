@@ -13,6 +13,7 @@ server.py — FastAPI для Singleton AGI Humanoid (Фаза 11 + 12).
 from __future__ import annotations
 import asyncio
 import json
+import os
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,7 +42,10 @@ _rag_status = {"last_run": None, "results": [], "running": False}
 def get_sim() -> Simulation:
     global _sim
     if _sim is None:
-        _sim = Simulation(device_str="cuda", start_world="humanoid")
+        _sim = Simulation(
+            device_str=os.environ.get("RKK_DEVICE", "cuda"),
+            start_world="humanoid",
+        )
     return _sim
 
 def get_seeder() -> RAGSeeder:
@@ -55,6 +59,14 @@ def get_seeder() -> RAGSeeder:
 
 
 # ── Health / State ────────────────────────────────────────────────────────────
+def _hardware_label() -> str:
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name(0)
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "Apple Silicon MPS"
+    return "CPU"
+
+
 @app.get("/health")
 def health():
     sim = get_sim()
@@ -62,7 +74,7 @@ def health():
         "status":        "ok",
         "singleton":     True,
         "device":        str(sim.device),
-        "gpu":           torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
+        "gpu":           _hardware_label(),
         "current_world": sim.current_world,
         "gnn_d":         sim.agent.graph._d,
         "fallen":        sim._fall_count,
@@ -332,7 +344,10 @@ async def causal_stream(websocket: WebSocket):
                     speed = int(msg.get("value", 1))
                 elif cmd == "reset":
                     global _sim
-                    _sim = Simulation(device_str="cuda", start_world="humanoid")
+                    _sim = Simulation(
+                        device_str=os.environ.get("RKK_DEVICE", "cuda"),
+                        start_world="humanoid",
+                    )
                     sim  = get_sim()
                 elif cmd == "inject_seeds":
                     sim.inject_seeds(agent_id=0, edges=msg.get("edges", []))

@@ -24,7 +24,7 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         print(f"[RKK] Device: {torch.cuda.get_device_name(0)}")
     else:
-        print("[RKK] Running on CPU (install ROCm PyTorch for GPU)")
+        print("[RKK] Running on CPU (для GPU: PyTorch+cuda; при наличии GPU задайте RKK_DEVICE=cuda)")
 
     import uvicorn
     uvicorn.run(

@@ -71,9 +71,14 @@ class EnvironmentVisual:
         self.preset      = f"visual({base_env.preset})"
         self.n_interventions = 0
 
-        # Инициализируем visual cortex
+        # Инициализируем visual cortex (все веса на том же device, что и GNN)
         self.cortex = make_visual_cortex(device, n_slots=n_slots)
-        print(f"[VisualEnv] mode={mode}, slots={n_slots}, base={base_env.preset}")
+        self.cortex.to(device)
+        _p = next(self.cortex.parameters())
+        print(
+            f"[VisualEnv] mode={mode}, slots={n_slots}, base={base_env.preset}, "
+            f"cortex_device={_p.device}"
+        )
 
         # Кэш последнего кадра и слотов
         self._last_frame:    np.ndarray | None    = None

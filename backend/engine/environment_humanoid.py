@@ -910,39 +910,65 @@ class _PyBulletHumanoid:
         "diag":  {"eye": [2.5, -2.5, 2.0], "target": [0, 0, 0.7], "up": [0, 0, 1]},
     }
 
+    def _link_world_pos(self, link_name: str) -> np.ndarray | None:
+        """Позиция origin звена в мире (как в скелете, st[4])."""
+        if link_name not in self.link_names:
+            return None
+        i = self.link_names.index(link_name)
+        st = pb.getLinkState(
+            self.robot_id, i, computeForwardKinematics=1, physicsClientId=self.client
+        )
+        return np.array(st[4][:3], dtype=float)
+
     def _ego_camera_rt(self) -> tuple[list[float], list[float], list[float]] | None:
-        """Глаза у шеи: вперёд по горизонтали, up вдоль груди→шея."""
+        """Глаза у шеи: вперёд привязан к корпусу (поворот вокруг вертикали), up — грудь→шея."""
         names = set(self.link_names)
         if "neck" not in names or "chest" not in names:
             return None
-        i_neck = self.link_names.index("neck")
-        i_chest = self.link_names.index("chest")
-        st_n = pb.getLinkState(
-            self.robot_id, i_neck, computeForwardKinematics=1, physicsClientId=self.client
-        )
-        st_c = pb.getLinkState(
-            self.robot_id, i_chest, computeForwardKinematics=1, physicsClientId=self.client
-        )
-        pos_n = np.array(st_n[0][:3], dtype=float)
-        pos_c = np.array(st_c[0][:3], dtype=float)
+        pos_n = self._link_world_pos("neck")
+        pos_c = self._link_world_pos("chest")
+        if pos_n is None or pos_c is None:
+            return None
         up = pos_n - pos_c
         ln = float(np.linalg.norm(up))
         if ln < 1e-6:
             up = np.array([0.0, 0.0, 1.0], dtype=float)
         else:
             up = up / ln
-        # Горизонтальный «взгляд»: направление в плоскости, перпендикулярной up
-        for pref in (
-            np.array([0.0, 1.0, 0.0], dtype=float),
-            np.array([1.0, 0.0, 0.0], dtype=float),
-        ):
-            fwd = pref - float(np.dot(pref, up)) * up
-            fn = float(np.linalg.norm(fwd))
-            if fn >= 1e-5:
-                fwd = fwd / fn
-                break
-        else:
-            return None
+
+        # Вперёд = up × right_body (right_body: левое плечо → правое).
+        fwd: np.ndarray | None = None
+        if {"left_shoulder", "right_shoulder"}.issubset(names):
+            pl = self._link_world_pos("left_shoulder")
+            pr = self._link_world_pos("right_shoulder")
+            if pl is not None and pr is not None:
+                right_body = pr - pl
+                rn = float(np.linalg.norm(right_body))
+                if rn >= 1e-5:
+                    right_body = right_body / rn
+                    fwd = np.cross(up, right_body)
+                    fn = float(np.linalg.norm(fwd))
+                    if fn >= 1e-5:
+                        fwd = fwd / fn
+                    else:
+                        fwd = None
+        if fwd is None:
+            # Fallback: локальная ось шеи из кватерниона звена (без фиксированного мира Y)
+            i_neck = self.link_names.index("neck")
+            st_n = pb.getLinkState(
+                self.robot_id, i_neck, computeForwardKinematics=1, physicsClientId=self.client
+            )
+            R = np.array(pb.getMatrixFromQuaternion(st_n[5]), dtype=float).reshape(3, 3)
+            # URDF neck: ось роста ~ локальный Y; «вперёд» — локальный +X в мир (строки R_row @ e_local)
+            # PyBullet: матрица 3×3 row-major, v_world = R @ v_local
+            local_fwd = np.array([1.0, 0.0, 0.0], dtype=float)
+            cand = R @ local_fwd
+            cand = cand - float(np.dot(cand, up)) * up
+            fn = float(np.linalg.norm(cand))
+            if fn < 1e-5:
+                return None
+            fwd = cand / fn
+
         # Слегка впереди и выше центра шеи
         eye = pos_n + 0.10 * up + 0.05 * fwd
         target = eye + 2.2 * fwd
@@ -954,9 +980,11 @@ class _PyBulletHumanoid:
             return None
         try:
             vkey = (view or "diag").lower()
+            ego_cam = False
             if vkey in ("ego", "first_person", "fp"):
                 eg = self._ego_camera_rt()
                 if eg is not None:
+                    ego_cam = True
                     eye, tgt, cup = eg
                     vm = pb.computeViewMatrix(eye, tgt, cup, physicsClientId=self.client)
                 else:
@@ -983,6 +1011,9 @@ class _PyBulletHumanoid:
             if pix.size < need:
                 raise ValueError(f"camera pixels {pix.size} < expected {need}")
             rgb = pix[:need].reshape((height, width, 4))[:, :, :3]
+            # TinyRenderer + view matrix: для ego часто лево/право на экране наоборот от тела
+            if ego_cam:
+                rgb = np.ascontiguousarray(rgb[:, ::-1, :])
             img = PILImage.fromarray(rgb)
             buf = BytesIO()
             img.save(buf, format="JPEG", quality=85)

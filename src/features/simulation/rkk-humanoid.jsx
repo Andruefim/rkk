@@ -3,6 +3,8 @@ import * as THREE from "three";
 import { useRKKStream } from "../../hooks/useRKKStream";
 
 const API = "http://localhost:8000";
+/** Опрос PyBullet-превью (не связан с тиками симуляции) */
+const CAMERA_PREVIEW_MS = 500;
 
 const WORLD_COLORS = {
   humanoid:"#cc44ff", robot:"#aa22dd", pybullet:"#ff44aa",
@@ -113,7 +115,7 @@ export default function RKKHumanoid() {
         const d = await fetch(`${API}/camera/frame?view=${camView}`).then(r=>r.json());
         if (d.available) setCamFrame(d.frame);
       } catch {}
-    }, 500);
+    }, CAMERA_PREVIEW_MS);
     return () => clearInterval(iv);
   }, [connected, showCam, camView]);
 
