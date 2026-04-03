@@ -187,19 +187,20 @@ class SlotAttention(nn.Module):
 
 # ─── Slot Projector ───────────────────────────────────────────────────────────
 class SlotProjector(nn.Module):
-    """Slot vector → scalar value ∈ (0,1) для GNN узла."""
+    """Slot vector → scalar в коридоре Value Layer [0.05, 0.95] (гомеостаз)."""
     def __init__(self, slot_dim: int):
         super().__init__()
-        self.net = nn.Sequential(
+        self.trunk = nn.Sequential(
             nn.LayerNorm(slot_dim),
             nn.Linear(slot_dim, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
-            nn.Sigmoid(),
         )
+
     def forward(self, slots: torch.Tensor) -> torch.Tensor:
-        """slots: (B, K, D) → values (B, K)"""
-        return self.net(slots).squeeze(-1)
+        """slots: (B, K, D) → values (B, K) строго внутри [0.05, 0.95]."""
+        raw = self.trunk(slots).squeeze(-1)
+        return torch.sigmoid(raw) * 0.9 + 0.05
 
 
 # ─── CausalVisualCortex ───────────────────────────────────────────────────────

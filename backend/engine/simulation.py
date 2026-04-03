@@ -141,6 +141,7 @@ class Simulation:
 
         self._fall_count  = 0
         self._stand_ticks = 0
+        self._last_fall_reset_tick: int = -999
 
         # ── Фаза 12: Visual Cortex ────────────────────────────────────────────
         self._visual_mode   = False     # выкл по умолчанию
@@ -176,11 +177,12 @@ class Simulation:
         return result
 
     # ── Фаза 12: Visual mode ──────────────────────────────────────────────────
-    def enable_visual(self, n_slots: int = 8, mode: str = "visual") -> dict:
+    def enable_visual(self, n_slots: int = 8, mode: str = "hybrid") -> dict:
         """
         Включаем Causal Visual Cortex.
         Текущая среда оборачивается в EnvironmentVisual.
-        GNN перестраивается под slot_0...slot_N переменные.
+        По умолчанию mode="hybrid": слоты для наблюдения + phys_* моторы — иначе VL/физика
+        блокируют do(slot_k) без реального сустава.
         """
         if self._visual_mode:
             return {"visual": True, "already_enabled": True}
@@ -281,17 +283,38 @@ class Simulation:
             "variables": list(self.agent.graph.nodes.keys()),
         }
 
+    def _try_reset_pose_after_fall(self) -> bool:
+        """Сброс позы гуманоида (база PyBullet), чтобы выйти из ловушки fallen + VL block."""
+        env = self.agent.env
+        fn = getattr(env, "reset_stance", None)
+        if not callable(fn):
+            return False
+        if self.tick - self._last_fall_reset_tick < 4:
+            return False
+        fn()
+        self._last_fall_reset_tick = self.tick
+        self._add_event("🔄 Сброс позы после падения", "#44aaff", "value")
+        return True
+
     # ── Tick ──────────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
         self.tick += 1
 
-        # Fallen check
+        # Fallen check + автосброс физики (иначе VL и block_rate залипают)
         fallen = False
         is_fn  = getattr(self.agent.env, "is_fallen", None)
         if callable(is_fn):
             fallen = is_fn()
             if fallen:
                 self._fall_count += 1
+                if self._try_reset_pose_after_fall():
+                    obs = self.agent.env.observe()
+                    for nid in self.agent.graph._node_ids:
+                        if nid in obs:
+                            self.agent.graph.nodes[nid] = obs[nid]
+                    self.agent.graph.record_observation(obs)
+                    self.agent.temporal.step(obs)
+                    fallen = is_fn()
                 if self._fall_count % 20 == 1:
                     self._add_event(
                         f"💀 [FALLEN] Nova упал! (×{self._fall_count})",
@@ -364,7 +387,8 @@ class Simulation:
                 if sid in node_ids:
                     idx = node_ids.index(sid)
                     if idx < len(pred_full):
-                        slot_pred[i] = pred_full[idx]
+                        p = float(pred_full[idx].item())
+                        slot_pred[i] = min(0.95, max(0.05, p))
             self._visual_env.set_gnn_prediction(slot_pred)
         except Exception:
             pass

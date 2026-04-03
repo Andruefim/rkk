@@ -224,7 +224,7 @@ def demon_stats():
 
 class VisionEnableRequest(BaseModel):
     n_slots: int = 8
-    mode:    str = "visual"   # "visual" | "hybrid"
+    mode:    str = "hybrid"   # "hybrid" (слоты + моторы) | "visual" (только слоты)
 
 @app.post("/vision/enable")
 def vision_enable(req: VisionEnableRequest):
@@ -350,7 +350,7 @@ async def causal_stream(websocket: WebSocket):
                 # Фаза 12: visual cortex commands
                 elif cmd == "vision_enable":
                     n = int(msg.get("n_slots", 8))
-                    mode = msg.get("mode", "visual")
+                    mode = msg.get("mode", "hybrid")
                     sim.enable_visual(n_slots=n, mode=mode)
                 elif cmd == "vision_disable":
                     sim.disable_visual()

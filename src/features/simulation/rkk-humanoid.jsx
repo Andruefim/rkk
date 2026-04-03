@@ -181,7 +181,7 @@ export default function RKKHumanoid() {
     try {
       const d = await fetch(`${API}/vision/enable`,{method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({n_slots:nSlots,mode:"visual"})}).then(r=>r.json());
+        body:JSON.stringify({n_slots:nSlots,mode:"hybrid"})}).then(r=>r.json());
       if (d.visual) {
         setVisionEnabled(true);
         setStatus(`👁 Vision ON: ${d.n_slots} slots, d=${d.gnn_d}`);

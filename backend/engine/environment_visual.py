@@ -62,7 +62,7 @@ class EnvironmentVisual:
         base_env,
         device:  torch.device,
         n_slots: int   = 8,
-        mode:    str   = "visual",   # "visual" | "hybrid"
+        mode:    str   = "hybrid",   # "hybrid" = слоты + моторные phys_* (рекомендуется); "visual" = только слоты
     ):
         self.base_env    = base_env
         self.device      = device
@@ -297,6 +297,12 @@ class EnvironmentVisual:
     def is_fallen(self) -> bool:
         fn = getattr(self.base_env, "is_fallen", None)
         return fn() if callable(fn) else False
+
+    def reset_stance(self) -> None:
+        fn = getattr(self.base_env, "reset_stance", None)
+        if callable(fn):
+            fn()
+        self._refresh()
 
     # ── Seeds для visual env ─────────────────────────────────────────────────
     def hardcoded_seeds(self) -> list[dict]:

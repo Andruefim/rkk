@@ -85,6 +85,11 @@ STAND_Z      = 0.85   # нормальная высота стоя
 # humanoid.urdf из PyBullet: звенья вытянуты ~5m по цепочке — для UI/fallback (~1.8m) уменьшаем модель.
 HUMANOID_URDF_GLOBAL_SCALING = 0.36
 
+# URDF: туловище вдоль локальной Y; мир PyBullet Z-up. Без поворота робот «лежит» вдоль пола.
+# +90° вокруг X: ось роста → Z. Высота базы подобрана под plane + globalScaling.
+HUMANOID_URDF_STAND_EULER = (np.pi / 2, 0.0, 0.0)
+HUMANOID_URDF_SPAWN_Z = 1.15
+
 
 def _forward_kinematics_skeleton(
     cx: float, cy: float, cz: float, joints: dict[str, float]
@@ -226,6 +231,12 @@ class _FallbackHumanoid:
     def get_frame_base64(self, view="side") -> str | None:
         return None
 
+    def reset_stance(self) -> None:
+        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS}
+        self.com = np.array([0.0, 0.0, STAND_Z], dtype=np.float64)
+        self.torso_euler = np.zeros(3)
+        self._vel = np.zeros(3)
+
 
 # ─── PyBullet гуманоид ────────────────────────────────────────────────────────
 class _PyBulletHumanoid:
@@ -322,11 +333,13 @@ class _PyBulletHumanoid:
         for _ in range(100):
             pb.stepSimulation(physicsClientId=self.client)
 
-        # Строим маппинг link_name → index для скелетона
+        # Имена звеньев + типы суставов (для reset_stance: spherical → MultiDof)
         self.link_names: list[str] = []
+        self._joint_types: list[int] = []
         for i in range(self.n_joints):
             info = pb.getJointInfo(self.robot_id, i, physicsClientId=self.client)
             self.link_names.append(info[12].decode("utf-8"))
+            self._joint_types.append(int(info[2]))
 
     def _build_ramp(self):
         """Наклонная плоскость 2×1 под 15°."""
@@ -352,18 +365,29 @@ class _PyBulletHumanoid:
             candidates.append(str(local))
         candidates.extend(["humanoid/humanoid.urdf", "humanoid.urdf", "atlas/atlas.urdf"])
 
+        self._reset_base_pos = [0.0, 0.0, HUMANOID_URDF_SPAWN_Z]
+        self._reset_base_orn = pb.getQuaternionFromEuler(HUMANOID_URDF_STAND_EULER)
+
         for rel in candidates:
             try:
                 rel_l = rel.replace("\\", "/").lower()
                 gs = 1.0 if "atlas" in rel_l else HUMANOID_URDF_GLOBAL_SCALING
+                if "atlas" in rel_l:
+                    pos = [0.0, 0.0, 1.0]
+                    orn = pb.getQuaternionFromEuler([0.0, 0.0, 0.0])
+                else:
+                    pos = [0.0, 0.0, HUMANOID_URDF_SPAWN_Z]
+                    orn = pb.getQuaternionFromEuler(HUMANOID_URDF_STAND_EULER)
                 robot = pb.loadURDF(
                     rel,
-                    basePosition=[0, 0, 1.0],
-                    baseOrientation=pb.getQuaternionFromEuler([0, 0, 0]),
+                    basePosition=pos,
+                    baseOrientation=orn,
                     flags=pb.URDF_USE_SELF_COLLISION,
                     globalScaling=gs,
                     physicsClientId=self.client,
                 )
+                self._reset_base_pos = list(pos)
+                self._reset_base_orn = orn
                 print(f"[HumanoidEnv] Loaded: {rel}" + (f" (globalScaling={gs})" if gs != 1.0 else ""))
                 return robot
             except Exception as e:
@@ -427,11 +451,99 @@ class _PyBulletHumanoid:
         custom_map = {6:"lhip",7:"rhip",8:"lknee",9:"rknee",2:"lshoulder",3:"rshoulder",4:"lelbow",5:"relbow"}
         self.joint_map   = custom_map
         self.joint_by_var = {v:k for k,v in custom_map.items()}
+        self._reset_base_pos = [0.0, 0.0, 1.0]
+        self._reset_base_orn = pb.getQuaternionFromEuler([0.0, 0.0, 0.0])
         return robot
 
     def step(self, n: int = 10):
         for _ in range(n):
             pb.stepSimulation(physicsClientId=self.client)
+
+    def _motor_relax_velocity(self) -> None:
+        """Как после __init__: слабые моторы — обычный режим intervene()."""
+        rid, cid = self.robot_id, self.client
+        for i in range(self.n_joints):
+            if self._joint_types[i] == pb.JOINT_FIXED:
+                continue
+            pb.setJointMotorControl2(
+                rid, i,
+                controlMode=pb.VELOCITY_CONTROL,
+                targetVelocity=0.0, force=0.1,
+                physicsClientId=cid,
+            )
+
+    def _motor_stabilize_neutral_pose(self) -> None:
+        """
+        После kinematic reset сферы под гравитацией снова «схлопываются», если
+        оставить force=0.1. Кратко держим нейтраль: spherical → identity quat,
+        revolute → 0 с нормальным PD.
+        """
+        rid, cid = self.robot_id, self.client
+        quat_id = [0.0, 0.0, 0.0, 1.0]
+        motor_m = getattr(pb, "setJointMotorControlMultiDof", None)
+        for i in range(self.n_joints):
+            jt = self._joint_types[i]
+            if jt == pb.JOINT_FIXED:
+                continue
+            if jt == pb.JOINT_SPHERICAL and callable(motor_m):
+                motor_m(
+                    rid, i, pb.POSITION_CONTROL,
+                    targetPosition=quat_id,
+                    positionGain=1.0,
+                    velocityGain=0.35,
+                    maxVelocity=8.0,
+                    force=[220.0, 220.0, 220.0],
+                    physicsClientId=cid,
+                )
+            else:
+                pb.setJointMotorControl2(
+                    rid, i,
+                    controlMode=pb.POSITION_CONTROL,
+                    targetPosition=0.0,
+                    positionGain=0.55, velocityGain=0.12,
+                    force=100.0,
+                    physicsClientId=cid,
+                )
+
+    def reset_stance(self) -> None:
+        """
+        Вернуть робота в спавн-позу. Сферические суставы — MultiDof + краткий
+        POSITION_CONTROL, иначе гравитация снова ломает осанку при слабом VELOCITY.
+        """
+        rid = self.robot_id
+        cid = self.client
+        pb.resetBasePositionAndOrientation(
+            rid, self._reset_base_pos, self._reset_base_orn,
+            physicsClientId=cid,
+        )
+        pb.resetBaseVelocity(rid, [0, 0, 0], [0, 0, 0], physicsClientId=cid)
+
+        dof_reset = getattr(pb, "resetJointStateMultiDof", None)
+        quat_identity = [0.0, 0.0, 0.0, 1.0]
+        omega_zero = [0.0, 0.0, 0.0]
+
+        for i in range(self.n_joints):
+            jt = self._joint_types[i]
+            if jt == pb.JOINT_FIXED:
+                continue
+            if jt == pb.JOINT_SPHERICAL and callable(dof_reset):
+                dof_reset(
+                    rid, i, quat_identity, omega_zero, physicsClientId=cid,
+                )
+            else:
+                pb.resetJointState(
+                    rid, i,
+                    targetValue=0.0, targetVelocity=0.0,
+                    physicsClientId=cid,
+                )
+
+        self._motor_stabilize_neutral_pose()
+        for _ in range(260):
+            pb.stepSimulation(physicsClientId=cid)
+
+        self._motor_relax_velocity()
+        for _ in range(80):
+            pb.stepSimulation(physicsClientId=cid)
 
     def set_joint(self, var_name: str, target_pos: float):
         """PD control на сустав."""
@@ -521,8 +633,8 @@ class _PyBulletHumanoid:
 
     def _skeleton_from_urdf_links(self) -> list[dict] | None:
         """
-        Stock humanoid.urdf: тело вытянуто вдоль локальной оси Y, не Z.
-        Аналитический FK от (cx,cy,cz) базы давал «комок» в одной точке.
+        Позиции звеньев из PyBullet (мир Z вверх). База URDF повёрнута так,
+        что цепочка идёт вдоль Z — см. HUMANOID_URDF_STAND_EULER при loadURDF.
         """
         need = {
             "neck", "chest", "root",
@@ -718,6 +830,9 @@ class EnvironmentHumanoid:
     def is_fallen(self) -> bool:
         obs = self.observe()
         return obs.get("com_z", 0.5) < self._norm("com_z", FALLEN_Z)
+
+    def reset_stance(self) -> None:
+        self._sim.reset_stance()
 
     # ── Camera / Skeleton ──────────────────────────────────────────────────────
     def get_frame_base64(self, view: str = "diag") -> str | None:
