@@ -186,53 +186,59 @@ class ValueLayer:
         # 2. Предсказываем результат через CausalGraph
         predicted_state = graph.propagate(variable, value)
 
-        # 3. Предсказание SCM в [0,1]; узкое окно давало 100% var_out_of_range при «жёстких» W
-        for var_name, pred_val in predicted_state.items():
-            pv = float(
-                np.clip(
-                    np.nan_to_num(pred_val, nan=0.5, posinf=1.0, neginf=0.0),
-                    0.0,
-                    1.0,
+        # Слоты зрения: SCM не моделирует «пиксели→физика»; коридор предсказания и скачок
+        # энтропии по графу дают ложные var_out_of_range / ENTROPY_SPIKE на каждом do(slot_k).
+        slot_action = variable.startswith("slot_")
+        entropy_delta = 0.0
+
+        if not slot_action:
+            # 3. Предсказание SCM в [0,1]; узкое окно давало 100% var_out_of_range при «жёстких» W
+            for var_name, pred_val in predicted_state.items():
+                pv = float(
+                    np.clip(
+                        np.nan_to_num(pred_val, nan=0.5, posinf=1.0, neginf=0.0),
+                        0.0,
+                        1.0,
+                    )
                 )
-            )
-            if not np.isfinite(pv):
+                if not np.isfinite(pv):
+                    return self._block(
+                        BlockReason.VAR_OUT_OF_RANGE,
+                        predicted_state, current_phi,
+                        f"predicted {var_name} non-finite",
+                        variable, value,
+                    )
+                # После прогрева — узкий коридор (растёт с blend); на прогреве lo=0, hi=1
+                if pv < eff.predict_lo or pv > eff.predict_hi:
+                    return self._block(
+                        BlockReason.VAR_OUT_OF_RANGE,
+                        predicted_state, current_phi,
+                        f"predicted {var_name}={pv:.3f} outside [{eff.predict_lo:.3f}, {eff.predict_hi:.3f}]",
+                        variable, value,
+                    )
+
+            # 4. Скачок разброса по уже клипнутому предсказанию (сырой X@W давал ложные ENTROPY_SPIKE)
+            pred_for_entropy = {
+                k: float(
+                    np.clip(
+                        np.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0),
+                        0.0,
+                        1.0,
+                    )
+                )
+                for k, v in predicted_state.items()
+            }
+            current_entropy   = float(np.std(list(current_nodes.values())))
+            predicted_entropy = float(np.std(list(pred_for_entropy.values())))
+            entropy_delta     = predicted_entropy - current_entropy
+
+            if entropy_delta > eff.env_entropy_max_delta:
                 return self._block(
-                    BlockReason.VAR_OUT_OF_RANGE,
+                    BlockReason.ENTROPY_SPIKE,
                     predicted_state, current_phi,
-                    f"predicted {var_name} non-finite",
+                    f"entropy spike +{entropy_delta:.3f} > {eff.env_entropy_max_delta:.3f}",
                     variable, value,
                 )
-            # После прогрева — узкий коридор (растёт с blend); на прогреве lo=0, hi=1
-            if pv < eff.predict_lo or pv > eff.predict_hi:
-                return self._block(
-                    BlockReason.VAR_OUT_OF_RANGE,
-                    predicted_state, current_phi,
-                    f"predicted {var_name}={pv:.3f} outside [{eff.predict_lo:.3f}, {eff.predict_hi:.3f}]",
-                    variable, value,
-                )
-
-        # 4. Скачок разброса по уже клипнутому предсказанию (сырой X@W давал ложные ENTROPY_SPIKE)
-        pred_for_entropy = {
-            k: float(
-                np.clip(
-                    np.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0),
-                    0.0,
-                    1.0,
-                )
-            )
-            for k, v in predicted_state.items()
-        }
-        current_entropy   = float(np.std(list(current_nodes.values())))
-        predicted_entropy = float(np.std(list(pred_for_entropy.values())))
-        entropy_delta     = predicted_entropy - current_entropy
-
-        if entropy_delta > eff.env_entropy_max_delta:
-            return self._block(
-                BlockReason.ENTROPY_SPIKE,
-                predicted_state, current_phi,
-                f"entropy spike +{entropy_delta:.3f} > {eff.env_entropy_max_delta:.3f}",
-                variable, value,
-            )
 
         # 5. Проверяем Φ через slow SSM состояние
         h_slow_norm = temporal.h_slow.norm().item() if temporal is not None else 0.0

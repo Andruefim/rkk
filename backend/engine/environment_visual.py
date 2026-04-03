@@ -93,7 +93,11 @@ class EnvironmentVisual:
         # PyBullet env: get_frame_base64 → декодируем
         fn = getattr(self.base_env, "get_frame_base64", None)
         if callable(fn):
-            b64 = fn("diag")
+            b64 = None
+            for view in ("ego", "diag"):
+                b64 = fn(view)
+                if b64:
+                    break
             if b64:
                 import base64 as _b64
                 from io import BytesIO

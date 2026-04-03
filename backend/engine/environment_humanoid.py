@@ -32,8 +32,8 @@ do() оператор:
   do(lknee=0.4) → сгибаем колено
 
 Камера:
-  3 угла обзора: side, front, top
-  get_frame_base64(view="side"|"front"|"top") → PNG
+  diag / side / front / top + ego (от шеи, вперёд по горизонтали)
+  get_frame_base64(view=...) → JPEG base64
 """
 from __future__ import annotations
 
@@ -707,13 +707,64 @@ class _PyBulletHumanoid:
         "diag":  {"eye": [2.5, -2.5, 2.0], "target": [0, 0, 0.7], "up": [0, 0, 1]},
     }
 
+    def _ego_camera_rt(self) -> tuple[list[float], list[float], list[float]] | None:
+        """Глаза у шеи: вперёд по горизонтали, up вдоль груди→шея."""
+        names = set(self.link_names)
+        if "neck" not in names or "chest" not in names:
+            return None
+        i_neck = self.link_names.index("neck")
+        i_chest = self.link_names.index("chest")
+        st_n = pb.getLinkState(
+            self.robot_id, i_neck, computeForwardKinematics=1, physicsClientId=self.client
+        )
+        st_c = pb.getLinkState(
+            self.robot_id, i_chest, computeForwardKinematics=1, physicsClientId=self.client
+        )
+        pos_n = np.array(st_n[0][:3], dtype=float)
+        pos_c = np.array(st_c[0][:3], dtype=float)
+        up = pos_n - pos_c
+        ln = float(np.linalg.norm(up))
+        if ln < 1e-6:
+            up = np.array([0.0, 0.0, 1.0], dtype=float)
+        else:
+            up = up / ln
+        # Горизонтальный «взгляд»: направление в плоскости, перпендикулярной up
+        for pref in (
+            np.array([0.0, 1.0, 0.0], dtype=float),
+            np.array([1.0, 0.0, 0.0], dtype=float),
+        ):
+            fwd = pref - float(np.dot(pref, up)) * up
+            fn = float(np.linalg.norm(fwd))
+            if fn >= 1e-5:
+                fwd = fwd / fn
+                break
+        else:
+            return None
+        # Слегка впереди и выше центра шеи
+        eye = pos_n + 0.10 * up + 0.05 * fwd
+        target = eye + 2.2 * fwd
+        return eye.tolist(), target.tolist(), up.tolist()
+
     def get_frame_base64(self, view: str = "diag",
                          width: int = 480, height: int = 360) -> str | None:
         if not PIL_AVAILABLE:
             return None
         try:
-            cfg  = self._CAMERA_CONFIGS.get(view, self._CAMERA_CONFIGS["diag"])
-            vm   = pb.computeViewMatrix(cfg["eye"], cfg["target"], cfg["up"],
+            vkey = (view or "diag").lower()
+            if vkey in ("ego", "first_person", "fp"):
+                eg = self._ego_camera_rt()
+                if eg is not None:
+                    eye, tgt, cup = eg
+                    vm = pb.computeViewMatrix(eye, tgt, cup, physicsClientId=self.client)
+                else:
+                    vkey = "diag"
+                    eg = None
+            else:
+                eg = None
+
+            if eg is None:
+                cfg = self._CAMERA_CONFIGS.get(vkey, self._CAMERA_CONFIGS["diag"])
+                vm = pb.computeViewMatrix(cfg["eye"], cfg["target"], cfg["up"],
                                          physicsClientId=self.client)
             pm   = pb.computeProjectionMatrixFOV(
                 fov=60, aspect=width/height, nearVal=0.1, farVal=15.0,

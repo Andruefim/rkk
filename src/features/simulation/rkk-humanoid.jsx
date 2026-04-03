@@ -82,7 +82,7 @@ export default function RKKHumanoid() {
   const [activePanel, setPanel]      = useState(null);
   const [seedText,    setSeedText]   = useState('[\n  {"from_": "lhip", "to": "com_z", "weight": 0.6}\n]');
   const [status,      setStatus]     = useState("");
-  const [camView,     setCamView]    = useState("diag");
+  const [camView,     setCamView]    = useState("ego");
   const [camFrame,    setCamFrame]   = useState(null);
   const [showCam,     setShowCam]    = useState(false);
   const [showCubes,   setShowCubes]  = useState(false);
@@ -510,7 +510,7 @@ export default function RKKHumanoid() {
       {showCam&&camFrame&&(
         <div style={{position:"absolute",bottom:120,right:14,border:`1px solid ${wCol}55`,borderRadius:3,overflow:"hidden",width:280}}>
           <div style={{display:"flex",gap:4,padding:"3px 6px",background:"rgba(0,0,0,0.7)",fontSize:8}}>
-            {["diag","side","front","top"].map(v=>(
+            {["ego","diag","side","front","top"].map(v=>(
               <button key={v} onClick={()=>setCamView(v)} style={{padding:"1px 5px",borderRadius:2,fontSize:7,cursor:"pointer",background:camView===v?"#441166":"transparent",border:`1px solid ${camView===v?wCol:"#332255"}`,color:camView===v?wCol:"#554477"}}>{v}</button>
             ))}
             <span style={{color:wCol,fontSize:7,marginLeft:"auto"}}>PyBullet 📷</span>
