@@ -1,13 +1,14 @@
 """
-server_humanoid.py — FastAPI для Singleton AGI Humanoid (Фаза 11).
+server.py — FastAPI для Singleton AGI Humanoid (Фаза 11 + 12).
 
-Новые endpoints:
-  GET  /camera/frame?view=diag|side|front|top  — JPEG из PyBullet
-  GET  /scene           — skeleton + cubes + target + fallen (JSON)
-  POST /world/switch    — переключить мир
-  GET  /world/list      — доступные миры
-  POST /bootstrap/humanoid — сиды биомеханики
-  POST /bootstrap/llm   — LLM гипотезы
+Фаза 12 новые endpoints:
+  POST /vision/enable              — включить SlotAttention visual cortex
+  POST /vision/disable             — вернуться к ручным переменным
+  GET  /vision/slots               — слоты + attention masks (base64)
+  GET  /vision/status              — статус кортекса
+  GET  /vision/attn_frame?slot_idx — PyBullet frame с overlay маской
+
+Установить для Фазы 12: pip install opencv-python scipy
 """
 from __future__ import annotations
 import asyncio
@@ -21,7 +22,7 @@ from pydantic import BaseModel
 from engine.simulation import Simulation
 from engine.rag_seeder import RAGSeeder, HARDCODED_SEEDS
 
-app = FastAPI(title="RKK Singleton Humanoid AGI")
+app = FastAPI(title="RKK Singleton AGI Humanoid v12")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -53,6 +54,7 @@ def get_seeder() -> RAGSeeder:
     return _seeder
 
 
+# ── Health / State ────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     sim = get_sim()
@@ -64,6 +66,7 @@ def health():
         "current_world": sim.current_world,
         "gnn_d":         sim.agent.graph._d,
         "fallen":        sim._fall_count,
+        "visual_mode":   sim._visual_mode,
     }
 
 @app.get("/state")
@@ -78,7 +81,6 @@ def step():
 # ── Camera ────────────────────────────────────────────────────────────────────
 @app.get("/camera/frame")
 def camera_frame(view: str = Query(default="diag")):
-    """JPEG кадр из PyBullet. view = diag | side | front | top"""
     frame = get_sim().get_camera_frame(view=view)
     if frame is None:
         return JSONResponse({"frame": None, "available": False})
@@ -88,7 +90,6 @@ def camera_frame(view: str = Query(default="diag")):
 # ── Full scene ────────────────────────────────────────────────────────────────
 @app.get("/scene")
 def full_scene():
-    """Skeleton + cubes + target + fallen status — всё за один запрос."""
     sim = get_sim()
     fn  = getattr(sim.agent.env, "get_full_scene", None)
     if callable(fn):
@@ -217,13 +218,109 @@ def demon_stats():
     return get_sim().demon.snapshot
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ФАЗА 12: VISUAL CORTEX ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VisionEnableRequest(BaseModel):
+    n_slots: int = 8
+    mode:    str = "visual"   # "visual" | "hybrid"
+
+@app.post("/vision/enable")
+def vision_enable(req: VisionEnableRequest):
+    """
+    Включаем Causal Visual Cortex (Фаза 12).
+    Требует: pip install opencv-python scipy Pillow
+    """
+    sim = get_sim()
+    result = sim.enable_visual(n_slots=req.n_slots, mode=req.mode)
+    return result
+
+@app.post("/vision/disable")
+def vision_disable():
+    """Возвращаемся к ручным переменным."""
+    return get_sim().disable_visual()
+
+@app.get("/vision/status")
+def vision_status():
+    """Статус Visual Cortex."""
+    sim = get_sim()
+    return {
+        "visual_mode":  sim._visual_mode,
+        "vision_ticks": sim._vision_ticks,
+        "n_slots":      sim._visual_env.n_slots if sim._visual_env else 0,
+        "gnn_d":        sim.agent.graph._d,
+        "cortex":       sim._visual_env.cortex.snapshot() if sim._visual_env else None,
+    }
+
+@app.get("/vision/slots")
+def vision_slots():
+    """
+    Текущие данные Visual Cortex:
+      frame:       base64 JPEG
+      masks:       list[base64 PNG] — attention mask per slot
+      slot_values: list[float]
+      variability: list[float] — насколько активен слот
+      active_slots: int
+      cortex:      dict — stats
+    """
+    sim = get_sim()
+    return sim.get_vision_state()
+
+@app.get("/vision/attn_frame")
+def vision_attn_frame(slot_idx: int = Query(default=0)):
+    """PyBullet frame с наложенной attention mask конкретного слота."""
+    sim   = get_sim()
+    state = sim.get_vision_state()
+    if not state.get("visual_mode"):
+        return JSONResponse({"available": False, "reason": "visual mode disabled"})
+
+    frame  = state.get("frame")
+    masks  = state.get("masks", [])
+    if not frame or slot_idx >= len(masks):
+        return JSONResponse({"available": False, "reason": "no data"})
+
+    try:
+        import base64, numpy as np
+        from io import BytesIO
+        from PIL import Image as PILImage
+
+        frame_bytes = base64.b64decode(frame)
+        frame_img   = PILImage.open(BytesIO(frame_bytes)).convert("RGBA")
+        W, H        = frame_img.size
+
+        mask_bytes = base64.b64decode(masks[slot_idx])
+        mask_img   = PILImage.open(BytesIO(mask_bytes)).convert("L")
+        mask_img   = mask_img.resize((W, H), PILImage.BILINEAR)
+        mask_np    = np.array(mask_img, dtype=np.float32) / 255.0
+
+        SLOT_COLORS = [
+            (255, 80,  80),   (80,  200, 255), (80,  255, 100), (255, 200, 80),
+            (200, 80,  255),  (255, 140, 80),  (80,  255, 220), (180, 180, 255),
+        ]
+        color = SLOT_COLORS[slot_idx % len(SLOT_COLORS)]
+        overlay = np.zeros((H, W, 4), dtype=np.uint8)
+        overlay[:, :, 0] = color[0]
+        overlay[:, :, 1] = color[1]
+        overlay[:, :, 2] = color[2]
+        overlay[:, :, 3] = (mask_np * 160).astype(np.uint8)
+
+        composite = PILImage.alpha_composite(frame_img, PILImage.fromarray(overlay, "RGBA"))
+        buf = BytesIO()
+        composite.convert("RGB").save(buf, format="JPEG", quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return JSONResponse({"available": True, "frame": b64, "slot_idx": slot_idx})
+    except Exception as e:
+        return JSONResponse({"available": False, "error": str(e)})
+
+
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 @app.websocket("/ws/causal-stream")
 async def causal_stream(websocket: WebSocket):
     await websocket.accept()
     sim   = get_sim()
     speed = 1
-    print(f"[WS] Humanoid Singleton connected. d={sim.agent.graph._d}")
+    print(f"[WS] Humanoid+Vision Singleton connected. d={sim.agent.graph._d}")
 
     try:
         while True:
@@ -250,6 +347,13 @@ async def causal_stream(websocket: WebSocket):
                         edges = HARDCODED_SEEDS.get(ctx["preset"], [])
                         if edges:
                             sim.inject_seeds(agent_id=0, edges=edges)
+                # Фаза 12: visual cortex commands
+                elif cmd == "vision_enable":
+                    n = int(msg.get("n_slots", 8))
+                    mode = msg.get("mode", "visual")
+                    sim.enable_visual(n_slots=n, mode=mode)
+                elif cmd == "vision_disable":
+                    sim.disable_visual()
             except asyncio.TimeoutError:
                 pass
             except Exception:
@@ -260,7 +364,7 @@ async def causal_stream(websocket: WebSocket):
                 data = sim.tick_step()
 
             await websocket.send_json(data)
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
 
     except WebSocketDisconnect:
         print("[WS] Disconnected")

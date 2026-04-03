@@ -1,11 +1,12 @@
 """
-simulation_singleton_v2.py — Singleton AGI с гуманоидом (Фаза 11).
+simulation_singleton_v2.py — Singleton AGI с гуманоидом (Фаза 11/12).
 
-Ключевые изменения:
-  - start_world="humanoid" по умолчанию
-  - WORLDS расширен (humanoid включён)
-  - tick_step() передаёт is_fallen() агенту через контекст
-  - full_scene() для UI (skeleton + cubes + camera)
+Фаза 12 добавляет:
+  - visual_mode toggle: enable_visual() / disable_visual()
+  - EnvironmentVisual wrapper активируется без перезапуска агента
+  - Predictive coding loop: GNN prediction → visual cortex feedback
+  - /vision/slots endpoint data через get_vision_state()
+  - vision_stats в snapshot
 """
 from __future__ import annotations
 
@@ -104,6 +105,7 @@ class WorldSwitcher:
         return {"switched": True, **rec}
 
 
+# ─── Simulation ───────────────────────────────────────────────────────────────
 class Simulation:
     AGI_NAME  = "Nova"
     AGI_COLOR = "#cc44ff"
@@ -123,28 +125,40 @@ class Simulation:
             env=env, device=self.device, bounds=bounds,
         )
 
-        self.switcher = WorldSwitcher(self.agent, self.device)
-        self.demon    = AdversarialDemon(n_agents=1, device=self.device)
+        self.switcher    = WorldSwitcher(self.agent, self.device)
+        self.demon       = AdversarialDemon(n_agents=1, device=self.device)
 
-        self.tick      = 0
-        self.phase     = 1
-        self.max_phase = 1
+        self.tick        = 0
+        self.phase       = 1
+        self.max_phase   = 1
 
         self._phase_hold_counter = 0
         self._candidate_phase    = 1
         self._dr_window: deque[float] = deque(maxlen=20)
         self.events:    deque[dict]   = deque(maxlen=24)
         self._prev_edge_count = 0
-        self._last_snapshot: dict     = {}
+        self._last_snapshot: dict = {}
 
-        # Статистика падений
         self._fall_count  = 0
         self._stand_ticks = 0
+
+        # ── Фаза 12: Visual Cortex ────────────────────────────────────────────
+        self._visual_mode   = False     # выкл по умолчанию
+        self._visual_env    = None      # EnvironmentVisual instance
+        self._base_env_ref  = None      # оригинальный env (до visual wrap)
+        self._vision_ticks  = 0         # тиков с включённым зрением
+        self._last_vision_state: dict = {}
 
     # ── World switch ──────────────────────────────────────────────────────────
     def switch_world(self, new_world: str) -> dict:
         if new_world not in WORLDS:
             return {"error": f"unknown world: {new_world}"}
+
+        # Если visual mode — сначала отключаем
+        was_visual = self._visual_mode
+        if was_visual:
+            self._disable_visual_internal()
+
         result = self.switcher.switch(new_world)
         if result.get("switched"):
             self.current_world = new_world
@@ -154,7 +168,102 @@ class Simulation:
                 f"(+{len(result.get('new_nodes',[]))} vars, d={result.get('gnn_d')})",
                 winfo["color"], "phase"
             )
+
+        # Восстанавливаем visual mode если был
+        if was_visual and result.get("switched"):
+            self.enable_visual()
+
         return result
+
+    # ── Фаза 12: Visual mode ──────────────────────────────────────────────────
+    def enable_visual(self, n_slots: int = 8, mode: str = "visual") -> dict:
+        """
+        Включаем Causal Visual Cortex.
+        Текущая среда оборачивается в EnvironmentVisual.
+        GNN перестраивается под slot_0...slot_N переменные.
+        """
+        if self._visual_mode:
+            return {"visual": True, "already_enabled": True}
+
+        try:
+            from engine.environment_visual import EnvironmentVisual
+        except ImportError:
+            return {"error": "causal_vision module not available (install: opencv-python, scipy)"}
+
+        # Сохраняем оригинальный env
+        self._base_env_ref = self.agent.env
+
+        # Оборачиваем
+        vis_env = EnvironmentVisual(
+            self._base_env_ref,
+            device=self.device,
+            n_slots=n_slots,
+            mode=mode,
+        )
+        self._visual_env = vis_env
+
+        # Меняем среду агента: граф только под variable_ids обёртки (не 26+K узлов)
+        new_vars  = list(vis_env.variable_ids)
+        init_obs  = vis_env.observe()
+        self.agent.graph.rebind_variables(new_vars, init_obs)
+
+        self.agent.env = vis_env
+
+        # Пересоздаём Temporal для нового d
+        from engine.temporal import TemporalBlankets
+        new_d = len(new_vars)
+        if self.agent.temporal.d_input != new_d:
+            self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
+
+        self.agent.temporal.step(init_obs)
+        self.agent.graph.record_observation(init_obs)
+
+        # Инжектируем слабые seeds между слотами
+        seeds = vis_env.hardcoded_seeds()
+        self.agent.inject_text_priors(seeds)
+
+        self._visual_mode = True
+        self._vision_ticks = 0
+
+        self._add_event(
+            f"👁 Visual Cortex ENABLED: {n_slots} slots · {mode} mode",
+            "#44ffcc", "phase"
+        )
+        print(f"[Simulation] Visual mode ON: {n_slots} slots, d={self.agent.graph._d}")
+
+        return {
+            "visual": True,
+            "n_slots": n_slots,
+            "mode": mode,
+            "new_vars": new_vars,
+            "gnn_d": self.agent.graph._d,
+        }
+
+    def _disable_visual_internal(self):
+        """Внутреннее отключение без event."""
+        if not self._visual_mode:
+            return
+        if self._base_env_ref is not None:
+            self.agent.env = self._base_env_ref
+            base_ids = list(self._base_env_ref.variable_ids)
+            base_obs = self._base_env_ref.observe()
+            self.agent.graph.rebind_variables(base_ids, base_obs)
+            from engine.temporal import TemporalBlankets
+            new_d = len(base_ids)
+            if self.agent.temporal.d_input != new_d:
+                self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
+            self.agent.temporal.step(base_obs)
+            self.agent.graph.record_observation(base_obs)
+        self._visual_mode = False
+        self._visual_env  = None
+
+    def disable_visual(self) -> dict:
+        """Отключаем Visual Cortex, возвращаемся к ручным переменным."""
+        if not self._visual_mode:
+            return {"visual": False, "was_enabled": False}
+        self._disable_visual_internal()
+        self._add_event("👁 Visual Cortex DISABLED", "#cc44ff", "phase")
+        return {"visual": False, "was_enabled": True}
 
     # ── Seeds ─────────────────────────────────────────────────────────────────
     def inject_seeds(self, agent_id: int, edges: list[dict]) -> dict:
@@ -176,7 +285,7 @@ class Simulation:
     def tick_step(self) -> dict:
         self.tick += 1
 
-        # Проверяем падение (гуманоид-специфично)
+        # Fallen check
         fallen = False
         is_fn  = getattr(self.agent.env, "is_fallen", None)
         if callable(is_fn):
@@ -189,22 +298,26 @@ class Simulation:
                         "#ff2244", "value"
                     )
 
+        # Фаза 12: передаём GNN prediction в visual env перед шагом
+        if self._visual_mode and self._visual_env is not None:
+            self._vision_ticks += 1
+            self._feed_gnn_prediction_to_visual()
+
         self.agent.other_agents_phi = []
         result = self.agent.step(engine_tick=self.tick)
         self._log_step(result, fallen)
 
         snap = self.agent.snapshot()
-        snap["fallen"] = fallen
+        snap["fallen"]     = fallen
         snap["fall_count"] = self._fall_count
         self._last_snapshot = snap
 
-        # Demon feedback
+        # Demon
         if self.demon._last_action is not None:
             pe = 0.0
             if not result.get("blocked") and not result.get("skipped"):
                 pe = float(result.get("prediction_error", 0))
             self.demon.learn(pe, self.demon._last_action_complexity, [snap])
-
         self._step_demon(snap)
 
         smoothed = self._update_phase(snap)
@@ -215,17 +328,51 @@ class Simulation:
             graph_deltas[0] = [e.as_dict() for e in self.agent.graph.edges]
             self._prev_edge_count = cnt
 
-        # Сцена (skeleton + cubes)
+        # Scene
         scene_fn = getattr(self.agent.env, "get_full_scene", None)
         scene    = scene_fn() if callable(scene_fn) else {}
 
+        # Vision state (кэш для /vision/slots endpoint)
+        if self._visual_mode and self._visual_env is not None:
+            try:
+                self._last_vision_state = self._visual_env.get_slot_visualization()
+            except Exception:
+                pass
+
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)
+
+    def _feed_gnn_prediction_to_visual(self):
+        """Передаём текущий GNN-прогноз в visual env для predictive coding."""
+        if self._visual_env is None or self.agent.graph._core is None:
+            return
+        try:
+            current_obs = self._visual_env.observe()
+            node_ids    = self.agent.graph._node_ids
+            slot_ids    = [f"slot_{k}" for k in range(self._visual_env.n_slots)]
+            values_list = [current_obs.get(sid, 0.5) for sid in slot_ids]
+            current_t   = torch.tensor(values_list, dtype=torch.float32, device=self.device)
+            # Прогоняем текущие значения через GNN → получаем предсказания
+            with torch.no_grad():
+                full_state = torch.tensor(
+                    [self.agent.graph.nodes.get(n, 0.5) for n in node_ids],
+                    dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
+                pred_full = self.agent.graph._core(full_state).squeeze(0)
+            # Выбираем только slot_ переменные
+            slot_pred = torch.tensor(values_list, dtype=torch.float32, device=self.device)
+            for i, sid in enumerate(slot_ids):
+                if sid in node_ids:
+                    idx = node_ids.index(sid)
+                    if idx < len(pred_full):
+                        slot_pred[i] = pred_full[idx]
+            self._visual_env.set_gnn_prediction(slot_pred)
+        except Exception:
+            pass
 
     def _step_demon(self, snap: dict):
         try:
             action = self.demon.step([snap], 1 - snap.get("peak_discovery_rate", 0))
         except RuntimeError as e:
-            # Несовпадение размерности политики (например старый чекпойнт / другой n_agents)
             print(f"[Singleton] Demon step skipped: {e}")
             return
         if action is None:
@@ -274,23 +421,43 @@ class Simulation:
             cg  = result.get("compression_delta", 0)
             var = result.get("variable", "?")
             val = result.get("value", 0)
+            color = WORLDS.get(self.current_world, {}).get("color", "#cc44ff")
+            if self._visual_mode:
+                color = "#44ffcc"
             self._add_event(
                 f"Nova: do({var}={val:.2f}) CG{'+' if cg>=0 else ''}{cg:.3f}",
-                WORLDS.get(self.current_world, {}).get("color", "#cc44ff"),
-                "discovery"
+                color, "discovery"
             )
 
     def _add_event(self, text: str, color: str, type_: str):
         self.events.appendleft({"tick": self.tick, "text": text, "color": color, "type": type_})
 
-    # ── Camera ────────────────────────────────────────────────────────────────
+    # ── Camera / Scene ────────────────────────────────────────────────────────
     def get_camera_frame(self, view: str = "diag") -> str | None:
         fn = getattr(self.agent.env, "get_frame_base64", None)
         return fn(view) if callable(fn) else None
 
+    def get_vision_state(self) -> dict:
+        """Данные для /vision/slots endpoint."""
+        if not self._visual_mode or self._visual_env is None:
+            return {"visual_mode": False}
+        state = dict(self._last_vision_state)
+        state["visual_mode"]  = True
+        state["n_slots"]      = self._visual_env.n_slots
+        state["vision_ticks"] = self._vision_ticks
+        state["cortex"]       = self._visual_env.cortex.snapshot()
+        return state
+
     # ── Snapshot ──────────────────────────────────────────────────────────────
-    def _build_snapshot(self, snap: dict, graph_deltas: dict, smoothed: float, scene: dict) -> dict:
+    def _build_snapshot(self, snap: dict, graph_deltas: dict,
+                        smoothed: float, scene: dict) -> dict:
         winfo = WORLDS.get(self.current_world, {"color": "#cc44ff", "label": self.current_world})
+
+        # Visual cortex summary
+        vision_summary = None
+        if self._visual_mode and self._visual_env is not None:
+            vision_summary = self._visual_env.cortex.snapshot()
+
         return {
             "tick":          self.tick,
             "phase":         self.phase,
@@ -320,6 +487,10 @@ class Simulation:
             "fallen":        snap.get("fallen", False),
             "fall_count":    snap.get("fall_count", 0),
             "scene":         scene,
+            # Фаза 12
+            "visual_mode":   self._visual_mode,
+            "vision_ticks":  self._vision_ticks,
+            "vision":        vision_summary,
         }
 
     def public_state(self) -> dict:

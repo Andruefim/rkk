@@ -611,7 +611,13 @@ class _PyBulletHumanoid:
                 renderer=pb.ER_TINY_RENDERER,
                 physicsClientId=self.client,
             )
-            img = PILImage.fromarray(rgba[:, :, :3].astype(np.uint8))
+            # PyBullet может вернуть tuple/list/1D-массив — не индексировать как (H,W,4)
+            pix = np.asarray(rgba, dtype=np.uint8).reshape(-1)
+            need = width * height * 4
+            if pix.size < need:
+                raise ValueError(f"camera pixels {pix.size} < expected {need}")
+            rgb = pix[:need].reshape((height, width, 4))[:, :, :3]
+            img = PILImage.fromarray(rgb)
             buf = BytesIO()
             img.save(buf, format="JPEG", quality=85)
             return base64.b64encode(buf.getvalue()).decode()

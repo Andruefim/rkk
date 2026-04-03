@@ -106,6 +106,21 @@ class CausalGraph:
         if self._core is None or self._core.d != self._d:
             self._rebuild_core()
 
+    def rebind_variables(self, ordered_ids: list[str], values: dict[str, float]) -> None:
+        """
+        Полностью заменить набор узлов (например humanoid → только slot_* в visual mode).
+        Сбрасывает NOTEARS/GNN буферы, чтобы размеры строк совпадали с новым d.
+        """
+        self._invalidate_cache()
+        self.nodes = {k: float(values.get(k, 0.5)) for k in ordered_ids}
+        self._node_ids = list(ordered_ids)
+        self._d = len(ordered_ids)
+        self._obs_buffer.clear()
+        self._int_buffer.clear()
+        self._core = None
+        self._optim = None
+        self._rebuild_core()
+
     def _rebuild_core(self):
         if USE_GNN:
             from engine.causal_gnn import CausalGNNCore
