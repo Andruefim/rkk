@@ -260,7 +260,7 @@ async def causal_stream(websocket: WebSocket):
                 data = sim.tick_step()
 
             await websocket.send_json(data)
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
 
     except WebSocketDisconnect:
         print("[WS] Disconnected")

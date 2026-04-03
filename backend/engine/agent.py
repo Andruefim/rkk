@@ -21,7 +21,7 @@ from engine.temporal     import TemporalBlankets
 from engine.value_layer  import ValueLayer, HomeostaticBounds, BlockReason
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
-NOTEARS_EVERY = 8
+NOTEARS_EVERY = 16
 MAX_FALLBACK_TRIES = 12  # больше кандидатов, чтобы пройти Value Layer в начале обучения
 
 
@@ -129,16 +129,31 @@ class RKKAgent:
             return 0.0
         return float(self.graph._core.dag_constraint().item())
 
-    def _get_grad_norm(self, i: int, j: int) -> float:
-        if self.graph._core is None or self.graph._core.W.grad is None:
-            return 0.0
-        return float(self.graph._core.W.grad[i, j].abs().item())
-
     # ── Epistemic scoring ─────────────────────────────────────────────────────
     def score_interventions(self) -> list[dict]:
         var_ids   = self.env.variable_ids
         h_W_norm  = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
         disc_rate = self.discovery_rate
+
+        # Один проход по рёбрам: счётчики интервенций (раньше — O(pairs×|E|) через next() в цикле)
+        ic_map: dict[tuple[str, str], int] = {}
+        for e in self.graph.edges:
+            ic_map[(e.from_, e.to)] = e.intervention_count
+
+        # Имя узла → индекс без O(d) list.index на каждую пару
+        nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
+
+        # Один раз W, α и |grad| на CPU — вместо O(d²) вызовов alpha_trust_matrix / W_masked
+        core = self.graph._core
+        W_m = unc_m = g_m = None
+        if core is not None:
+            with torch.no_grad():
+                W_t = core.W_masked().detach().float()
+                A_t = core.alpha_trust_matrix().detach().float()
+                W_m = W_t.cpu().numpy()
+                unc_m = (1.0 - A_t).cpu().numpy()
+            if core.W.grad is not None:
+                g_m = core.W.grad.detach().float().abs().cpu().numpy()
 
         features_batch: list[list[float]] = []
         candidates:     list[dict]        = []
@@ -148,24 +163,20 @@ class RKKAgent:
                 if v_from == v_to:
                     continue
 
-                uncertainty = self.graph.edge_uncertainty(v_from, v_to)
-                w_ij = grad_norm = 0.0
-
-                if (self.graph._core is not None
-                        and v_from in self.graph._node_ids
-                        and v_to   in self.graph._node_ids):
-                    ii = self.graph._node_ids.index(v_from)
-                    jj = self.graph._node_ids.index(v_to)
-                    w_ij      = self.graph._core.W_masked()[ii, jj].item()
-                    grad_norm = self._get_grad_norm(ii, jj)
+                ii = nid_to_i.get(v_from)
+                jj = nid_to_i.get(v_to)
+                if W_m is not None and ii is not None and jj is not None:
+                    uncertainty = float(unc_m[ii, jj])
+                    w_ij      = float(W_m[ii, jj])
+                    grad_norm = float(g_m[ii, jj]) if g_m is not None else 0.0
+                else:
+                    uncertainty = 1.0
+                    w_ij = grad_norm = 0.0
 
                 alpha    = 1.0 - uncertainty
                 val_from = self.graph.nodes.get(v_from, 0.5)
                 val_to   = self.graph.nodes.get(v_to, 0.5)
-                ic = next(
-                    (e.intervention_count for e in self.graph.edges
-                     if e.from_ == v_from and e.to == v_to), 0
-                )
+                ic       = ic_map.get((v_from, v_to), 0)
 
                 feat = self.system1.build_features(
                     w_ij=w_ij, alpha_ij=alpha,
