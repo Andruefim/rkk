@@ -91,6 +91,29 @@ HUMANOID_URDF_STAND_EULER = (np.pi / 2, 0.0, 0.0)
 HUMANOID_URDF_SPAWN_Z = 1.15
 
 
+def _np_quat_from_axis_angle(axis: np.ndarray, angle: float) -> list[float]:
+    ax = np.asarray(axis, dtype=float).reshape(3)
+    n = float(np.linalg.norm(ax))
+    if n < 1e-9:
+        return [0.0, 0.0, 0.0, 1.0]
+    ax = ax / n
+    half = 0.5 * float(angle)
+    s = np.sin(half)
+    return [float(ax[0] * s), float(ax[1] * s), float(ax[2] * s), float(np.cos(half))]
+
+
+def _np_quat_mul(q1: list[float], q2: list[float]) -> list[float]:
+    """Hamilton product, порядок как в PyBullet [x,y,z,w]."""
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return [
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ]
+
+
 def _forward_kinematics_skeleton(
     cx: float, cy: float, cz: float, joints: dict[str, float]
 ) -> list[dict]:
@@ -320,19 +343,6 @@ class _PyBulletHumanoid:
                     self.joint_by_var[varname] = i
                     break
 
-        # Включаем моторы (velocity control, слабая сила → мягкие ограничения)
-        for i in range(self.n_joints):
-            pb.setJointMotorControl2(
-                self.robot_id, i,
-                controlMode=pb.VELOCITY_CONTROL,
-                targetVelocity=0, force=0.1,
-                physicsClientId=self.client
-            )
-
-        # Прогрев (даём упасть/устоять)
-        for _ in range(100):
-            pb.stepSimulation(physicsClientId=self.client)
-
         # Имена звеньев + типы суставов (для reset_stance: spherical → MultiDof)
         self.link_names: list[str] = []
         self._joint_types: list[int] = []
@@ -340,6 +350,10 @@ class _PyBulletHumanoid:
             info = pb.getJointInfo(self.robot_id, i, physicsClientId=self.client)
             self.link_names.append(info[12].decode("utf-8"))
             self._joint_types.append(int(info[2]))
+
+        # Без «прогрева» на VELOCITY для всех суставов: для spherical это ломает осанку.
+        # Сразу нейтральная стойка (как при резете после падения).
+        self.reset_stance()
 
     def _build_ramp(self):
         """Наклонная плоскость 2×1 под 15°."""
@@ -460,17 +474,39 @@ class _PyBulletHumanoid:
             pb.stepSimulation(physicsClientId=self.client)
 
     def _motor_relax_velocity(self) -> None:
-        """Как после __init__: слабые моторы — обычный режим intervene()."""
+        """
+        Режим удержания между шагами: те же цели, что в _motor_stabilize_neutral_pose.
+        Слабый VELOCITY на spherical через setJointMotorControl2 давал завал назад (~30–40°);
+        оставляем MultiDof POSITION к нейтрали с теми же gain/force, что после reset.
+        """
         rid, cid = self.robot_id, self.client
+        quat_id = [0.0, 0.0, 0.0, 1.0]
+        motor_m = getattr(pb, "setJointMotorControlMultiDof", None)
         for i in range(self.n_joints):
-            if self._joint_types[i] == pb.JOINT_FIXED:
+            jt = self._joint_types[i]
+            if jt == pb.JOINT_FIXED:
                 continue
-            pb.setJointMotorControl2(
-                rid, i,
-                controlMode=pb.VELOCITY_CONTROL,
-                targetVelocity=0.0, force=0.1,
-                physicsClientId=cid,
-            )
+            if jt == pb.JOINT_SPHERICAL and callable(motor_m):
+                motor_m(
+                    rid, i,
+                    pb.POSITION_CONTROL,
+                    targetPosition=quat_id,
+                    positionGain=1.0,
+                    velocityGain=0.35,
+                    maxVelocity=8.0,
+                    force=[220.0, 220.0, 220.0],
+                    physicsClientId=cid,
+                )
+            else:
+                pb.setJointMotorControl2(
+                    rid, i,
+                    controlMode=pb.POSITION_CONTROL,
+                    targetPosition=0.0,
+                    positionGain=0.55,
+                    velocityGain=0.12,
+                    force=100.0,
+                    physicsClientId=cid,
+                )
 
     def _motor_stabilize_neutral_pose(self) -> None:
         """
@@ -504,6 +540,41 @@ class _PyBulletHumanoid:
                     force=100.0,
                     physicsClientId=cid,
                 )
+
+    def _snap_base_spine_vertical(self) -> None:
+        """
+        Нейтральные суставы + гравитация дают ~25–35° наклон таз→шея от мирового Z.
+        Поворачиваем базу вокруг мира так, чтобы вектор root→neck совпал с +Z,
+        затем короткий settle (стопы остаются над полом при типичном спавне).
+        """
+        if not {"root", "neck"}.issubset(set(self.link_names)):
+            return
+        rid, cid = self.robot_id, self.client
+        i_root = self.link_names.index("root")
+        i_neck = self.link_names.index("neck")
+        st_r = pb.getLinkState(rid, i_root, computeForwardKinematics=1, physicsClientId=cid)
+        st_n = pb.getLinkState(rid, i_neck, computeForwardKinematics=1, physicsClientId=cid)
+        pr = np.array(st_r[4][:3], dtype=float)
+        pn = np.array(st_n[4][:3], dtype=float)
+        spine = pn - pr
+        ln = float(np.linalg.norm(spine))
+        if ln < 1e-6:
+            return
+        spine = spine / ln
+        ez = np.array([0.0, 0.0, 1.0], dtype=float)
+        c = float(np.clip(np.dot(spine, ez), -1.0, 1.0))
+        if c > 0.998:
+            return
+        axis = np.cross(spine, ez)
+        an = float(np.linalg.norm(axis))
+        if an < 1e-8:
+            return
+        axis = axis / an
+        ang = float(np.arccos(c))
+        dq = _np_quat_from_axis_angle(axis, ang)
+        pos, orn = pb.getBasePositionAndOrientation(rid, physicsClientId=cid)
+        new_orn = _np_quat_mul(dq, list(orn))
+        pb.resetBasePositionAndOrientation(rid, pos, new_orn, physicsClientId=cid)
 
     def reset_stance(self) -> None:
         """
@@ -544,6 +615,15 @@ class _PyBulletHumanoid:
         self._motor_relax_velocity()
         for _ in range(80):
             pb.stepSimulation(physicsClientId=cid)
+
+        pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
+
+        self._snap_base_spine_vertical()
+        pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
+        self._motor_relax_velocity()
+        for _ in range(72):
+            pb.stepSimulation(physicsClientId=cid)
+        pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
 
     def set_joint(self, var_name: str, target_pos: float):
         """PD control на сустав."""
