@@ -375,7 +375,7 @@ class Simulation:
             values_list = [current_obs.get(sid, 0.5) for sid in slot_ids]
             current_t   = torch.tensor(values_list, dtype=torch.float32, device=self.device)
             # Прогоняем текущие значения через GNN → получаем предсказания
-            with torch.no_grad():
+            with torch.inference_mode():
                 full_state = torch.tensor(
                     [self.agent.graph.nodes.get(n, 0.5) for n in node_ids],
                     dtype=torch.float32, device=self.device

@@ -391,7 +391,7 @@ class CausalVisualCortex(nn.Module):
             mask = attn_np[k]                                      # (H', W')
             mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
             mask_up = cv2.resize(mask, (self.cfg.frame_w, self.cfg.frame_h),
-                                 interpolation=cv2.INTER_LINEAR)
+                                 interpolation=cv2.INTER_NEAREST)
             img_arr = (mask_up * 255).astype(np.uint8)
             img = PILImage.fromarray(img_arr, mode="L")
             buf = BytesIO()
@@ -414,13 +414,14 @@ class CausalVisualCortex(nn.Module):
 
 # ─── Фабрика с умолчаниями для гуманоидной среды ────────────────────────────
 def make_visual_cortex(device: torch.device, n_slots: int = 8) -> CausalVisualCortex:
+    # n_iters=2: ~−30% времени SlotAttention при малых потерях качества для 64×64
     cfg = VisionConfig(
         frame_h=64, frame_w=64,
         cnn_channels=[16, 32, 32],
         feat_dim=32,
         n_slots=n_slots,
         slot_dim=64,
-        n_iters=3,
+        n_iters=2,
         lr=3e-4,
     )
     return CausalVisualCortex(cfg, device)

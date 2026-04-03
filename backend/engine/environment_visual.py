@@ -81,6 +81,10 @@ class EnvironmentVisual:
         self._last_slot_vecs: torch.Tensor | None = None   # (K,D)
         self._last_attn:     torch.Tensor | None  = None   # (K,H',W')
 
+        # Тяжёлая визуализация для UI: считаем один раз при encode, не на каждый WS-тик
+        self._cached_frame_b64: str | None = None
+        self._cached_masks_b64: list[str]  = []
+
         # GNN prediction для текущего шага (заполняется агентом)
         self._gnn_predicted: torch.Tensor | None  = None
 
@@ -120,7 +124,14 @@ class EnvironmentVisual:
             self._last_slots     = vals    # (K,) float in (0,1)
             self._last_slot_vecs = vecs    # (K,D)
             self._last_attn      = attn    # (K,H',W')
+            # JPEG + PNG масок только здесь (раньше дублировались на каждый tick_step)
+            self._cached_frame_b64, self._cached_masks_b64 = (
+                self._encode_frame_and_masks_for_ui(frame, attn)
+            )
         else:
+            self._last_attn = None
+            self._cached_frame_b64 = None
+            self._cached_masks_b64 = []
             # Fallback: берём ручные переменные base_env → псевдо-слоты
             raw_obs = self.base_env.observe()
             vals    = list(raw_obs.values())
@@ -129,6 +140,27 @@ class EnvironmentVisual:
             indices = np.linspace(0, len(vals)-1, K)
             pseudo  = np.array([vals[int(round(i))] for i in indices], dtype=np.float32)
             self._last_slots = torch.from_numpy(pseudo).to(self.device)
+
+    def _encode_frame_and_masks_for_ui(
+        self, frame: np.ndarray, attn: torch.Tensor
+    ) -> tuple[str | None, list[str]]:
+        """Один JPEG кадра + base64 PNG масок — вызывать только после encode."""
+        import base64 as _b64
+        from io import BytesIO
+        frame_b64: str | None = None
+        try:
+            from PIL import Image as PILImage
+            img = PILImage.fromarray(frame)
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=65, optimize=True)
+            frame_b64 = _b64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            pass
+        try:
+            masks = self.cortex.get_slot_masks_base64(attn)
+        except Exception:
+            masks = []
+        return frame_b64, masks
 
     # ── Observe ───────────────────────────────────────────────────────────────
     def observe(self) -> dict[str, float]:
@@ -244,28 +276,14 @@ class EnvironmentVisual:
         self._gnn_predicted = predicted.detach()
 
     def get_slot_visualization(self) -> dict:
-        """Данные для UI: кадр + slot masks."""
+        """Данные для UI: кадр + slot masks (кэш из _refresh, без PIL/cv2 на каждый тик)."""
         result: dict = {
-            "frame":      None,
-            "masks":      [],
+            "frame":      self._cached_frame_b64,
+            "masks":      list(self._cached_masks_b64),
             "slot_values": [],
             "variability": [],
             "active_slots": 0,
         }
-        if self._last_frame is not None:
-            import base64 as _b64
-            from io import BytesIO
-            try:
-                from PIL import Image as PILImage
-                img = PILImage.fromarray(self._last_frame)
-                buf = BytesIO()
-                img.save(buf, format="JPEG", quality=75)
-                result["frame"] = _b64.b64encode(buf.getvalue()).decode()
-            except Exception:
-                pass
-
-        if self._last_attn is not None:
-            result["masks"] = self.cortex.get_slot_masks_base64(self._last_attn)
 
         if self._last_slots is not None:
             result["slot_values"] = [round(float(v), 4)
