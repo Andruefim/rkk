@@ -1,0 +1,650 @@
+"""
+environment_humanoid.py — Humanoid Robot Sandbox (Фаза 11).
+
+Среда: Полноценный гуманоид (humanoid.urdf) в комнате с интерактивными объектами.
+Задача: AGI открывает законы биомеханики через интервенции.
+
+Физический мир:
+  - Гуманоид (humanoid.urdf / atlas.urdf из pybullet_data)
+  - Пол (plane.urdf)
+  - 3 куба разного размера и массы (интерактивные)
+  - Рампа (наклонная плоскость, нагружает гравитацию)
+
+Редуцированные переменные (~22):
+  Торс:  com_x, com_y, com_z, roll, pitch                    (5)
+  Ноги:  lhip, lknee, lankle, rhip, rknee, rankle            (6)
+  Руки:  lshoulder, lelbow, rshoulder, relbow                 (4)
+  Стопы: lfoot_z, rfoot_z                                     (2)
+  Кубы:  cube0_x,y,z  cube1_x,y,z  cube2_x,y,z              (9)
+  Итого: 26 переменных
+
+GT каузальная структура (скрытая):
+  lhip, rknee  → com_x/y      (локомоция)
+  lknee, rknee → lfoot_z/rfoot_z (положение стоп)
+  gravity_implicit → com_z    (баланс)
+  lshoulder/rshoulder → cube_x/y/z (взаимодействие)
+
+Value Layer интеграция:
+  com_z < FALLEN_THRESHOLD → BlockReason.FALLEN + штраф
+
+do() оператор:
+  do(lhip=0.6)  → устанавливаем позицию (PD контроль)
+  do(lknee=0.4) → сгибаем колено
+
+Камера:
+  3 угла обзора: side, front, top
+  get_frame_base64(view="side"|"front"|"top") → PNG
+"""
+from __future__ import annotations
+
+import numpy as np
+import torch
+import base64
+from io import BytesIO
+
+try:
+    import pybullet as pb
+    import pybullet_data as pbd
+    PYBULLET_AVAILABLE = True
+except ImportError:
+    PYBULLET_AVAILABLE = False
+    print("[HumanoidEnv] pybullet not installed, using fallback")
+
+try:
+    from PIL import Image as PILImage
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+
+# ─── Переменные ───────────────────────────────────────────────────────────────
+TORSO_VARS  = ["com_x", "com_y", "com_z", "torso_roll", "torso_pitch"]
+LEG_VARS    = ["lhip", "lknee", "lankle", "rhip", "rknee", "rankle"]
+ARM_VARS    = ["lshoulder", "lelbow", "rshoulder", "relbow"]
+FOOT_VARS   = ["lfoot_z", "rfoot_z"]
+CUBE_VARS   = [f"cube{i}_{d}" for i in range(3) for d in ["x","y","z"]]
+VAR_NAMES   = TORSO_VARS + LEG_VARS + ARM_VARS + FOOT_VARS + CUBE_VARS
+
+# Нормализация диапазонов
+_RANGES = {}
+for v in TORSO_VARS[:2]:  _RANGES[v] = (-1.5, 1.5)   # COM xy
+_RANGES["com_z"]          = (0.0,  1.5)                # высота
+_RANGES["torso_roll"]     = (-1.2, 1.2)
+_RANGES["torso_pitch"]    = (-1.2, 1.2)
+for v in LEG_VARS:         _RANGES[v] = (-1.5, 1.5)   # angles rad
+for v in ARM_VARS:         _RANGES[v] = (-2.0, 2.0)
+for v in FOOT_VARS:        _RANGES[v] = (-0.1, 0.5)
+for v in CUBE_VARS:
+    if v.endswith("_z"):   _RANGES[v] = (-0.1, 1.0)
+    else:                  _RANGES[v] = (-2.0, 2.0)
+
+FALLEN_Z     = 0.25   # ниже этой высоты = упал
+STAND_Z      = 0.85   # нормальная высота стоя
+
+
+# ─── Fallback гуманоид (аналитический) ───────────────────────────────────────
+class _FallbackHumanoid:
+    """Простая кинематическая модель без физики."""
+
+    def __init__(self):
+        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS}
+        self.com    = np.array([0.0, 0.0, STAND_Z])
+        self.torso_euler = np.zeros(3)
+        self.cubes  = np.array([
+            [ 0.8,  0.3, 0.15],
+            [-0.5,  0.6, 0.15],
+            [ 0.2, -0.7, 0.25],
+        ])
+        self._vel   = np.zeros(3)
+        self._dt    = 0.02
+
+    def step(self, n: int = 10):
+        for _ in range(n):
+            # Гравитация и лёгкая нестабильность
+            balance = abs(self.torso_euler[0]) + abs(self.torso_euler[1])
+            self.com[2] += (-0.02 * balance + 0.001 * (np.random.rand()-0.5)) * self._dt
+            self.com[2]  = np.clip(self.com[2], 0.0, 1.5)
+            self.com[:2] += np.random.normal(0, 0.002, 2)
+            self.torso_euler[:2] += np.random.normal(0, 0.003, 2)
+            self.torso_euler[:2] = np.clip(self.torso_euler[:2], -1.2, 1.2)
+
+    def set_joint(self, name: str, val: float):
+        if name in self.joints:
+            self.joints[name] = np.clip(float(val), -2.0, 2.0)
+            # Кинематическое влияние на COM
+            if "hip" in name:
+                idx = 0 if name.startswith("l") else 1
+                self.com[idx] += val * 0.02
+            if "knee" in name:
+                self.com[2] = max(0.1, self.com[2] + val * 0.01)
+
+    def get_foot_z(self) -> tuple[float, float]:
+        k_l = self.joints.get("lknee", 0)
+        k_r = self.joints.get("rknee", 0)
+        return (max(0, 0.1 - k_l * 0.05), max(0, 0.1 - k_r * 0.05))
+
+    def get_all_link_positions(self) -> list[dict]:
+        """Скелетон для Three.js (22 точки)."""
+        cx, cy, cz = self.com
+        rl, rp = self.torso_euler[0], self.torso_euler[1]
+        j = self.joints
+        # Упрощённая FK
+        head    = [cx, cy, cz + 0.22]
+        neck    = [cx, cy, cz + 0.15]
+        torso_b = [cx, cy, cz - 0.20]
+        # Плечи
+        lshld   = [cx - 0.22, cy, cz + 0.10]
+        rshld   = [cx + 0.22, cy, cz + 0.10]
+        # Локти
+        lelbow  = [cx - 0.22 - np.sin(j.get("lshoulder",0))*0.28, cy, cz + 0.10 - np.cos(j.get("lshoulder",0))*0.28]
+        relbow  = [cx + 0.22 + np.sin(j.get("rshoulder",0))*0.28, cy, cz + 0.10 - np.cos(j.get("rshoulder",0))*0.28]
+        # Кисти
+        lhand   = [lelbow[0] - np.sin(j.get("lelbow",0))*0.22, cy, lelbow[2] - np.cos(j.get("lelbow",0))*0.22]
+        rhand   = [relbow[0] + np.sin(j.get("relbow",0))*0.22, cy, relbow[2] - np.cos(j.get("relbow",0))*0.22]
+        # Бёдра
+        lhip_p  = [cx - 0.12, cy, cz - 0.20]
+        rhip_p  = [cx + 0.12, cy, cz - 0.20]
+        # Колени
+        lknee_p = [cx - 0.12 + np.sin(j.get("lhip",0))*0.35, cy, cz - 0.20 - np.cos(j.get("lhip",0))*0.35]
+        rknee_p = [cx + 0.12 + np.sin(j.get("rhip",0))*0.35, cy, cz - 0.20 - np.cos(j.get("rhip",0))*0.35]
+        # Стопы
+        lfoot   = [lknee_p[0] + np.sin(j.get("lknee",0))*0.30, cy, lknee_p[2] - np.cos(j.get("lknee",0))*0.30]
+        rfoot   = [rknee_p[0] + np.sin(j.get("rknee",0))*0.30, cy, rknee_p[2] - np.cos(j.get("rknee",0))*0.30]
+
+        pts = [head, neck, torso_b, lshld, rshld, lelbow, relbow,
+               lhand, rhand, lhip_p, rhip_p, lknee_p, rknee_p, lfoot, rfoot]
+        return [{"x":float(p[0]),"y":float(p[1]),"z":float(p[2])} for p in pts]
+
+    def get_state(self) -> dict:
+        lf_z, rf_z = self.get_foot_z()
+        s = {}
+        s["com_x"]        = float(self.com[0])
+        s["com_y"]        = float(self.com[1])
+        s["com_z"]        = float(self.com[2])
+        s["torso_roll"]   = float(self.torso_euler[0])
+        s["torso_pitch"]  = float(self.torso_euler[1])
+        for v in LEG_VARS + ARM_VARS:
+            s[v] = float(self.joints.get(v, 0.0))
+        s["lfoot_z"]  = float(lf_z)
+        s["rfoot_z"]  = float(rf_z)
+        for i, cube in enumerate(self.cubes):
+            s[f"cube{i}_x"] = float(cube[0])
+            s[f"cube{i}_y"] = float(cube[1])
+            s[f"cube{i}_z"] = float(cube[2])
+        return s
+
+    def get_cube_positions(self) -> list[dict]:
+        return [{"x":float(c[0]),"y":float(c[1]),"z":float(c[2])} for c in self.cubes]
+
+    def get_frame_base64(self, view="side") -> str | None:
+        return None
+
+
+# ─── PyBullet гуманоид ────────────────────────────────────────────────────────
+class _PyBulletHumanoid:
+
+    # Список URDF путей для попытки загрузки
+    _HUMANOID_URDFS = [
+        "humanoid/humanoid.urdf",
+        "humanoid.urdf",
+        "atlas/atlas.urdf",
+    ]
+
+    # Joint name → наш variable name (частичное совпадение)
+    _JOINT_MAP = {
+        "leftHip":     "lhip",
+        "left_hip":    "lhip",
+        "LeftHip":     "lhip",
+        "leftKnee":    "lknee",
+        "left_knee":   "lknee",
+        "LeftKnee":    "lknee",
+        "leftAnkle":   "lankle",
+        "left_ankle":  "lankle",
+        "rightHip":    "rhip",
+        "right_hip":   "rhip",
+        "RightHip":    "rhip",
+        "rightKnee":   "rknee",
+        "right_knee":  "rknee",
+        "RightKnee":   "rknee",
+        "rightAnkle":  "rankle",
+        "right_ankle": "rankle",
+        "leftShoulder":"lshoulder",
+        "left_shoulder":"lshoulder",
+        "rightShoulder":"rshoulder",
+        "right_shoulder":"rshoulder",
+        "leftElbow":   "lelbow",
+        "left_elbow":  "lelbow",
+        "rightElbow":  "relbow",
+        "right_elbow": "relbow",
+    }
+
+    def __init__(self):
+        self.client = pb.connect(pb.DIRECT)
+        pb.setGravity(0, 0, -9.81, physicsClientId=self.client)
+        pb.setAdditionalSearchPath(pbd.getDataPath(), physicsClientId=self.client)
+        pb.setTimeStep(1/240., physicsClientId=self.client)
+        pb.setPhysicsEngineParameter(numSolverIterations=50, physicsClientId=self.client)
+
+        # Пол
+        self.floor_id = pb.loadURDF("plane.urdf", physicsClientId=self.client)
+
+        # Рампа (наклонная плоскость)
+        self._build_ramp()
+
+        # Кубы разного размера и массы
+        self.cube_ids = []
+        cube_configs = [
+            {"pos": [1.0,  0.3, 0.15], "size": 0.12, "mass": 2.0,  "color": [1.0, 0.4, 0.1, 1]},
+            {"pos": [-0.6, 0.8, 0.12], "size": 0.10, "mass": 0.5,  "color": [0.2, 0.7, 1.0, 1]},
+            {"pos": [0.3, -0.9, 0.20], "size": 0.16, "mass": 5.0,  "color": [0.3, 1.0, 0.4, 1]},
+        ]
+        for cfg in cube_configs:
+            hs = cfg["size"] / 2
+            col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=[hs,hs,hs], physicsClientId=self.client)
+            vis = pb.createVisualShape(pb.GEOM_BOX, halfExtents=[hs,hs,hs],
+                                        rgbaColor=cfg["color"], physicsClientId=self.client)
+            b = pb.createMultiBody(
+                baseMass=cfg["mass"],
+                baseCollisionShapeIndex=col,
+                baseVisualShapeIndex=vis,
+                basePosition=cfg["pos"],
+                physicsClientId=self.client
+            )
+            pb.changeDynamics(b, -1, lateralFriction=0.5, physicsClientId=self.client)
+            self.cube_ids.append(b)
+
+        # Гуманоид
+        self.robot_id = self._load_humanoid()
+        self.n_joints = pb.getNumJoints(self.robot_id, physicsClientId=self.client)
+
+        # Строим маппинг joint_index → variable_name
+        self.joint_map: dict[int, str] = {}
+        self.joint_by_var: dict[str, int] = {}
+        for i in range(self.n_joints):
+            info = pb.getJointInfo(self.robot_id, i, physicsClientId=self.client)
+            jname = info[1].decode("utf-8")
+            for key, varname in self._JOINT_MAP.items():
+                if key.lower() in jname.lower():
+                    self.joint_map[i] = varname
+                    self.joint_by_var[varname] = i
+                    break
+
+        # Включаем моторы (velocity control, слабая сила → мягкие ограничения)
+        for i in range(self.n_joints):
+            pb.setJointMotorControl2(
+                self.robot_id, i,
+                controlMode=pb.VELOCITY_CONTROL,
+                targetVelocity=0, force=0.1,
+                physicsClientId=self.client
+            )
+
+        # Прогрев (даём упасть/устоять)
+        for _ in range(100):
+            pb.stepSimulation(physicsClientId=self.client)
+
+        # Строим маппинг link_name → index для скелетона
+        self.link_names: list[str] = []
+        for i in range(self.n_joints):
+            info = pb.getJointInfo(self.robot_id, i, physicsClientId=self.client)
+            self.link_names.append(info[12].decode("utf-8"))
+
+    def _build_ramp(self):
+        """Наклонная плоскость 2×1 под 15°."""
+        import math
+        angle = math.radians(15)
+        half  = [1.0, 0.5, 0.03]
+        col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half, physicsClientId=self.client)
+        vis = pb.createVisualShape(pb.GEOM_BOX, halfExtents=half,
+                                    rgbaColor=[0.4, 0.35, 0.3, 1.0], physicsClientId=self.client)
+        orn = pb.getQuaternionFromEuler([angle, 0, 0])
+        pb.createMultiBody(
+            baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+            basePosition=[2.0, 0, 0.3*math.sin(angle) + 0.03],
+            baseOrientation=orn, physicsClientId=self.client
+        )
+
+    def _load_humanoid(self) -> int:
+        data_path = pbd.getDataPath()
+        for rel in self._HUMANOID_URDFS:
+            try:
+                robot = pb.loadURDF(
+                    rel,
+                    basePosition=[0, 0, 1.0],
+                    baseOrientation=pb.getQuaternionFromEuler([0, 0, 0]),
+                    flags=pb.URDF_USE_SELF_COLLISION,
+                    physicsClientId=self.client,
+                )
+                print(f"[HumanoidEnv] Loaded: {rel}")
+                return robot
+            except Exception as e:
+                print(f"[HumanoidEnv] Could not load {rel}: {e}")
+
+        # Крайний fallback: строим вручную из multi-body
+        return self._build_custom_humanoid()
+
+    def _build_custom_humanoid(self) -> int:
+        """Строим гуманоида из 15 сочленений если URDF недоступен."""
+        masses     = [8.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 3.0, 3.0, 1.5, 1.5, 0.5, 0.5]
+        col_shapes, vis_shapes, positions, orientations = [], [], [], []
+        inertial_pos, inertial_orn, parents, jtypes, jaxes = [], [], [], [], []
+
+        segments = [
+            # (halfExtents, color,           pos_rel_parent,  parent)
+            ([0.1,0.15,0.12], [0.7,0.7,0.7,1], [0,0,0],      0),   # 0 torso
+            ([0.05,0.05,0.05],[0.9,0.8,0.7,1], [0,0,0.22],   0),   # 1 head
+            ([0.04,0.04,0.14],[0.7,0.7,0.7,1], [-0.18,0,0.1],0),   # 2 lup-arm
+            ([0.04,0.04,0.14],[0.7,0.7,0.7,1], [0.18,0,0.1], 0),   # 3 rup-arm
+            ([0.03,0.03,0.12],[0.8,0.8,0.8,1], [-0.18,0,-0.14],2), # 4 lforearm
+            ([0.03,0.03,0.12],[0.8,0.8,0.8,1], [0.18,0,-0.14],3),  # 5 rforearm
+            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [-0.08,0,-0.15],0), # 6 lthigh
+            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [0.08,0,-0.15], 0), # 7 rthigh
+            ([0.05,0.05,0.14],[0.8,0.8,0.8,1], [0,0,-0.15],   6),  # 8 lshin
+            ([0.05,0.05,0.14],[0.8,0.8,0.8,1], [0,0,-0.15],   7),  # 9 rshin
+            ([0.07,0.03,0.03],[0.6,0.6,0.6,1], [0,0,-0.14],   8),  # 10 lfoot
+            ([0.07,0.03,0.03],[0.6,0.6,0.6,1], [0,0,-0.14],   9),  # 11 rfoot
+        ]
+        for i, (he, col_c, pos, par) in enumerate(segments):
+            col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=he, physicsClientId=self.client)
+            vis = pb.createVisualShape(pb.GEOM_BOX, halfExtents=he, rgbaColor=col_c, physicsClientId=self.client)
+            col_shapes.append(col); vis_shapes.append(vis)
+            positions.append(pos); orientations.append([0,0,0,1])
+            inertial_pos.append([0,0,0]); inertial_orn.append([0,0,0,1])
+            parents.append(par)
+            jtypes.append(pb.JOINT_REVOLUTE)
+            jaxes.append([1,0,0] if i not in [1,2,3] else [0,1,0])
+
+        base_col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=[0.1,0.08,0.12], physicsClientId=self.client)
+        base_vis = pb.createVisualShape(pb.GEOM_BOX, halfExtents=[0.1,0.08,0.12],
+                                         rgbaColor=[0.5,0.5,0.6,1.0], physicsClientId=self.client)
+        robot = pb.createMultiBody(
+            baseMass=masses[0],
+            baseCollisionShapeIndex=base_col,
+            baseVisualShapeIndex=base_vis,
+            basePosition=[0, 0, 1.0],
+            linkMasses=masses[1:len(segments)+1],
+            linkCollisionShapeIndices=col_shapes,
+            linkVisualShapeIndices=vis_shapes,
+            linkPositions=positions,
+            linkOrientations=orientations,
+            linkInertialFramePositions=inertial_pos,
+            linkInertialFrameOrientations=inertial_orn,
+            linkParentIndices=parents,
+            linkJointTypes=jtypes,
+            linkJointAxis=jaxes,
+            physicsClientId=self.client,
+        )
+        # Маппинг вручную для кастомного тела
+        custom_map = {6:"lhip",7:"rhip",8:"lknee",9:"rknee",2:"lshoulder",3:"rshoulder",4:"lelbow",5:"relbow"}
+        self.joint_map   = custom_map
+        self.joint_by_var = {v:k for k,v in custom_map.items()}
+        return robot
+
+    def step(self, n: int = 10):
+        for _ in range(n):
+            pb.stepSimulation(physicsClientId=self.client)
+
+    def set_joint(self, var_name: str, target_pos: float):
+        """PD control на сустав."""
+        if var_name not in self.joint_by_var:
+            return
+        jid = self.joint_by_var[var_name]
+        lo, hi = _RANGES.get(var_name, (-2.0, 2.0))
+        real_pos = target_pos * (hi - lo) + lo
+        pb.setJointMotorControl2(
+            self.robot_id, jid,
+            controlMode=pb.POSITION_CONTROL,
+            targetPosition=float(np.clip(real_pos, lo, hi)),
+            positionGain=0.5, velocityGain=0.1,
+            force=80.0,
+            physicsClientId=self.client
+        )
+
+    def get_com(self) -> tuple[np.ndarray, np.ndarray]:
+        """Центр масс тела + ориентация торса."""
+        pos, orn = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
+        euler    = pb.getEulerFromQuaternion(orn)
+        return np.array(pos), np.array(euler)
+
+    def get_joint_angle(self, var_name: str) -> float:
+        if var_name not in self.joint_by_var:
+            return 0.0
+        jid = self.joint_by_var[var_name]
+        st  = pb.getJointState(self.robot_id, jid, physicsClientId=self.client)
+        return float(st[0])
+
+    def get_foot_heights(self) -> tuple[float, float]:
+        """Высота стоп через link state."""
+        lz = rz = 0.05
+        n_links = pb.getNumJoints(self.robot_id, physicsClientId=self.client)
+        # Ищем самые нижние links по Z
+        zs = []
+        for i in range(n_links):
+            try:
+                st = pb.getLinkState(self.robot_id, i, physicsClientId=self.client)
+                zs.append((i, st[4][2]))   # world position z
+            except Exception:
+                pass
+        zs.sort(key=lambda x: x[1])
+        if len(zs) >= 2:
+            lz = max(0.0, zs[0][1])
+            rz = max(0.0, zs[1][1])
+        return float(lz), float(rz)
+
+    def get_cube_state(self) -> list[np.ndarray]:
+        positions = []
+        for cid in self.cube_ids:
+            pos, _ = pb.getBasePositionAndOrientation(cid, physicsClientId=self.client)
+            positions.append(np.array(pos))
+        return positions
+
+    def get_state(self) -> dict:
+        com, euler = self.get_com()
+        lf, rf = self.get_foot_heights()
+        s = {}
+        s["com_x"]       = float(com[0])
+        s["com_y"]       = float(com[1])
+        s["com_z"]       = float(com[2])
+        s["torso_roll"]  = float(euler[0])
+        s["torso_pitch"] = float(euler[1])
+        for v in LEG_VARS + ARM_VARS:
+            s[v] = self.get_joint_angle(v)
+        s["lfoot_z"] = lf
+        s["rfoot_z"] = rf
+        for i, cp in enumerate(self.get_cube_state()):
+            s[f"cube{i}_x"] = float(cp[0])
+            s[f"cube{i}_y"] = float(cp[1])
+            s[f"cube{i}_z"] = float(cp[2])
+        return s
+
+    def get_all_link_positions(self) -> list[dict]:
+        """Все link positions для Three.js скелетона."""
+        result = []
+        # База (торс)
+        pos, _ = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
+        result.append({"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2]), "name": "base"})
+        for i in range(self.n_joints):
+            try:
+                st   = pb.getLinkState(self.robot_id, i, physicsClientId=self.client)
+                name = self.joint_map.get(i, f"link{i}")
+                result.append({
+                    "x": float(st[4][0]),
+                    "y": float(st[4][1]),
+                    "z": float(st[4][2]),
+                    "name": str(name),
+                    "idx": i,
+                })
+            except Exception:
+                pass
+        return result
+
+    def get_cube_positions(self) -> list[dict]:
+        result = []
+        for cid in self.cube_ids:
+            pos, _ = pb.getBasePositionAndOrientation(cid, physicsClientId=self.client)
+            result.append({"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])})
+        return result
+
+    _CAMERA_CONFIGS = {
+        "side":  {"eye": [0, -3.5, 1.2], "target": [0, 0, 0.7], "up": [0, 0, 1]},
+        "front": {"eye": [3.5, 0,  1.2], "target": [0, 0, 0.7], "up": [0, 0, 1]},
+        "top":   {"eye": [0,  0,   4.0], "target": [0, 0, 0.5], "up": [0, 1, 0]},
+        "diag":  {"eye": [2.5, -2.5, 2.0], "target": [0, 0, 0.7], "up": [0, 0, 1]},
+    }
+
+    def get_frame_base64(self, view: str = "diag",
+                         width: int = 480, height: int = 360) -> str | None:
+        if not PIL_AVAILABLE:
+            return None
+        try:
+            cfg  = self._CAMERA_CONFIGS.get(view, self._CAMERA_CONFIGS["diag"])
+            vm   = pb.computeViewMatrix(cfg["eye"], cfg["target"], cfg["up"],
+                                         physicsClientId=self.client)
+            pm   = pb.computeProjectionMatrixFOV(
+                fov=60, aspect=width/height, nearVal=0.1, farVal=15.0,
+                physicsClientId=self.client)
+            _, _, rgba, _, _ = pb.getCameraImage(
+                width, height, vm, pm,
+                renderer=pb.ER_TINY_RENDERER,
+                physicsClientId=self.client,
+            )
+            img = PILImage.fromarray(rgba[:, :, :3].astype(np.uint8))
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            return base64.b64encode(buf.getvalue()).decode()
+        except Exception as e:
+            print(f"[HumanoidEnv] Camera error: {e}")
+            return None
+
+    def __del__(self):
+        try:
+            pb.disconnect(self.client)
+        except Exception:
+            pass
+
+
+# ─── EnvironmentHumanoid ─────────────────────────────────────────────────────
+class EnvironmentHumanoid:
+    """
+    Среда гуманоида для Singleton AGI.
+
+    Совместима с Environment / EnvironmentRobot:
+      observe()         → dict[str, float] (нормализованные)
+      intervene()       → dict[str, float]
+      discovery_rate()  → float
+      gt_edges()        → list[dict]
+      get_frame_base64() → str | None
+    """
+
+    PRESET = "humanoid"
+
+    def __init__(self, device: torch.device | None = None, steps_per_do: int = 12):
+        self.device       = device or torch.device("cpu")
+        self.steps_per_do = steps_per_do
+        self.preset       = self.PRESET
+        self.n_interventions = 0
+
+        if PYBULLET_AVAILABLE:
+            self._sim     = _PyBulletHumanoid()
+            self._backend = "pybullet"
+        else:
+            self._sim     = _FallbackHumanoid()
+            self._backend = "fallback"
+
+        print(f"[HumanoidEnv] backend={self._backend}, vars={len(VAR_NAMES)}")
+
+    # ── Нормализация ───────────────────────────────────────────────────────────
+    def _norm(self, key: str, val: float) -> float:
+        lo, hi = _RANGES.get(key, (-1.0, 1.0))
+        return float(np.clip((val - lo) / (hi - lo), 0.05, 0.95))
+
+    def _denorm(self, key: str, val: float) -> float:
+        lo, hi = _RANGES.get(key, (-1.0, 1.0))
+        return float(val * (hi - lo) + lo)
+
+    # ── Observe ────────────────────────────────────────────────────────────────
+    def observe(self) -> dict[str, float]:
+        raw = self._sim.get_state()
+        return {k: self._norm(k, v) for k, v in raw.items() if k in VAR_NAMES}
+
+    @property
+    def variables(self) -> dict[str, float]:
+        return self.observe()
+
+    @property
+    def variable_ids(self) -> list[str]:
+        return list(VAR_NAMES)
+
+    # ── do() ──────────────────────────────────────────────────────────────────
+    def intervene(self, variable: str, value: float) -> dict[str, float]:
+        self.n_interventions += 1
+        if variable in LEG_VARS + ARM_VARS:
+            self._sim.set_joint(variable, value)
+        self._sim.step(self.steps_per_do)
+        return self.observe()
+
+    # ── Discovery rate ─────────────────────────────────────────────────────────
+    def discovery_rate(self, agent_edges: list[dict]) -> float:
+        gt = self.gt_edges()
+        gt_set = {(e["from_"], e["to"]) for e in gt}
+        hits = sum(1 for e in agent_edges if (e.get("from_"), e.get("to")) in gt_set)
+        return hits / len(gt_set) if gt_set else 0.0
+
+    def gt_edges(self) -> list[dict]:
+        edges = []
+        # Интеграция: скорость сустава → позиция
+        for v in LEG_VARS:
+            edges.append({"from_": v, "to": "com_z",  "weight": 0.5})
+        edges.append({"from_": "lhip",  "to": "com_x",  "weight": 0.7})
+        edges.append({"from_": "rhip",  "to": "com_x",  "weight": 0.7})
+        edges.append({"from_": "lknee", "to": "lfoot_z","weight": 0.8})
+        edges.append({"from_": "rknee", "to": "rfoot_z","weight": 0.8})
+        # Кинематика
+        edges.append({"from_": "lshoulder", "to": "cube0_x", "weight": 0.6})
+        edges.append({"from_": "rshoulder", "to": "cube1_x", "weight": 0.6})
+        edges.append({"from_": "com_z",     "to": "torso_roll", "weight": -0.4})
+        return edges
+
+    # ── Упал ли? ───────────────────────────────────────────────────────────────
+    def is_fallen(self) -> bool:
+        obs = self.observe()
+        return obs.get("com_z", 0.5) < self._norm("com_z", FALLEN_Z)
+
+    # ── Camera / Skeleton ──────────────────────────────────────────────────────
+    def get_frame_base64(self, view: str = "diag") -> str | None:
+        return self._sim.get_frame_base64(view)
+
+    def get_joint_positions_world(self) -> list[dict]:
+        return self._sim.get_all_link_positions()
+
+    def get_cube_positions(self) -> list[dict]:
+        return self._sim.get_cube_positions()
+
+    def get_target(self) -> dict:
+        # Для гуманоида "цель" — это стоять прямо (целевая позиция COM)
+        return {"x": 0.0, "y": 0.0, "z": STAND_Z}
+
+    def get_full_scene(self) -> dict:
+        """Всё для Three.js за один вызов."""
+        return {
+            "skeleton": self.get_joint_positions_world(),
+            "cubes":    self.get_cube_positions(),
+            "target":   self.get_target(),
+            "fallen":   self.is_fallen(),
+            "com_z":    self.observe().get("com_z", 0.5),
+        }
+
+
+# ─── Seeds ────────────────────────────────────────────────────────────────────
+def humanoid_hardcoded_seeds() -> list[dict]:
+    """Биомеханические text priors: суставы → COM, стопы."""
+    return [
+        {"from_": "lhip",       "to": "com_x",    "weight": 0.22, "alpha": 0.05},
+        {"from_": "rhip",       "to": "com_x",    "weight": 0.22, "alpha": 0.05},
+        {"from_": "lknee",      "to": "lfoot_z",  "weight": 0.25, "alpha": 0.05},
+        {"from_": "rknee",      "to": "rfoot_z",  "weight": 0.25, "alpha": 0.05},
+        {"from_": "lhip",       "to": "com_z",    "weight": 0.18, "alpha": 0.05},
+        {"from_": "rhip",       "to": "com_z",    "weight": 0.18, "alpha": 0.05},
+        {"from_": "lshoulder",  "to": "cube0_x",  "weight": 0.20, "alpha": 0.05},
+        {"from_": "rshoulder",  "to": "cube1_x",  "weight": 0.20, "alpha": 0.05},
+        {"from_": "com_z",      "to": "torso_roll","weight":-0.15, "alpha": 0.05},
+    ]
