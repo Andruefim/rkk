@@ -114,13 +114,53 @@ def _np_quat_mul(q1: list[float], q2: list[float]) -> list[float]:
     ]
 
 
+# Three.js: Vector3(pb.x, pb.z, pb.y) — тот же линейный swap для матрицы вращения.
+_PB_VEC_TO_THREE = np.array(
+    [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]], dtype=float
+)
+
+
+def _rotmat_to_xyzw(R: np.ndarray) -> tuple[float, float, float, float]:
+    """Матрица 3×3 → кватернион [x,y,z,w] (как THREE.Quaternion)."""
+    m = np.asarray(R, dtype=float).reshape(3, 3)
+    tr = float(np.trace(m))
+    if tr > 0.0:
+        s = 0.5 / np.sqrt(tr + 1.0)
+        w = 0.25 / s
+        x = (m[2, 1] - m[1, 2]) * s
+        y = (m[0, 2] - m[2, 0]) * s
+        z = (m[1, 0] - m[0, 1]) * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    n = float(np.sqrt(x * x + y * y + z * z + w * w))
+    if n < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    return (x / n, y / n, z / n, w / n)
+
+
 def _forward_kinematics_skeleton(
     cx: float, cy: float, cz: float, joints: dict[str, float]
 ) -> list[dict]:
     """
-    15 точек в том же порядке, что rkk-humanoid.jsx:
-    0 голова, 1 шея (хаб рук), 2 таз/root (хаб ног), 3–8 руки, 9–14 ноги.
-    Отдельного узла «грудь» нет — плечи у шеи. Оси: x,y горизонталь, z вверх.
+    17 точек в том же порядке, что rkk-humanoid.jsx:
+    0 голова, 1 шея, 2 таз, 3–8 руки, 9–14 ноги, 15–16 центры подошв.
+    Оси: x,y горизонталь, z вверх.
     """
     j = joints
     pelvis_z = cz - 0.12
@@ -176,10 +216,14 @@ def _forward_kinematics_skeleton(
         cy,
         rknee_p[2] - np.cos(j.get("rknee", 0)) * 0.30,
     ]
+    sc = float(HUMANOID_URDF_GLOBAL_SCALING)
+    lsole = [lfoot[0] - 0.05 * sc, lfoot[1], lfoot[2] - 0.12 * sc]
+    rsole = [rfoot[0] + 0.05 * sc, rfoot[1], rfoot[2] - 0.12 * sc]
     pts = [
         head, neck, pelvis,
         lshld, rshld, lelbow, relbow, lhand, rhand,
         lhip_p, rhip_p, lknee_p, rknee_p, lfoot, rfoot,
+        lsole, rsole,
     ]
     return [{"x": float(p[0]), "y": float(p[1]), "z": float(p[2])} for p in pts]
 
@@ -226,7 +270,7 @@ class _FallbackHumanoid:
         return (max(0, 0.1 - k_l * 0.05), max(0, 0.1 - k_r * 0.05))
 
     def get_all_link_positions(self) -> list[dict]:
-        """Скелетон для Three.js: 15 точек, порядок как на фронте (без узла грудь)."""
+        """Скелетон для Three.js: 17 точек (+ подошвы), порядок как на фронте."""
         cx, cy, cz = float(self.com[0]), float(self.com[1]), float(self.com[2])
         return _forward_kinematics_skeleton(cx, cy, cz, self.joints)
 
@@ -253,6 +297,12 @@ class _FallbackHumanoid:
 
     def get_frame_base64(self, view="side") -> str | None:
         return None
+
+    def get_ankle_quaternions_three_js(self) -> list[dict[str, float]]:
+        return [
+            {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        ]
 
     def reset_stance(self) -> None:
         self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS}
@@ -626,20 +676,51 @@ class _PyBulletHumanoid:
         pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
 
     def set_joint(self, var_name: str, target_pos: float):
-        """PD control на сустав."""
+        """PD control: револьверные — одна ось; сферические — кватернион из скаляра (интервенция)."""
         if var_name not in self.joint_by_var:
             return
         jid = self.joint_by_var[var_name]
         lo, hi = _RANGES.get(var_name, (-2.0, 2.0))
-        real_pos = target_pos * (hi - lo) + lo
-        pb.setJointMotorControl2(
-            self.robot_id, jid,
-            controlMode=pb.POSITION_CONTROL,
-            targetPosition=float(np.clip(real_pos, lo, hi)),
-            positionGain=0.5, velocityGain=0.1,
-            force=80.0,
-            physicsClientId=self.client
-        )
+        real_pos = float(np.clip(target_pos * (hi - lo) + lo, lo, hi))
+        rid, cid = self.robot_id, self.client
+        jt = self._joint_types[jid]
+        motor_m = getattr(pb, "setJointMotorControlMultiDof", None)
+
+        if jt == pb.JOINT_SPHERICAL and callable(motor_m):
+            # Один нормализованный скаляр → локальный euler (порядок Bullet XYZ)
+            if var_name == "lshoulder":
+                q = pb.getQuaternionFromEuler((0.32 * real_pos, 0.42 * real_pos, 0.28 * real_pos))
+            elif var_name == "rshoulder":
+                q = pb.getQuaternionFromEuler((0.32 * real_pos, -0.42 * real_pos, -0.28 * real_pos))
+            elif var_name == "lhip":
+                q = pb.getQuaternionFromEuler((0.1 * real_pos, 0.42 * real_pos, 0.05 * real_pos))
+            elif var_name == "rhip":
+                q = pb.getQuaternionFromEuler((0.1 * real_pos, -0.42 * real_pos, -0.05 * real_pos))
+            elif var_name == "lankle":
+                q = pb.getQuaternionFromEuler((-0.22 * real_pos, 0.1 * real_pos, 0.0))
+            elif var_name == "rankle":
+                q = pb.getQuaternionFromEuler((-0.22 * real_pos, -0.1 * real_pos, 0.0))
+            else:
+                q = [0.0, 0.0, 0.0, 1.0]
+            motor_m(
+                rid, jid,
+                pb.POSITION_CONTROL,
+                targetPosition=list(q),
+                positionGain=0.52,
+                velocityGain=0.15,
+                maxVelocity=5.5,
+                force=[165.0, 165.0, 165.0],
+                physicsClientId=cid,
+            )
+        else:
+            pb.setJointMotorControl2(
+                rid, jid,
+                controlMode=pb.POSITION_CONTROL,
+                targetPosition=real_pos,
+                positionGain=0.5, velocityGain=0.1,
+                force=80.0,
+                physicsClientId=cid,
+            )
 
     def get_com(self) -> tuple[np.ndarray, np.ndarray]:
         """Центр масс тела + ориентация торса."""
@@ -711,6 +792,43 @@ class _PyBulletHumanoid:
             out[name] = np.array(st[4][:3], dtype=float)
         return out
 
+    def _sole_center_world(self, ankle_link: str) -> np.ndarray | None:
+        """Центр подошвы (локальный origin из URDF ankle) в мировых координатах."""
+        if ankle_link not in self.link_names:
+            return None
+        i = self.link_names.index(ankle_link)
+        st = pb.getLinkState(
+            self.robot_id, i,
+            computeForwardKinematics=1,
+            physicsClientId=self.client,
+        )
+        lw = np.array(st[4][:3], dtype=float)
+        R = np.array(pb.getMatrixFromQuaternion(st[5]), dtype=float).reshape(3, 3)
+        local = np.array([0.42, -0.09, -0.16], dtype=float) * float(HUMANOID_URDF_GLOBAL_SCALING)
+        return lw + R @ local
+
+    def get_ankle_quaternions_three_js(self) -> list[dict[str, float]]:
+        """
+        Ориентация звена left_ankle / right_ankle для Three.js:
+        позиции скелета задаются как (pb.x, pb.z, pb.y) — тот же базис, что
+        у R_three = P @ R_pb @ P.T.
+        """
+        out: list[dict[str, float]] = []
+        rid, cid = self.robot_id, self.client
+        for name in ("left_ankle", "right_ankle"):
+            if name not in self.link_names:
+                out.append({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0})
+                continue
+            i = self.link_names.index(name)
+            st = pb.getLinkState(
+                rid, i, computeForwardKinematics=1, physicsClientId=cid
+            )
+            R = np.array(pb.getMatrixFromQuaternion(st[5]), dtype=float).reshape(3, 3)
+            R3 = _PB_VEC_TO_THREE @ R @ _PB_VEC_TO_THREE.T
+            x, y, z, w = _rotmat_to_xyzw(R3)
+            out.append({"x": float(x), "y": float(y), "z": float(z), "w": float(w)})
+        return out
+
     def _skeleton_from_urdf_links(self) -> list[dict] | None:
         """
         Позиции звеньев из PyBullet (мир Z вверх). База URDF повёрнута так,
@@ -758,11 +876,16 @@ class _PyBulletHumanoid:
             vec("left_ankle"),
             vec("right_ankle"),
         ]
+        ls = self._sole_center_world("left_ankle")
+        rs = self._sole_center_world("right_ankle")
+        if ls is not None and rs is not None:
+            order.append(ls)
+            order.append(rs)
         return [{"x": float(v[0]), "y": float(v[1]), "z": float(v[2])} for v in order]
 
     def get_all_link_positions(self) -> list[dict]:
         """
-        15 точек (как rkk-humanoid.jsx): голова, шея, таз; руки от шеи, ноги от таза.
+        17 точек (как rkk-humanoid.jsx): + центры подошв после лодыжек.
         Для URDF humanoid — getLinkState; иначе FK от базы (кастомный multi-body).
         """
         urdf_pts = self._skeleton_from_urdf_links()
@@ -983,6 +1106,7 @@ class EnvironmentHumanoid:
         """Всё для Three.js за один вызов."""
         return {
             "skeleton": self.get_joint_positions_world(),
+            "ankleQuats": self._sim.get_ankle_quaternions_three_js(),
             "cubes":    self.get_cube_positions(),
             "target":   self.get_target(),
             "fallen":   self.is_fallen(),

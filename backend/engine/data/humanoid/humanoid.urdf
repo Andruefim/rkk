@@ -120,18 +120,18 @@
 				<box size="0.708000 0.220000 0.360000" />
 			</geometry>
 		</collision>
-		<!-- Подошва: шире и ниже для опоры и визуала стопы -->
+		<!-- Подошва: тонкая ось = локальная Y → после stand_euler мир +Z (пластина в плоскости пола XY) -->
 		<visual>
 				<origin rpy = "0 0 0" xyz = "0.42 -0.09 -0.16" />
 			<geometry>
-				<box size="0.26 0.34 0.06" />
+				<box size="0.34 0.06 0.26" />
 			</geometry>
 			<material name="sole_r"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
 				<origin rpy = "0 0 0" xyz = "0.42 -0.09 -0.16" />
 			<geometry>
-				<box size="0.26 0.34 0.06" />
+				<box size="0.34 0.06 0.26" />
 			</geometry>
 		</collision>
 	</link>
@@ -259,14 +259,14 @@
 		<visual>
 				<origin rpy = "0 0 0" xyz = "0.42 -0.09 -0.16" />
 			<geometry>
-				<box size="0.26 0.34 0.06" />
+				<box size="0.34 0.06 0.26" />
 			</geometry>
 			<material name="sole_l"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
 				<origin rpy = "0 0 0" xyz = "0.42 -0.09 -0.16" />
 			<geometry>
-				<box size="0.26 0.34 0.06" />
+				<box size="0.34 0.06 0.26" />
 			</geometry>
 		</collision>
 	</link>

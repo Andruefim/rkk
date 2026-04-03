@@ -243,18 +243,26 @@ export default function RKKHumanoid() {
     ramp.position.set(3,0.38,0); ramp.rotation.x=-0.26; scene.add(ramp);
 
     // Гуманоид
-    const JOINT_COUNT = 15;
+    const JOINT_COUNT = 17;
     const jointMeshes = Array.from({length:JOINT_COUNT},(_,i)=>{
-      const isTorso = i<=2;
-      const m = new THREE.Mesh(
-        new THREE.SphereGeometry(isTorso?0.065:0.05,8,8),
-        new THREE.MeshStandardMaterial({
-          color:isTorso?0xcc88ff:0x8844cc,
-          emissive:isTorso?0x6622aa:0x441188,
-          emissiveIntensity:0.4, roughness:0.3,
-        })
-      );
-      m.castShadow=true; scene.add(m); return m;
+      if (i >= 15) {
+        const o = new THREE.Object3D();
+        o.visible = false;
+        scene.add(o);
+        return o;
+      }
+      const isTorso = i <= 2;
+      const geom = new THREE.SphereGeometry(isTorso ? 0.065 : 0.05, 8, 8);
+      const mat = new THREE.MeshStandardMaterial({
+        color: isTorso ? 0xcc88ff : 0x8844cc,
+        emissive: isTorso ? 0x6622aa : 0x441188,
+        emissiveIntensity: 0.4,
+        roughness: 0.3,
+      });
+      const m = new THREE.Mesh(geom, mat);
+      m.castShadow = true;
+      scene.add(m);
+      return m;
     });
 
     const boneMeshes = SKELETON_BONES.map(()=>{
@@ -379,7 +387,7 @@ export default function RKKHumanoid() {
           jointPositions.push(v);
           if(i<jointMeshes.length){
             jointMeshes[i].position.copy(v);
-            jointMeshes[i].visible=true;
+            if(i<15) jointMeshes[i].visible=true;
             if(i===0){
               jointMeshes[i].material.emissiveIntensity=0.3+(ag.phi??0.1)*0.4+Math.sin(frame*0.08)*0.1;
               jointMeshes[i].material.emissive.setHex(fallen?0xff2200:isVis?0x22ccaa:0x6622aa);
@@ -400,11 +408,15 @@ export default function RKKHumanoid() {
           [-0.11,comH-0.22,0],[0.11,comH-0.22,0],
           [-0.11,comH-0.56+Math.sin(t)*0.05,0],[0.11,comH-0.56+Math.sin(t+Math.PI)*0.05,0],
           [-0.11+Math.sin(t)*0.04,comH-0.86,0.05],[0.11+Math.sin(t+Math.PI)*0.04,comH-0.86,0.05],
+          [-0.15+Math.sin(t)*0.04,comH-0.90,0.05],[0.15+Math.sin(t+Math.PI)*0.04,comH-0.90,0.05],
         ];
         poses.forEach(([x,y,z],i)=>{
           const v=new THREE.Vector3(x,y,z);
           jointPositions.push(v);
-          if(i<jointMeshes.length){jointMeshes[i].position.copy(v);jointMeshes[i].visible=true;}
+          if(i<jointMeshes.length){
+            jointMeshes[i].position.copy(v);
+            if(i<15) jointMeshes[i].visible=true;
+          }
         });
       }
 
