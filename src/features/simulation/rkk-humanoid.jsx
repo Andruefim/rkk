@@ -3,27 +3,19 @@ import * as THREE from "three";
 import { useRKKStream } from "../../hooks/useRKKStream";
 
 const API = "http://localhost:8000";
-/** Опрос PyBullet-превью (не связан с тиками симуляции) */
 const CAMERA_PREVIEW_MS = 500;
-/** query `view` для /camera/frame (бэкенд гуманоида пока игнорирует — всегда first-person) */
 const CAM_VIEW = "fp";
 
 const WORLD_COLORS = {
   humanoid:"#cc44ff", robot:"#aa22dd", pybullet:"#ff44aa",
   physics:"#00ff99", chemistry:"#0099ff", logic:"#ff9900",
 };
-const WORLD_LABELS = {
-  humanoid:"Humanoid", robot:"Robot Arm", pybullet:"3D Physics",
-  physics:"Thermodynamics", chemistry:"Chemical Kinetics", logic:"Logic Gates",
-};
 
-// Цвета слотов (те же что на бэке)
 const SLOT_COLORS = [
   "#ff5050","#50c8ff","#50ff64","#ffc850",
   "#c850ff","#ff8c50","#50ffdc","#b4b4ff",
 ];
 
-/** Красный «демон» в Three.js-сцене (AdversarialDemon только визуализация) */
 const SHOW_SCENE_DEMON = false;
 
 const phiC  = p => p>0.6?"#00ff99":p>0.3?"#aacc00":"#ff8844";
@@ -57,11 +49,10 @@ function normFrame(raw) {
     events:raw.events??[], valueLayer:raw.value_layer??null,
     fallen:raw.fallen??false, fallCount:raw.fall_count??0,
     scene:raw.scene??{skeleton:[],cubes:[],target:{x:0,y:0,z:0.9},fallen:false},
-    // Фаза 12
     visualMode:raw.visual_mode??false,
     visionTicks:raw.vision_ticks??0,
     vision:raw.vision??null,
-    fixedRoot:raw.fixed_root??false,
+    fixedRoot:raw.fixed_root??false,  // НОВОЕ
   };
 }
 
@@ -71,8 +62,8 @@ const mono = {fontFamily:"'Courier New',monospace"};
 
 const SKELETON_BONES = [
   [0,1],[1,2],[2,3],
-  [1,4],[4,6],[6,8], [1,5],[5,7],[7,9],
-  [3,10],[10,12],[12,14], [3,11],[11,13],[13,15],
+  [1,4],[4,6],[6,8],[1,5],[5,7],[7,9],
+  [3,10],[10,12],[12,14],[3,11],[11,13],[13,15],
 ];
 
 export default function RKKHumanoid() {
@@ -82,39 +73,42 @@ export default function RKKHumanoid() {
   const wsFrameRef = useRef(wsFrame);
   wsFrameRef.current = wsFrame;
 
-  const [speed,       setSpeedLocal] = useState(1);
-  const [ui,          setUI]         = useState(() => normFrame(wsFrame));
-  const [activePanel, setPanel]      = useState(null);
-  const [seedText,    setSeedText]   = useState('[\n  {"from_": "lhip", "to": "com_z", "weight": 0.6}\n]');
-  const [status,      setStatus]     = useState("");
-  const [camFrame,    setCamFrame]   = useState(null);
-  const [showCam,     setShowCam]    = useState(false);
-  const [showCubes,   setShowCubes]  = useState(false);
-  const [ragLoading,  setRagLoading] = useState(false);
+  const [speed,        setSpeedLocal]    = useState(1);
+  const [ui,           setUI]            = useState(() => normFrame(wsFrame));
+  const [activePanel,  setPanel]         = useState(null);
+  const [seedText,     setSeedText]      = useState('[\n  {"from_": "lshoulder", "to": "cube0_x", "weight": 0.6}\n]');
+  const [status,       setStatus]        = useState("");
+  const [camFrame,     setCamFrame]      = useState(null);
+  const [showCam,      setShowCam]       = useState(false);
+  const [showCubes,    setShowCubes]     = useState(true);
+  const [ragLoading,   setRagLoading]    = useState(false);
 
-  // Фаза 12
-  const [visionData,   setVisionData]   = useState(null);
-  const [visionLoading,setVisionLoading]= useState(false);
+  // Vision
+  const [visionData,    setVisionData]    = useState(null);
+  const [visionLoading, setVisionLoading] = useState(false);
   const [vlmLoading,    setVlmLoading]    = useState(false);
   const [vlmWeakEdges,  setVlmWeakEdges]  = useState(false);
-  const [selectedSlot, setSelectedSlot] = useState(0);
-  const [attnFrame,    setAttnFrame]    = useState(null);
-  const [visionEnabled,setVisionEnabled]= useState(false);
-  const [fixedRoot, setFixedRoot] = useState(false);
+  const [selectedSlot,  setSelectedSlot]  = useState(0);
+  const [attnFrame,     setAttnFrame]     = useState(null);
+  const [visionEnabled, setVisionEnabled] = useState(false);
+
+  // Fixed root — НОВОЕ
+  const [fixedRoot,        setFixedRoot]        = useState(false);
   const [fixedRootLoading, setFixedRootLoading] = useState(false);
+  const fixedRootRef = useRef(false);
 
   const showCubesRef = useRef(showCubes);
   showCubesRef.current = showCubes;
 
-  const fixedRootRef = useRef(fixedRoot);
-  useEffect(() => { fixedRootRef.current = fixedRoot; }, [fixedRoot]);
-
   const setSpeed = s => { setSpeedLocal(s); if (connected) wsSetSpeed(s); };
+
   useEffect(() => {
     const f = normFrame(wsFrame);
     setUI(f);
     setVisionEnabled(f.visualMode);
+    // Синхронизируем fixed_root из WS stream
     setFixedRoot(f.fixedRoot);
+    fixedRootRef.current = f.fixedRoot;
   }, [wsFrame]);
 
   // Camera polling
@@ -129,7 +123,7 @@ export default function RKKHumanoid() {
     return () => clearInterval(iv);
   }, [connected, showCam]);
 
-  // Vision slots polling (только когда visual mode и панель открыта)
+  // Vision polling
   useEffect(() => {
     if (!connected || !visionEnabled || activePanel !== "vision") return;
     const iv = setInterval(async () => {
@@ -141,18 +135,17 @@ export default function RKKHumanoid() {
     return () => clearInterval(iv);
   }, [connected, visionEnabled, activePanel]);
 
-  // Attn frame для выбранного слота
   useEffect(() => {
     if (!visionEnabled || activePanel !== "vision") return;
-    const fetchAttn = async () => {
+    (async () => {
       try {
         const d = await fetch(`${API}/vision/attn_frame?slot_idx=${selectedSlot}`).then(r=>r.json());
         if (d.available) setAttnFrame(d.frame);
       } catch {}
-    };
-    fetchAttn();
+    })();
   }, [selectedSlot, visionEnabled, activePanel]);
 
+  // ── Actions ────────────────────────────────────────────────────────────────
   const switchWorld = async w => {
     try {
       const d = await fetch(`${API}/world/switch`,{method:"POST",
@@ -187,20 +180,14 @@ export default function RKKHumanoid() {
     finally { setRagLoading(false); }
   };
 
-  // ── Фаза 12 действия ──────────────────────────────────────────────────────
   const enableVision = async (nSlots=8) => {
     setVisionLoading(true);
     try {
       const d = await fetch(`${API}/vision/enable`,{method:"POST",
         headers:{"Content-Type":"application/json"},
         body:JSON.stringify({n_slots:nSlots,mode:"hybrid"})}).then(r=>r.json());
-      if (d.visual) {
-        setVisionEnabled(true);
-        setStatus(`👁 Vision ON: ${d.n_slots} slots, d=${d.gnn_d}`);
-        setPanel("vision");
-      } else {
-        setStatus(`✗ ${d.error||"failed"}`);
-      }
+      if (d.visual) { setVisionEnabled(true); setStatus(`👁 Vision ON: ${d.n_slots} slots, d=${d.gnn_d}`); setPanel("vision"); }
+      else setStatus(`✗ ${d.error||"failed"}`);
     } catch(e) { setStatus(`✗ ${e.message}`); }
     finally { setVisionLoading(false); }
   };
@@ -208,66 +195,45 @@ export default function RKKHumanoid() {
   const runVlmSlotLabels = async () => {
     setVlmLoading(true);
     try {
-      const d = await fetch(`${API}/vision/vlm-label`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          llm_url: "http://localhost:11434/api/generate",
-          llm_model: "gemma4:e4b",
-          max_mask_images: 4,
-          text_only: false,
-          inject_weak_edges: vlmWeakEdges,
-        }),
-      }).then((r) => r.json());
+      const d = await fetch(`${API}/vision/vlm-label`,{method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({llm_url:"http://localhost:11434/api/generate",
+          llm_model:"gemma4:e4b",max_mask_images:4,text_only:false,
+          inject_weak_edges:vlmWeakEdges})}).then(r=>r.json());
       if (d.ok) {
-        const w = d.weak_edges_injected ? ` · +${d.weak_edges_injected} weak edges` : "";
-        const warn = d.warning ? ` (${d.warning})` : "";
-        setStatus(`🔬 VLM ${d.mode}: ${d.n_slots_labeled} labels${w}${warn}`);
-        try {
-          const refresh = await fetch(`${API}/vision/slots`).then((r) => r.json());
-          if (refresh.visual_mode !== false) setVisionData(refresh);
-        } catch {}
-      } else {
-        setStatus(`✗ VLM: ${d.error || "failed"}`);
-      }
-    } catch (e) {
-      setStatus(`✗ ${e.message}`);
-    } finally {
-      setVlmLoading(false);
-    }
+        setStatus(`🔬 VLM ${d.mode}: ${d.n_slots_labeled} labels${d.warning?` (${d.warning})`:""}`);
+        try { const r2=await fetch(`${API}/vision/slots`).then(r=>r.json()); if(r2.visual_mode!==false) setVisionData(r2); } catch{}
+      } else setStatus(`✗ VLM: ${d.error||"failed"}`);
+    } catch(e) { setStatus(`✗ ${e.message}`); }
+    finally { setVlmLoading(false); }
   };
 
   const disableVision = async () => {
     try {
       await fetch(`${API}/vision/disable`,{method:"POST"});
-      setVisionEnabled(false);
-      setVisionData(null);
-      setAttnFrame(null);
-      setStatus("👁 Vision OFF — ручные переменные");
+      setVisionEnabled(false); setVisionData(null); setAttnFrame(null);
+      setStatus("👁 Vision OFF");
     } catch(e) { setStatus(`✗ ${e.message}`); }
   };
 
+  // ── Fixed root toggle ──────────────────────────────────────────────────────
   const toggleFixedRoot = async () => {
     setFixedRootLoading(true);
     try {
       const endpoint = fixedRoot
         ? `${API}/fixed-root/disable`
         : `${API}/fixed-root/enable`;
-      const d = await fetch(endpoint, { method: "POST" }).then((r) => r.json());
+      const d = await fetch(endpoint,{method:"POST"}).then(r=>r.json());
       if (d.error) {
         setStatus(`✗ Fixed root: ${d.error}`);
       } else {
-        const state = d.fixed_root ? "ON" : "OFF";
-        setFixedRoot(d.fixed_root ?? !fixedRoot);
-        setStatus(
-          `📌 Fixed root ${state}: d=${d.gnn_d}, ${d.new_vars?.length ?? "?"} vars, ${d.seeds_injected ?? 0} seeds`
-        );
+        const on = d.fixed_root ?? !fixedRoot;
+        setFixedRoot(on);
+        fixedRootRef.current = on;
+        setStatus(`📌 Fixed root ${on?"ON":"OFF"}: d=${d.gnn_d}, ${d.new_vars?.length??0} vars, +${d.seeds_injected??0} seeds`);
       }
-    } catch (e) {
-      setStatus(`✗ ${e.message}`);
-    } finally {
-      setFixedRootLoading(false);
-    }
+    } catch(e) { setStatus(`✗ ${e.message}`); }
+    finally { setFixedRootLoading(false); }
   };
 
   // ── Three.js ───────────────────────────────────────────────────────────────
@@ -275,25 +241,24 @@ export default function RKKHumanoid() {
     const mount = mountRef.current;
     if (!mount) return;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
-    renderer.setSize(mount.clientWidth, mount.clientHeight);
+    renderer.setSize(mount.clientWidth,mount.clientHeight);
     mount.appendChild(renderer.domElement);
 
-    const scene = new THREE.Scene();
+    const scene  = new THREE.Scene();
     scene.background = new THREE.Color(0x030912);
-    scene.fog = new THREE.FogExp2(0x030912, 0.022);
+    scene.fog = new THREE.FogExp2(0x030912,0.022);
 
-    const camera = new THREE.PerspectiveCamera(55, mount.clientWidth/mount.clientHeight, 0.1, 100);
-    camera.position.set(0, 1.2, 5.5);
+    const camera = new THREE.PerspectiveCamera(55,mount.clientWidth/mount.clientHeight,0.1,100);
+    camera.position.set(0,1.2,5.5);
 
-    scene.add(new THREE.AmbientLight(0x0a1020, 3.0));
-    const key = new THREE.DirectionalLight(0x8899ff, 2.5);
+    scene.add(new THREE.AmbientLight(0x0a1020,3.0));
+    const key = new THREE.DirectionalLight(0x8899ff,2.5);
     key.position.set(3,6,4); key.castShadow=true; scene.add(key);
-    scene.add(new THREE.DirectionalLight(0x334455, 1.0).position.set(-3,2,-3) && new THREE.DirectionalLight(0x334455, 1.0));
-    const rim = new THREE.PointLight(0x6644ff, 1.5, 10);
+    const rim = new THREE.PointLight(0x6644ff,1.5,10);
     rim.position.set(0,4,-2); scene.add(rim);
 
     const floor = new THREE.Mesh(
@@ -303,37 +268,35 @@ export default function RKKHumanoid() {
     floor.rotation.x=-Math.PI/2; floor.receiveShadow=true; scene.add(floor);
     scene.add(new THREE.GridHelper(20,40,0x0d1a2e,0x071220));
 
+    // Рампа
     const ramp = new THREE.Mesh(
       new THREE.BoxGeometry(3,0.1,2),
       new THREE.MeshStandardMaterial({color:0x1a1510,roughness:0.8})
     );
     ramp.position.set(3,0.38,0); ramp.rotation.x=-0.26; scene.add(ramp);
 
+    // Платформа (полка)
+    const shelf = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5,0.05,0.5),
+      new THREE.MeshStandardMaterial({color:0x1a2030,roughness:0.6})
+    );
+    shelf.position.set(0.95,0.18,0.0); scene.add(shelf);
+
     // Гуманоид
     const JOINT_COUNT = 18;
     const jointMeshes = Array.from({length:JOINT_COUNT},(_,i)=>{
-      if (i >= 16) {
-        const o = new THREE.Object3D();
-        o.visible = false;
-        scene.add(o);
-        return o;
-      }
-      const isTorso = i <= 2;
-      const geom = new THREE.SphereGeometry(isTorso ? 0.065 : 0.05, 8, 8);
-      const mat = new THREE.MeshStandardMaterial({
-        color: isTorso ? 0xcc88ff : 0x8844cc,
-        emissive: isTorso ? 0x6622aa : 0x441188,
-        emissiveIntensity: 0.4,
-        roughness: 0.3,
-      });
-      const m = new THREE.Mesh(geom, mat);
-      m.castShadow = true;
-      scene.add(m);
-      return m;
+      if (i>=16){const o=new THREE.Object3D();o.visible=false;scene.add(o);return o;}
+      const isTorso=i<=2;
+      const m=new THREE.Mesh(
+        new THREE.SphereGeometry(isTorso?0.065:0.05,8,8),
+        new THREE.MeshStandardMaterial({color:isTorso?0xcc88ff:0x8844cc,
+          emissive:isTorso?0x6622aa:0x441188,emissiveIntensity:0.4,roughness:0.3})
+      );
+      m.castShadow=true; scene.add(m); return m;
     });
 
     const boneMeshes = SKELETON_BONES.map(()=>{
-      const m = new THREE.Mesh(
+      const m=new THREE.Mesh(
         new THREE.CylinderGeometry(0.025,0.025,1,6),
         new THREE.MeshStandardMaterial({color:0x6633aa,emissive:0x221144,emissiveIntensity:0.2,roughness:0.6})
       );
@@ -341,70 +304,85 @@ export default function RKKHumanoid() {
     });
 
     // Кубы
-    const CUBE_COLORS_HEX = [0xff6622,0x22aaff,0x44ff88];
-    const cubeMeshes = CUBE_COLORS_HEX.map((col,i)=>{
-      const size=0.22+i*0.06;
-      const m = new THREE.Mesh(
-        new THREE.BoxGeometry(size,size,size),
-        new THREE.MeshStandardMaterial({color:col,emissive:col,emissiveIntensity:0.15,roughness:0.4})
-      );
-      m.castShadow=true; m.receiveShadow=true;
-      m.position.set(1.5+i*0.8,size/2,0.5-i*0.4); scene.add(m); return m;
-    });
+    // cube0: box оранжевый, cube1: СФЕРА синяя, cube2: box зелёный
+    const cubeMeshes = [];
 
-    // Target ring
-    const targetMesh = new THREE.Mesh(
-      new THREE.RingGeometry(0.12,0.18,16),
-      new THREE.MeshBasicMaterial({color:0x66ffaa,side:THREE.DoubleSide,transparent:true,opacity:0.4})
+    // cube0 — лёгкий box
+    const cm0=new THREE.Mesh(
+      new THREE.BoxGeometry(0.20,0.20,0.20),
+      new THREE.MeshStandardMaterial({color:0xff6622,emissive:0xff4400,emissiveIntensity:0.15,roughness:0.4})
     );
-    targetMesh.rotation.x=-Math.PI/2; targetMesh.position.y=0.01; scene.add(targetMesh);
+    cm0.castShadow=true; cm0.receiveShadow=true;
+    cm0.position.set(0.45,0.10,0.10); scene.add(cm0); cubeMeshes.push(cm0);
 
-    const fallenLight = new THREE.PointLight(0xff0022,0,3);
-    fallenLight.position.set(0,0.1,0); scene.add(fallenLight);
+    // cube1 — СФЕРА (ball) голубая
+    const cm1=new THREE.Mesh(
+      new THREE.SphereGeometry(0.09,12,12),
+      new THREE.MeshStandardMaterial({color:0x22aaff,emissive:0x0066ff,emissiveIntensity:0.2,roughness:0.2,metalness:0.1})
+    );
+    cm1.castShadow=true; cm1.receiveShadow=true;
+    cm1.position.set(-0.35,0.15,0.40); scene.add(cm1); cubeMeshes.push(cm1);
 
-    // Фаза 12: слот-сферы (K=8 маленьких орбитальных шаров, цветных по слоту)
-    const slotSpheres = Array.from({length:8},(_, k)=>{
-      const col = parseInt(SLOT_COLORS[k].replace("#",""), 16);
-      const m = new THREE.Mesh(
+    // cube2 — тяжёлый box зелёный
+    const cm2=new THREE.Mesh(
+      new THREE.BoxGeometry(0.28,0.28,0.28),
+      new THREE.MeshStandardMaterial({color:0x44ff88,emissive:0x22aa44,emissiveIntensity:0.15,roughness:0.5})
+    );
+    cm2.castShadow=true; cm2.receiveShadow=true;
+    cm2.position.set(0.20,0.20,-0.60); scene.add(cm2); cubeMeshes.push(cm2);
+
+    // Рычаг
+    const leverBase = new THREE.Mesh(
+      new THREE.BoxGeometry(0.08,0.08,0.08),
+      new THREE.MeshStandardMaterial({color:0x444455,roughness:0.7})
+    );
+    leverBase.position.set(0.50,0.04,0.45); scene.add(leverBase);
+
+    const leverArm = new THREE.Mesh(
+      new THREE.BoxGeometry(0.56,0.06,0.04),
+      new THREE.MeshStandardMaterial({color:0xddaa22,emissive:0x886600,emissiveIntensity:0.3,roughness:0.4})
+    );
+    leverArm.position.set(0.50,0.08,0.45); scene.add(leverArm);
+
+    // Fixed root indicator ring (вокруг таза, жёлтый)
+    const fixedRootRing = new THREE.Mesh(
+      new THREE.TorusGeometry(0.35,0.015,8,32),
+      new THREE.MeshBasicMaterial({color:0xffcc00,transparent:true,opacity:0.})
+    );
+    scene.add(fixedRootRing);
+
+    // Vision ring
+    const visionRing = new THREE.Mesh(
+      new THREE.TorusGeometry(0.6,0.02,8,32),
+      new THREE.MeshBasicMaterial({color:0x44ffcc,transparent:true,opacity:0.})
+    );
+    scene.add(visionRing);
+
+    // Slot spheres
+    const slotSpheres = Array.from({length:8},(_,k)=>{
+      const col=parseInt(SLOT_COLORS[k].replace("#",""),16);
+      const m=new THREE.Mesh(
         new THREE.SphereGeometry(0.05,8,8),
-        new THREE.MeshStandardMaterial({
-          color:col, emissive:col, emissiveIntensity:0.5,
-          transparent:true, opacity:0.0,
-        })
+        new THREE.MeshStandardMaterial({color:col,emissive:col,emissiveIntensity:0.5,transparent:true,opacity:0.})
       );
       scene.add(m); return m;
     });
 
-    // Visual mode glow ring вокруг персонажа
-    const visionRing = new THREE.Mesh(
-      new THREE.TorusGeometry(0.6,0.02,8,32),
-      new THREE.MeshBasicMaterial({color:0x44ffcc,transparent:true,opacity:0.0})
-    );
-    scene.add(visionRing);
-
-    let demon = null;
-    if (SHOW_SCENE_DEMON) {
-      demon = new THREE.Mesh(
-        new THREE.OctahedronGeometry(0.35,0),
-        new THREE.MeshStandardMaterial({color:0xff2244,emissive:0xff0022,emissiveIntensity:0.9,roughness:0.2})
-      );
-      demon.add(new THREE.PointLight(0xff2244,0.8,4));
-      demon.position.set(4,0.8,2);
-      demon.userData={vel:new THREE.Vector3(-0.015,0,-0.01)};
-      scene.add(demon);
-    }
+    // Fallen light
+    const fallenLight = new THREE.PointLight(0xff0022,0,3);
+    fallenLight.position.set(0,0.1,0); scene.add(fallenLight);
 
     // Particles
-    const pPos = new Float32Array(600*3);
+    const pPos=new Float32Array(600*3);
     for(let i=0;i<600;i++){pPos[i*3]=(Math.random()-.5)*30;pPos[i*3+1]=Math.random()*12;pPos[i*3+2]=(Math.random()-.5)*30;}
-    const pGeom = new THREE.BufferGeometry();
+    const pGeom=new THREE.BufferGeometry();
     pGeom.setAttribute("position",new THREE.BufferAttribute(pPos,3));
     scene.add(new THREE.Points(pGeom,new THREE.PointsMaterial({color:0x220044,size:0.06,transparent:true,opacity:0.4})));
 
     let frame=0;
-    const camTarget = new THREE.Vector3(0,1,0);
-    let camAzim=0, camElev=0.2, camRadius=5.5;
-    let camDrag=false, camPtrX=0, camPtrY=0;
+    const camTarget=new THREE.Vector3(0,1,0);
+    let camAzim=0,camElev=0.2,camRadius=5.5;
+    let camDrag=false,camPtrX=0,camPtrY=0;
 
     function updateBone(b,a,bp){
       const mid=new THREE.Vector3().addVectors(a,bp).multiplyScalar(0.5);
@@ -423,6 +401,7 @@ export default function RKKHumanoid() {
       const wCol=parseInt((ds.worldColor||"#cc44ff").replace("#",""),16);
       const fallen=ds.fallen||ds.scene?.fallen;
       const isVis=ds.visualMode;
+      const isFR=fixedRootRef.current;
 
       // Камера
       let comX=0,comZ=0;
@@ -430,8 +409,7 @@ export default function RKKHumanoid() {
       if(sk&&sk.length>=3){
         let sx=0,sz=0,n=0;
         for(let j=0;j<Math.min(sk.length,JOINT_COUNT);j++){
-          const pt=sk[j]; if(!pt)continue;
-          sx+=pt.x??0; sz+=pt.y??0; n++;
+          const pt=sk[j]; if(!pt)continue; sx+=pt.x??0;sz+=pt.y??0;n++;
         }
         if(n>0){comX=sx/n;comZ=sz/n;}
       }
@@ -444,7 +422,7 @@ export default function RKKHumanoid() {
       );
       camera.lookAt(camTarget);
 
-      fallenLight.intensity=fallen?2.0+Math.sin(frame*0.2)*0.5:0;
+      fallenLight.intensity=fallen?2.+Math.sin(frame*.2)*.5:0.;
 
       // Skeleton
       const jointPositions=[];
@@ -456,34 +434,31 @@ export default function RKKHumanoid() {
             jointMeshes[i].position.copy(v);
             if(i<16) jointMeshes[i].visible=true;
             if(i===0){
-              jointMeshes[i].material.emissiveIntensity=0.3+(ag.phi??0.1)*0.4+Math.sin(frame*0.08)*0.1;
-              jointMeshes[i].material.emissive.setHex(fallen?0xff2200:isVis?0x22ccaa:0x6622aa);
-              jointMeshes[i].material.color.setHex(isVis?0x44ffcc:0xcc88ff);
+              jointMeshes[i].material.emissiveIntensity=0.3+(ag.phi??0.1)*0.4+Math.sin(frame*.08)*.1;
+              jointMeshes[i].material.emissive.setHex(fallen?0xff2200:isFR?0xaa8800:isVis?0x22ccaa:0x6622aa);
+              jointMeshes[i].material.color.setHex(isFR?0xffcc44:isVis?0x44ffcc:0xcc88ff);
             }
           }
         });
         for(let i=jointPositions.length;i<JOINT_COUNT;i++)
           jointPositions.push(jointMeshes[Math.max(0,i-1)]?.position?.clone()??new THREE.Vector3());
       } else {
-        const t=frame*0.025;
-        const comH=1.2+(fallen?-0.8:0);
+        const t=frame*.025;
+        const comH=1.2+(fallen?-.8:0);
         const poses=[
-          [0,comH+0.26,0],[0,comH+0.13,0],[0,comH+0.02,0],[0,comH-0.10,0],
-          [-0.26,comH+0.11,0],[0.26,comH+0.11,0],
-          [-0.42,comH+0.05+Math.sin(t+1)*0.06,0],[0.42,comH+0.05+Math.sin(t+2)*0.06,0],
-          [-0.50,comH-0.18,0],[0.50,comH-0.18,0],
-          [-0.11,comH-0.22,0],[0.11,comH-0.22,0],
-          [-0.11,comH-0.56+Math.sin(t)*0.05,0],[0.11,comH-0.56+Math.sin(t+Math.PI)*0.05,0],
-          [-0.11+Math.sin(t)*0.04,comH-0.86,0.05],[0.11+Math.sin(t+Math.PI)*0.04,comH-0.86,0.05],
-          [-0.15+Math.sin(t)*0.04,comH-0.90,0.05],[0.15+Math.sin(t+Math.PI)*0.04,comH-0.90,0.05],
+          [0,comH+.26,0],[0,comH+.13,0],[0,comH+.02,0],[0,comH-.10,0],
+          [-.26,comH+.11,0],[.26,comH+.11,0],
+          [-.42,comH+.05+Math.sin(t+1)*.06,0],[.42,comH+.05+Math.sin(t+2)*.06,0],
+          [-.50,comH-.18,0],[.50,comH-.18,0],
+          [-.11,comH-.22,0],[.11,comH-.22,0],
+          [-.11,comH-.56+Math.sin(t)*.05,0],[.11,comH-.56+Math.sin(t+Math.PI)*.05,0],
+          [-.11+Math.sin(t)*.04,comH-.86,.05],[.11+Math.sin(t+Math.PI)*.04,comH-.86,.05],
+          [-.15+Math.sin(t)*.04,comH-.90,.05],[.15+Math.sin(t+Math.PI)*.04,comH-.90,.05],
         ];
         poses.forEach(([x,y,z],i)=>{
           const v=new THREE.Vector3(x,y,z);
           jointPositions.push(v);
-          if(i<jointMeshes.length){
-            jointMeshes[i].position.copy(v);
-            if(i<16) jointMeshes[i].visible=true;
-          }
+          if(i<jointMeshes.length){jointMeshes[i].position.copy(v);if(i<16)jointMeshes[i].visible=true;}
         });
       }
 
@@ -491,68 +466,69 @@ export default function RKKHumanoid() {
         if(a<jointPositions.length&&b<jointPositions.length&&k<boneMeshes.length){
           updateBone(boneMeshes[k],jointPositions[a],jointPositions[b]);
           boneMeshes[k].visible=true;
-          const boneCol = fallen
-            ? 0x881100
-            : fixedRootRef.current
-              ? 0x886600
-              : isVis
-                ? parseInt(SLOT_COLORS[k % 8].replace("#", ""), 16)
-                : wCol;
+          const boneCol=fallen?0x881100:isFR?0x886600:isVis?parseInt(SLOT_COLORS[k%8].replace("#",""),16):wCol;
           boneMeshes[k].material.color.setHex(boneCol);
-          boneMeshes[k].material.emissiveIntensity=0.15+Math.sin(frame*0.05+k)*0.05;
+          boneMeshes[k].material.emissiveIntensity=0.15+Math.sin(frame*.05+k)*.05;
         }
       });
 
-      // Кубы
+      // Кубы из scene data
       const cubes=ds.scene?.cubes;
       cubeMeshes.forEach((cm,i)=>{
         const c=cubes?.[i];
         const has=c&&typeof c.x==="number";
         cm.visible=showCubesRef.current&&has;
-        if(has){cm.position.set(c.x,Math.max(0,c.z??0)+cm.geometry.parameters.height/2,c.y??0);}
-        if(showCubesRef.current){cm.rotation.y+=0.005;}
+        if(has){
+          cm.position.set(c.x,Math.max(0,c.z??0)+cm.geometry.parameters?.height/2||0.12,c.y??0);
+        }
+        if(showCubesRef.current){
+          // Шар (cube1) вращается быстрее
+          cm.rotation.y+=i===1?0.03:0.005;
+        }
       });
 
-      // Фаза 12: слот сферы — орбитируют вокруг головы
-      const head = jointPositions[0] ?? new THREE.Vector3(0,1.5,0);
-      const visionS = ds.vision;
-      slotSpheres.forEach((sm, k) => {
-        const active = isVis && visionS?.variability?.[k] !== undefined;
-        const varVal  = active ? (visionS.variability[k] ?? 0) : 0;
-        const slotVal = active ? (visionS.slot_values?.[k] ?? 0.5) : 0.5;
+      // Рычаг
+      const lever=ds.scene?.lever;
+      if(lever){
+        leverBase.position.set(lever.x,lever.z,lever.y);
+        leverArm.position.set(lever.x,lever.z+0.07,lever.y);
+      }
+      // Наклон рычага из nodes (lever_angle)
+      const la=ag.edges?.find?.(e=>e.from_==="lever_angle")?.weight??0;
+      leverArm.rotation.z=la*0.5;
+      // Подсветка рычага если активен
+      const leverGlow=Math.abs(la)>0.1;
+      leverArm.material.emissiveIntensity=leverGlow?0.7+Math.sin(frame*.1)*.3:0.3;
+      leverArm.material.emissive.setHex(leverGlow?0xff8800:0x886600);
 
-        sm.visible = active && varVal > 0.01;
-        if (!active) return;
-
-        const angle = (k / 8) * Math.PI * 2 + frame * 0.015;
-        const r = 0.8 + varVal * 0.4;
-        sm.position.set(
-          head.x + Math.cos(angle) * r,
-          head.y + 0.3 + Math.sin(frame * 0.03 + k) * 0.15,
-          head.z + Math.sin(angle) * r
-        );
-        sm.material.opacity = 0.3 + varVal * 0.6;
-        sm.material.emissiveIntensity = 0.3 + slotVal * 0.6;
-        sm.scale.setScalar(0.8 + slotVal * 0.5);
-      });
+      // Fixed root ring
+      const pelvisPos=jointPositions[3]??new THREE.Vector3(0,0.9,0);
+      fixedRootRing.position.copy(pelvisPos);
+      fixedRootRing.rotation.x=Math.PI/2;
+      fixedRootRing.material.opacity=isFR?0.6+Math.sin(frame*.08)*.2:0.;
+      fixedRootRing.material.color.setHex(0xffcc00);
 
       // Vision ring
-      const showRing = isVis;
+      const head=jointPositions[0]??new THREE.Vector3(0,1.5,0);
+      const visionS=ds.vision;
+      slotSpheres.forEach((sm,k)=>{
+        const active=isVis&&visionS?.variability?.[k]!==undefined;
+        const varVal=active?(visionS.variability[k]??0):0;
+        const slotVal=active?(visionS.slot_values?.[k]??0.5):0.5;
+        sm.visible=active&&varVal>0.01;
+        if(!active)return;
+        const angle=(k/8)*Math.PI*2+frame*.015;
+        const r=0.8+varVal*.4;
+        sm.position.set(head.x+Math.cos(angle)*r,head.y+.3+Math.sin(frame*.03+k)*.15,head.z+Math.sin(angle)*r);
+        sm.material.opacity=0.3+varVal*.6;
+        sm.material.emissiveIntensity=0.3+slotVal*.6;
+        sm.scale.setScalar(0.8+slotVal*.5);
+      });
       visionRing.position.copy(head);
-      visionRing.position.y = head.y - 0.05;
-      visionRing.rotation.x = -Math.PI / 2 + Math.sin(frame * 0.02) * 0.05;
-      visionRing.rotation.z = frame * 0.01;
-      visionRing.material.opacity = showRing ? 0.5 + Math.sin(frame * 0.06) * 0.2 : 0;
-      visionRing.material.color.setHex(0x44ffcc);
-
-      if (demon) {
-        const comPos=jointPositions[2]??new THREE.Vector3(0,1,0);
-        const tmpV=new THREE.Vector3().copy(comPos).sub(demon.position).normalize().multiplyScalar(0.018);
-        demon.userData.vel.lerp(tmpV,0.06);
-        demon.position.add(demon.userData.vel);
-        demon.position.y=Math.max(0.3,demon.position.y);
-        demon.rotation.y+=0.05; demon.rotation.x+=0.025;
-      }
+      visionRing.position.y=head.y-.05;
+      visionRing.rotation.x=-Math.PI/2+Math.sin(frame*.02)*.05;
+      visionRing.rotation.z=frame*.01;
+      visionRing.material.opacity=isVis?0.5+Math.sin(frame*.06)*.2:0.;
 
       renderer.render(scene,camera);
     }
@@ -561,17 +537,15 @@ export default function RKKHumanoid() {
     const el=renderer.domElement;
     el.style.cursor="grab"; el.style.touchAction="none";
     const onPD=e=>{if(e.button!==0)return;camDrag=true;camPtrX=e.clientX;camPtrY=e.clientY;el.setPointerCapture(e.pointerId);el.style.cursor="grabbing";};
-    const onPM=e=>{if(!camDrag)return;camAzim-=(e.clientX-camPtrX)*0.005;camElev-=(e.clientY-camPtrY)*0.005;camElev=Math.max(0.08,Math.min(Math.PI/2-0.06,camElev));camPtrX=e.clientX;camPtrY=e.clientY;};
+    const onPM=e=>{if(!camDrag)return;camAzim-=(e.clientX-camPtrX)*.005;camElev-=(e.clientY-camPtrY)*.005;camElev=Math.max(.08,Math.min(Math.PI/2-.06,camElev));camPtrX=e.clientX;camPtrY=e.clientY;};
     const onPU=e=>{camDrag=false;try{el.releasePointerCapture(e.pointerId);}catch{}el.style.cursor="grab";};
     const onW=e=>{e.preventDefault();camRadius=Math.max(2,Math.min(24,camRadius*(e.deltaY>0?1.1:1/1.1)));};
-    el.addEventListener("pointerdown",onPD);
-    el.addEventListener("pointermove",onPM);
-    el.addEventListener("pointerup",onPU);
-    el.addEventListener("pointercancel",onPU);
+    el.addEventListener("pointerdown",onPD);el.addEventListener("pointermove",onPM);
+    el.addEventListener("pointerup",onPU);el.addEventListener("pointercancel",onPU);
     el.addEventListener("wheel",onW,{passive:false});
     const onR=()=>{if(!mount)return;camera.aspect=mount.clientWidth/mount.clientHeight;camera.updateProjectionMatrix();renderer.setSize(mount.clientWidth,mount.clientHeight);};
     window.addEventListener("resize",onR);
-    return ()=>{
+    return()=>{
       cancelAnimationFrame(rafRef.current);
       el.removeEventListener("pointerdown",onPD);el.removeEventListener("pointermove",onPM);
       el.removeEventListener("pointerup",onPU);el.removeEventListener("pointercancel",onPU);
@@ -585,7 +559,9 @@ export default function RKKHumanoid() {
   const blkR=a.valueLayer?.block_rate??0;
   const fallen=ui.fallen||a.fallen;
   const isVis=ui.visualMode;
+  const isFR=fixedRoot;
   const visColor="#44ffcc";
+  const frColor="#ffcc44";
 
   return(
     <div style={{position:"relative",width:"100%",height:"100vh",background:"#030912",overflow:"hidden",...mono}}>
@@ -595,45 +571,37 @@ export default function RKKHumanoid() {
       {showCam&&camFrame&&(
         <div style={{position:"absolute",bottom:120,right:14,border:`1px solid ${wCol}55`,borderRadius:3,overflow:"hidden",width:280}}>
           <div style={{display:"flex",gap:4,padding:"3px 6px",background:"rgba(0,0,0,0.7)",fontSize:8}}>
-            <span style={{color:wCol,fontSize:7}}>вид из головы (FP)</span>
+            <span style={{color:wCol,fontSize:7}}>FP view</span>
+            {isFR&&<span style={{color:frColor,fontSize:7}}>📌 fixed</span>}
           </div>
           <img src={`data:image/jpeg;base64,${camFrame}`} style={{width:"100%",display:"block"}} alt="cam"/>
         </div>
       )}
 
-      {/* Status badge */}
+      {/* Status badges */}
       <div style={{position:"absolute",top:14,right:14,display:"flex",gap:6,alignItems:"center"}}>
-        {isVis&&<div style={{background:"rgba(0,40,30,0.9)",border:"1px solid #44ffcc",padding:"4px 10px",borderRadius:2,fontSize:9,color:"#44ffcc"}}>
-          👁 VISUAL CORTEX · {ui.vision?.n_slots||8} slots
+        {isFR&&<div style={{background:"rgba(40,30,0,0.9)",border:`1px solid ${frColor}`,padding:"4px 10px",borderRadius:2,fontSize:9,color:frColor}}>
+          📌 FIXED BASE · d={ui.gnnD}
         </div>}
-        {fixedRoot && (
-          <div style={{
-            background: "rgba(40,30,0,0.9)",
-            border: "1px solid #ffcc00",
-            padding: "4px 10px",
-            borderRadius: 2,
-            fontSize: 9,
-            color: "#ffcc00",
-          }}>
-            📌 FIXED BASE · d={ui.gnnD} · {ui.agent.edgeCount} edges
-          </div>
-        )}
+        {isVis&&<div style={{background:"rgba(0,40,30,0.9)",border:"1px solid #44ffcc",padding:"4px 10px",borderRadius:2,fontSize:9,color:"#44ffcc"}}>
+          👁 VISUAL · {ui.vision?.active_slots||0} active
+        </div>}
         <div style={{background:connected?"rgba(0,30,10,0.9)":"rgba(20,0,0,0.9)",border:`1px solid ${connected?"#00aa44":"#aa4400"}`,padding:"4px 10px",borderRadius:2,fontSize:9,color:connected?"#00ff88":"#ff8844"}}>
           {connected?"● ONLINE":"○ OFFLINE"} · d={ui.gnnD}
         </div>
       </div>
 
       {/* Header */}
-      <div style={{position:"absolute",top:14,left:"50%",transform:"translateX(-50%)",background:"rgba(2,6,16,0.92)",border:`1px solid ${isVis?visColor:wCol}44`,padding:"7px 22px",textAlign:"center",borderRadius:3,whiteSpace:"nowrap",boxShadow:`0 0 30px ${isVis?visColor:wCol}22`}}>
-        <div style={{color:fallen?"#ff4422":isVis?visColor:wCol,fontSize:12,fontWeight:"bold",letterSpacing:"0.18em"}}>
-          {fallen?"⚠ FALLEN — ":isVis?"👁 VISION — ":""}AGI NOVA · {isVis?"CAUSAL VISUAL CORTEX":"HUMANOID"} · d={ui.gnnD}
+      <div style={{position:"absolute",top:14,left:"50%",transform:"translateX(-50%)",background:"rgba(2,6,16,0.92)",border:`1px solid ${isFR?frColor:isVis?visColor:wCol}44`,padding:"7px 22px",textAlign:"center",borderRadius:3,whiteSpace:"nowrap",boxShadow:`0 0 30px ${isFR?frColor:isVis?visColor:wCol}22`}}>
+        <div style={{color:fallen?"#ff4422":isFR?frColor:isVis?visColor:wCol,fontSize:12,fontWeight:"bold",letterSpacing:"0.18em"}}>
+          {fallen?"⚠ FALLEN — ":isFR?"📌 FIXED BASE — ":isVis?"👁 VISION — ":""}AGI NOVA · d={ui.gnnD}
         </div>
         <div style={{color:"#1a3355",fontSize:10,marginTop:2,letterSpacing:"0.06em"}}>
           PHASE {ui.phase}/5 › {PHASE_NAMES[ui.phase]}
           &nbsp;│&nbsp;ENT:<span style={{color:ui.entropy<30?"#00ff99":"#8899bb"}}>{ui.entropy}%</span>
           &nbsp;│&nbsp;T:{ui.tick}
-          &nbsp;│&nbsp;<span style={{color:isVis?visColor:wCol}}>🌍 {ui.worldLabel||ui.currentWorld}</span>
-          {isVis&&<>&nbsp;│&nbsp;<span style={{color:visColor}}>🔬 {ui.vision?.active_slots??0}/{ui.vision?.n_slots??8} active</span></>}
+          &nbsp;│&nbsp;<span style={{color:isFR?frColor:isVis?visColor:wCol}}>🌍 {ui.worldLabel||ui.currentWorld}</span>
+          {isFR&&<>&nbsp;│&nbsp;<span style={{color:frColor}}>arms+spine+cubes</span></>}
           &nbsp;│&nbsp;<span style={{color:fallen?"#ff2244":"#335544"}}>{fallen?`💀×${ui.fallCount}`:"✓"}</span>
         </div>
       </div>
@@ -649,25 +617,17 @@ export default function RKKHumanoid() {
           <button key={w} onClick={()=>switchWorld(w)} style={{padding:"2px 7px",borderRadius:2,fontSize:9,cursor:"pointer",background:ui.currentWorld===w?"#0a0520":"transparent",border:`1px solid ${ui.currentWorld===w?c:"#111"}`,color:ui.currentWorld===w?c:"#334455"}}>{w}</button>
         ))}
         <span style={{color:"#0a1a2e"}}>│</span>
+        {/* Fixed root toggle */}
+        <button onClick={toggleFixedRoot} disabled={fixedRootLoading}
+          style={{padding:"2px 8px",borderRadius:2,fontSize:9,cursor:fixedRootLoading?"wait":"pointer",
+            background:isFR?"rgba(255,204,0,0.12)":"transparent",
+            border:`1px solid ${isFR?frColor:"#444"}`,
+            color:isFR?frColor:"#556677",fontWeight:isFR?"bold":"normal"}}>
+          {fixedRootLoading?"⏳":isFR?"📌 FIXED":"📌"}
+        </button>
         {[["💉","seeds"],["🌐","rag"],["👁","vision"]].map(([icon,panel])=>(
           <button key={panel} onClick={()=>setPanel(v=>v===panel?null:panel)} style={{padding:"2px 7px",borderRadius:2,fontSize:9,cursor:"pointer",background:activePanel===panel?"#180a30":"transparent",border:`1px solid ${activePanel===panel?(panel==="vision"?visColor:wCol):"#111"}`,color:activePanel===panel?(panel==="vision"?visColor:wCol):"#334455"}}>{icon}</button>
         ))}
-        <button
-          type="button"
-          onClick={toggleFixedRoot}
-          disabled={fixedRootLoading}
-          style={{
-            padding: "2px 7px",
-            borderRadius: 2,
-            fontSize: 9,
-            cursor: fixedRootLoading ? "wait" : "pointer",
-            background: fixedRoot ? "rgba(255,204,0,0.12)" : "transparent",
-            border: `1px solid ${fixedRoot ? "#ffcc00" : "#111"}`,
-            color: fixedRoot ? "#ffcc00" : "#334455",
-          }}
-        >
-          {fixedRootLoading ? "⏳" : fixedRoot ? "📌 FIXED" : "📌"}
-        </button>
         <button onClick={()=>setShowCam(v=>!v)} style={{padding:"2px 7px",borderRadius:2,fontSize:9,cursor:"pointer",background:showCam?"#0a0520":"transparent",border:`1px solid ${showCam?wCol:"#111"}`,color:showCam?wCol:"#334455"}}>📷</button>
       </div>
 
@@ -689,95 +649,55 @@ export default function RKKHumanoid() {
         <div style={{position:"absolute",top:118,left:"50%",transform:"translateX(-50%)",background:"rgba(0,4,10,0.97)",border:"1px solid #003322",padding:"12px 16px",borderRadius:3,width:380,zIndex:10}}>
           <div style={{color:"#00aa66",fontSize:10,marginBottom:6}}>🌐 LLM BOOTSTRAP</div>
           <button onClick={ragSeed} disabled={ragLoading} style={{width:"100%",padding:"5px",borderRadius:2,fontSize:9,cursor:"pointer",background:ragLoading?"#001a0a":"#002211",border:"1px solid #006633",color:ragLoading?"#225544":"#00ff88",marginBottom:6}}>
-            {ragLoading?"⏳ LLM генерирует…":"🌐 AUTO-SEED (Wikipedia + LLM)"}
+            {ragLoading?"⏳ LLM…":"🌐 AUTO-SEED (Wikipedia + LLM)"}
           </button>
-          <div style={{marginTop:4,fontSize:9,color:status.startsWith("✓")?"#00ff99":"#ff4422"}}>{status}</div>
+          <div style={{fontSize:9,color:status.startsWith("✓")?"#00ff99":"#ff4422"}}>{status}</div>
         </div>
       )}
 
-      {/* ═══════════════════════════════════════════════════════════════════ */}
-      {/* ФАЗА 12: VISUAL CORTEX PANEL                                       */}
-      {/* ═══════════════════════════════════════════════════════════════════ */}
+      {/* Vision panel */}
       {activePanel==="vision"&&(
         <div style={{position:"absolute",top:118,left:"50%",transform:"translateX(-50%)",background:"rgba(0,8,10,0.97)",border:`1px solid ${visColor}44`,padding:"12px 16px",borderRadius:3,width:520,zIndex:10,maxHeight:"70vh",overflowY:"auto"}}>
-          <div style={{color:visColor,fontSize:11,fontWeight:"bold",marginBottom:8,letterSpacing:"0.1em"}}>
-            👁 CAUSAL VISUAL CORTEX — Фаза 12
-          </div>
-
-          {/* Enable/Disable */}
+          <div style={{color:visColor,fontSize:11,fontWeight:"bold",marginBottom:8}}>👁 CAUSAL VISUAL CORTEX</div>
           <div style={{display:"flex",gap:8,marginBottom:10,alignItems:"center"}}>
             {!isVis?(
               <>
-                <button onClick={()=>enableVision(8)} disabled={visionLoading}
-                  style={{padding:"4px 12px",borderRadius:2,fontSize:9,cursor:"pointer",
-                    background:"#002218",border:`1px solid ${visColor}`,color:visColor}}>
-                  {visionLoading?"⏳ loading…":"👁 ENABLE (8 slots)"}
+                <button onClick={()=>enableVision(8)} disabled={visionLoading} style={{padding:"4px 12px",borderRadius:2,fontSize:9,cursor:"pointer",background:"#002218",border:`1px solid ${visColor}`,color:visColor}}>
+                  {visionLoading?"⏳…":"👁 ENABLE (8 slots)"}
                 </button>
-                <button onClick={()=>enableVision(12)} disabled={visionLoading}
-                  style={{padding:"4px 10px",borderRadius:2,fontSize:9,cursor:"pointer",
-                    background:"#001810",border:"1px solid #22cc88",color:"#22cc88"}}>
-                  12 slots
-                </button>
+                <button onClick={()=>enableVision(12)} disabled={visionLoading} style={{padding:"4px 10px",borderRadius:2,fontSize:9,cursor:"pointer",background:"#001810",border:"1px solid #22cc88",color:"#22cc88"}}>12 slots</button>
               </>
             ):(
-              <button onClick={disableVision}
-                style={{padding:"4px 12px",borderRadius:2,fontSize:9,cursor:"pointer",
-                  background:"#180010",border:"1px solid #ff4422",color:"#ff4422"}}>
-                ✕ DISABLE
-              </button>
+              <button onClick={disableVision} style={{padding:"4px 12px",borderRadius:2,fontSize:9,cursor:"pointer",background:"#180010",border:"1px solid #ff4422",color:"#ff4422"}}>✕ DISABLE</button>
             )}
-            <div style={{fontSize:8,color:"#224433",flexGrow:1}}>
-              {isVis?`visual mode · ${ui.visionTicks} ticks · d=${ui.gnnD}`:"ручные переменные"}
-            </div>
+            {isFR&&<div style={{fontSize:8,color:frColor}}>📌 fixed_root active — phys keys ограничены</div>}
           </div>
 
-          {isVis&&(
-            <div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center",marginBottom:10}}>
-              <button
-                type="button"
-                onClick={runVlmSlotLabels}
-                disabled={vlmLoading}
-                style={{
-                  padding: "4px 10px",
-                  borderRadius: 2,
-                  fontSize: 9,
-                  cursor: vlmLoading ? "wait" : "pointer",
-                  background: "#001828",
-                  border: `1px solid ${visColor}`,
-                  color: visColor,
-                }}
-              >
-                {vlmLoading ? "⏳ VLM…" : "🔬 VLM label slots (Фаза 2)"}
-              </button>
-              <label style={{ fontSize: 8, color: "#336655", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
-                <input
-                  type="checkbox"
-                  checked={vlmWeakEdges}
-                  onChange={(e) => setVlmWeakEdges(e.target.checked)}
-                />
-                weak slot→phys edges
-              </label>
-              <span style={{ fontSize: 7, color: "#224433" }}>
-                Ollama /api/chat + images; иначе текстовый fallback
-              </span>
-            </div>
-          )}
+          {isVis&&<div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center",marginBottom:10}}>
+            <button type="button" onClick={runVlmSlotLabels} disabled={vlmLoading}
+              style={{padding:"4px 10px",borderRadius:2,fontSize:9,cursor:vlmLoading?"wait":"pointer",
+                background:"#001828",border:`1px solid ${visColor}`,color:visColor}}>
+              {vlmLoading?"⏳ VLM…":"🔬 VLM label slots"}
+            </button>
+            <label style={{fontSize:8,color:"#336655",display:"flex",alignItems:"center",gap:4,cursor:"pointer"}}>
+              <input type="checkbox" checked={vlmWeakEdges} onChange={e=>setVlmWeakEdges(e.target.checked)}/>
+              weak edges
+            </label>
+          </div>}
 
           {isVis&&visionData&&(
             <>
-              {/* Slot Values & Variability */}
               <div style={{marginBottom:10}}>
                 <div style={{fontSize:9,color:"#336655",marginBottom:4}}>
-                  SLOT ACTIVATION — {visionData.active_slots??0}/{visionData.n_slots??8} active
+                  SLOTS — {visionData.active_slots??0}/{visionData.n_slots??8} active
                 </div>
                 <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:4}}>
                   {Array.from({length:visionData.n_slots??8},(_,k)=>{
-                    const val  = visionData.slot_values?.[k]??0;
-                    const varV = visionData.variability?.[k]??0;
-                    const active = varV > 0.02;
-                    const col = SLOT_COLORS[k%SLOT_COLORS.length];
-                    const sl = visionData.slot_labels?.[k];
-                    const lbl = sl?.label;
+                    const val=visionData.slot_values?.[k]??0;
+                    const varV=visionData.variability?.[k]??0;
+                    const active=varV>0.02;
+                    const col=SLOT_COLORS[k%SLOT_COLORS.length];
+                    const sl=visionData.slot_labels?.[k];
                     return(
                       <div key={k} onClick={()=>setSelectedSlot(k)}
                         style={{background:selectedSlot===k?"rgba(68,255,204,0.08)":"rgba(0,10,12,0.8)",
@@ -787,135 +707,74 @@ export default function RKKHumanoid() {
                           <span style={{color:col,fontSize:8,fontWeight:"bold"}}>S{k}</span>
                           <span style={{color:active?"#44ffcc":"#334444",fontSize:7}}>{active?"●":"○"}</span>
                         </div>
-                        {lbl ? (
-                          <div style={{ fontSize: 6, color: "#66bbaa", marginBottom: 2, lineHeight: 1.2, minHeight: 14 }} title={sl?.likely_phys?.join(", ") || ""}>
-                            {lbl}
-                            {typeof sl?.confidence === "number" ? ` · ${(sl.confidence * 100).toFixed(0)}%` : ""}
-                          </div>
-                        ) : (
-                          <div style={{ fontSize: 6, color: "#223333", marginBottom: 2, minHeight: 14 }}>—</div>
-                        )}
-                        {/* Value bar */}
+                        {sl?.label&&<div style={{fontSize:6,color:"#66bbaa",marginBottom:2,minHeight:14}}>{sl.label} {typeof sl.confidence==="number"?`${(sl.confidence*100).toFixed(0)}%`:""}</div>}
                         <div style={{height:3,background:"#0a1a1a",borderRadius:2,overflow:"hidden",marginBottom:2}}>
                           <div style={{width:`${val*100}%`,height:"100%",background:col,transition:"width 0.5s"}}/>
                         </div>
-                        {/* Variability */}
                         <div style={{height:2,background:"#050d0d",borderRadius:2,overflow:"hidden"}}>
                           <div style={{width:`${Math.min(varV*100*5,100)}%`,height:"100%",background:`${col}88`}}/>
                         </div>
                         <div style={{fontSize:6,color:"#225544",marginTop:1,display:"flex",justifyContent:"space-between"}}>
-                          <span>{val.toFixed(2)}</span>
-                          <span>σ={varV.toFixed(3)}</span>
+                          <span>{val.toFixed(2)}</span><span>σ={varV.toFixed(3)}</span>
                         </div>
                       </div>
                     );
                   })}
                 </div>
               </div>
-
-              {/* Attention frame для выбранного слота */}
-              <div style={{...sep,paddingTop:8}}>
-                <div style={{fontSize:9,color:"#336655",marginBottom:4,display:"flex",justifyContent:"space-between"}}>
-                  <span>ATTENTION MASK — <span style={{color:SLOT_COLORS[selectedSlot%8]}}>slot_{selectedSlot}</span>
-                    {visionData.slot_labels?.[selectedSlot]?.label ? (
-                      <span style={{ color: "#66bbaa", marginLeft: 6 }}>
-                        ({visionData.slot_labels[selectedSlot].label})
-                      </span>
-                    ) : null}
-                  </span>
-                  <span style={{color:"#224433",fontSize:8}}>что видит этот слот</span>
+              {attnFrame&&<div style={{...sep,paddingTop:8}}>
+                <div style={{fontSize:9,color:"#336655",marginBottom:4}}>
+                  MASK — <span style={{color:SLOT_COLORS[selectedSlot%8]}}>slot_{selectedSlot}</span>
+                  {visionData.slot_labels?.[selectedSlot]?.label&&
+                    <span style={{color:"#66bbaa",marginLeft:6}}>({visionData.slot_labels[selectedSlot].label})</span>}
                 </div>
-                {attnFrame?(
-                  <img src={`data:image/jpeg;base64,${attnFrame}`}
-                    style={{width:"100%",borderRadius:3,display:"block",border:`1px solid ${SLOT_COLORS[selectedSlot%8]}44`}}
-                    alt={`slot ${selectedSlot} attention`}/>
-                ):(
-                  <div style={{height:80,background:"#050d10",borderRadius:3,display:"flex",alignItems:"center",justifyContent:"center",color:"#224433",fontSize:9}}>
-                    {isVis?"loading…":"enable vision first"}
-                  </div>
-                )}
-                {/* Переключалки слотов */}
+                <img src={`data:image/jpeg;base64,${attnFrame}`}
+                  style={{width:"100%",borderRadius:3,border:`1px solid ${SLOT_COLORS[selectedSlot%8]}44`}}/>
                 <div style={{display:"flex",gap:3,marginTop:4,flexWrap:"wrap"}}>
                   {Array.from({length:visionData.n_slots??8},(_,k)=>(
                     <button key={k} onClick={()=>setSelectedSlot(k)}
                       style={{padding:"2px 6px",borderRadius:2,fontSize:8,cursor:"pointer",
                         background:selectedSlot===k?"rgba(0,20,15,0.9)":"transparent",
                         border:`1px solid ${selectedSlot===k?SLOT_COLORS[k%8]:"#0a1a1a"}`,
-                        color:selectedSlot===k?SLOT_COLORS[k%8]:"#334444"}}>
-                      S{k}
-                    </button>
+                        color:selectedSlot===k?SLOT_COLORS[k%8]:"#334444"}}>S{k}</button>
                   ))}
-                </div>
-              </div>
-
-              {/* Cortex stats */}
-              {visionData.cortex&&<div style={{...sep,paddingTop:6}}>
-                <div style={{fontSize:8,color:"#224433",display:"flex",gap:10}}>
-                  <span>encodes: <span style={{color:"#44ffcc"}}>{visionData.cortex.n_encode}</span></span>
-                  <span>trains: <span style={{color:"#44ffcc"}}>{visionData.cortex.n_train}</span></span>
-                  <span>loss: <span style={{color:visionData.cortex.mean_loss<0.05?"#00ff99":"#ffaa00"}}>{visionData.cortex.mean_loss?.toFixed(5)}</span></span>
                 </div>
               </div>}
             </>
           )}
-
-          {isVis&&!visionData&&(
-            <div style={{color:"#224433",fontSize:9,marginTop:8,padding:"10px",background:"rgba(0,10,8,0.6)",borderRadius:3}}>
-              ⏳ Загрузка данных visual cortex…
-            </div>
-          )}
-
-          {/* Установка зависимостей */}
-          <div style={{...sep,paddingTop:6}}>
-            <div style={{fontSize:7,color:"#1a3322"}}>
-              Требования Фазы 12: <code style={{color:"#336644",fontSize:7}}>pip install opencv-python scipy Pillow</code>
-            </div>
-          </div>
         </div>
       )}
 
       {/* Left HUD */}
       <div style={{position:"absolute",top:118,left:14}}>
-        <div style={{background:"rgba(2,5,14,0.92)",border:`1px solid ${fallen?"#660011":isVis?visColor+"33":wCol+"33"}`,borderLeft:`3px solid ${fallen?"#ff2244":isVis?visColor:wCol}`,padding:"10px 14px",minWidth:235,borderRadius:3,transition:"border-color 0.5s"}}>
-          <div style={{color:fallen?"#ff4422":isVis?visColor:wCol,fontSize:11,fontWeight:"bold",marginBottom:5,letterSpacing:"0.08em"}}>
-            {fallen?"💀":isVis?"👁":"◈"} NOVA — {isVis?"Visual AGI":"Singleton AGI"}
-            <span style={{color:"#1a2244",marginLeft:6,fontSize:8}}>GNN·{ui.currentWorld}</span>
+        <div style={{background:"rgba(2,5,14,0.92)",border:`1px solid ${fallen?"#660011":isFR?frColor+"33":isVis?visColor+"33":wCol+"33"}`,borderLeft:`3px solid ${fallen?"#ff2244":isFR?frColor:isVis?visColor:wCol}`,padding:"10px 14px",minWidth:235,borderRadius:3}}>
+          <div style={{color:fallen?"#ff4422":isFR?frColor:isVis?visColor:wCol,fontSize:11,fontWeight:"bold",marginBottom:5}}>
+            {fallen?"💀":isFR?"📌":isVis?"👁":"◈"} NOVA {isFR?"Fixed Base":isVis?"Visual":"Singleton"}
+            <span style={{color:"#1a2244",marginLeft:6,fontSize:8}}>d={ui.gnnD}</span>
           </div>
 
           {fallen&&<div style={{background:"rgba(255,0,34,0.08)",border:"1px solid #ff224433",borderRadius:2,padding:"3px 7px",marginBottom:4,fontSize:8,color:"#ff4422"}}>
             ⚠ FALLEN × {ui.fallCount}
           </div>}
 
-          {isVis&&<div style={{background:"rgba(0,255,200,0.05)",border:"1px solid #44ffcc33",borderRadius:2,padding:"3px 7px",marginBottom:4,fontSize:8,color:"#44ffcc"}}>
-            👁 visual cortex · {ui.vision?.active_slots??0} slots active · {ui.visionTicks} ticks
+          {isFR&&<div style={{background:"rgba(255,204,0,0.06)",border:"1px solid #ffcc0033",borderRadius:2,padding:"3px 7px",marginBottom:4,fontSize:8,color:frColor}}>
+            📌 FIXED BASE · arm+spine+cubes · no falling
           </div>}
 
-          {fixedRoot && (
-            <div style={{
-              background: "rgba(255,204,0,0.06)",
-              border: "1px solid #ffcc0033",
-              borderRadius: 2,
-              padding: "3px 7px",
-              marginBottom: 4,
-              fontSize: 8,
-              color: "#ffcc00",
-            }}>
-              📌 FIXED BASE MODE
-              <span style={{ color: "#665500", marginLeft: 4 }}>
-                d={ui.gnnD} · arms+spine+cubes
-              </span>
-            </div>
-          )}
+          {isVis&&!isFR&&<div style={{background:"rgba(0,255,200,0.05)",border:"1px solid #44ffcc33",borderRadius:2,padding:"3px 7px",marginBottom:4,fontSize:8,color:"#44ffcc"}}>
+            👁 visual cortex · {ui.vision?.active_slots??0} active · {ui.visionTicks} ticks
+          </div>}
 
           <table style={{borderCollapse:"collapse",width:"100%",fontSize:9}}><tbody>
             {[
               ["Φ autonomy",  <span style={{color:phiC(a.phi??0)}}>{((a.phi??0)*100).toFixed(1)}%</span>],
-              ["CG d|G|/dt",  <span style={{color:cgC(a.compressionGain??0)}}>{(a.compressionGain??0)>=0?"+":""}{(a.compressionGain??0).toFixed(4)}</span>],
+              ["CG d|G|/dt",  <span style={{color:cgC(a.compressionGain??0)}}>{a.compressionGain>=0?"+":""}{(a.compressionGain??0).toFixed(4)}</span>],
               ["α trust",    `${Math.round((a.alphaMean??0)*100)}%`],
               ["h(W) DAG",   <span style={{color:hWC(a.hW??0)}}>{(a.hW??0).toFixed(4)}</span>],
-              ["GNN d",      <span style={{color:isVis?visColor:wCol}}>{ui.gnnD}</span>],
+              ["GNN d",      <span style={{color:isFR?frColor:isVis?visColor:wCol}}>{ui.gnnD}</span>],
               ["Edges",      a.edgeCount??0],
               ["do()/blk",   `${a.totalInterventions??0}/${a.totalBlocked??0}`],
+              ["block%",     <span style={{color:blkC(blkR)}}>{(blkR*100).toFixed(1)}%</span>],
               ["Discovery",  <span style={{color:(a.discoveryRate??0)>0.2?"#00ff99":"#aabbcc"}}>{((a.discoveryRate??0)*100).toFixed(0)}%</span>],
             ].map(([l,v],k)=>(
               <tr key={k}><td style={{color:"#2a4466",paddingRight:8,paddingBottom:2}}>{l}</td><td style={{color:"#aabbcc",textAlign:"right"}}>{v}</td></tr>
@@ -924,34 +783,35 @@ export default function RKKHumanoid() {
 
           {a.valueLayer&&<div style={{...sep,fontSize:8}}>
             <div style={{display:"flex",justifyContent:"space-between"}}>
-              <span style={{color:"#441133"}}>VALUE LAYER {a.valueLayer.vl_phase}</span>
+              <span style={{color:"#441133"}}>VL · {a.valueLayer.vl_phase}{a.valueLayer.fixed_root_mode?" · 📌fixed":""}</span>
               <span style={{color:blkC(blkR)}}>{(blkR*100).toFixed(1)}%</span>
             </div>
-            {(a.valueLayer.imagination_horizon??0)>0&&<div style={{color:"#553366",marginTop:3,fontSize:7}}>
-              imagination N={a.valueLayer.imagination_horizon} · checks {a.valueLayer.imagination_checks??0} · blk {a.valueLayer.imagination_blocks??0}
-            </div>}
           </div>}
-
-          {[
-            {w:`${Math.round((a.alphaMean??0)*100)}%`,f:"#110022",t:wCol},
-            {w:`${Math.round((a.phi??0)*100)}%`,f:"#220011",t:phiC(a.phi??0)},
-            {w:`${Math.max(0,100-Math.min((a.hW??0)*20,100))}%`,f:"#001811",t:hWC(a.hW??0)},
-          ].map((b,k)=>(
-            <div key={k} style={{marginTop:k===0?5:2,height:k===0?3:2,background:"#050a18",borderRadius:2,overflow:"hidden"}}>
-              <div style={{width:b.w,height:"100%",background:`linear-gradient(90deg,${b.f},${b.t})`,transition:"width 0.8s"}}/>
-            </div>
-          ))}
         </div>
       </div>
 
-      {/* Right panel */}
+      {/* Right HUD */}
       <div style={{position:"absolute",top:118,right:14,background:"rgba(2,5,14,0.92)",border:"1px solid #0a1a2e",padding:"10px 14px",borderRadius:3,fontSize:9,maxWidth:200}}>
-        <div style={{color:"#1a3355",marginBottom:6,fontSize:9}}>AGI NOVA — PHASE 12</div>
+        <div style={{color:"#1a3355",marginBottom:6,fontSize:9}}>NOVA · CURRICULUM</div>
 
         <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",color:"#556688",fontSize:8,marginBottom:4}}>
           <input type="checkbox" checked={showCubes} onChange={e=>setShowCubes(e.target.checked)} style={{accentColor:wCol}}/>
-          показать кубы
+          show objects
         </label>
+
+        <div style={{...sep,marginBottom:6}}>
+          <div style={{fontSize:8,color:"#333344",marginBottom:4}}>CURRICULUM PATH:</div>
+          <div style={{fontSize:8,color:isFR?frColor:"#445566",fontWeight:isFR?"bold":"normal",marginBottom:2}}>
+            {isFR?"● ":"→ "}Step 1: Fixed Base (arms only)
+            {isFR&&<span style={{color:"#665500"}}> · active</span>}
+          </div>
+          <div style={{fontSize:8,color:!isFR&&ui.currentWorld==="humanoid"?"#00cc88":"#224433",marginBottom:2}}>
+            → Step 2: Balance assist
+          </div>
+          <div style={{fontSize:8,color:"#224433",marginBottom:2}}>
+            → Step 3: Free locomotion
+          </div>
+        </div>
 
         <div style={{...sep}}>
           {Object.entries(WORLD_COLORS).map(([w,c])=>(
@@ -961,29 +821,8 @@ export default function RKKHumanoid() {
           ))}
         </div>
 
-        <div style={{...sep,lineHeight:1.9}}>
-          <div style={{color:"#1a2244",fontSize:8}}>ROADMAP:</div>
-          <div style={{color:"#224433",fontSize:8}}>✓ 11. Humanoid Singleton</div>
-          <div style={{
-            color: fixedRoot ? "#ffcc00" : "#224433",
-            fontSize: 8,
-            fontWeight: fixedRoot ? "bold" : "normal",
-          }}>
-            {fixedRoot ? "● " : "→ "}Fixed Base (curriculum step 1)
-            {fixedRoot ? ` · d=${ui.gnnD}` : ""}
-          </div>
-          <div style={{color:isVis?visColor:"#00cc88",fontSize:8,fontWeight:isVis?"bold":"normal"}}>
-            {isVis?"● ":"→ "}12. Causal Vision{isVis?` · ${ui.visionTicks}t`:""}
-          </div>
-          <div style={{color:(a.valueLayer?.imagination_horizon??0)>0?"#00cc88":"#224433",fontSize:8,fontWeight:(a.valueLayer?.imagination_horizon??0)>0?"bold":"normal"}}>
-            {(a.valueLayer?.imagination_horizon??0)>0?"● ":"→ "}13. N-step Imagination{(a.valueLayer?.imagination_horizon??0)>0?` · N=${a.valueLayer.imagination_horizon}`:""}
-          </div>
-          <div style={{color:"#224433",fontSize:8}}>→ 14. Cross-Domain</div>
-          <div style={{color:"#224433",fontSize:8}}>→ 15. Reality Bridge</div>
-        </div>
-
         {isVis&&ui.vision&&<div style={{...sep}}>
-          <div style={{fontSize:8,color:visColor,marginBottom:3}}>👁 VISION STATS</div>
+          <div style={{fontSize:8,color:visColor,marginBottom:3}}>SLOTS</div>
           {(ui.vision.variability||[]).map((v,k)=>(
             <div key={k} style={{display:"flex",gap:4,alignItems:"center",marginBottom:2}}>
               <span style={{color:SLOT_COLORS[k%8],fontSize:7,width:16}}>S{k}</span>
@@ -994,15 +833,21 @@ export default function RKKHumanoid() {
             </div>
           ))}
         </div>}
+
+        {status&&<div style={{...sep,fontSize:8,color:status.startsWith("✓")?"#00ff99":"#ff4422",wordBreak:"break-all"}}>
+          {status}
+        </div>}
       </div>
 
       {/* Event log */}
       <div style={{position:"absolute",bottom:14,left:14,right:14,background:"rgba(2,5,14,0.92)",border:"1px solid #0a1a2e",padding:"8px 14px",borderRadius:3,maxHeight:100,overflow:"hidden"}}>
         <div style={{color:"#0a1a2e",fontSize:9,letterSpacing:"0.1em",marginBottom:4}}>
-          CAUSAL EVENT STREAM {connected?"● ONLINE":"○ OFFLINE"} {isVis?"· 👁 VISUAL MODE":""}
+          CAUSAL STREAM {connected?"● ONLINE":"○ OFFLINE"}
+          {isFR&&<span style={{color:frColor}}> · 📌 FIXED BASE</span>}
+          {isVis&&<span style={{color:visColor}}> · 👁 VISUAL</span>}
         </div>
         {ui.events.map((ev,i)=>(
-          <div key={i} style={{color:ev.color??"#334455",fontSize:9,marginBottom:2,opacity:Math.max(0.15,1-i*0.12)}}>
+          <div key={i} style={{color:ev.color??"#334455",fontSize:9,marginBottom:2,opacity:Math.max(0.15,1-i*.12)}}>
             [{String(ev.tick??0).padStart(5,"0")}] › {ev.text}
           </div>
         ))}

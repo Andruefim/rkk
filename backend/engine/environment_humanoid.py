@@ -8,7 +8,7 @@ environment_humanoid.py — Humanoid Robot Sandbox (Фаза 11 + fixed_root).
   - GNN учит только arms→cubes, spine/neck pose
   - EnvironmentHumanoid.set_fixed_root(bool) — переключение в runtime
 
-FIXED_BASE_VARS = ARM_VARS(4) + SPINE_VARS(2) + HEAD_VARS(2) + CUBE_VARS(9) = 17
+FIXED_BASE_VARS = ARM + SPINE + HEAD + CUBE_VARS + SANDBOX_VARS (фикс. база + песочница)
 """
 from __future__ import annotations
 
@@ -41,12 +41,16 @@ LEG_VARS    = ["lhip", "lknee", "lankle", "rhip", "rknee", "rankle"]
 ARM_VARS    = ["lshoulder", "lelbow", "rshoulder", "relbow"]
 FOOT_VARS   = ["lfoot_z", "rfoot_z"]
 CUBE_VARS   = [f"cube{i}_{d}" for i in range(3) for d in ["x","y","z"]]
-VAR_NAMES   = TORSO_VARS + SPINE_VARS + HEAD_VARS + LEG_VARS + ARM_VARS + FOOT_VARS + CUBE_VARS
+# Песочница: мяч, рычаг (проксимити), расстояние до зоны доставки — обогащают каузальный граф.
+SANDBOX_VARS = ["ball_x", "ball_y", "ball_z", "lever_pin", "target_dist"]
+VAR_NAMES   = (
+    TORSO_VARS + SPINE_VARS + HEAD_VARS + LEG_VARS + ARM_VARS + FOOT_VARS
+    + CUBE_VARS + SANDBOX_VARS
+)
 
 # Fixed-base mode: таз зафиксирован в воздухе, баланс исключён.
-# Агент учит только: arms → cubes, spine/neck pose.
-# d = 4 + 2 + 2 + 9 = 17 (против 26 в полном режиме).
-FIXED_BASE_VARS: list[str] = ARM_VARS + SPINE_VARS + HEAD_VARS + CUBE_VARS
+# Агент учит arms/spine/neck → кубы + сигналы песочницы (мяч, рычаг, цель).
+FIXED_BASE_VARS: list[str] = ARM_VARS + SPINE_VARS + HEAD_VARS + CUBE_VARS + SANDBOX_VARS
 
 # Нормализация диапазонов
 _RANGES = {}
@@ -62,6 +66,11 @@ for v in FOOT_VARS:        _RANGES[v] = (-0.1, 0.5)
 for v in CUBE_VARS:
     if v.endswith("_z"):   _RANGES[v] = (-0.1, 1.0)
     else:                  _RANGES[v] = (-2.0, 2.0)
+for v in ("ball_x", "ball_y"):
+    _RANGES[v] = (-2.5, 2.5)
+_RANGES["ball_z"]       = (0.0, 2.0)
+_RANGES["lever_pin"]    = (0.0, 1.0)
+_RANGES["target_dist"]  = (0.0, 4.0)
 
 FALLEN_Z     = 0.25
 STAND_Z      = 0.85
@@ -215,6 +224,9 @@ class _FallbackHumanoid:
             [-0.5,  0.6, 0.15],
             [ 0.2, -0.7, 0.25],
         ])
+        self.ball = np.array([0.5, -0.35, 0.12], dtype=np.float64)
+        self._lever_center = np.array([-1.0, 0.5, 0.1], dtype=np.float64)
+        self._target_pad = np.array([1.85, -0.75, 0.02], dtype=np.float64)
         self._vel   = np.zeros(3)
         self._dt    = 0.02
 
@@ -271,10 +283,41 @@ class _FallbackHumanoid:
             s[f"cube{i}_x"] = float(cube[0])
             s[f"cube{i}_y"] = float(cube[1])
             s[f"cube{i}_z"] = float(cube[2])
+        s["ball_x"] = float(self.ball[0])
+        s["ball_y"] = float(self.ball[1])
+        s["ball_z"] = float(self.ball[2])
+        pts = [self.ball] + [self.cubes[i] for i in range(len(self.cubes))]
+        d_lv = min(float(np.linalg.norm(p[:2] - self._lever_center[:2])) for p in pts)
+        s["lever_pin"] = float(np.clip(1.0 - d_lv / 0.35, 0.0, 1.0))
+        d_tg = min(
+            float(np.linalg.norm(self.cubes[i][:2] - self._target_pad[:2]))
+            for i in range(len(self.cubes))
+        )
+        s["target_dist"] = float(d_tg)
         return s
 
     def get_cube_positions(self) -> list[dict]:
         return [{"x":float(c[0]),"y":float(c[1]),"z":float(c[2])} for c in self.cubes]
+
+    def get_sandbox_scene_extras(self) -> dict:
+        pts = [self.ball] + [self.cubes[i].copy() for i in range(len(self.cubes))]
+        d_lv = min(float(np.linalg.norm(p[:2] - self._lever_center[:2])) for p in pts)
+        lp = float(np.clip(1.0 - d_lv / 0.35, 0.0, 1.0))
+        return {
+            "ball": {"x": float(self.ball[0]), "y": float(self.ball[1]), "z": float(self.ball[2])},
+            "lever": {
+                "x": float(self._lever_center[0]),
+                "y": float(self._lever_center[1]),
+                "z": float(self._lever_center[2]),
+                "pressed": lp > 0.75,
+                "pin": round(lp, 3),
+            },
+            "delivery_target": {
+                "x": float(self._target_pad[0]),
+                "y": float(self._target_pad[1]),
+                "z": float(self._target_pad[2]),
+            },
+        }
 
     def get_frame_base64(self, view="side", **kwargs) -> str | None:
         return None
@@ -290,6 +333,7 @@ class _FallbackHumanoid:
         self.com = np.array([0.0, 0.0, STAND_Z], dtype=np.float64)
         self.torso_euler = np.zeros(3)
         self._vel = np.zeros(3)
+        self.ball = np.array([0.5, -0.35, 0.12], dtype=np.float64)
 
     # fixed_root controls для fallback — только флаг
     def enable_fixed_root(self) -> None:
@@ -330,7 +374,7 @@ class _PyBulletHumanoid:
         cube_configs = [
             {"pos": [1.0,  0.3, 0.15], "size": 0.12, "mass": 2.0,  "color": [1.0, 0.4, 0.1, 1]},
             {"pos": [-0.6, 0.8, 0.12], "size": 0.10, "mass": 0.5,  "color": [0.2, 0.7, 1.0, 1]},
-            {"pos": [0.3, -0.9, 0.20], "size": 0.16, "mass": 5.0,  "color": [0.3, 1.0, 0.4, 1]},
+            {"pos": [0.3, -0.9, 0.20], "size": 0.16, "mass": 6.0,  "color": [0.25, 0.85, 0.35, 1]},
         ]
         for cfg in cube_configs:
             hs = cfg["size"] / 2
@@ -346,6 +390,32 @@ class _PyBulletHumanoid:
             )
             pb.changeDynamics(b, -1, lateralFriction=0.5, physicsClientId=self.client)
             self.cube_ids.append(b)
+
+        # Песочница: рычаг (зона проксимити), цель доставки, лёгкий мяч
+        self.lever_center = np.array([-1.05, 0.55, 0.10], dtype=np.float64)
+        self.target_pad = np.array([1.85, -0.72, 0.02], dtype=np.float64)
+        self.lever_trigger_r = 0.26
+        self._ball_start = [0.55, -0.45, 0.11]
+        br = 0.09
+        col_ball = pb.createCollisionShape(pb.GEOM_SPHERE, radius=br, physicsClientId=self.client)
+        vis_ball = pb.createVisualShape(
+            pb.GEOM_SPHERE, radius=br,
+            rgbaColor=[0.95, 0.92, 0.35, 1.0], physicsClientId=self.client,
+        )
+        self.ball_id = pb.createMultiBody(
+            baseMass=0.14,
+            baseCollisionShapeIndex=col_ball,
+            baseVisualShapeIndex=vis_ball,
+            basePosition=self._ball_start,
+            physicsClientId=self.client,
+        )
+        pb.changeDynamics(
+            self.ball_id, -1, restitution=0.55, lateralFriction=0.35,
+            rollingFriction=0.02, physicsClientId=self.client,
+        )
+        self._build_low_incline()
+        self._build_lever_pedestal()
+        self._build_target_marker()
 
         self.robot_id = self._load_humanoid()
         self.n_joints = pb.getNumJoints(self.robot_id, physicsClientId=self.client)
@@ -448,6 +518,53 @@ class _PyBulletHumanoid:
             baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
             basePosition=[2.0, 0, 0.3*math.sin(angle) + 0.03],
             baseOrientation=orn, physicsClientId=self.client
+        )
+
+    def _build_low_incline(self) -> None:
+        """Второй пологий наклон — другое направление, больше контактов / скольжения."""
+        import math
+        ang = math.radians(10)
+        half = [0.55, 0.4, 0.028]
+        col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half, physicsClientId=self.client)
+        vis = pb.createVisualShape(
+            pb.GEOM_BOX, halfExtents=half,
+            rgbaColor=[0.32, 0.38, 0.42, 1.0], physicsClientId=self.client,
+        )
+        orn = pb.getQuaternionFromEuler([0, 0, ang])
+        pb.createMultiBody(
+            baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+            basePosition=[-1.35, -0.95, 0.22 * math.sin(ang) + 0.03],
+            baseOrientation=orn, physicsClientId=self.client,
+        )
+
+    def _build_lever_pedestal(self) -> None:
+        """Визуальный «рычаг» / кнопка — каузальность через lever_pin (проксимити объектов)."""
+        half = [0.07, 0.07, 0.055]
+        col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half, physicsClientId=self.client)
+        vis = pb.createVisualShape(
+            pb.GEOM_BOX, halfExtents=half,
+            rgbaColor=[0.88, 0.62, 0.15, 1.0], physicsClientId=self.client,
+        )
+        lc = self.lever_center
+        pb.createMultiBody(
+            baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+            basePosition=[float(lc[0]), float(lc[1]), float(lc[2])],
+            physicsClientId=self.client,
+        )
+
+    def _build_target_marker(self) -> None:
+        """Плоская мишень — зона доставки куба (target_dist в observe)."""
+        half = [0.22, 0.22, 0.012]
+        col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half, physicsClientId=self.client)
+        vis = pb.createVisualShape(
+            pb.GEOM_BOX, halfExtents=half,
+            rgbaColor=[0.15, 0.85, 0.55, 0.85], physicsClientId=self.client,
+        )
+        tp = self.target_pad
+        pb.createMultiBody(
+            baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+            basePosition=[float(tp[0]), float(tp[1]), float(tp[2])],
+            physicsClientId=self.client,
         )
 
     def _load_humanoid(self) -> int:
@@ -678,6 +795,17 @@ class _PyBulletHumanoid:
         if had_fixed:
             self.enable_fixed_root()
 
+        if getattr(self, "ball_id", None) is not None:
+            pb.resetBasePositionAndOrientation(
+                self.ball_id,
+                self._ball_start,
+                [0, 0, 0, 1],
+                physicsClientId=cid,
+            )
+            pb.resetBaseVelocity(
+                self.ball_id, [0, 0, 0], [0, 0, 0], physicsClientId=cid,
+            )
+
     def set_joint(self, var_name: str, target_pos: float):
         if var_name not in self.joint_by_var:
             return
@@ -800,6 +928,34 @@ class _PyBulletHumanoid:
             positions.append(np.array(pos))
         return positions
 
+    def _sandbox_dynamic_positions(self) -> list[np.ndarray]:
+        out: list[np.ndarray] = []
+        if getattr(self, "ball_id", None) is not None:
+            pos, _ = pb.getBasePositionAndOrientation(self.ball_id, physicsClientId=self.client)
+            out.append(np.array(pos, dtype=np.float64))
+        for cid in self.cube_ids:
+            pos, _ = pb.getBasePositionAndOrientation(cid, physicsClientId=self.client)
+            out.append(np.array(pos, dtype=np.float64))
+        return out
+
+    def _compute_lever_pin(self) -> float:
+        pts = self._sandbox_dynamic_positions()
+        if not pts:
+            return 0.0
+        lc = self.lever_center[:2]
+        d = min(float(np.linalg.norm(p[:2] - lc)) for p in pts)
+        return float(np.clip(1.0 - d / max(self.lever_trigger_r * 1.55, 1e-6), 0.0, 1.0))
+
+    def _compute_target_dist(self) -> float:
+        if not self.cube_ids:
+            return 2.5
+        tg = self.target_pad[:2]
+        best = 1e9
+        for cid in self.cube_ids:
+            pos, _ = pb.getBasePositionAndOrientation(cid, physicsClientId=self.client)
+            best = min(best, float(np.linalg.norm(np.array(pos[:2]) - tg)))
+        return float(best)
+
     def get_state(self) -> dict:
         com, euler = self.get_com()
         lf, rf = self.get_foot_heights()
@@ -819,6 +975,16 @@ class _PyBulletHumanoid:
             s[f"cube{i}_x"] = float(cp[0])
             s[f"cube{i}_y"] = float(cp[1])
             s[f"cube{i}_z"] = float(cp[2])
+        if getattr(self, "ball_id", None) is not None:
+            bp, _ = pb.getBasePositionAndOrientation(self.ball_id, physicsClientId=self.client)
+            s["ball_x"] = float(bp[0])
+            s["ball_y"] = float(bp[1])
+            s["ball_z"] = float(bp[2])
+        else:
+            s["ball_x"] = s["ball_y"] = 0.0
+            s["ball_z"] = 0.12
+        s["lever_pin"] = self._compute_lever_pin()
+        s["target_dist"] = self._compute_target_dist()
         return s
 
     def _named_link_world_positions(self) -> dict[str, np.ndarray]:
@@ -912,6 +1078,28 @@ class _PyBulletHumanoid:
             pos, _ = pb.getBasePositionAndOrientation(cid, physicsClientId=self.client)
             result.append({"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])})
         return result
+
+    def get_sandbox_scene_extras(self) -> dict:
+        ball = {"x": 0.0, "y": 0.0, "z": 0.12}
+        if getattr(self, "ball_id", None) is not None:
+            p, _ = pb.getBasePositionAndOrientation(self.ball_id, physicsClientId=self.client)
+            ball = {"x": float(p[0]), "y": float(p[1]), "z": float(p[2])}
+        lp = self._compute_lever_pin()
+        return {
+            "ball": ball,
+            "lever": {
+                "x": float(self.lever_center[0]),
+                "y": float(self.lever_center[1]),
+                "z": float(self.lever_center[2]),
+                "pressed": lp > 0.75,
+                "pin": round(lp, 3),
+            },
+            "delivery_target": {
+                "x": float(self.target_pad[0]),
+                "y": float(self.target_pad[1]),
+                "z": float(self.target_pad[2]),
+            },
+        }
 
     def _link_world_pos(self, link_name: str) -> np.ndarray | None:
         if link_name not in self.link_names:
@@ -1187,7 +1375,7 @@ class EnvironmentHumanoid:
         return {"x": 0.0, "y": 0.0, "z": STAND_Z}
 
     def get_full_scene(self) -> dict:
-        return {
+        scene = {
             "skeleton":   self.get_joint_positions_world(),
             "ankleQuats": self._sim.get_ankle_quaternions_three_js(),
             "cubes":      self.get_cube_positions(),
@@ -1196,6 +1384,10 @@ class EnvironmentHumanoid:
             "com_z":      self.observe().get("com_z", 0.5) if not self._fixed_root else 0.75,
             "fixed_root": self._fixed_root,
         }
+        fn = getattr(self._sim, "get_sandbox_scene_extras", None)
+        if callable(fn):
+            scene.update(fn())
+        return scene
 
 
 # ─── Seeds ────────────────────────────────────────────────────────────────────

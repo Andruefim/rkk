@@ -248,6 +248,7 @@ def health():
         "current_world": sim.current_world,
         "gnn_d":         sim.agent.graph._d,
         "fallen":        sim._fall_count,
+        "fall_count":    sim._fall_count,
         "visual_mode":   sim._visual_mode,
         "fixed_root":    sim._fixed_root_active,
     }
@@ -284,7 +285,12 @@ def full_scene():
             "target":   getattr(sim.agent.env, "get_target", lambda:{"x":0,"y":0,"z":0.9})(),
             "fallen":   sim._fall_count > 0,
         }
-    return scene
+    if not isinstance(scene, dict):
+        return scene
+    out = dict(scene)
+    out["lever"] = scene.get("lever", {"x": 0.5, "y": 0.45, "z": 0.05})
+    out["fixed_root"] = sim._fixed_root_active
+    return out
 
 
 # ── World switching ───────────────────────────────────────────────────────────
@@ -591,16 +597,17 @@ def vision_attn_frame(slot_idx: int = Query(default=0)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FIXED ROOT ENDPOINTS
+# FIXED ROOT / CURRICULUM ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 @app.post("/fixed-root/enable")
 async def fixed_root_enable():
     """
-    Фиксируем базу гуманоида в PyBullet (JOINT_FIXED constraint).
-    variable_ids → FIXED_BASE_VARS (17 vars, d=17).
-    Value Layer → for_fixed_root() (мягкие лимиты, короткий warmup).
+    Фиксируем базу гуманоида (curriculum step 1).
+    variable_ids → FIXED_BASE_VARS (18 vars), GNN d уменьшается.
+    Value Layer → for_fixed_root() (warmup=300, entropy_limit=2.0).
+    Работает поверх visual mode.
     """
     return get_sim().enable_fixed_root()
 
@@ -608,24 +615,26 @@ async def fixed_root_enable():
 @app.post("/fixed-root/disable")
 async def fixed_root_disable():
     """
-    Снимаем фиксацию. Переходим к полным VAR_NAMES (26 vars, d=26).
-    Value Layer → стандартный HomeostaticBounds с warmup=1500.
+    Снимаем фиксацию (curriculum step 2: переход к ходьбе).
+    variable_ids → VAR_NAMES (31 var), Value Layer → default с warmup.
     """
     return get_sim().disable_fixed_root()
 
 
 @app.get("/fixed-root/status")
 def fixed_root_status():
-    """Текущий статус fixed_root mode."""
+    """Статус fixed_root mode и текущего Value Layer."""
     sim = get_sim()
-    env = sim.agent.env
-    base_env = getattr(sim, "_base_env_ref", None) or env
+    vl = sim.agent.value_layer
     return {
-        "fixed_root":   sim._fixed_root_active,
-        "gnn_d":        sim.agent.graph._d,
-        "var_count":    len(sim.agent.graph.nodes),
-        "block_rate":   round(sim.agent.value_layer.block_rate, 3),
-        "vl_mode":      "fixed_root" if sim._fixed_root_active else "full",
+        "fixed_root":           sim._fixed_root_active,
+        "gnn_d":                sim.agent.graph._d,
+        "var_count":            len(sim.agent.graph.nodes),
+        "block_rate":           round(vl.block_rate, 3),
+        "vl_mode":              "fixed_root" if sim._fixed_root_active else "full",
+        "vl_fixed_root_bounds": sim._fixed_root_active,
+        "total_checked":        vl.total_checked,
+        "total_blocked":        vl.total_blocked,
     }
 
 
@@ -673,9 +682,11 @@ async def causal_stream(websocket: WebSocket):
                 elif cmd == "vision_disable":
                     sim.disable_visual()
                 elif cmd == "fixed_root_enable":
-                    sim.enable_fixed_root()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, sim.enable_fixed_root)
                 elif cmd == "fixed_root_disable":
-                    sim.disable_fixed_root()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, sim.disable_fixed_root)
             except asyncio.TimeoutError:
                 pass
             except Exception:

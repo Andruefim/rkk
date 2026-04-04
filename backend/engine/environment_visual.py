@@ -360,6 +360,19 @@ class EnvironmentVisual:
         self._slot_lexicon_tick = -1
         self._slot_lexicon_frame_hash = ""
 
+    def set_fixed_root(self, enabled: bool) -> None:
+        """
+        Прокидываем fixed_root в base_env и сбрасываем кэш hybrid phys / лексикона,
+        чтобы variable_ids совпали с новым набором суставов базы.
+        """
+        fn = getattr(self.base_env, "set_fixed_root", None)
+        if callable(fn):
+            fn(enabled)
+        self._hybrid_phys_gen = -1
+        self._hybrid_phys_obs = None
+        self.clear_slot_lexicon()
+        self._refresh(run_encode=True)
+
     def get_slot_visualization(self) -> dict:
         """Данные для UI: кадр + slot masks (кэш из _refresh, без PIL/cv2 на каждый тик)."""
         result: dict = {

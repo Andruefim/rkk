@@ -322,28 +322,30 @@ class Simulation:
         """
         Включаем fixed_root mode:
           1. PyBullet JOINT_FIXED constraint фиксирует базу
-          2. variable_ids → FIXED_BASE_VARS (17 vars)
-          3. GNN rebind d: 26→17
-          4. HomeostaticBounds → for_fixed_root() (мягкие лимиты)
-          5. inject fixed_root_seeds()
+          2. variable_ids → FIXED_BASE_VARS (+ sandbox vars)
+          3. GNN rebind; при visual — через EnvironmentVisual.set_fixed_root
+          4. HomeostaticBounds → for_fixed_root()
+          5. inject fixed_root_seeds() (для slot-графа большинство рёбер может быть skipped)
         """
         from engine.environment_humanoid import EnvironmentHumanoid, fixed_root_seeds
 
-        if self._visual_mode:
-            return {
-                "error": "fixed_root: отключите vision (disable_visual) перед включением",
-            }
-
-        env = self.agent.env
-
-        if not isinstance(env, EnvironmentHumanoid):
+        base_env = (
+            self._base_env_ref
+            if (self._visual_mode and getattr(self, "_base_env_ref", None) is not None)
+            else self.agent.env
+        )
+        if not isinstance(base_env, EnvironmentHumanoid):
             return {"error": "fixed_root требует humanoid world"}
 
-        if env.fixed_root:
+        if base_env.fixed_root:
             return {"fixed_root": True, "already_enabled": True}
 
-        env.set_fixed_root(True)
+        if self._visual_mode and self._visual_env is not None:
+            self._visual_env.set_fixed_root(True)
+        else:
+            base_env.set_fixed_root(True)
 
+        env = self.agent.env
         new_vars = list(env.variable_ids)
         init_obs = env.observe()
         self.agent.graph.rebind_variables(new_vars, init_obs)
@@ -384,27 +386,29 @@ class Simulation:
         """
         Отключаем fixed_root mode:
           1. Снимаем JOINT_FIXED constraint
-          2. variable_ids → полные VAR_NAMES (26 vars)
-          3. GNN rebind d: 17→26
+          2. variable_ids → полные VAR_NAMES
+          3. GNN rebind; при visual — через EnvironmentVisual.set_fixed_root(False)
           4. HomeostaticBounds → default (строгие, но с warmup)
         """
         from engine.environment_humanoid import EnvironmentHumanoid, humanoid_hardcoded_seeds
 
-        if self._visual_mode:
-            return {
-                "error": "fixed_root: отключите vision (disable_visual) перед выключением",
-            }
-
-        env = self.agent.env
-
-        if not isinstance(env, EnvironmentHumanoid):
+        base_env = (
+            self._base_env_ref
+            if (self._visual_mode and getattr(self, "_base_env_ref", None) is not None)
+            else self.agent.env
+        )
+        if not isinstance(base_env, EnvironmentHumanoid):
             return {"error": "не humanoid world"}
 
-        if not env.fixed_root:
+        if not base_env.fixed_root:
             return {"fixed_root": False, "was_enabled": False}
 
-        env.set_fixed_root(False)
+        if self._visual_mode and self._visual_env is not None:
+            self._visual_env.set_fixed_root(False)
+        else:
+            base_env.set_fixed_root(False)
 
+        env = self.agent.env
         new_vars = list(env.variable_ids)
         init_obs = env.observe()
         self.agent.graph.rebind_variables(new_vars, init_obs)
@@ -470,6 +474,8 @@ class Simulation:
         if self.tick - self._last_fall_reset_tick < 4:
             return False
         fn()
+        self.agent.graph._obs_buffer.clear()
+        self.agent.graph._int_buffer.clear()
         self._last_fall_reset_tick = self.tick
         self._add_event("🔄 Сброс позы после падения", "#44aaff", "value")
         return True
