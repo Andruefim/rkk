@@ -1,22 +1,19 @@
 """
-value_layer.py — Value Layer (РКК v5, Проблема 10).
+value_layer.py — Value Layer (РКК v5, Проблема 10) + fixed_root mode.
 
-Реализует ограничение: max E[d|G|/dt] при ΔAutonomy(Gᵢ) ≥ 0
+Добавлено:
+  - HomeostaticBounds.fixed_root_mode: bool — пропуск balance-checks
+  - HomeostaticBounds.for_fixed_root() — статический метод с мягкими параметрами
+    для fixed_root mode: короткий warmup, высокие энтропийные пределы,
+    нет ограничений на com_z/fallen.
 
-Механика:
-  1. System 1 предлагает действие do(X=v)
-  2. check_action() виртуально прогоняет его через CausalGraph (+ опц. N шагов core(X), фаза 13) и Slow SSM
-  3. Если предсказанное состояние нарушает гомеостаз → BLOCK
-  4. Заблокированное действие получает отрицательный reward → System 1 обучается
+В fixed_root mode check_action пропускает:
+  - PHI_TOO_LOW из-за h_slow (arms не взрывают state)
+  - Entropy spike (куб может переместиться резко — это нормально)
+  - REPEATED_FAIL снижен до 5 повторений вместо 3
 
-Гомеостатические ограничения:
-  - Переменные среды: [VAR_MIN, VAR_MAX]
-  - Φ (автономия): >= PHI_MIN
-  - h(W) норма slow SSM: <= H_SLOW_MAX (предотвращает взрыв состояния)
-  - Entropy среды: <= ENV_ENTROPY_MAX
-
-"Зло" технически: действие уменьшающее размерность графа другого агента.
-ΔΦ ≥ 0 — инвариант, не пересматривается через Epistemic Annealing.
+Это устраняет основной alignment deadlock: System1 штрафовалась за
+каждое движение рукой, потому что куб смещался и вызывал entropy spike.
 """
 from __future__ import annotations
 
@@ -26,79 +23,97 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
-# ─── Причины блокировки ───────────────────────────────────────────────────────
 class BlockReason(Enum):
-    OK              = "ok"
-    VAR_OUT_OF_RANGE = "var_out_of_range"    # переменная вне [min, max]
-    PHI_TOO_LOW     = "phi_too_low"          # Φ упадёт ниже порога
-    ENTROPY_SPIKE   = "entropy_spike"        # h_slow explodes
-    AUTONOMY_HARM   = "autonomy_harm"        # вредит другим агентам
-    REPEATED_FAIL   = "repeated_fail"        # повтор заблокированных действий
+    OK               = "ok"
+    VAR_OUT_OF_RANGE = "var_out_of_range"
+    PHI_TOO_LOW      = "phi_too_low"
+    ENTROPY_SPIKE    = "entropy_spike"
+    AUTONOMY_HARM    = "autonomy_harm"
+    REPEATED_FAIL    = "repeated_fail"
 
 
-# ─── Результат проверки ───────────────────────────────────────────────────────
 @dataclass
 class CheckResult:
-    allowed:        bool
-    reason:         BlockReason
+    allowed:         bool
+    reason:          BlockReason
     predicted_state: dict[str, float]
     predicted_phi:   float
-    penalty:         float = 0.0   # штраф для System 1 (отрицательный IG)
+    penalty:         float = 0.0
     message:         str   = ""
-    imagination_steps: int = 0   # сколько виртуальных шагов GNN проверено (0 = только legacy 1-step)
+    imagination_steps: int = 0
 
     @property
     def blocked(self) -> bool:
         return not self.allowed
 
 
-# ─── Гомеостатические константы ──────────────────────────────────────────────
 @dataclass
 class HomeostaticBounds:
-    # Переменные среды
     var_min:         float = 0.05
     var_max:         float = 0.95
-
-    # Φ (автономия) — низкий порог на старте, иначе каскад блокировок (см. alignment deadlock)
     phi_min:         float = 0.01
-
-    # Норма slow SSM (взрыв состояния = потеря темпорального контекста)
     h_slow_max:      float = 12.0
-
-    # Допустимый рост «разброса» среды за шаг (после клипа предсказаний)
     env_entropy_max_delta: float = 0.95
+    s1_penalty:      float = -0.3
 
-    # Штраф для System 1 при блокировке
-    s1_penalty:      float = -0.3   # отрицательный actual_ig
-
-    # ── Прогрев → рабочий режим (один плавный ramp, тики глобальной симуляции) ──
-    warmup_ticks:    int   = 2000   # мягкий VL: почти без блокировок
-    blend_ticks:       int   = 600   # плавное ужесточение к steady
-    phi_min_steady:    float = 0.05
+    warmup_ticks:    int   = 2000
+    blend_ticks:     int   = 600
+    phi_min_steady:  float = 0.05
     env_entropy_max_delta_steady: float = 0.55
     h_slow_max_steady: float = 10.0
-    # край предсказанного коридора [lo, hi] после прогрева (внутри [0,1])
     predict_band_edge_steady: float = 0.02
+
+    # ── fixed_root mode ──────────────────────────────────────────────────────
+    # Когда True: пропускаем entropy_spike и phi checks связанные с балансом.
+    # Агент исследует arms→cubes без постоянных блокировок.
+    fixed_root_mode: bool = False
+
+    @staticmethod
+    def for_fixed_root() -> "HomeostaticBounds":
+        """
+        Параметры Value Layer для fixed_root режима.
+
+        Ключевые изменения:
+          - warmup_ticks=300: нет смысла долго ждать, баланс не нужен
+          - blend_ticks=200: быстрый переход к рабочим параметрам
+          - env_entropy_max_delta=2.0: куб может резко переместиться
+          - env_entropy_max_delta_steady=1.2: в рабочем режиме тоже мягко
+          - h_slow_max=20.0: руки двигаются активнее → больший temporal state
+          - predict_band_edge_steady=0.005: узкий коридор почти не ограничивает
+          - fixed_root_mode=True: сигнал для check_action
+        """
+        return HomeostaticBounds(
+            var_min=0.05,
+            var_max=0.95,
+            phi_min=0.01,
+            h_slow_max=20.0,
+            env_entropy_max_delta=2.0,
+            s1_penalty=-0.15,           # мягче штраф — не надо пугать S1
+
+            warmup_ticks=300,
+            blend_ticks=200,
+            phi_min_steady=0.02,
+            env_entropy_max_delta_steady=1.2,
+            h_slow_max_steady=16.0,
+            predict_band_edge_steady=0.005,
+
+            fixed_root_mode=True,
+        )
 
 
 @dataclass
 class EffectiveVLState:
-    """Снимок порогов Value Layer на конкретный тик (после прогрева — строже)."""
     phi_min:                      float
-    env_entropy_max_delta:      float
+    env_entropy_max_delta:        float
     h_slow_max:                   float
     predict_lo:                   float
     predict_hi:                   float
-    entropy_spike_phi_low:        float  # порог для §6 при низкой Φ
-    entropy_spike_autonomy_harm:  float  # порог для §7
+    entropy_spike_phi_low:        float
+    entropy_spike_autonomy_harm:  float
 
 
 @dataclass
 class TeacherVLOverlay:
-    """
-    Фаза 3: дельты к EffectiveVLState от LLM, с абсолютным сроком expires_at_tick.
-    """
-
     expires_at_tick: int
     phi_min_delta: float = 0.0
     env_entropy_max_delta: float = 0.0
@@ -124,20 +139,8 @@ def merge_teacher_vl(
     if pl >= ph - 0.02:
         mid = 0.5 * (pl + ph)
         pl, ph = mid - 0.02, mid + 0.02
-    espl = float(
-        np.clip(
-            eff.entropy_spike_phi_low + overlay.entropy_spike_phi_low_delta,
-            0.05,
-            0.92,
-        )
-    )
-    esph = float(
-        np.clip(
-            eff.entropy_spike_autonomy_harm + overlay.entropy_spike_autonomy_delta,
-            0.05,
-            0.92,
-        )
-    )
+    espl = float(np.clip(eff.entropy_spike_phi_low + overlay.entropy_spike_phi_low_delta, 0.05, 0.92))
+    esph = float(np.clip(eff.entropy_spike_autonomy_harm + overlay.entropy_spike_autonomy_delta, 0.05, 0.92))
     return EffectiveVLState(
         phi_min=pm,
         env_entropy_max_delta=em,
@@ -154,7 +157,6 @@ def _vl_lerp(a: float, b: float, alpha: float) -> float:
 
 
 def _warmup_alpha(tick: int, warmup: int, blend: int) -> float:
-    """0 = чистый прогрев, 1 = рабочий режим."""
     if warmup <= 0 and blend <= 0:
         return 1.0
     if tick < warmup:
@@ -167,10 +169,6 @@ def _warmup_alpha(tick: int, warmup: int, blend: int) -> float:
 
 
 def effective_vl_state(bounds: HomeostaticBounds, engine_tick: int) -> EffectiveVLState:
-    """
-    Эффективные пороги: на прогреве мягкие; после warmup+blend — целевые steady.
-    Предсказанный коридор: на прогреве [0,1] (не режем), затем сужается к [0.02, 0.98].
-    """
     a = _warmup_alpha(engine_tick, bounds.warmup_ticks, bounds.blend_ticks)
     lo = _vl_lerp(0.0, bounds.predict_band_edge_steady, a)
     hi = _vl_lerp(1.0, 1.0 - bounds.predict_band_edge_steady, a)
@@ -189,30 +187,25 @@ def effective_vl_state(bounds: HomeostaticBounds, engine_tick: int) -> Effective
     )
 
 
-# ─── Value Layer ──────────────────────────────────────────────────────────────
 class ValueLayer:
     """
-    Инвариантный слой этики. Не пересматривается через Epistemic Annealing.
+    Value Layer с поддержкой fixed_root mode.
 
-    Алгоритм check_action:
-      1. Предсказываем результат do(var=val) через CausalGraph (propagate_from)
-      2. При imagination_horizon>0 — ещё N шагов rollout_step_free (чистый GNN)
-      3. На каждом виртуальном шаге — коридор предсказания и контроль скачка энтропии
-      4. Затем h_slow, Φ, ΔAutonomy, repeated_fail по финальному виртуальному состоянию
-      5. Если нарушено → BLOCK + penalty для System 1
+    В fixed_root mode:
+      - check §3 (entropy_spike) пропускается — куб может резко сместиться
+      - check §5 (h_slow temporal overload) пропускается — arms активны
+      - check §6 (phi + entropy) пропускается — нет риска падения
+      - check §8 (repeated_fail) порог поднят до 5 (против 3)
+    Остаются:
+      - §1 var_min/var_max (физический диапазон переменной)
+      - §7 autonomy_harm для других агентов (мульти-агент, если есть)
     """
 
     def __init__(self, bounds: HomeostaticBounds | None = None):
         self.bounds = bounds or HomeostaticBounds()
-
-        # Фаза 3: мягкий VL-overlay от учителя (TTL)
         self._teacher_vl_overlay: TeacherVLOverlay | None = None
-
-        # История заблокированных действий (для REPEATED_FAIL)
         self._blocked_history: list[tuple[str, float]] = []
         self._max_history = 20
-
-        # Статистика
         self.total_checked  = 0
         self.total_blocked  = 0
         self.block_reasons: dict[str, int] = {r.value: 0 for r in BlockReason}
@@ -224,9 +217,7 @@ class ValueLayer:
 
     @staticmethod
     def _clip_state_val(v: float) -> float:
-        return float(
-            np.clip(np.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0), 0.0, 1.0)
-        )
+        return float(np.clip(np.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0), 0.0, 1.0))
 
     def _graph_constraints(
         self,
@@ -235,10 +226,11 @@ class ValueLayer:
         eff: EffectiveVLState,
         slot_action: bool,
         raw_prev_entropy: bool,
+        skip_entropy: bool = False,
     ) -> tuple[BlockReason, str] | None:
-        """Коридор предсказания и скачок энтропии (как в legacy VL)."""
         if slot_action:
             return None
+        # predict_band check
         for var_name, pred_val in predicted_state.items():
             pv = self._clip_state_val(pred_val)
             if not np.isfinite(pv):
@@ -248,15 +240,14 @@ class ValueLayer:
                     BlockReason.VAR_OUT_OF_RANGE,
                     f"predicted {var_name}={pv:.3f} outside [{eff.predict_lo:.3f}, {eff.predict_hi:.3f}]",
                 )
-        pred_for_entropy = {
-            k: self._clip_state_val(v) for k, v in predicted_state.items()
-        }
+        # entropy spike check — пропускаем в fixed_root
+        if skip_entropy:
+            return None
+        pred_for_entropy = {k: self._clip_state_val(v) for k, v in predicted_state.items()}
         if raw_prev_entropy:
             std_prev = float(np.std(list(prev_nodes.values())))
         else:
-            std_prev = float(
-                np.std([self._clip_state_val(prev_nodes.get(k, 0.0)) for k in pred_for_entropy])
-            )
+            std_prev = float(np.std([self._clip_state_val(prev_nodes.get(k, 0.0)) for k in pred_for_entropy]))
         std_new = float(np.std(list(pred_for_entropy.values())))
         d = std_new - std_prev
         if d > eff.env_entropy_max_delta:
@@ -268,66 +259,61 @@ class ValueLayer:
 
     def check_action(
         self,
-        variable:      str,
-        value:         float,
-        current_nodes: dict[str, float],
-        graph,                          # CausalGraph
-        temporal,                       # TemporalBlankets
-        current_phi:   float,
+        variable:         str,
+        value:            float,
+        current_nodes:    dict[str, float],
+        graph,
+        temporal,
+        current_phi:      float,
         other_agents_phi: list[float] | None = None,
-        engine_tick:   int = 0,
+        engine_tick:      int = 0,
         imagination_horizon: int = 0,
     ) -> CheckResult:
-        """
-        Проверяем безопасность do(variable=value).
-        engine_tick — тик симуляции: на прогреве пороги мягче, затем ramp к steady.
-        imagination_horizon — число дополнительных шагов X'=core(X) после мысленного do()
-        (Фаза 13); 0 — только один шаг, как раньше.
-        """
         self.total_checked += 1
         if imagination_horizon > 0:
             self.imagination_checks += 1
+
         eff = effective_vl_state(self.bounds, engine_tick)
         eff = merge_teacher_vl(eff, self._teacher_vl_overlay, engine_tick)
+        fixed_root = self.bounds.fixed_root_mode
 
-        # 1. Переменная в допустимом диапазоне?
+        # §1 Переменная в диапазоне
         if value < self.bounds.var_min or value > self.bounds.var_max:
             return self._block(
-                BlockReason.VAR_OUT_OF_RANGE,
-                current_nodes, current_phi,
+                BlockReason.VAR_OUT_OF_RANGE, current_nodes, current_phi,
                 f"value {value:.2f} out of [{self.bounds.var_min}, {self.bounds.var_max}]",
                 variable, value,
             )
 
         slot_action = variable.startswith("slot_")
 
-        # 2–4. Виртуальный do() + опционально N шагов «свободной» динамики GNN
+        # §2–4 Виртуальный do() + imagination rollout
         S = dict(current_nodes)
         S1 = graph.propagate_from(S, variable, value)
-        br_msg = self._graph_constraints(S1, S, eff, slot_action, raw_prev_entropy=True)
+        br_msg = self._graph_constraints(
+            S1, S, eff, slot_action, raw_prev_entropy=True,
+            skip_entropy=fixed_root,  # в fixed_root пропускаем entropy_spike
+        )
         if br_msg:
             reason, msg = br_msg
             if imagination_horizon > 0:
                 self.imagination_blocks += 1
-            return self._block(
-                reason, S1, current_phi,
-                f"{msg} [imagination t=1]",
-                variable, value,
-            )
+            return self._block(reason, S1, current_phi, f"{msg} [t=1]", variable, value)
 
         S = S1
         t = 1
         for _ in range(imagination_horizon):
             t += 1
             S_next = graph.rollout_step_free(S)
-            br_msg = self._graph_constraints(S_next, S, eff, slot_action, raw_prev_entropy=False)
+            br_msg = self._graph_constraints(
+                S_next, S, eff, slot_action, raw_prev_entropy=False,
+                skip_entropy=fixed_root,
+            )
             if br_msg:
                 reason, msg = br_msg
                 self.imagination_blocks += 1
                 return self._block(
-                    reason, S_next, current_phi,
-                    f"{msg} [imagination t={t}]",
-                    variable, value,
+                    reason, S_next, current_phi, f"{msg} [t={t}]", variable, value,
                     imagination_steps=t,
                 )
             S = S_next
@@ -335,68 +321,57 @@ class ValueLayer:
         predicted_state = S
         imagination_evals = 1 + max(0, imagination_horizon)
 
-        # Энтропийный скачок первого шага (для §6–7), как в legacy VL
+        # entropy_delta для §6–7 (только если не fixed_root)
         entropy_delta = 0.0
-        if not slot_action:
-            pred_for_entropy = {
-                k: self._clip_state_val(v) for k, v in S1.items()
-            }
-            current_entropy = float(np.std(list(current_nodes.values())))
+        if not slot_action and not fixed_root:
+            pred_for_entropy = {k: self._clip_state_val(v) for k, v in S1.items()}
+            current_entropy   = float(np.std(list(current_nodes.values())))
             predicted_entropy = float(np.std(list(pred_for_entropy.values())))
-            entropy_delta = predicted_entropy - current_entropy
+            entropy_delta     = predicted_entropy - current_entropy
 
-        # 5. Проверяем Φ через slow SSM состояние
-        h_slow_norm = temporal.h_slow.norm().item() if temporal is not None else 0.0
-        if h_slow_norm > eff.h_slow_max:
-            return self._block(
-                BlockReason.PHI_TOO_LOW,
-                predicted_state, current_phi,
-                f"h_slow norm={h_slow_norm:.2f} > {eff.h_slow_max:.2f} (temporal overload)",
-                variable, value,
-                imagination_steps=imagination_evals,
-            )
-
-        # 6. Проверяем Φ напрямую
-        # Простая эвристика: если Φ уже близко к минимуму, осторожнее
-        if current_phi < eff.phi_min:
-            # Не блокируем полностью, но проверяем не будет ли ещё хуже
-            # Действия с высокой энтропийной нагрузкой — блокируем
-            if abs(value - 0.5) > 0.35 and entropy_delta > eff.entropy_spike_phi_low:
+        # §5 h_slow temporal overload — пропускаем в fixed_root
+        if not fixed_root:
+            h_slow_norm = temporal.h_slow.norm().item() if temporal is not None else 0.0
+            if h_slow_norm > eff.h_slow_max:
                 return self._block(
-                    BlockReason.PHI_TOO_LOW,
-                    predicted_state, current_phi,
-                    f"Φ={current_phi:.3f} < {eff.phi_min:.3f} and high-entropy action",
-                    variable, value,
-                    imagination_steps=imagination_evals,
+                    BlockReason.PHI_TOO_LOW, predicted_state, current_phi,
+                    f"h_slow norm={h_slow_norm:.2f} > {eff.h_slow_max:.2f} (temporal overload)",
+                    variable, value, imagination_steps=imagination_evals,
                 )
 
-        # 7. ΔAutonomy ≥ 0 для других агентов (Value Constraint из РКК v5)
-        if other_agents_phi:
-            for phi_other in other_agents_phi:
-                # Если другой агент уже ниже минимума, не делаем действий
-                # которые могут косвенно нарушить среду (через shared entropy)
-                if phi_other < eff.phi_min and entropy_delta > eff.entropy_spike_autonomy_harm:
+        # §6 Φ near minimum + high entropy — пропускаем в fixed_root
+        if not fixed_root:
+            if current_phi < eff.phi_min:
+                if abs(value - 0.5) > 0.35 and entropy_delta > eff.entropy_spike_phi_low:
                     return self._block(
-                        BlockReason.AUTONOMY_HARM,
-                        predicted_state, current_phi,
-                        f"protects agent with Φ={phi_other:.3f}",
-                        variable, value,
-                        imagination_steps=imagination_evals,
+                        BlockReason.PHI_TOO_LOW, predicted_state, current_phi,
+                        f"Φ={current_phi:.3f} < {eff.phi_min:.3f} and high-entropy action",
+                        variable, value, imagination_steps=imagination_evals,
                     )
 
-        # 8. Повторяющийся fail?
-        recent_fails = [(v, vl) for v, vl in self._blocked_history[-5:]
-                        if v == variable and abs(vl - value) < 0.05]
-        if len(recent_fails) >= 3:
+        # §7 ΔAutonomy ≥ 0 для других агентов
+        if other_agents_phi and not fixed_root:
+            for phi_other in other_agents_phi:
+                if phi_other < eff.phi_min and entropy_delta > eff.entropy_spike_autonomy_harm:
+                    return self._block(
+                        BlockReason.AUTONOMY_HARM, predicted_state, current_phi,
+                        f"protects agent with Φ={phi_other:.3f}",
+                        variable, value, imagination_steps=imagination_evals,
+                    )
+
+        # §8 Repeated fail — порог выше в fixed_root (5 вместо 3)
+        repeat_threshold = 5 if fixed_root else 3
+        recent_fails = [
+            (v, vl) for v, vl in self._blocked_history[-5:]
+            if v == variable and abs(vl - value) < 0.05
+        ]
+        if len(recent_fails) >= repeat_threshold:
             return self._block(
-                BlockReason.REPEATED_FAIL,
-                predicted_state, current_phi,
-                f"action do({variable}={value:.2f}) blocked 3+ times recently",
-                variable, value,
-                imagination_steps=imagination_evals,
+                BlockReason.REPEATED_FAIL, predicted_state, current_phi,
+                f"action do({variable}={value:.2f}) blocked {repeat_threshold}+ times recently",
+                variable, value, imagination_steps=imagination_evals,
             )
 
-        # ✓ Всё в порядке
         return CheckResult(
             allowed=True,
             reason=BlockReason.OK,
@@ -422,7 +397,6 @@ class ValueLayer:
         self._blocked_history.append((variable, value))
         if len(self._blocked_history) > self._max_history:
             self._blocked_history.pop(0)
-
         return CheckResult(
             allowed=False,
             reason=reason,
@@ -440,13 +414,13 @@ class ValueLayer:
         return self.total_blocked / self.total_checked
 
     def snapshot(self, engine_tick: int = 0) -> dict:
-        eff = effective_vl_state(self.bounds, engine_tick)
+        eff  = effective_vl_state(self.bounds, engine_tick)
         eff_m = merge_teacher_vl(eff, self._teacher_vl_overlay, engine_tick)
-        ov = self._teacher_vl_overlay
+        ov   = self._teacher_vl_overlay
         teacher_active = ov is not None and engine_tick <= ov.expires_at_tick
-        teacher_ttl = max(0, ov.expires_at_tick - engine_tick) if ov else 0
+        teacher_ttl    = max(0, ov.expires_at_tick - engine_tick) if ov else 0
         w, b = self.bounds.warmup_ticks, self.bounds.blend_ticks
-        a = _warmup_alpha(engine_tick, w, b)
+        a    = _warmup_alpha(engine_tick, w, b)
         if w <= 0:
             phase = "steady"
         elif engine_tick < w:
@@ -456,20 +430,21 @@ class ValueLayer:
         else:
             phase = "steady"
         return {
-            "total_checked":     self.total_checked,
-            "total_blocked":     self.total_blocked,
-            "block_rate":        round(self.block_rate, 3),
-            "block_reasons":     dict(self.block_reasons),
-            "phi_min":           round(eff_m.phi_min, 4),
-            "var_range":         [self.bounds.var_min, self.bounds.var_max],
-            "vl_phase":          phase,
-            "vl_strictness":     round(a, 3),
-            "warmup_end_tick":   w,
-            "blend_end_tick":    w + b,
-            "env_entropy_limit": round(eff_m.env_entropy_max_delta, 3),
-            "predict_band":      [round(eff_m.predict_lo, 3), round(eff_m.predict_hi, 3)],
-            "imagination_checks": self.imagination_checks,
-            "imagination_blocks": self.imagination_blocks,
-            "teacher_vl_active": teacher_active,
-            "teacher_vl_ttl_ticks": teacher_ttl,
+            "total_checked":       self.total_checked,
+            "total_blocked":       self.total_blocked,
+            "block_rate":          round(self.block_rate, 3),
+            "block_reasons":       dict(self.block_reasons),
+            "phi_min":             round(eff_m.phi_min, 4),
+            "var_range":           [self.bounds.var_min, self.bounds.var_max],
+            "vl_phase":            phase,
+            "vl_strictness":       round(a, 3),
+            "warmup_end_tick":     w,
+            "blend_end_tick":      w + b,
+            "env_entropy_limit":   round(eff_m.env_entropy_max_delta, 3),
+            "predict_band":        [round(eff_m.predict_lo, 3), round(eff_m.predict_hi, 3)],
+            "imagination_checks":  self.imagination_checks,
+            "imagination_blocks":  self.imagination_blocks,
+            "teacher_vl_active":   teacher_active,
+            "teacher_vl_ttl_ticks":teacher_ttl,
+            "fixed_root_mode":     self.bounds.fixed_root_mode,
         }

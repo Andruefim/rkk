@@ -177,6 +177,7 @@ class Simulation:
         self._last_snapshot: dict = {}
 
         self._fall_count  = 0
+        self._fixed_root_active = False
         self._stand_ticks = 0
         self._last_fall_reset_tick: int = -999
 
@@ -204,6 +205,7 @@ class Simulation:
         result = self.switcher.switch(new_world)
         if result.get("switched"):
             self.current_world = new_world
+            self._fixed_root_active = False
             self._phase3_teacher_rules = []
             self._phase3_vl_overlay = None
             self.agent.value_layer.set_teacher_vl_overlay(None)
@@ -316,6 +318,133 @@ class Simulation:
         self._add_event("👁 Visual Cortex DISABLED", "#cc44ff", "phase")
         return {"visual": False, "was_enabled": True}
 
+    def enable_fixed_root(self) -> dict:
+        """
+        Включаем fixed_root mode:
+          1. PyBullet JOINT_FIXED constraint фиксирует базу
+          2. variable_ids → FIXED_BASE_VARS (17 vars)
+          3. GNN rebind d: 26→17
+          4. HomeostaticBounds → for_fixed_root() (мягкие лимиты)
+          5. inject fixed_root_seeds()
+        """
+        from engine.environment_humanoid import EnvironmentHumanoid, fixed_root_seeds
+
+        if self._visual_mode:
+            return {
+                "error": "fixed_root: отключите vision (disable_visual) перед включением",
+            }
+
+        env = self.agent.env
+
+        if not isinstance(env, EnvironmentHumanoid):
+            return {"error": "fixed_root требует humanoid world"}
+
+        if env.fixed_root:
+            return {"fixed_root": True, "already_enabled": True}
+
+        env.set_fixed_root(True)
+
+        new_vars = list(env.variable_ids)
+        init_obs = env.observe()
+        self.agent.graph.rebind_variables(new_vars, init_obs)
+
+        from engine.temporal import TemporalBlankets
+        new_d = len(new_vars)
+        if self.agent.temporal.d_input != new_d:
+            self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
+        self.agent.temporal.step(init_obs)
+        self.agent.graph.record_observation(init_obs)
+
+        from engine.value_layer import HomeostaticBounds
+        self.agent.value_layer.bounds = HomeostaticBounds.for_fixed_root()
+
+        seeds = fixed_root_seeds()
+        result = self.agent.inject_text_priors(seeds)
+
+        self._fixed_root_active = True
+        self._fall_count = 0
+
+        self._add_event(
+            f"📌 FIXED ROOT ON: d={self.agent.graph._d}, "
+            f"{len(new_vars)} vars, +{result.get('injected',0)} seeds",
+            "#ffcc44", "phase"
+        )
+        print(
+            f"[Simulation] fixed_root ON: vars={len(new_vars)}, "
+            f"d={self.agent.graph._d}, seeds={result.get('injected',0)}"
+        )
+        return {
+            "fixed_root": True,
+            "gnn_d":      self.agent.graph._d,
+            "new_vars":   new_vars,
+            "seeds_injected": result.get("injected", 0),
+        }
+
+    def disable_fixed_root(self) -> dict:
+        """
+        Отключаем fixed_root mode:
+          1. Снимаем JOINT_FIXED constraint
+          2. variable_ids → полные VAR_NAMES (26 vars)
+          3. GNN rebind d: 17→26
+          4. HomeostaticBounds → default (строгие, но с warmup)
+        """
+        from engine.environment_humanoid import EnvironmentHumanoid, humanoid_hardcoded_seeds
+
+        if self._visual_mode:
+            return {
+                "error": "fixed_root: отключите vision (disable_visual) перед выключением",
+            }
+
+        env = self.agent.env
+
+        if not isinstance(env, EnvironmentHumanoid):
+            return {"error": "не humanoid world"}
+
+        if not env.fixed_root:
+            return {"fixed_root": False, "was_enabled": False}
+
+        env.set_fixed_root(False)
+
+        new_vars = list(env.variable_ids)
+        init_obs = env.observe()
+        self.agent.graph.rebind_variables(new_vars, init_obs)
+
+        from engine.temporal import TemporalBlankets
+        new_d = len(new_vars)
+        if self.agent.temporal.d_input != new_d:
+            self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
+        self.agent.temporal.step(init_obs)
+        self.agent.graph.record_observation(init_obs)
+
+        from engine.value_layer import HomeostaticBounds
+        self.agent.value_layer.bounds = HomeostaticBounds(
+            var_min=0.05, var_max=0.95,
+            phi_min=0.01,
+            h_slow_max=14.0,
+            env_entropy_max_delta=0.96,
+            warmup_ticks=1500,
+            blend_ticks=500,
+            phi_min_steady=0.04,
+            env_entropy_max_delta_steady=0.60,
+            h_slow_max_steady=11.0,
+            predict_band_edge_steady=0.02,
+            fixed_root_mode=False,
+        )
+
+        result = self.agent.inject_text_priors(humanoid_hardcoded_seeds())
+
+        self._fixed_root_active = False
+        self._add_event(
+            f"📌 FIXED ROOT OFF: d={self.agent.graph._d}, {len(new_vars)} vars",
+            "#cc44ff", "phase"
+        )
+        return {
+            "fixed_root": False,
+            "gnn_d":      self.agent.graph._d,
+            "new_vars":   new_vars,
+            "seeds_injected": result.get("injected", 0),
+        }
+
     # ── Seeds ─────────────────────────────────────────────────────────────────
     def inject_seeds(self, agent_id: int, edges: list[dict]) -> dict:
         result = self.agent.inject_text_priors(edges)
@@ -352,7 +481,7 @@ class Simulation:
         # Fallen check + автосброс физики (иначе VL и block_rate залипают)
         fallen = False
         is_fn  = getattr(self.agent.env, "is_fallen", None)
-        if callable(is_fn):
+        if callable(is_fn) and not self._fixed_root_active:
             fallen = is_fn()
             if fallen:
                 self._fall_count += 1
@@ -635,7 +764,7 @@ class Simulation:
 
         fallen = False
         is_fn = getattr(agent.env, "is_fallen", None)
-        if callable(is_fn):
+        if callable(is_fn) and not self._fixed_root_active:
             try:
                 fallen = bool(is_fn())
             except Exception:
@@ -737,6 +866,7 @@ class Simulation:
             "gnn_d":         self.agent.graph._d,
             "fallen":        snap.get("fallen", False),
             "fall_count":    snap.get("fall_count", 0),
+            "fixed_root":    self._fixed_root_active,
             "scene":         scene,
             # Фаза 12
             "visual_mode":   self._visual_mode,

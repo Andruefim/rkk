@@ -61,6 +61,7 @@ function normFrame(raw) {
     visualMode:raw.visual_mode??false,
     visionTicks:raw.vision_ticks??0,
     vision:raw.vision??null,
+    fixedRoot:raw.fixed_root??false,
   };
 }
 
@@ -99,15 +100,21 @@ export default function RKKHumanoid() {
   const [selectedSlot, setSelectedSlot] = useState(0);
   const [attnFrame,    setAttnFrame]    = useState(null);
   const [visionEnabled,setVisionEnabled]= useState(false);
+  const [fixedRoot, setFixedRoot] = useState(false);
+  const [fixedRootLoading, setFixedRootLoading] = useState(false);
 
   const showCubesRef = useRef(showCubes);
   showCubesRef.current = showCubes;
+
+  const fixedRootRef = useRef(fixedRoot);
+  useEffect(() => { fixedRootRef.current = fixedRoot; }, [fixedRoot]);
 
   const setSpeed = s => { setSpeedLocal(s); if (connected) wsSetSpeed(s); };
   useEffect(() => {
     const f = normFrame(wsFrame);
     setUI(f);
     setVisionEnabled(f.visualMode);
+    setFixedRoot(f.fixedRoot);
   }, [wsFrame]);
 
   // Camera polling
@@ -238,6 +245,29 @@ export default function RKKHumanoid() {
       setAttnFrame(null);
       setStatus("👁 Vision OFF — ручные переменные");
     } catch(e) { setStatus(`✗ ${e.message}`); }
+  };
+
+  const toggleFixedRoot = async () => {
+    setFixedRootLoading(true);
+    try {
+      const endpoint = fixedRoot
+        ? `${API}/fixed-root/disable`
+        : `${API}/fixed-root/enable`;
+      const d = await fetch(endpoint, { method: "POST" }).then((r) => r.json());
+      if (d.error) {
+        setStatus(`✗ Fixed root: ${d.error}`);
+      } else {
+        const state = d.fixed_root ? "ON" : "OFF";
+        setFixedRoot(d.fixed_root ?? !fixedRoot);
+        setStatus(
+          `📌 Fixed root ${state}: d=${d.gnn_d}, ${d.new_vars?.length ?? "?"} vars, ${d.seeds_injected ?? 0} seeds`
+        );
+      }
+    } catch (e) {
+      setStatus(`✗ ${e.message}`);
+    } finally {
+      setFixedRootLoading(false);
+    }
   };
 
   // ── Three.js ───────────────────────────────────────────────────────────────
@@ -461,7 +491,13 @@ export default function RKKHumanoid() {
         if(a<jointPositions.length&&b<jointPositions.length&&k<boneMeshes.length){
           updateBone(boneMeshes[k],jointPositions[a],jointPositions[b]);
           boneMeshes[k].visible=true;
-          const boneCol=fallen?0x881100:isVis?parseInt(SLOT_COLORS[k%8].replace("#",""),16):wCol;
+          const boneCol = fallen
+            ? 0x881100
+            : fixedRootRef.current
+              ? 0x886600
+              : isVis
+                ? parseInt(SLOT_COLORS[k % 8].replace("#", ""), 16)
+                : wCol;
           boneMeshes[k].material.color.setHex(boneCol);
           boneMeshes[k].material.emissiveIntensity=0.15+Math.sin(frame*0.05+k)*0.05;
         }
@@ -570,6 +606,18 @@ export default function RKKHumanoid() {
         {isVis&&<div style={{background:"rgba(0,40,30,0.9)",border:"1px solid #44ffcc",padding:"4px 10px",borderRadius:2,fontSize:9,color:"#44ffcc"}}>
           👁 VISUAL CORTEX · {ui.vision?.n_slots||8} slots
         </div>}
+        {fixedRoot && (
+          <div style={{
+            background: "rgba(40,30,0,0.9)",
+            border: "1px solid #ffcc00",
+            padding: "4px 10px",
+            borderRadius: 2,
+            fontSize: 9,
+            color: "#ffcc00",
+          }}>
+            📌 FIXED BASE · d={ui.gnnD} · {ui.agent.edgeCount} edges
+          </div>
+        )}
         <div style={{background:connected?"rgba(0,30,10,0.9)":"rgba(20,0,0,0.9)",border:`1px solid ${connected?"#00aa44":"#aa4400"}`,padding:"4px 10px",borderRadius:2,fontSize:9,color:connected?"#00ff88":"#ff8844"}}>
           {connected?"● ONLINE":"○ OFFLINE"} · d={ui.gnnD}
         </div>
@@ -604,6 +652,22 @@ export default function RKKHumanoid() {
         {[["💉","seeds"],["🌐","rag"],["👁","vision"]].map(([icon,panel])=>(
           <button key={panel} onClick={()=>setPanel(v=>v===panel?null:panel)} style={{padding:"2px 7px",borderRadius:2,fontSize:9,cursor:"pointer",background:activePanel===panel?"#180a30":"transparent",border:`1px solid ${activePanel===panel?(panel==="vision"?visColor:wCol):"#111"}`,color:activePanel===panel?(panel==="vision"?visColor:wCol):"#334455"}}>{icon}</button>
         ))}
+        <button
+          type="button"
+          onClick={toggleFixedRoot}
+          disabled={fixedRootLoading}
+          style={{
+            padding: "2px 7px",
+            borderRadius: 2,
+            fontSize: 9,
+            cursor: fixedRootLoading ? "wait" : "pointer",
+            background: fixedRoot ? "rgba(255,204,0,0.12)" : "transparent",
+            border: `1px solid ${fixedRoot ? "#ffcc00" : "#111"}`,
+            color: fixedRoot ? "#ffcc00" : "#334455",
+          }}
+        >
+          {fixedRootLoading ? "⏳" : fixedRoot ? "📌 FIXED" : "📌"}
+        </button>
         <button onClick={()=>setShowCam(v=>!v)} style={{padding:"2px 7px",borderRadius:2,fontSize:9,cursor:"pointer",background:showCam?"#0a0520":"transparent",border:`1px solid ${showCam?wCol:"#111"}`,color:showCam?wCol:"#334455"}}>📷</button>
       </div>
 
@@ -826,6 +890,23 @@ export default function RKKHumanoid() {
             👁 visual cortex · {ui.vision?.active_slots??0} slots active · {ui.visionTicks} ticks
           </div>}
 
+          {fixedRoot && (
+            <div style={{
+              background: "rgba(255,204,0,0.06)",
+              border: "1px solid #ffcc0033",
+              borderRadius: 2,
+              padding: "3px 7px",
+              marginBottom: 4,
+              fontSize: 8,
+              color: "#ffcc00",
+            }}>
+              📌 FIXED BASE MODE
+              <span style={{ color: "#665500", marginLeft: 4 }}>
+                d={ui.gnnD} · arms+spine+cubes
+              </span>
+            </div>
+          )}
+
           <table style={{borderCollapse:"collapse",width:"100%",fontSize:9}}><tbody>
             {[
               ["Φ autonomy",  <span style={{color:phiC(a.phi??0)}}>{((a.phi??0)*100).toFixed(1)}%</span>],
@@ -883,6 +964,14 @@ export default function RKKHumanoid() {
         <div style={{...sep,lineHeight:1.9}}>
           <div style={{color:"#1a2244",fontSize:8}}>ROADMAP:</div>
           <div style={{color:"#224433",fontSize:8}}>✓ 11. Humanoid Singleton</div>
+          <div style={{
+            color: fixedRoot ? "#ffcc00" : "#224433",
+            fontSize: 8,
+            fontWeight: fixedRoot ? "bold" : "normal",
+          }}>
+            {fixedRoot ? "● " : "→ "}Fixed Base (curriculum step 1)
+            {fixedRoot ? ` · d=${ui.gnnD}` : ""}
+          </div>
           <div style={{color:isVis?visColor:"#00cc88",fontSize:8,fontWeight:isVis?"bold":"normal"}}>
             {isVis?"● ":"→ "}12. Causal Vision{isVis?` · ${ui.visionTicks}t`:""}
           </div>

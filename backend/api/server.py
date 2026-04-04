@@ -249,6 +249,7 @@ def health():
         "gnn_d":         sim.agent.graph._d,
         "fallen":        sim._fall_count,
         "visual_mode":   sim._visual_mode,
+        "fixed_root":    sim._fixed_root_active,
     }
 
 @app.get("/state")
@@ -589,6 +590,45 @@ def vision_attn_frame(slot_idx: int = Query(default=0)):
         return JSONResponse({"available": False, "error": str(e)})
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FIXED ROOT ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/fixed-root/enable")
+async def fixed_root_enable():
+    """
+    Фиксируем базу гуманоида в PyBullet (JOINT_FIXED constraint).
+    variable_ids → FIXED_BASE_VARS (17 vars, d=17).
+    Value Layer → for_fixed_root() (мягкие лимиты, короткий warmup).
+    """
+    return get_sim().enable_fixed_root()
+
+
+@app.post("/fixed-root/disable")
+async def fixed_root_disable():
+    """
+    Снимаем фиксацию. Переходим к полным VAR_NAMES (26 vars, d=26).
+    Value Layer → стандартный HomeostaticBounds с warmup=1500.
+    """
+    return get_sim().disable_fixed_root()
+
+
+@app.get("/fixed-root/status")
+def fixed_root_status():
+    """Текущий статус fixed_root mode."""
+    sim = get_sim()
+    env = sim.agent.env
+    base_env = getattr(sim, "_base_env_ref", None) or env
+    return {
+        "fixed_root":   sim._fixed_root_active,
+        "gnn_d":        sim.agent.graph._d,
+        "var_count":    len(sim.agent.graph.nodes),
+        "block_rate":   round(sim.agent.value_layer.block_rate, 3),
+        "vl_mode":      "fixed_root" if sim._fixed_root_active else "full",
+    }
+
+
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 @app.websocket("/ws/causal-stream")
 async def causal_stream(websocket: WebSocket):
@@ -632,6 +672,10 @@ async def causal_stream(websocket: WebSocket):
                     sim.enable_visual(n_slots=n, mode=mode)
                 elif cmd == "vision_disable":
                     sim.disable_visual()
+                elif cmd == "fixed_root_enable":
+                    sim.enable_fixed_root()
+                elif cmd == "fixed_root_disable":
+                    sim.disable_fixed_root()
             except asyncio.TimeoutError:
                 pass
             except Exception:
