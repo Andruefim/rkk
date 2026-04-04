@@ -253,7 +253,7 @@ export default function RKKHumanoid() {
     scene.fog = new THREE.FogExp2(0x030912,0.022);
 
     const camera = new THREE.PerspectiveCamera(55,mount.clientWidth/mount.clientHeight,0.1,100);
-    camera.position.set(0,1.2,5.5);
+    camera.position.set(0,0.6,5.5);
 
     scene.add(new THREE.AmbientLight(0x0a1020,3.0));
     const key = new THREE.DirectionalLight(0x8899ff,2.5);
@@ -269,6 +269,8 @@ export default function RKKHumanoid() {
     scene.add(new THREE.GridHelper(20,40,0x0d1a2e,0x071220));
 
     // Рампа
+    const vS = 0.5;
+
     const ramp = new THREE.Mesh(
       new THREE.BoxGeometry(3,0.1,2),
       new THREE.MeshStandardMaterial({color:0x1a1510,roughness:0.8})
@@ -288,7 +290,7 @@ export default function RKKHumanoid() {
       if (i>=16){const o=new THREE.Object3D();o.visible=false;scene.add(o);return o;}
       const isTorso=i<=2;
       const m=new THREE.Mesh(
-        new THREE.SphereGeometry(isTorso?0.065:0.05,8,8),
+        new THREE.SphereGeometry(isTorso?0.065*vS:0.05*vS,8,8),
         new THREE.MeshStandardMaterial({color:isTorso?0xcc88ff:0x8844cc,
           emissive:isTorso?0x6622aa:0x441188,emissiveIntensity:0.4,roughness:0.3})
       );
@@ -297,7 +299,7 @@ export default function RKKHumanoid() {
 
     const boneMeshes = SKELETON_BONES.map(()=>{
       const m=new THREE.Mesh(
-        new THREE.CylinderGeometry(0.025,0.025,1,6),
+        new THREE.CylinderGeometry(0.025*vS,0.025*vS,1,6),
         new THREE.MeshStandardMaterial({color:0x6633aa,emissive:0x221144,emissiveIntensity:0.2,roughness:0.6})
       );
       m.castShadow=true; scene.add(m); return m;
@@ -346,14 +348,14 @@ export default function RKKHumanoid() {
 
     // Fixed root indicator ring (вокруг таза, жёлтый)
     const fixedRootRing = new THREE.Mesh(
-      new THREE.TorusGeometry(0.35,0.015,8,32),
+      new THREE.TorusGeometry(0.35*vS,0.015*vS,8,32),
       new THREE.MeshBasicMaterial({color:0xffcc00,transparent:true,opacity:0.})
     );
     scene.add(fixedRootRing);
 
     // Vision ring
     const visionRing = new THREE.Mesh(
-      new THREE.TorusGeometry(0.6,0.02,8,32),
+      new THREE.TorusGeometry(0.6*vS,0.02*vS,8,32),
       new THREE.MeshBasicMaterial({color:0x44ffcc,transparent:true,opacity:0.})
     );
     scene.add(visionRing);
@@ -362,7 +364,7 @@ export default function RKKHumanoid() {
     const slotSpheres = Array.from({length:8},(_,k)=>{
       const col=parseInt(SLOT_COLORS[k].replace("#",""),16);
       const m=new THREE.Mesh(
-        new THREE.SphereGeometry(0.05,8,8),
+        new THREE.SphereGeometry(0.05*vS,8,8),
         new THREE.MeshStandardMaterial({color:col,emissive:col,emissiveIntensity:0.5,transparent:true,opacity:0.})
       );
       scene.add(m); return m;
@@ -380,7 +382,7 @@ export default function RKKHumanoid() {
     scene.add(new THREE.Points(pGeom,new THREE.PointsMaterial({color:0x220044,size:0.06,transparent:true,opacity:0.4})));
 
     let frame=0;
-    const camTarget=new THREE.Vector3(0,1,0);
+    const camTarget=new THREE.Vector3(0,0.5,0);
     let camAzim=0,camElev=0.2,camRadius=5.5;
     let camDrag=false,camPtrX=0,camPtrY=0;
 
@@ -444,7 +446,7 @@ export default function RKKHumanoid() {
           jointPositions.push(jointMeshes[Math.max(0,i-1)]?.position?.clone()??new THREE.Vector3());
       } else {
         const t=frame*.025;
-        const comH=1.2+(fallen?-.8:0);
+        const comH=0.6+(fallen?-.4:0);
         const poses=[
           [0,comH+.26,0],[0,comH+.13,0],[0,comH+.02,0],[0,comH-.10,0],
           [-.26,comH+.11,0],[.26,comH+.11,0],

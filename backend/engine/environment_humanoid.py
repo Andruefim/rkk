@@ -72,12 +72,15 @@ _RANGES["ball_z"]       = (0.0, 2.0)
 _RANGES["lever_pin"]    = (0.0, 1.0)
 _RANGES["target_dist"]  = (0.0, 4.0)
 
-FALLEN_Z     = 0.25
-STAND_Z      = 0.85
+# Масштаб URDF относительно прежнего «эталона» 0.36 (0.18 = ровно в 2× меньше по линейным размерам).
+HUMANOID_URDF_LEGACY_SCALE = 0.36
+HUMANOID_URDF_GLOBAL_SCALING = 0.18
+_HSZ = HUMANOID_URDF_GLOBAL_SCALING / HUMANOID_URDF_LEGACY_SCALE
 
-HUMANOID_URDF_GLOBAL_SCALING = 0.36
+FALLEN_Z     = 0.25 * _HSZ
+STAND_Z      = 0.85 * _HSZ
 HUMANOID_URDF_STAND_EULER = (np.pi / 2, 0.0, 0.0)
-HUMANOID_URDF_SPAWN_Z = 1.15
+HUMANOID_URDF_SPAWN_Z = 1.15 * _HSZ
 
 
 def _np_quat_from_axis_angle(axis: np.ndarray, angle: float) -> list[float]:
@@ -143,62 +146,63 @@ def _rotmat_to_xyzw(R: np.ndarray) -> tuple[float, float, float, float]:
 def _forward_kinematics_skeleton(
     cx: float, cy: float, cz: float, joints: dict[str, float]
 ) -> list[dict]:
+    sk = float(HUMANOID_URDF_GLOBAL_SCALING) / float(HUMANOID_URDF_LEGACY_SCALE)
     j = joints
-    pelvis_z = cz - 0.12
-    neck_z = cz + 0.17
+    pelvis_z = cz - 0.12 * sk
+    neck_z = cz + 0.17 * sk
     spine_z = 0.5 * (neck_z + pelvis_z)
-    head_z = cz + 0.29
-    sh_z = neck_z - 0.02
-    hip_z = pelvis_z - 0.08
+    head_z = cz + 0.29 * sk
+    sh_z = neck_z - 0.02 * sk
+    hip_z = pelvis_z - 0.08 * sk
 
     head = [cx, cy, head_z]
     neck = [cx, cy, neck_z]
     spine = [cx, cy, spine_z]
     pelvis = [cx, cy, pelvis_z]
-    lshld = [cx - 0.26, cy, sh_z]
-    rshld = [cx + 0.26, cy, sh_z]
+    lshld = [cx - 0.26 * sk, cy, sh_z]
+    rshld = [cx + 0.26 * sk, cy, sh_z]
     lelbow = [
-        cx - 0.26 - np.sin(j.get("lshoulder", 0)) * 0.28,
+        cx - 0.26 * sk - np.sin(j.get("lshoulder", 0)) * 0.28 * sk,
         cy,
-        sh_z - np.cos(j.get("lshoulder", 0)) * 0.28,
+        sh_z - np.cos(j.get("lshoulder", 0)) * 0.28 * sk,
     ]
     relbow = [
-        cx + 0.26 + np.sin(j.get("rshoulder", 0)) * 0.28,
+        cx + 0.26 * sk + np.sin(j.get("rshoulder", 0)) * 0.28 * sk,
         cy,
-        sh_z - np.cos(j.get("rshoulder", 0)) * 0.28,
+        sh_z - np.cos(j.get("rshoulder", 0)) * 0.28 * sk,
     ]
     lhand = [
-        lelbow[0] - np.sin(j.get("lelbow", 0)) * 0.22,
+        lelbow[0] - np.sin(j.get("lelbow", 0)) * 0.22 * sk,
         cy,
-        lelbow[2] - np.cos(j.get("lelbow", 0)) * 0.22,
+        lelbow[2] - np.cos(j.get("lelbow", 0)) * 0.22 * sk,
     ]
     rhand = [
-        relbow[0] + np.sin(j.get("relbow", 0)) * 0.22,
+        relbow[0] + np.sin(j.get("relbow", 0)) * 0.22 * sk,
         cy,
-        relbow[2] - np.cos(j.get("relbow", 0)) * 0.22,
+        relbow[2] - np.cos(j.get("relbow", 0)) * 0.22 * sk,
     ]
-    hip_half = 0.15
+    hip_half = 0.15 * sk
     lhip_p = [cx - hip_half, cy, hip_z]
     rhip_p = [cx + hip_half, cy, hip_z]
     lknee_p = [
-        cx - hip_half + np.sin(j.get("lhip", 0)) * 0.35,
+        cx - hip_half + np.sin(j.get("lhip", 0)) * 0.35 * sk,
         cy,
-        hip_z - np.cos(j.get("lhip", 0)) * 0.35,
+        hip_z - np.cos(j.get("lhip", 0)) * 0.35 * sk,
     ]
     rknee_p = [
-        cx + hip_half + np.sin(j.get("rhip", 0)) * 0.35,
+        cx + hip_half + np.sin(j.get("rhip", 0)) * 0.35 * sk,
         cy,
-        hip_z - np.cos(j.get("rhip", 0)) * 0.35,
+        hip_z - np.cos(j.get("rhip", 0)) * 0.35 * sk,
     ]
     lfoot = [
-        lknee_p[0] + np.sin(j.get("lknee", 0)) * 0.30,
+        lknee_p[0] + np.sin(j.get("lknee", 0)) * 0.30 * sk,
         cy,
-        lknee_p[2] - np.cos(j.get("lknee", 0)) * 0.30,
+        lknee_p[2] - np.cos(j.get("lknee", 0)) * 0.30 * sk,
     ]
     rfoot = [
-        rknee_p[0] + np.sin(j.get("rknee", 0)) * 0.30,
+        rknee_p[0] + np.sin(j.get("rknee", 0)) * 0.30 * sk,
         cy,
-        rknee_p[2] - np.cos(j.get("rknee", 0)) * 0.30,
+        rknee_p[2] - np.cos(j.get("rknee", 0)) * 0.30 * sk,
     ]
     sc = float(HUMANOID_URDF_GLOBAL_SCALING)
     lsole = [lfoot[0] - 0.05 * sc, lfoot[1], lfoot[2] - 0.12 * sc]
@@ -1045,7 +1049,8 @@ class _PyBulletHumanoid:
             up = np.array([0.0, 0.0, 1.0], dtype=float)
         else:
             up = up / ln
-        head_v = neck_v + 0.26 * up
+        sk = float(HUMANOID_URDF_GLOBAL_SCALING) / float(HUMANOID_URDF_LEGACY_SCALE)
+        head_v = neck_v + 0.26 * sk * up
 
         order = [
             head_v, neck_v, vec("spine"), vec("root"),
@@ -1150,9 +1155,10 @@ class _PyBulletHumanoid:
                 return None
             fwd = cand / fn
 
-        head_anchor = pos_n + 0.26 * up
-        eye = head_anchor + 0.04 * up + 0.06 * fwd
-        target = eye + 2.4 * fwd
+        sk = float(HUMANOID_URDF_GLOBAL_SCALING) / float(HUMANOID_URDF_LEGACY_SCALE)
+        head_anchor = pos_n + 0.26 * sk * up
+        eye = head_anchor + 0.04 * sk * up + 0.06 * sk * fwd
+        target = eye + 2.4 * sk * fwd
         return eye.tolist(), target.tolist(), up.tolist()
 
     def get_frame_base64(
