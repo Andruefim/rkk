@@ -5,9 +5,19 @@ PowerShell:
   cd backend
   python run.py
 
-После старта API автоматически вызывается humanoid_structured LLM-bootstrap (Ollama).
-  Отключить: RKK_SKIP_AUTO_HUMANOID_LLM=1
-  URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL (по умолчанию localhost:11434, gemma4:e4b)
+После старта API (фоном): humanoid_structured LLM-bootstrap → автоматически vision ON → один VLM.
+  Отключить LLM: RKK_SKIP_AUTO_HUMANOID_LLM=1
+  Отключить авто-зрение: RKK_SKIP_AUTO_VISION=1
+  Зрение да, без авто-VLM: RKK_SKIP_AUTO_VLM_BOOTSTRAP=1
+  Слоты/режим: RKK_AUTO_VISION_N_SLOTS=8, RKK_AUTO_VISION_MODE=hybrid
+  VLM как в UI: RKK_AUTO_VLM_WEAK_EDGES=1, RKK_AUTO_VLM_TEXT_ONLY=1, RKK_AUTO_VLM_MAX_MASKS=4
+  URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL
+
+Фаза 3 (после VLM): LLM-учитель для System1 + мягкий VL-overlay (TTL).
+  Отключить авто: RKK_SKIP_PHASE3_LLM=1
+  Затухание бонуса: RKK_TEACHER_T_MAX (интервенций, по умолчанию 140)
+
+Ручной VLM: POST /vision/vlm-label. Повтор учителя: POST /teacher/refresh.
 
 Или через uvicorn напрямую:
   uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload

@@ -30,6 +30,7 @@ import base64
 from typing import Callable
 
 from engine.causal_vision import CausalVisualCortex, make_visual_cortex
+from engine.slot_lexicon import frame_content_hash
 
 # Рендер камеры для слотов: меньше пикселей → быстрее PyBullet + JPEG (превью /camera — отдельно)
 VISION_PIPELINE_CAM_W = 288
@@ -114,6 +115,11 @@ class EnvironmentVisual:
         self._hybrid_phys_gen = -1
         self._refresh_index = 0
         self._vision_stride_counter = 0
+
+        # Фаза 2: VLM-лексикон по индексу слота (после Hungarian; ключи slot_0…)
+        self._slot_lexicon: dict[str, dict] = {}
+        self._slot_lexicon_tick: int = -1
+        self._slot_lexicon_frame_hash: str = ""
 
         # Начальная инициализация
         self._refresh(run_encode=True)
@@ -338,6 +344,22 @@ class EnvironmentVisual:
         """Агент сообщает что GNN предсказал → для predictive coding."""
         self._gnn_predicted = predicted.detach()
 
+    def set_slot_lexicon(
+        self,
+        labels: dict[str, dict],
+        tick: int,
+        frame_b64: str | None = None,
+    ) -> None:
+        """Сохраняем последнюю VLM-разметку (метки по slot_k, не меняя порядок слотов)."""
+        self._slot_lexicon = dict(labels)
+        self._slot_lexicon_tick = tick
+        self._slot_lexicon_frame_hash = frame_content_hash(frame_b64)
+
+    def clear_slot_lexicon(self) -> None:
+        self._slot_lexicon = {}
+        self._slot_lexicon_tick = -1
+        self._slot_lexicon_frame_hash = ""
+
     def get_slot_visualization(self) -> dict:
         """Данные для UI: кадр + slot masks (кэш из _refresh, без PIL/cv2 на каждый тик)."""
         result: dict = {
@@ -355,6 +377,34 @@ class EnvironmentVisual:
         var = self.cortex.slot_variability()
         result["variability"]   = [round(float(v), 4) for v in var]
         result["active_slots"]  = int((var > 0.02).sum())
+
+        # Фаза 2: подписи слотов (параллельно индексу 0…K-1)
+        lex = self._slot_lexicon
+        slot_labels: list[dict] = []
+        for k in range(self.n_slots):
+            sid = f"slot_{k}"
+            e = lex.get(sid)
+            if e:
+                slot_labels.append(
+                    {
+                        "slot_id": sid,
+                        "label": e.get("label"),
+                        "likely_phys": list(e.get("likely_phys") or []),
+                        "confidence": round(float(e.get("confidence", 0)), 3),
+                    }
+                )
+            else:
+                slot_labels.append(
+                    {
+                        "slot_id": sid,
+                        "label": None,
+                        "likely_phys": [],
+                        "confidence": 0.0,
+                    }
+                )
+        result["slot_labels"] = slot_labels
+        result["slot_lexicon_tick"] = self._slot_lexicon_tick
+        result["slot_lexicon_frame_hash"] = self._slot_lexicon_frame_hash
         return result
 
     def get_frame_base64(self, view: str | None = None) -> str | None:
@@ -388,6 +438,7 @@ class EnvironmentVisual:
         if callable(fn):
             fn()
         self._vision_stride_counter = 0
+        self.clear_slot_lexicon()
         self._refresh(run_encode=True)
 
     # ── Seeds для visual env ─────────────────────────────────────────────────

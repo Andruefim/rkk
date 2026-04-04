@@ -93,6 +93,62 @@ class EffectiveVLState:
     entropy_spike_autonomy_harm:  float  # порог для §7
 
 
+@dataclass
+class TeacherVLOverlay:
+    """
+    Фаза 3: дельты к EffectiveVLState от LLM, с абсолютным сроком expires_at_tick.
+    """
+
+    expires_at_tick: int
+    phi_min_delta: float = 0.0
+    env_entropy_max_delta: float = 0.0
+    h_slow_max_delta: float = 0.0
+    predict_lo_delta: float = 0.0
+    predict_hi_delta: float = 0.0
+    entropy_spike_phi_low_delta: float = 0.0
+    entropy_spike_autonomy_delta: float = 0.0
+
+
+def merge_teacher_vl(
+    eff: EffectiveVLState,
+    overlay: TeacherVLOverlay | None,
+    engine_tick: int,
+) -> EffectiveVLState:
+    if overlay is None or engine_tick > overlay.expires_at_tick:
+        return eff
+    pm = float(np.clip(eff.phi_min + overlay.phi_min_delta, 0.005, 0.42))
+    em = float(np.clip(eff.env_entropy_max_delta + overlay.env_entropy_max_delta, 0.08, 1.55))
+    hm = float(np.clip(eff.h_slow_max + overlay.h_slow_max_delta, 4.0, 24.0))
+    pl = float(np.clip(eff.predict_lo + overlay.predict_lo_delta, 0.0, 0.48))
+    ph = float(np.clip(eff.predict_hi + overlay.predict_hi_delta, 0.52, 1.0))
+    if pl >= ph - 0.02:
+        mid = 0.5 * (pl + ph)
+        pl, ph = mid - 0.02, mid + 0.02
+    espl = float(
+        np.clip(
+            eff.entropy_spike_phi_low + overlay.entropy_spike_phi_low_delta,
+            0.05,
+            0.92,
+        )
+    )
+    esph = float(
+        np.clip(
+            eff.entropy_spike_autonomy_harm + overlay.entropy_spike_autonomy_delta,
+            0.05,
+            0.92,
+        )
+    )
+    return EffectiveVLState(
+        phi_min=pm,
+        env_entropy_max_delta=em,
+        h_slow_max=hm,
+        predict_lo=pl,
+        predict_hi=ph,
+        entropy_spike_phi_low=espl,
+        entropy_spike_autonomy_harm=esph,
+    )
+
+
 def _vl_lerp(a: float, b: float, alpha: float) -> float:
     return a + (b - a) * alpha
 
@@ -149,6 +205,9 @@ class ValueLayer:
     def __init__(self, bounds: HomeostaticBounds | None = None):
         self.bounds = bounds or HomeostaticBounds()
 
+        # Фаза 3: мягкий VL-overlay от учителя (TTL)
+        self._teacher_vl_overlay: TeacherVLOverlay | None = None
+
         # История заблокированных действий (для REPEATED_FAIL)
         self._blocked_history: list[tuple[str, float]] = []
         self._max_history = 20
@@ -159,6 +218,9 @@ class ValueLayer:
         self.block_reasons: dict[str, int] = {r.value: 0 for r in BlockReason}
         self.imagination_checks = 0
         self.imagination_blocks = 0
+
+    def set_teacher_vl_overlay(self, overlay: TeacherVLOverlay | None) -> None:
+        self._teacher_vl_overlay = overlay
 
     @staticmethod
     def _clip_state_val(v: float) -> float:
@@ -226,6 +288,7 @@ class ValueLayer:
         if imagination_horizon > 0:
             self.imagination_checks += 1
         eff = effective_vl_state(self.bounds, engine_tick)
+        eff = merge_teacher_vl(eff, self._teacher_vl_overlay, engine_tick)
 
         # 1. Переменная в допустимом диапазоне?
         if value < self.bounds.var_min or value > self.bounds.var_max:
@@ -378,6 +441,10 @@ class ValueLayer:
 
     def snapshot(self, engine_tick: int = 0) -> dict:
         eff = effective_vl_state(self.bounds, engine_tick)
+        eff_m = merge_teacher_vl(eff, self._teacher_vl_overlay, engine_tick)
+        ov = self._teacher_vl_overlay
+        teacher_active = ov is not None and engine_tick <= ov.expires_at_tick
+        teacher_ttl = max(0, ov.expires_at_tick - engine_tick) if ov else 0
         w, b = self.bounds.warmup_ticks, self.bounds.blend_ticks
         a = _warmup_alpha(engine_tick, w, b)
         if w <= 0:
@@ -393,14 +460,16 @@ class ValueLayer:
             "total_blocked":     self.total_blocked,
             "block_rate":        round(self.block_rate, 3),
             "block_reasons":     dict(self.block_reasons),
-            "phi_min":           round(eff.phi_min, 4),
+            "phi_min":           round(eff_m.phi_min, 4),
             "var_range":         [self.bounds.var_min, self.bounds.var_max],
             "vl_phase":          phase,
             "vl_strictness":     round(a, 3),
             "warmup_end_tick":   w,
             "blend_end_tick":    w + b,
-            "env_entropy_limit": round(eff.env_entropy_max_delta, 3),
-            "predict_band":      [round(eff.predict_lo, 3), round(eff.predict_hi, 3)],
+            "env_entropy_limit": round(eff_m.env_entropy_max_delta, 3),
+            "predict_band":      [round(eff_m.predict_lo, 3), round(eff_m.predict_hi, 3)],
             "imagination_checks": self.imagination_checks,
             "imagination_blocks": self.imagination_blocks,
+            "teacher_vl_active": teacher_active,
+            "teacher_vl_ttl_ticks": teacher_ttl,
         }

@@ -20,6 +20,7 @@ from engine.environment  import Environment
 from engine.system1      import System1
 from engine.temporal     import TemporalBlankets
 from engine.value_layer  import ValueLayer, HomeostaticBounds, BlockReason
+from engine.phase3_teacher import TeacherIGRule
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
 NOTEARS_EVERY = 16
@@ -74,6 +75,10 @@ class RKKAgent:
         # Φ других агентов (заполняется Simulation-ом перед step())
         self.other_agents_phi: list[float] = []
         self._last_engine_tick = 0
+
+        # Фаза 3: LLM-учитель (IG-бонус затухает с числом интервенций)
+        self._teacher_rules: list[TeacherIGRule] = []
+        self._teacher_weight: float = 0.0
 
         self._bootstrap()
 
@@ -220,6 +225,30 @@ class RKKAgent:
 
         return sorted(candidates, key=lambda x: -x["expected_ig"])
 
+    def set_teacher_state(self, rules: list[TeacherIGRule], weight: float) -> None:
+        """Фаза 3: правила от LLM и текущий teacher_weight (симуляция считает annealing)."""
+        self._teacher_rules = list(rules)
+        self._teacher_weight = float(max(0.0, min(1.0, weight)))
+
+    def _teacher_ig_bonus(self, variable: str, nodes: dict[str, float]) -> float:
+        w = self._teacher_weight
+        if w <= 0 or not self._teacher_rules:
+            return 0.0
+        acc = 0.0
+        for r in self._teacher_rules:
+            if r.target_var != variable:
+                continue
+            if r.when_var:
+                val = nodes.get(r.when_var)
+                if val is None:
+                    continue
+                if r.when_min is not None and float(val) < r.when_min:
+                    continue
+                if r.when_max is not None and float(val) > r.when_max:
+                    continue
+            acc += r.bonus * w
+        return min(0.28, acc)
+
     # ── Один шаг с Value Layer ────────────────────────────────────────────────
     def step(self, engine_tick: int = 0) -> dict:
         self._last_engine_tick = engine_tick
@@ -330,6 +359,9 @@ class RKKAgent:
             actual_ig = pe_phys
         else:
             actual_ig = pe_slot
+
+        t_bonus = self._teacher_ig_bonus(var, dict(self.graph.nodes))
+        actual_ig = float(np.clip(actual_ig + t_bonus, 0.0, 1.0))
 
         self.system1.push_experience(
             features=chosen["features"],
@@ -454,6 +486,10 @@ class RKKAgent:
             "temporal":              tb_info,
             "system1":               s1_info,
             "value_layer":           vl_info,
+            "teacher": {
+                "weight":     round(self._teacher_weight, 4),
+                "rules":      len(self._teacher_rules),
+            },
             "edges": [e.as_dict() for e in self.graph.edges],
         }
         if self.env.preset == "pybullet":

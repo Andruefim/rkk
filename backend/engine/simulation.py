@@ -7,6 +7,10 @@ simulation_singleton_v2.py — Singleton AGI с гуманоидом (Фаза 1
   - Predictive coding loop: GNN prediction → visual cortex feedback
   - /vision/slots endpoint data через get_vision_state()
   - vision_stats в snapshot
+
+Фаза 3:
+  - refresh_phase3_teacher_llm(): LLM → правила IG + VL overlay (TTL)
+  - tick_step: teacher_weight annealing (RKK_TEACHER_T_MAX), overlay на ValueLayer
 """
 from __future__ import annotations
 
@@ -183,6 +187,10 @@ class Simulation:
         self._vision_ticks  = 0         # тиков с включённым зрением
         self._last_vision_state: dict = {}
 
+        # Фаза 3: виртуальный учитель (LLM → правила + VL overlay)
+        self._phase3_teacher_rules: list = []
+        self._phase3_vl_overlay = None
+
     # ── World switch ──────────────────────────────────────────────────────────
     def switch_world(self, new_world: str) -> dict:
         if new_world not in WORLDS:
@@ -196,6 +204,9 @@ class Simulation:
         result = self.switcher.switch(new_world)
         if result.get("switched"):
             self.current_world = new_world
+            self._phase3_teacher_rules = []
+            self._phase3_vl_overlay = None
+            self.agent.value_layer.set_teacher_vl_overlay(None)
             winfo = WORLDS[new_world]
             self._add_event(
                 f"🌍 → {winfo['label']} "
@@ -365,6 +376,20 @@ class Simulation:
             if self._vision_ticks % VISION_GNN_FEED_EVERY == 0:
                 self._feed_gnn_prediction_to_visual()
 
+        # Фаза 3: annealing teacher_weight; VL-overlay только пока не истёк TTL и weight>0
+        try:
+            tmax = int(os.environ.get("RKK_TEACHER_T_MAX", "140"))
+        except ValueError:
+            tmax = 140
+        tmax = max(1, tmax)
+        tw = max(0.0, 1.0 - (self.agent._total_interventions / tmax))
+        self.agent.set_teacher_state(self._phase3_teacher_rules, tw)
+        ov = self._phase3_vl_overlay
+        if ov is not None and self.tick <= ov.expires_at_tick and tw > 0:
+            self.agent.value_layer.set_teacher_vl_overlay(ov)
+        else:
+            self.agent.value_layer.set_teacher_vl_overlay(None)
+
         self.agent.other_agents_phi = []
         result = self.agent.step(engine_tick=self.tick)
         self._log_step(result, fallen)
@@ -501,15 +526,175 @@ class Simulation:
         return fn(view) if callable(fn) else None
 
     def get_vision_state(self) -> dict:
-        """Данные для /vision/slots endpoint."""
+        """Данные для /vision/slots endpoint (свежий снимок, в т.ч. slot_labels Фазы 2)."""
         if not self._visual_mode or self._visual_env is None:
             return {"visual_mode": False}
-        state = dict(self._last_vision_state)
-        state["visual_mode"]  = True
-        state["n_slots"]      = self._visual_env.n_slots
+        try:
+            state = self._visual_env.get_slot_visualization()
+        except Exception:
+            state = dict(self._last_vision_state)
+        state["visual_mode"] = True
+        state["n_slots"] = self._visual_env.n_slots
         state["vision_ticks"] = self._vision_ticks
-        state["cortex"]       = self._visual_env.cortex.snapshot()
+        state["cortex"] = self._visual_env.cortex.snapshot()
         return state
+
+    async def vlm_label_slots(
+        self,
+        llm_url: str,
+        llm_model: str,
+        max_mask_images: int = 4,
+        text_only: bool = False,
+        inject_weak_edges: bool = False,
+    ) -> dict:
+        """
+        Фаза 2: один вызов VLM (или текстовый fallback) → лексикон на EnvironmentVisual.
+        Опционально слабые рёбра slot→phys при inject_weak_edges и confidence.
+
+        Идея на будущее (без авто-повтора здесь): вызывать из tick_step при «запутался»
+        — например серия fallen, высокий block_rate, длительная стагнация discovery;
+        с дебаунсом и env RKK_VLM_ON_CONFUSION=1.
+        """
+        if not self._visual_mode or self._visual_env is None:
+            return {"ok": False, "error": "visual mode off"}
+
+        from engine.slot_lexicon import (
+            run_slot_vlm_labeling,
+            weak_slot_to_phys_edges,
+        )
+
+        vis = self._visual_env
+        snap = vis.get_slot_visualization()
+        var_ids = list(self.agent.graph.nodes.keys())
+
+        labels, mode, err = await run_slot_vlm_labeling(
+            frame_b64=snap.get("frame"),
+            masks_b64=list(snap.get("masks") or []),
+            slot_values=list(snap.get("slot_values") or []),
+            variability=list(snap.get("variability") or []),
+            n_slots=vis.n_slots,
+            variable_ids=var_ids,
+            llm_url=llm_url,
+            llm_model=llm_model,
+            max_mask_images=max_mask_images,
+            text_only=text_only,
+        )
+
+        if not labels:
+            return {
+                "ok": False,
+                "mode": mode,
+                "error": err or "empty labels",
+            }
+
+        vis.set_slot_lexicon(labels, self.tick, snap.get("frame"))
+
+        injected = 0
+        skipped: list[str] = []
+        if inject_weak_edges:
+            edges = weak_slot_to_phys_edges(labels)
+            if edges:
+                r = self.agent.inject_text_priors(edges)
+                injected = int(r.get("injected", 0))
+                skipped = list(r.get("skipped") or [])
+
+        self._add_event(
+            f"🔬 VLM slots: {mode}, {len(labels)} labels"
+            + (f", +{injected} weak edges" if inject_weak_edges else ""),
+            "#44ccff",
+            "phase",
+        )
+
+        return {
+            "ok": True,
+            "mode": mode,
+            "n_slots_labeled": len(labels),
+            "warning": err,
+            "slot_lexicon_tick": self.tick,
+            "weak_edges_injected": injected,
+            "weak_edges_skipped": skipped,
+        }
+
+    async def refresh_phase3_teacher_llm(self) -> dict:
+        """
+        Фаза 3: один вызов Ollama → правила IG-бонуса для System1 + TTL-дельты Value Layer.
+        """
+        from engine.phase3_teacher import (
+            fetch_phase3_teacher_bundle,
+            build_phase3_digest,
+            top_uncertain_vars_from_agent,
+            _slot_lexicon_summary,
+        )
+
+        llm_url = os.environ.get("RKK_OLLAMA_URL", "http://localhost:11434/api/generate")
+        model = os.environ.get("RKK_OLLAMA_MODEL", "gemma4:e4b")
+        agent = self.agent
+        valid = set(agent.graph.nodes.keys())
+        if not valid:
+            return {"ok": False, "error": "no graph nodes"}
+
+        fallen = False
+        is_fn = getattr(agent.env, "is_fallen", None)
+        if callable(is_fn):
+            try:
+                fallen = bool(is_fn())
+            except Exception:
+                fallen = False
+
+        pn = (
+            PHASE_NAMES[self.phase]
+            if 0 <= self.phase < len(PHASE_NAMES)
+            else ""
+        )
+        digest = build_phase3_digest(
+            variable_ids=sorted(valid),
+            nodes=dict(agent.graph.nodes),
+            phase_idx=self.phase,
+            phase_name=pn,
+            fallen=fallen,
+            block_rate=agent.value_layer.block_rate,
+            total_interventions=agent._total_interventions,
+            top_uncertain_vars=top_uncertain_vars_from_agent(agent),
+            slot_lexicon=_slot_lexicon_summary(self._visual_env),
+        )
+
+        rules, ov, err = await fetch_phase3_teacher_bundle(
+            llm_url=llm_url,
+            llm_model=model,
+            digest=digest,
+            valid_vars=valid,
+            current_tick=self.tick,
+        )
+
+        if err and not rules and ov is None:
+            return {"ok": False, "error": err}
+
+        self._phase3_teacher_rules = rules
+        self._phase3_vl_overlay = ov
+
+        try:
+            tmax = int(os.environ.get("RKK_TEACHER_T_MAX", "140"))
+        except ValueError:
+            tmax = 140
+        tw = max(0.0, 1.0 - (agent._total_interventions / max(1, tmax)))
+        agent.set_teacher_state(rules, tw)
+        if ov is not None and self.tick <= ov.expires_at_tick and tw > 0:
+            agent.value_layer.set_teacher_vl_overlay(ov)
+        else:
+            agent.value_layer.set_teacher_vl_overlay(None)
+
+        msg = f"📚 Phase3 teacher: {len(rules)} rules"
+        if ov is not None:
+            msg += f", VL overlay ttl={ov.expires_at_tick - self.tick}t"
+        self._add_event(msg, "#ddaa44", "phase")
+
+        return {
+            "ok": True,
+            "n_rules": len(rules),
+            "vl_overlay": ov is not None,
+            "warning": err,
+            "expires_at_tick": ov.expires_at_tick if ov is not None else None,
+        }
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
     def _build_snapshot(self, snap: dict, graph_deltas: dict,

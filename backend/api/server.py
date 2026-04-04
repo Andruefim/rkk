@@ -7,6 +7,12 @@ server.py — FastAPI для Singleton AGI Humanoid (Фаза 11 + 12).
   GET  /vision/slots               — слоты + attention masks (base64)
   GET  /vision/status              — статус кортекса
   GET  /vision/attn_frame?slot_idx — PyBullet frame с overlay маской
+  POST /vision/vlm-label          — Фаза 2: VLM-лексикон слотов (Ollama chat + images)
+  POST /teacher/refresh           — Фаза 3: LLM-учитель (правила S1 + VL overlay TTL)
+
+Авто при старте (lifespan): humanoid_structured LLM → enable visual → один VLM → фаза 3 teacher.
+  RKK_SKIP_AUTO_VISION=1, RKK_SKIP_AUTO_VLM_BOOTSTRAP=1 — отключить шаги.
+  RKK_AUTO_VISION_N_SLOTS, RKK_AUTO_VISION_MODE (hybrid|visual)
 
 Установить для Фазы 12: pip install opencv-python scipy
 """
@@ -50,6 +56,10 @@ def get_seeder() -> RAGSeeder:
     return _seeder
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 async def _startup_humanoid_llm_bootstrap() -> None:
     """
     После старта сервера: humanoid_structured через Ollama (как POST /bootstrap/llm).
@@ -89,6 +99,7 @@ async def _startup_humanoid_llm_bootstrap() -> None:
         else:
             edges = humanoid_hardcoded_seeds()
             src = "hardcoded_fallback"
+        res = sim.inject_seeds(agent_id=0, edges=edges)
         print(
             f"[RKK] Auto humanoid_structured bootstrap: source={src}, "
             f"injected={res.get('injected', 0)}, skipped={len(res.get('skipped', []))}"
@@ -97,9 +108,111 @@ async def _startup_humanoid_llm_bootstrap() -> None:
         print(f"[RKK] Auto humanoid_structured bootstrap error: {e}")
 
 
+async def _startup_auto_vision_and_one_vlm() -> None:
+    """
+    После LLM-bootstrap: включить SlotAttention (hybrid) и один вызов VLM-лексикона.
+    Повтор VLM намеренно не делаем — позже можно триггерить по «запутался»
+    (высокий block_rate / fallen / стагнация фазы), см. simulation tick.
+
+    RKK_SKIP_AUTO_VISION=1 — не включать зрение (и VLM не запустится).
+    RKK_SKIP_AUTO_VLM_BOOTSTRAP=1 — зрение да, VLM один раз пропустить.
+    RKK_AUTO_VLM_WEAK_EDGES=1 — как у ручного POST: слабые slot→phys.
+    RKK_AUTO_VLM_TEXT_ONLY=1 — только текстовый режим (без картинок в chat).
+    """
+    if _env_flag("RKK_SKIP_AUTO_VISION"):
+        print("[RKK] Auto vision skipped (RKK_SKIP_AUTO_VISION)")
+        return
+    try:
+        sim = get_sim()
+        if sim.current_world != "humanoid":
+            print("[RKK] Auto vision: only humanoid world, skipping")
+            return
+        if sim._visual_mode:
+            print("[RKK] Auto vision: already enabled, skipping enable_visual")
+        else:
+            try:
+                n_slots = int(os.environ.get("RKK_AUTO_VISION_N_SLOTS", "8"))
+            except ValueError:
+                n_slots = 8
+            mode = (os.environ.get("RKK_AUTO_VISION_MODE", "hybrid") or "hybrid").strip()
+            out = sim.enable_visual(n_slots=n_slots, mode=mode)
+            if out.get("error"):
+                print(f"[RKK] Auto vision failed: {out.get('error')}")
+                return
+            print(
+                f"[RKK] Auto vision ON: n_slots={out.get('n_slots')}, "
+                f"mode={out.get('mode')}, gnn_d={out.get('gnn_d')}"
+            )
+
+        if _env_flag("RKK_SKIP_AUTO_VLM_BOOTSTRAP"):
+            print("[RKK] Auto VLM bootstrap skipped (RKK_SKIP_AUTO_VLM_BOOTSTRAP)")
+            return
+
+        llm_url = os.environ.get("RKK_OLLAMA_URL", "http://localhost:11434/api/generate")
+        model = os.environ.get("RKK_OLLAMA_MODEL", "gemma4:e4b")
+        try:
+            max_masks = int(os.environ.get("RKK_AUTO_VLM_MAX_MASKS", "4"))
+        except ValueError:
+            max_masks = 4
+
+        vlm_out = await sim.vlm_label_slots(
+            llm_url=llm_url,
+            llm_model=model,
+            max_mask_images=max_masks,
+            text_only=_env_flag("RKK_AUTO_VLM_TEXT_ONLY"),
+            inject_weak_edges=_env_flag("RKK_AUTO_VLM_WEAK_EDGES"),
+        )
+        if vlm_out.get("ok"):
+            w = vlm_out.get("weak_edges_injected") or 0
+            print(
+                f"[RKK] Auto VLM bootstrap: mode={vlm_out.get('mode')}, "
+                f"labels={vlm_out.get('n_slots_labeled')}, weak_edges={w}"
+            )
+            if vlm_out.get("warning"):
+                print(f"[RKK] Auto VLM note: {vlm_out.get('warning')}")
+        else:
+            print(f"[RKK] Auto VLM bootstrap failed: {vlm_out.get('error', vlm_out)}")
+    except Exception as e:
+        print(f"[RKK] Auto vision/VLM error: {e}")
+
+
+async def _startup_phase3_teacher() -> None:
+    """
+    Фаза 3 после VLM: один запрос LLM → правила для push_experience + дельты VL (TTL).
+    RKK_SKIP_PHASE3_LLM=1 — пропуск.
+    """
+    if _env_flag("RKK_SKIP_PHASE3_LLM"):
+        print("[RKK] Phase3 teacher skipped (RKK_SKIP_PHASE3_LLM)")
+        return
+    try:
+        sim = get_sim()
+        if sim.current_world != "humanoid":
+            print("[RKK] Phase3 teacher: only humanoid, skipping")
+            return
+        out = await sim.refresh_phase3_teacher_llm()
+        if out.get("ok"):
+            print(
+                f"[RKK] Phase3 teacher: rules={out.get('n_rules', 0)}, "
+                f"vl_overlay={out.get('vl_overlay')}, ttl_tick={out.get('expires_at_tick')}"
+            )
+            if out.get("warning"):
+                print(f"[RKK] Phase3 teacher note: {out.get('warning')}")
+        else:
+            print(f"[RKK] Phase3 teacher failed: {out.get('error')}")
+    except Exception as e:
+        print(f"[RKK] Phase3 teacher error: {e}")
+
+
+async def _startup_post_boot_pipeline() -> None:
+    """Порядок: LLM приоры → зрение → VLM → фаза 3 teacher (фон после yield сервера)."""
+    await _startup_humanoid_llm_bootstrap()
+    await _startup_auto_vision_and_one_vlm()
+    await _startup_phase3_teacher()
+
+
 @asynccontextmanager
 async def _app_lifespan(_: FastAPI):
-    asyncio.create_task(_startup_humanoid_llm_bootstrap())
+    asyncio.create_task(_startup_post_boot_pipeline())
     yield
 
 
@@ -349,6 +462,15 @@ class VisionEnableRequest(BaseModel):
     n_slots: int = 8
     mode:    str = "hybrid"   # "hybrid" (слоты + моторы) | "visual" (только слоты)
 
+
+class VisionVLMRequest(BaseModel):
+    """Фаза 2: разметка slot_k через Ollama (/api/chat + images или текстовый fallback)."""
+    llm_url: str = "http://localhost:11434/api/generate"
+    llm_model: str = "gemma4:e4b"
+    max_mask_images: int = 4
+    text_only: bool = False
+    inject_weak_edges: bool = False
+
 @app.post("/vision/enable")
 def vision_enable(req: VisionEnableRequest):
     """
@@ -385,10 +507,40 @@ def vision_slots():
       slot_values: list[float]
       variability: list[float] — насколько активен слот
       active_slots: int
+      slot_labels: list[dict] — Фаза 2: label, likely_phys, confidence по индексу
+      slot_lexicon_tick, slot_lexicon_frame_hash — метаданные последней разметки
       cortex:      dict — stats
     """
     sim = get_sim()
     return sim.get_vision_state()
+
+
+@app.post("/vision/vlm-label")
+async def vision_vlm_label(req: VisionVLMRequest):
+    """
+    Фаза 2: один вызов VLM (кадр + до K масок) → словарь меток на слотах.
+    При ошибке vision API — автоматический текстовый fallback (числа слотов).
+    inject_weak_edges: очень слабые рёбра slot→phys в граф (опционально).
+    """
+    sim = get_sim()
+    return await sim.vlm_label_slots(
+        llm_url=req.llm_url,
+        llm_model=req.llm_model,
+        max_mask_images=req.max_mask_images,
+        text_only=req.text_only,
+        inject_weak_edges=req.inject_weak_edges,
+    )
+
+
+# ── Фаза 3: виртуальный учитель ───────────────────────────────────────────────
+@app.post("/teacher/refresh")
+async def teacher_refresh():
+    """
+    Повторный запрос LLM: ig_rules (бонус к actual_ig при совпадении do(var)) +
+    vl_overlay с TTL. teacher_weight всё равно затухает с RKK_TEACHER_T_MAX интервенций.
+    """
+    return await get_sim().refresh_phase3_teacher_llm()
+
 
 @app.get("/vision/attn_frame")
 def vision_attn_frame(slot_idx: int = Query(default=0)):
