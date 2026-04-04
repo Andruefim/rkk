@@ -285,20 +285,42 @@ class CausalGraph:
         return mdl
 
     def propagate(self, variable: str, value: float) -> dict[str, float]:
+        return self.propagate_from(self.nodes, variable, value)
+
+    def propagate_from(
+        self, base: dict[str, float], variable: str, value: float
+    ) -> dict[str, float]:
+        """
+        Предсказание после do(variable=value) от произвольного снимка узлов
+        (Фаза 13: imagination rollout без мутации self.nodes).
+        """
         if self._core is None:
-            return dict(self.nodes)
+            return dict(base)
         state_vec = torch.tensor(
-            [[self.nodes.get(n, 0.0) for n in self._node_ids]],
-            dtype=torch.float32, device=self.device
+            [[float(base.get(n, 0.0)) for n in self._node_ids]],
+            dtype=torch.float32, device=self.device,
         )
         if variable in self._node_ids:
-            state_vec[0, self._node_ids.index(variable)] = value
+            state_vec[0, self._node_ids.index(variable)] = float(value)
         with torch.no_grad():
             pred = self._core(state_vec)
-        result = dict(self.nodes)
-        for i, nid in enumerate(self._node_ids):
-            result[nid] = pred[0, i].item()
+        result = {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
         return result
+
+    def rollout_step_free(self, base: dict[str, float]) -> dict[str, float]:
+        """
+        Один шаг «свободной» динамики GNN: X' = core(X), без интервенции.
+        Используется для многошагового imagination после мысленного do().
+        """
+        if self._core is None:
+            return dict(base)
+        state_vec = torch.tensor(
+            [[float(base.get(n, 0.0)) for n in self._node_ids]],
+            dtype=torch.float32, device=self.device,
+        )
+        with torch.no_grad():
+            pred = self._core(state_vec)
+        return {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
 
     def _invalidate_cache(self):
         self._edge_cache = None

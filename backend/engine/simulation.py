@@ -492,7 +492,7 @@ class Simulation:
         self.events.appendleft({"tick": self.tick, "text": text, "color": color, "type": type_})
 
     # ── Camera / Scene ────────────────────────────────────────────────────────
-    def get_camera_frame(self, view: str = "diag") -> str | None:
+    def get_camera_frame(self, view: str | None = None) -> str | None:
         fn = getattr(self.agent.env, "get_frame_base64", None)
         return fn(view) if callable(fn) else None
 
@@ -532,6 +532,9 @@ class Simulation:
             "value_layer":   {
                 "total_blocked_all": snap.get("total_blocked", 0),
                 "block_rates": [round(snap.get("value_layer", {}).get("block_rate", 0), 3)],
+                "imagination_horizon": snap.get("value_layer", {}).get("imagination_horizon", 0),
+                "imagination_checks": snap.get("value_layer", {}).get("imagination_checks", 0),
+                "imagination_blocks": snap.get("value_layer", {}).get("imagination_blocks", 0),
             },
             "byzantine":     None,
             "motif":         None,

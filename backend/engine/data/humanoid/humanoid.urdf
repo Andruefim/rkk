@@ -120,16 +120,16 @@
 				<box size="0.708000 0.220000 0.360000" />
 			</geometry>
 		</collision>
-		<!-- Подошва: тонкая ось = локальная Y → после stand_euler мир +Z (пластина в плоскости пола XY) -->
+		<!-- Подошва: центр смещён назад (пятка), сустав ≈ задняя треть опоры — иначе COM падает назад «лыжами» -->
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.42 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
 			<geometry>
 				<box size="0.34 0.06 0.26" />
 			</geometry>
 			<material name="sole_r"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.42 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
 			<geometry>
 				<box size="0.34 0.06 0.26" />
 			</geometry>
@@ -257,14 +257,14 @@
 			</geometry>
 		</collision>
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.42 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
 			<geometry>
 				<box size="0.34 0.06 0.26" />
 			</geometry>
 			<material name="sole_l"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.42 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
 			<geometry>
 				<box size="0.34 0.06 0.26" />
 			</geometry>

@@ -103,10 +103,7 @@ class EnvironmentVisual:
         fn = getattr(self.base_env, "get_frame_base64", None)
         if callable(fn):
             b64 = None
-            for view in ("ego", "diag"):
-                b64 = fn(view)
-                if b64:
-                    break
+            b64 = fn(None)
             if b64:
                 import base64 as _b64
                 from io import BytesIO
@@ -177,7 +174,10 @@ class EnvironmentVisual:
         # Hybrid mode: добавляем несколько ключевых ручных переменных
         if self.mode == "hybrid":
             raw = self.base_env.observe()
-            for key in ["com_z", "torso_roll", "lknee", "rknee"]:
+            for key in [
+                "com_z", "torso_roll", "lknee", "rknee",
+                "neck_yaw", "neck_pitch", "lshoulder", "rshoulder",
+            ]:
                 if key in raw:
                     obs[f"phys_{key}"] = raw[key]
         return obs
@@ -191,7 +191,10 @@ class EnvironmentVisual:
         ids = slot_var_ids(self.n_slots)
         if self.mode == "hybrid":
             raw = self.base_env.observe()
-            for key in ["com_z", "torso_roll", "lknee", "rknee"]:
+            for key in [
+                "com_z", "torso_roll", "lknee", "rknee",
+                "neck_yaw", "neck_pitch", "lshoulder", "rshoulder",
+            ]:
                 if key in raw:
                     ids.append(f"phys_{key}")
         return ids
@@ -299,9 +302,9 @@ class EnvironmentVisual:
         result["active_slots"]  = int((var > 0.02).sum())
         return result
 
-    def get_frame_base64(self, view: str = "diag") -> str | None:
+    def get_frame_base64(self, view: str | None = None) -> str | None:
         fn = getattr(self.base_env, "get_frame_base64", None)
-        return fn(view) if callable(fn) else None
+        return fn(None) if callable(fn) else None
 
     def get_full_scene(self) -> dict:
         fn = getattr(self.base_env, "get_full_scene", None)

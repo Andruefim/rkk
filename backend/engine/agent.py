@@ -10,6 +10,7 @@ agent_v4.py — RKKAgent с Value Layer (Шаг А).
 """
 from __future__ import annotations
 
+import os
 import torch
 import numpy as np
 from collections import deque
@@ -23,6 +24,18 @@ from engine.value_layer  import ValueLayer, HomeostaticBounds, BlockReason
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
 NOTEARS_EVERY = 16
 MAX_FALLBACK_TRIES = 12  # больше кандидатов, чтобы пройти Value Layer в начале обучения
+# Вес slot_* в actual_ig для System 1; основной сигнал — не-визуальные узлы (RKK_VISUAL_IG_WEIGHT=0 → только физика).
+VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.18"))
+
+
+def _imagination_horizon_from_env() -> int:
+    """Фаза 13: RKK_IMAGINATION_STEPS — число шагов core(X) после мысленного do(); 0 = как раньше."""
+    raw = os.environ.get("RKK_IMAGINATION_STEPS", "2")
+    try:
+        h = int(raw)
+    except ValueError:
+        h = 0
+    return max(0, h)
 
 
 class RKKAgent:
@@ -46,6 +59,7 @@ class RKKAgent:
             d_input=len(env.variable_ids), device=device
         )
         self.value_layer = ValueLayer(bounds)
+        self._imagination_horizon = _imagination_horizon_from_env()
 
         self._cg_history: deque[float] = deque(maxlen=20)
         self._total_interventions = 0
@@ -232,6 +246,7 @@ class RKKAgent:
                 current_phi=current_phi,
                 other_agents_phi=self.other_agents_phi,
                 engine_tick=engine_tick,
+                imagination_horizon=self._imagination_horizon,
             )
 
             if check_result.allowed:
@@ -293,10 +308,28 @@ class RKKAgent:
         compression_delta = mdl_before - mdl_after
         self._cg_history.append(compression_delta)
 
-        # Обучаем System 1 реальным исходом
-        pred_val  = predicted.get(list(observed.keys())[-1], 0.5)
-        obs_last  = list(observed.values())[-1]
-        actual_ig = float(abs(pred_val - obs_last))
+        # System 1: IG в основном по физическим узлам; slot_* — вспомогательный канал (не единственный реворд).
+        nids = self.graph._node_ids
+        phys_ids = [k for k in nids if not str(k).startswith("slot_")]
+        slot_ids = [k for k in nids if str(k).startswith("slot_")]
+
+        def _mean_abs_err(keys: list) -> float:
+            if not keys:
+                return 0.0
+            return float(np.mean([
+                abs(float(predicted.get(k, 0.5)) - float(observed.get(k, 0.5)))
+                for k in keys
+            ]))
+
+        pe_phys = _mean_abs_err(phys_ids)
+        pe_slot = _mean_abs_err(slot_ids)
+        w_vis = min(0.45, max(0.0, VISUAL_IG_WEIGHT))
+        if slot_ids and phys_ids:
+            actual_ig = (1.0 - w_vis) * pe_phys + w_vis * pe_slot
+        elif phys_ids:
+            actual_ig = pe_phys
+        else:
+            actual_ig = pe_slot
 
         self.system1.push_experience(
             features=chosen["features"],
@@ -387,7 +420,8 @@ class RKKAgent:
             "buffer_size": len(self.system1.buffer),
             "mean_loss":   round(self.system1.mean_loss, 6),
         }
-        vl_info = self.value_layer.snapshot(self._last_engine_tick)
+        vl_info = dict(self.value_layer.snapshot(self._last_engine_tick))
+        vl_info["imagination_horizon"] = self._imagination_horizon
 
         notears_info = None
         if self._last_notears_loss:

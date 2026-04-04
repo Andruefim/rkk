@@ -5,7 +5,7 @@ value_layer.py — Value Layer (РКК v5, Проблема 10).
 
 Механика:
   1. System 1 предлагает действие do(X=v)
-  2. check_action() виртуально прогоняет его через CausalGraph + Slow SSM
+  2. check_action() виртуально прогоняет его через CausalGraph (+ опц. N шагов core(X), фаза 13) и Slow SSM
   3. Если предсказанное состояние нарушает гомеостаз → BLOCK
   4. Заблокированное действие получает отрицательный reward → System 1 обучается
 
@@ -45,6 +45,7 @@ class CheckResult:
     predicted_phi:   float
     penalty:         float = 0.0   # штраф для System 1 (отрицательный IG)
     message:         str   = ""
+    imagination_steps: int = 0   # сколько виртуальных шагов GNN проверено (0 = только legacy 1-step)
 
     @property
     def blocked(self) -> bool:
@@ -138,10 +139,11 @@ class ValueLayer:
     Инвариантный слой этики. Не пересматривается через Epistemic Annealing.
 
     Алгоритм check_action:
-      1. Предсказываем результат do(var=val) через CausalGraph
-      2. Оцениваем Φ_pred через TemporalBlankets (на виртуальном шаге)
-      3. Проверяем все гомеостатические ограничения
-      4. Если любое нарушено → BLOCK + penalty для System 1
+      1. Предсказываем результат do(var=val) через CausalGraph (propagate_from)
+      2. При imagination_horizon>0 — ещё N шагов rollout_step_free (чистый GNN)
+      3. На каждом виртуальном шаге — коридор предсказания и контроль скачка энтропии
+      4. Затем h_slow, Φ, ΔAutonomy, repeated_fail по финальному виртуальному состоянию
+      5. Если нарушено → BLOCK + penalty для System 1
     """
 
     def __init__(self, bounds: HomeostaticBounds | None = None):
@@ -155,6 +157,52 @@ class ValueLayer:
         self.total_checked  = 0
         self.total_blocked  = 0
         self.block_reasons: dict[str, int] = {r.value: 0 for r in BlockReason}
+        self.imagination_checks = 0
+        self.imagination_blocks = 0
+
+    @staticmethod
+    def _clip_state_val(v: float) -> float:
+        return float(
+            np.clip(np.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        )
+
+    def _graph_constraints(
+        self,
+        predicted_state: dict[str, float],
+        prev_nodes: dict[str, float],
+        eff: EffectiveVLState,
+        slot_action: bool,
+        raw_prev_entropy: bool,
+    ) -> tuple[BlockReason, str] | None:
+        """Коридор предсказания и скачок энтропии (как в legacy VL)."""
+        if slot_action:
+            return None
+        for var_name, pred_val in predicted_state.items():
+            pv = self._clip_state_val(pred_val)
+            if not np.isfinite(pv):
+                return BlockReason.VAR_OUT_OF_RANGE, f"predicted {var_name} non-finite"
+            if pv < eff.predict_lo or pv > eff.predict_hi:
+                return (
+                    BlockReason.VAR_OUT_OF_RANGE,
+                    f"predicted {var_name}={pv:.3f} outside [{eff.predict_lo:.3f}, {eff.predict_hi:.3f}]",
+                )
+        pred_for_entropy = {
+            k: self._clip_state_val(v) for k, v in predicted_state.items()
+        }
+        if raw_prev_entropy:
+            std_prev = float(np.std(list(prev_nodes.values())))
+        else:
+            std_prev = float(
+                np.std([self._clip_state_val(prev_nodes.get(k, 0.0)) for k in pred_for_entropy])
+            )
+        std_new = float(np.std(list(pred_for_entropy.values())))
+        d = std_new - std_prev
+        if d > eff.env_entropy_max_delta:
+            return (
+                BlockReason.ENTROPY_SPIKE,
+                f"entropy spike +{d:.3f} > {eff.env_entropy_max_delta:.3f}",
+            )
+        return None
 
     def check_action(
         self,
@@ -166,12 +214,17 @@ class ValueLayer:
         current_phi:   float,
         other_agents_phi: list[float] | None = None,
         engine_tick:   int = 0,
+        imagination_horizon: int = 0,
     ) -> CheckResult:
         """
         Проверяем безопасность do(variable=value).
         engine_tick — тик симуляции: на прогреве пороги мягче, затем ramp к steady.
+        imagination_horizon — число дополнительных шагов X'=core(X) после мысленного do()
+        (Фаза 13); 0 — только один шаг, как раньше.
         """
         self.total_checked += 1
+        if imagination_horizon > 0:
+            self.imagination_checks += 1
         eff = effective_vl_state(self.bounds, engine_tick)
 
         # 1. Переменная в допустимом диапазоне?
@@ -183,62 +236,51 @@ class ValueLayer:
                 variable, value,
             )
 
-        # 2. Предсказываем результат через CausalGraph
-        predicted_state = graph.propagate(variable, value)
-
-        # Слоты зрения: SCM не моделирует «пиксели→физика»; коридор предсказания и скачок
-        # энтропии по графу дают ложные var_out_of_range / ENTROPY_SPIKE на каждом do(slot_k).
         slot_action = variable.startswith("slot_")
-        entropy_delta = 0.0
 
-        if not slot_action:
-            # 3. Предсказание SCM в [0,1]; узкое окно давало 100% var_out_of_range при «жёстких» W
-            for var_name, pred_val in predicted_state.items():
-                pv = float(
-                    np.clip(
-                        np.nan_to_num(pred_val, nan=0.5, posinf=1.0, neginf=0.0),
-                        0.0,
-                        1.0,
-                    )
-                )
-                if not np.isfinite(pv):
-                    return self._block(
-                        BlockReason.VAR_OUT_OF_RANGE,
-                        predicted_state, current_phi,
-                        f"predicted {var_name} non-finite",
-                        variable, value,
-                    )
-                # После прогрева — узкий коридор (растёт с blend); на прогреве lo=0, hi=1
-                if pv < eff.predict_lo or pv > eff.predict_hi:
-                    return self._block(
-                        BlockReason.VAR_OUT_OF_RANGE,
-                        predicted_state, current_phi,
-                        f"predicted {var_name}={pv:.3f} outside [{eff.predict_lo:.3f}, {eff.predict_hi:.3f}]",
-                        variable, value,
-                    )
+        # 2–4. Виртуальный do() + опционально N шагов «свободной» динамики GNN
+        S = dict(current_nodes)
+        S1 = graph.propagate_from(S, variable, value)
+        br_msg = self._graph_constraints(S1, S, eff, slot_action, raw_prev_entropy=True)
+        if br_msg:
+            reason, msg = br_msg
+            if imagination_horizon > 0:
+                self.imagination_blocks += 1
+            return self._block(
+                reason, S1, current_phi,
+                f"{msg} [imagination t=1]",
+                variable, value,
+            )
 
-            # 4. Скачок разброса по уже клипнутому предсказанию (сырой X@W давал ложные ENTROPY_SPIKE)
-            pred_for_entropy = {
-                k: float(
-                    np.clip(
-                        np.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0),
-                        0.0,
-                        1.0,
-                    )
-                )
-                for k, v in predicted_state.items()
-            }
-            current_entropy   = float(np.std(list(current_nodes.values())))
-            predicted_entropy = float(np.std(list(pred_for_entropy.values())))
-            entropy_delta     = predicted_entropy - current_entropy
-
-            if entropy_delta > eff.env_entropy_max_delta:
+        S = S1
+        t = 1
+        for _ in range(imagination_horizon):
+            t += 1
+            S_next = graph.rollout_step_free(S)
+            br_msg = self._graph_constraints(S_next, S, eff, slot_action, raw_prev_entropy=False)
+            if br_msg:
+                reason, msg = br_msg
+                self.imagination_blocks += 1
                 return self._block(
-                    BlockReason.ENTROPY_SPIKE,
-                    predicted_state, current_phi,
-                    f"entropy spike +{entropy_delta:.3f} > {eff.env_entropy_max_delta:.3f}",
+                    reason, S_next, current_phi,
+                    f"{msg} [imagination t={t}]",
                     variable, value,
+                    imagination_steps=t,
                 )
+            S = S_next
+
+        predicted_state = S
+        imagination_evals = 1 + max(0, imagination_horizon)
+
+        # Энтропийный скачок первого шага (для §6–7), как в legacy VL
+        entropy_delta = 0.0
+        if not slot_action:
+            pred_for_entropy = {
+                k: self._clip_state_val(v) for k, v in S1.items()
+            }
+            current_entropy = float(np.std(list(current_nodes.values())))
+            predicted_entropy = float(np.std(list(pred_for_entropy.values())))
+            entropy_delta = predicted_entropy - current_entropy
 
         # 5. Проверяем Φ через slow SSM состояние
         h_slow_norm = temporal.h_slow.norm().item() if temporal is not None else 0.0
@@ -248,6 +290,7 @@ class ValueLayer:
                 predicted_state, current_phi,
                 f"h_slow norm={h_slow_norm:.2f} > {eff.h_slow_max:.2f} (temporal overload)",
                 variable, value,
+                imagination_steps=imagination_evals,
             )
 
         # 6. Проверяем Φ напрямую
@@ -261,6 +304,7 @@ class ValueLayer:
                     predicted_state, current_phi,
                     f"Φ={current_phi:.3f} < {eff.phi_min:.3f} and high-entropy action",
                     variable, value,
+                    imagination_steps=imagination_evals,
                 )
 
         # 7. ΔAutonomy ≥ 0 для других агентов (Value Constraint из РКК v5)
@@ -274,6 +318,7 @@ class ValueLayer:
                         predicted_state, current_phi,
                         f"protects agent with Φ={phi_other:.3f}",
                         variable, value,
+                        imagination_steps=imagination_evals,
                     )
 
         # 8. Повторяющийся fail?
@@ -285,6 +330,7 @@ class ValueLayer:
                 predicted_state, current_phi,
                 f"action do({variable}={value:.2f}) blocked 3+ times recently",
                 variable, value,
+                imagination_steps=imagination_evals,
             )
 
         # ✓ Всё в порядке
@@ -295,6 +341,7 @@ class ValueLayer:
             predicted_phi=current_phi,
             penalty=0.0,
             message="ok",
+            imagination_steps=imagination_evals,
         )
 
     def _block(
@@ -305,6 +352,7 @@ class ValueLayer:
         message:         str,
         variable:        str,
         value:           float,
+        imagination_steps: int = 0,
     ) -> CheckResult:
         self.total_blocked += 1
         self.block_reasons[reason.value] = self.block_reasons.get(reason.value, 0) + 1
@@ -319,6 +367,7 @@ class ValueLayer:
             predicted_phi=predicted_phi,
             penalty=self.bounds.s1_penalty,
             message=message,
+            imagination_steps=imagination_steps,
         )
 
     @property
@@ -352,4 +401,6 @@ class ValueLayer:
             "blend_end_tick":    w + b,
             "env_entropy_limit": round(eff.env_entropy_max_delta, 3),
             "predict_band":      [round(eff.predict_lo, 3), round(eff.predict_hi, 3)],
+            "imagination_checks": self.imagination_checks,
+            "imagination_blocks": self.imagination_blocks,
         }

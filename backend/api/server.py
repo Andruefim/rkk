@@ -92,7 +92,7 @@ def step():
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 @app.get("/camera/frame")
-def camera_frame(view: str = Query(default="diag")):
+def camera_frame(view: str | None = Query(default=None)):
     frame = get_sim().get_camera_frame(view=view)
     if frame is None:
         return JSONResponse({"frame": None, "available": False})

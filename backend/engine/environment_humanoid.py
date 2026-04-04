@@ -10,13 +10,13 @@ environment_humanoid.py — Humanoid Robot Sandbox (Фаза 11).
   - 3 куба разного размера и массы (интерактивные)
   - Рампа (наклонная плоскость, нагружает гравитацию)
 
-Редуцированные переменные (~22):
-  Торс:  com_x, com_y, com_z, roll, pitch                    (5)
+Редуцированные переменные:
+  Торс:  com_x, com_y, com_z, torso_roll, torso_pitch       (5)
+  Голова: neck_yaw, neck_pitch                                (2)
   Ноги:  lhip, lknee, lankle, rhip, rknee, rankle            (6)
   Руки:  lshoulder, lelbow, rshoulder, relbow                 (4)
   Стопы: lfoot_z, rfoot_z                                     (2)
-  Кубы:  cube0_x,y,z  cube1_x,y,z  cube2_x,y,z              (9)
-  Итого: 26 переменных
+  Кубы:  cube0_x,y,z …                                        (9)
 
 GT каузальная структура (скрытая):
   lhip, rknee  → com_x/y      (локомоция)
@@ -32,8 +32,11 @@ do() оператор:
   do(lknee=0.4) → сгибаем колено
 
 Камера:
-  diag / side / front / top + ego (от шеи, вперёд по горизонтали)
-  get_frame_base64(view=...) → JPEG base64
+  только first-person из головы (neck→верх, вперёд по корпусу); view игнорируется.
+  get_frame_base64(...) → JPEG base64
+
+Голова:
+  neck_yaw, neck_pitch — сферический neck (два скаляра → локальный euler XYZ).
 """
 from __future__ import annotations
 
@@ -60,11 +63,12 @@ except ImportError:
 
 # ─── Переменные ───────────────────────────────────────────────────────────────
 TORSO_VARS  = ["com_x", "com_y", "com_z", "torso_roll", "torso_pitch"]
+HEAD_VARS   = ["neck_yaw", "neck_pitch"]
 LEG_VARS    = ["lhip", "lknee", "lankle", "rhip", "rknee", "rankle"]
 ARM_VARS    = ["lshoulder", "lelbow", "rshoulder", "relbow"]
 FOOT_VARS   = ["lfoot_z", "rfoot_z"]
 CUBE_VARS   = [f"cube{i}_{d}" for i in range(3) for d in ["x","y","z"]]
-VAR_NAMES   = TORSO_VARS + LEG_VARS + ARM_VARS + FOOT_VARS + CUBE_VARS
+VAR_NAMES   = TORSO_VARS + HEAD_VARS + LEG_VARS + ARM_VARS + FOOT_VARS + CUBE_VARS
 
 # Нормализация диапазонов
 _RANGES = {}
@@ -72,6 +76,7 @@ for v in TORSO_VARS[:2]:  _RANGES[v] = (-1.5, 1.5)   # COM xy
 _RANGES["com_z"]          = (0.0,  1.5)                # высота
 _RANGES["torso_roll"]     = (-1.2, 1.2)
 _RANGES["torso_pitch"]    = (-1.2, 1.2)
+for v in HEAD_VARS:        _RANGES[v] = (-1.2, 1.2)
 for v in LEG_VARS:         _RANGES[v] = (-1.5, 1.5)   # angles rad
 for v in ARM_VARS:         _RANGES[v] = (-2.0, 2.0)
 for v in FOOT_VARS:        _RANGES[v] = (-0.1, 0.5)
@@ -233,7 +238,7 @@ class _FallbackHumanoid:
     """Простая кинематическая модель без физики."""
 
     def __init__(self):
-        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS}
+        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS + HEAD_VARS}
         self.com    = np.array([0.0, 0.0, STAND_Z])
         self.torso_euler = np.zeros(3)
         self.cubes  = np.array([
@@ -256,7 +261,9 @@ class _FallbackHumanoid:
 
     def set_joint(self, name: str, val: float):
         if name in self.joints:
-            self.joints[name] = np.clip(float(val), -2.0, 2.0)
+            lo, hi = _RANGES.get(name, (-2.0, 2.0))
+            # Как в PyBullet: val ∈ [0,1] из агента → физический диапазон сустава
+            self.joints[name] = float(np.clip(val * (hi - lo) + lo, lo, hi))
             # Кинематическое влияние на COM
             if "hip" in name:
                 idx = 0 if name.startswith("l") else 1
@@ -282,7 +289,7 @@ class _FallbackHumanoid:
         s["com_z"]        = float(self.com[2])
         s["torso_roll"]   = float(self.torso_euler[0])
         s["torso_pitch"]  = float(self.torso_euler[1])
-        for v in LEG_VARS + ARM_VARS:
+        for v in LEG_VARS + ARM_VARS + HEAD_VARS:
             s[v] = float(self.joints.get(v, 0.0))
         s["lfoot_z"]  = float(lf_z)
         s["rfoot_z"]  = float(rf_z)
@@ -305,7 +312,7 @@ class _FallbackHumanoid:
         ]
 
     def reset_stance(self) -> None:
-        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS}
+        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS + HEAD_VARS}
         self.com = np.array([0.0, 0.0, STAND_Z], dtype=np.float64)
         self.torso_euler = np.zeros(3)
         self._vel = np.zeros(3)
@@ -400,6 +407,15 @@ class _PyBulletHumanoid:
             info = pb.getJointInfo(self.robot_id, i, physicsClientId=self.client)
             self.link_names.append(info[12].decode("utf-8"))
             self._joint_types.append(int(info[2]))
+
+        self._neck_euler = np.zeros(3, dtype=float)
+        for i in range(self.n_joints):
+            info = pb.getJointInfo(self.robot_id, i, physicsClientId=self.client)
+            jname = info[1].decode("utf-8")
+            if jname.lower() == "neck":
+                self.joint_by_var["neck_yaw"] = i
+                self.joint_by_var["neck_pitch"] = i
+                break
 
         # Без «прогрева» на VELOCITY для всех суставов: для spherical это ломает осанку.
         # Сразу нейтральная стойка (как при резете после падения).
@@ -631,6 +647,7 @@ class _PyBulletHumanoid:
         Вернуть робота в спавн-позу. Сферические суставы — MultiDof + краткий
         POSITION_CONTROL, иначе гравитация снова ломает осанку при слабом VELOCITY.
         """
+        self._neck_euler[:] = 0.0
         rid = self.robot_id
         cid = self.client
         pb.resetBasePositionAndOrientation(
@@ -686,6 +703,27 @@ class _PyBulletHumanoid:
         jt = self._joint_types[jid]
         motor_m = getattr(pb, "setJointMotorControlMultiDof", None)
 
+        if var_name in ("neck_yaw", "neck_pitch"):
+            if not callable(motor_m) or jt != pb.JOINT_SPHERICAL:
+                return
+            if var_name == "neck_yaw":
+                self._neck_euler[2] = 0.55 * real_pos
+            else:
+                self._neck_euler[0] = 0.45 * real_pos
+            ex, ey, ez = float(self._neck_euler[0]), float(self._neck_euler[1]), float(self._neck_euler[2])
+            q = pb.getQuaternionFromEuler((ex, ey, ez))
+            motor_m(
+                rid, jid,
+                pb.POSITION_CONTROL,
+                targetPosition=list(q),
+                positionGain=0.62,
+                velocityGain=0.18,
+                maxVelocity=4.0,
+                force=[110.0, 110.0, 110.0],
+                physicsClientId=cid,
+            )
+            return
+
         if jt == pb.JOINT_SPHERICAL and callable(motor_m):
             # Один нормализованный скаляр → локальный euler (порядок Bullet XYZ)
             if var_name == "lshoulder":
@@ -729,10 +767,39 @@ class _PyBulletHumanoid:
         return np.array(pos), np.array(euler)
 
     def get_joint_angle(self, var_name: str) -> float:
+        """
+        Револьверный — позиция в радианах.
+        Сферический — скаляр из кватерниона (PyBullet: getJointState()[0] это qx, не «угол плеча»).
+        Иначе левая/правая рука в observe() выглядят асимметрично при схожей физике.
+        """
+        if var_name == "neck_yaw":
+            return float(self._neck_euler[2])
+        if var_name == "neck_pitch":
+            return float(self._neck_euler[0])
         if var_name not in self.joint_by_var:
             return 0.0
         jid = self.joint_by_var[var_name]
-        st  = pb.getJointState(self.robot_id, jid, physicsClientId=self.client)
+        rid, cid = self.robot_id, self.client
+        jt = self._joint_types[jid]
+        gmd = getattr(pb, "getJointStateMultiDof", None)
+        if jt == pb.JOINT_SPHERICAL and callable(gmd):
+            q = gmd(rid, jid, physicsClientId=cid)[0]
+            if isinstance(q, (list, tuple)) and len(q) >= 4:
+                x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+                imag_norm = float(np.sqrt(x * x + y * y + z * z))
+                w_cl = float(np.clip(abs(w), 0.0, 1.0))
+                ang = 2.0 * float(np.arctan2(imag_norm, w_cl))
+                if imag_norm < 1e-8:
+                    return 0.0
+                ax, ay, az = abs(x), abs(y), abs(z)
+                if ax >= ay and ax >= az:
+                    sgn = 1.0 if x >= 0.0 else -1.0
+                elif ay >= az:
+                    sgn = 1.0 if y >= 0.0 else -1.0
+                else:
+                    sgn = 1.0 if z >= 0.0 else -1.0
+                return float(np.clip(sgn * ang, -2.0, 2.0))
+        st = pb.getJointState(rid, jid, physicsClientId=cid)
         return float(st[0])
 
     def get_foot_heights(self) -> tuple[float, float]:
@@ -769,6 +836,8 @@ class _PyBulletHumanoid:
         s["com_z"]       = float(com[2])
         s["torso_roll"]  = float(euler[0])
         s["torso_pitch"] = float(euler[1])
+        for v in HEAD_VARS:
+            s[v] = self.get_joint_angle(v)
         for v in LEG_VARS + ARM_VARS:
             s[v] = self.get_joint_angle(v)
         s["lfoot_z"] = lf
@@ -804,7 +873,7 @@ class _PyBulletHumanoid:
         )
         lw = np.array(st[4][:3], dtype=float)
         R = np.array(pb.getMatrixFromQuaternion(st[5]), dtype=float).reshape(3, 3)
-        local = np.array([0.42, -0.09, -0.16], dtype=float) * float(HUMANOID_URDF_GLOBAL_SCALING)
+        local = np.array([0.15, -0.09, -0.16], dtype=float) * float(HUMANOID_URDF_GLOBAL_SCALING)
         return lw + R @ local
 
     def get_ankle_quaternions_three_js(self) -> list[dict[str, float]]:
@@ -893,7 +962,7 @@ class _PyBulletHumanoid:
             return urdf_pts
         pos, _ = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
         cx, cy, cz = float(pos[0]), float(pos[1]), float(pos[2])
-        j = {v: self.get_joint_angle(v) for v in LEG_VARS + ARM_VARS}
+        j = {v: self.get_joint_angle(v) for v in LEG_VARS + ARM_VARS + HEAD_VARS}
         return _forward_kinematics_skeleton(cx, cy, cz, j)
 
     def get_cube_positions(self) -> list[dict]:
@@ -902,13 +971,6 @@ class _PyBulletHumanoid:
             pos, _ = pb.getBasePositionAndOrientation(cid, physicsClientId=self.client)
             result.append({"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])})
         return result
-
-    _CAMERA_CONFIGS = {
-        "side":  {"eye": [0, -3.5, 1.2], "target": [0, 0, 0.7], "up": [0, 0, 1]},
-        "front": {"eye": [3.5, 0,  1.2], "target": [0, 0, 0.7], "up": [0, 0, 1]},
-        "top":   {"eye": [0,  0,   4.0], "target": [0, 0, 0.5], "up": [0, 1, 0]},
-        "diag":  {"eye": [2.5, -2.5, 2.0], "target": [0, 0, 0.7], "up": [0, 0, 1]},
-    }
 
     def _link_world_pos(self, link_name: str) -> np.ndarray | None:
         """Позиция origin звена в мире (как в скелете, st[4])."""
@@ -921,7 +983,7 @@ class _PyBulletHumanoid:
         return np.array(st[4][:3], dtype=float)
 
     def _ego_camera_rt(self) -> tuple[list[float], list[float], list[float]] | None:
-        """Глаза у шеи: вперёд привязан к корпусу (поворот вокруг вертикали), up — грудь→шея."""
+        """Камера только из «головы»: выше шеи вдоль оси роста, взгляд вперёд по корпусу."""
         names = set(self.link_names)
         if "neck" not in names or "chest" not in names:
             return None
@@ -969,34 +1031,29 @@ class _PyBulletHumanoid:
                 return None
             fwd = cand / fn
 
-        # Слегка впереди и выше центра шеи
-        eye = pos_n + 0.10 * up + 0.05 * fwd
-        target = eye + 2.2 * fwd
+        # Голова: ~верх сферы neck (совпадает с визуализацией скелета head ≈ neck + 0.26·up)
+        head_anchor = pos_n + 0.26 * up
+        eye = head_anchor + 0.04 * up + 0.06 * fwd
+        target = eye + 2.4 * fwd
         return eye.tolist(), target.tolist(), up.tolist()
 
-    def get_frame_base64(self, view: str = "diag",
+    def get_frame_base64(self, view: str | None = None,
                          width: int = 480, height: int = 360) -> str | None:
+        """Всегда first-person из головы; аргумент view оставлен для совместимости API."""
         if not PIL_AVAILABLE:
             return None
         try:
-            vkey = (view or "diag").lower()
-            ego_cam = False
-            if vkey in ("ego", "first_person", "fp"):
-                eg = self._ego_camera_rt()
-                if eg is not None:
-                    ego_cam = True
-                    eye, tgt, cup = eg
-                    vm = pb.computeViewMatrix(eye, tgt, cup, physicsClientId=self.client)
-                else:
-                    vkey = "diag"
-                    eg = None
-            else:
-                eg = None
-
+            eg = self._ego_camera_rt()
             if eg is None:
-                cfg = self._CAMERA_CONFIGS.get(vkey, self._CAMERA_CONFIGS["diag"])
-                vm = pb.computeViewMatrix(cfg["eye"], cfg["target"], cfg["up"],
-                                         physicsClientId=self.client)
+                vm = pb.computeViewMatrix(
+                    [2.2, -2.2, 1.6], [0, 0, 0.75], [0, 0, 1],
+                    physicsClientId=self.client,
+                )
+                ego_cam = False
+            else:
+                eye, tgt, cup = eg
+                vm = pb.computeViewMatrix(eye, tgt, cup, physicsClientId=self.client)
+                ego_cam = True
             pm   = pb.computeProjectionMatrixFOV(
                 fov=60, aspect=width/height, nearVal=0.1, farVal=15.0,
                 physicsClientId=self.client)
@@ -1011,7 +1068,6 @@ class _PyBulletHumanoid:
             if pix.size < need:
                 raise ValueError(f"camera pixels {pix.size} < expected {need}")
             rgb = pix[:need].reshape((height, width, 4))[:, :, :3]
-            # TinyRenderer + view matrix: для ego часто лево/право на экране наоборот от тела
             if ego_cam:
                 rgb = np.ascontiguousarray(rgb[:, ::-1, :])
             img = PILImage.fromarray(rgb)
@@ -1084,7 +1140,7 @@ class EnvironmentHumanoid:
     # ── do() ──────────────────────────────────────────────────────────────────
     def intervene(self, variable: str, value: float) -> dict[str, float]:
         self.n_interventions += 1
-        if variable in LEG_VARS + ARM_VARS:
+        if variable in LEG_VARS + ARM_VARS + HEAD_VARS:
             self._sim.set_joint(variable, value)
         self._sim.step(self.steps_per_do)
         return self.observe()
@@ -1120,7 +1176,7 @@ class EnvironmentHumanoid:
         self._sim.reset_stance()
 
     # ── Camera / Skeleton ──────────────────────────────────────────────────────
-    def get_frame_base64(self, view: str = "diag") -> str | None:
+    def get_frame_base64(self, view: str | None = None) -> str | None:
         return self._sim.get_frame_base64(view)
 
     def get_joint_positions_world(self) -> list[dict]:

@@ -84,7 +84,6 @@ export default function RKKHumanoid() {
   const [activePanel, setPanel]      = useState(null);
   const [seedText,    setSeedText]   = useState('[\n  {"from_": "lhip", "to": "com_z", "weight": 0.6}\n]');
   const [status,      setStatus]     = useState("");
-  const [camView,     setCamView]    = useState("ego");
   const [camFrame,    setCamFrame]   = useState(null);
   const [showCam,     setShowCam]    = useState(false);
   const [showCubes,   setShowCubes]  = useState(false);
@@ -117,7 +116,7 @@ export default function RKKHumanoid() {
       } catch {}
     }, CAMERA_PREVIEW_MS);
     return () => clearInterval(iv);
-  }, [connected, showCam, camView]);
+  }, [connected, showCam]);
 
   // Vision slots polling (только когда visual mode и панель открыта)
   useEffect(() => {
@@ -524,10 +523,7 @@ export default function RKKHumanoid() {
       {showCam&&camFrame&&(
         <div style={{position:"absolute",bottom:120,right:14,border:`1px solid ${wCol}55`,borderRadius:3,overflow:"hidden",width:280}}>
           <div style={{display:"flex",gap:4,padding:"3px 6px",background:"rgba(0,0,0,0.7)",fontSize:8}}>
-            {["ego","diag","side","front","top"].map(v=>(
-              <button key={v} onClick={()=>setCamView(v)} style={{padding:"1px 5px",borderRadius:2,fontSize:7,cursor:"pointer",background:camView===v?"#441166":"transparent",border:`1px solid ${camView===v?wCol:"#332255"}`,color:camView===v?wCol:"#554477"}}>{v}</button>
-            ))}
-            <span style={{color:wCol,fontSize:7,marginLeft:"auto"}}>PyBullet 📷</span>
+            <span style={{color:wCol,fontSize:7}}>вид из головы (FP)</span>
           </div>
           <img src={`data:image/jpeg;base64,${camFrame}`} style={{width:"100%",display:"block"}} alt="cam"/>
         </div>
@@ -766,6 +762,9 @@ export default function RKKHumanoid() {
               <span style={{color:"#441133"}}>VALUE LAYER {a.valueLayer.vl_phase}</span>
               <span style={{color:blkC(blkR)}}>{(blkR*100).toFixed(1)}%</span>
             </div>
+            {(a.valueLayer.imagination_horizon??0)>0&&<div style={{color:"#553366",marginTop:3,fontSize:7}}>
+              imagination N={a.valueLayer.imagination_horizon} · checks {a.valueLayer.imagination_checks??0} · blk {a.valueLayer.imagination_blocks??0}
+            </div>}
           </div>}
 
           {[
@@ -803,7 +802,9 @@ export default function RKKHumanoid() {
           <div style={{color:isVis?visColor:"#00cc88",fontSize:8,fontWeight:isVis?"bold":"normal"}}>
             {isVis?"● ":"→ "}12. Causal Vision{isVis?` · ${ui.visionTicks}t`:""}
           </div>
-          <div style={{color:"#224433",fontSize:8}}>→ 13. N-step Imagination</div>
+          <div style={{color:(a.valueLayer?.imagination_horizon??0)>0?"#00cc88":"#224433",fontSize:8,fontWeight:(a.valueLayer?.imagination_horizon??0)>0?"bold":"normal"}}>
+            {(a.valueLayer?.imagination_horizon??0)>0?"● ":"→ "}13. N-step Imagination{(a.valueLayer?.imagination_horizon??0)>0?` · N=${a.valueLayer.imagination_horizon}`:""}
+          </div>
           <div style={{color:"#224433",fontSize:8}}>→ 14. Cross-Domain</div>
           <div style={{color:"#224433",fontSize:8}}>→ 15. Reality Bridge</div>
         </div>
