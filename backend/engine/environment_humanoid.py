@@ -205,15 +205,16 @@ def _forward_kinematics_skeleton(
         cy,
         relbow[2] - np.cos(j.get("relbow", 0)) * 0.22,
     ]
-    lhip_p = [cx - 0.12, cy, hip_z]
-    rhip_p = [cx + 0.12, cy, hip_z]
+    hip_half = 0.15  # шире бёдер, в духе URDF ±0.425 по Z у hip joints
+    lhip_p = [cx - hip_half, cy, hip_z]
+    rhip_p = [cx + hip_half, cy, hip_z]
     lknee_p = [
-        cx - 0.12 + np.sin(j.get("lhip", 0)) * 0.35,
+        cx - hip_half + np.sin(j.get("lhip", 0)) * 0.35,
         cy,
         hip_z - np.cos(j.get("lhip", 0)) * 0.35,
     ]
     rknee_p = [
-        cx + 0.12 + np.sin(j.get("rhip", 0)) * 0.35,
+        cx + hip_half + np.sin(j.get("rhip", 0)) * 0.35,
         cy,
         hip_z - np.cos(j.get("rhip", 0)) * 0.35,
     ]
@@ -499,12 +500,12 @@ class _PyBulletHumanoid:
             ([0.04,0.04,0.14],[0.7,0.7,0.7,1], [0.18,0,0.1], 0),   # 3 rup-arm
             ([0.03,0.03,0.12],[0.8,0.8,0.8,1], [-0.18,0,-0.14],2), # 4 lforearm
             ([0.03,0.03,0.12],[0.8,0.8,0.8,1], [0.18,0,-0.14],3),  # 5 rforearm
-            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [-0.08,0,-0.15],0), # 6 lthigh
-            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [0.08,0,-0.15], 0), # 7 rthigh
+            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [-0.10,0,-0.15],0), # 6 lthigh
+            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [0.10,0,-0.15], 0), # 7 rthigh
             ([0.05,0.05,0.14],[0.8,0.8,0.8,1], [0,0,-0.15],   6),  # 8 lshin
             ([0.05,0.05,0.14],[0.8,0.8,0.8,1], [0,0,-0.15],   7),  # 9 rshin
-            ([0.07,0.03,0.03],[0.6,0.6,0.6,1], [0,0,-0.14],   8),  # 10 lfoot
-            ([0.07,0.03,0.03],[0.6,0.6,0.6,1], [0,0,-0.14],   9),  # 11 rfoot
+            ([0.09,0.04,0.035],[0.6,0.6,0.6,1], [0,0,-0.14],   8),  # 10 lfoot
+            ([0.09,0.04,0.035],[0.6,0.6,0.6,1], [0,0,-0.14],   9),  # 11 rfoot
         ]
         for i, (he, col_c, pos, par) in enumerate(segments):
             col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=he, physicsClientId=self.client)

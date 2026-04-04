@@ -97,7 +97,7 @@
 	<joint name="right_hip" type="spherical" >
 		<parent link="root" />
 		<child link="right_hip" />
-				<origin rpy = "0 0 0" xyz = "0.000000 0.000000 0.339548" />
+				<origin rpy = "0 0 0" xyz = "0.000000 0.000000 0.425000" />
 		<axis xyz="0 0 1" />
 	</joint>
 	<link name="right_knee" >
@@ -129,28 +129,28 @@
 		<visual>
 				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
 			<geometry>
-				<box size="0.708000 0.220000 0.360000" />
+				<box size="0.780000 0.300000 0.400000" />
 			</geometry>
 			<material name="white"><color rgba="0.95 0.95 0.95 1"/></material>
 		</visual>
 		<collision>
 				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
 			<geometry>
-				<box size="0.708000 0.220000 0.360000" />
+				<box size="0.780000 0.300000 0.400000" />
 			</geometry>
 		</collision>
 		<!-- Подошва: центр смещён назад (пятка), сустав ≈ задняя треть опоры — иначе COM падает назад «лыжами» -->
 		<visual>
 				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
 			<geometry>
-				<box size="0.34 0.06 0.26" />
+				<box size="0.44 0.08 0.30" />
 			</geometry>
 			<material name="sole_r"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
 				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
 			<geometry>
-				<box size="0.34 0.06 0.26" />
+				<box size="0.44 0.08 0.30" />
 			</geometry>
 		</collision>
 	</link>
@@ -233,7 +233,7 @@
 	<joint name="left_hip" type="spherical" >
 		<parent link="root" />
 		<child link="left_hip" />
-				<origin rpy = "0 0 0" xyz = "0.000000 0.000000 -0.339548" />
+				<origin rpy = "0 0 0" xyz = "0.000000 0.000000 -0.425000" />
 		<axis xyz="0 0 1" />
 	</joint>
 	<link name="left_knee" >
@@ -265,27 +265,27 @@
 		<visual>
 				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
 			<geometry>
-				<box size="0.708000 0.220000 0.360000" />
+				<box size="0.780000 0.300000 0.400000" />
 			</geometry>
 			<material name="white_l"><color rgba="0.95 0.95 0.95 1"/></material>
 		</visual>
 		<collision>
 				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
 			<geometry>
-				<box size="0.708000 0.220000 0.360000" />
+				<box size="0.780000 0.300000 0.400000" />
 			</geometry>
 		</collision>
 		<visual>
 				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
 			<geometry>
-				<box size="0.34 0.06 0.26" />
+				<box size="0.44 0.08 0.30" />
 			</geometry>
 			<material name="sole_l"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
 				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
 			<geometry>
-				<box size="0.34 0.06 0.26" />
+				<box size="0.44 0.08 0.30" />
 			</geometry>
 		</collision>
 	</link>
