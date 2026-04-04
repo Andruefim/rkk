@@ -7,13 +7,16 @@ rag_seeder.py — RAG Pipeline для генерации каузальных se
   3. Variable Mapping → маппим слова на переменные агента
   4. inject_seeds() → загружаем с alpha=0.05
 
+Фаза 1 (humanoid_structured):
+  Промпт с полным списком переменных + дайджест URDF → JSON рёбер (без Wikipedia).
+
 Опциональная LLM интеграция (фаза 11+):
   Если задан LLM_URL (OpenAI-совместимый API, напр. Ollama),
   используем его вместо regex для извлечения.
 
 Поддерживаемые backends:
   - "wikipedia" : Wikipedia REST API (бесплатно, без LLM)
-  - "ollama"    : локальная LLM через Ollama (qwen2.5:3b и т.д.)
+  - "ollama"    : локальная LLM через Ollama (gemma4:e4b и т.д.)
   - "openai"    : OpenAI-compatible API
 """
 from __future__ import annotations
@@ -24,6 +27,7 @@ import asyncio
 import httpx
 import numpy as np
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 
@@ -191,7 +195,7 @@ async def extract_via_llm(
     text:     str,
     var_names: list[str],
     llm_url:  str,
-    model:    str = "qwen2.5:3b",
+    model:    str = "gemma4:e4b",
 ) -> list[tuple[str, str, float]]:
     """
     Используем LLM (Ollama/OpenAI-compatible) для извлечения каузальных пар.
@@ -244,6 +248,153 @@ Rules:
     return []
 
 
+# ─── Humanoid: структурный LLM-bootstrap (Фаза 1, без Wikipedia) ─────────────
+def humanoid_urdf_digest(max_chars: int = 2800) -> str:
+    """
+    Краткое текстовое описание URDF для промпта: имена суставов и звеньев.
+    """
+    urdf = Path(__file__).resolve().parent / "data" / "humanoid" / "humanoid.urdf"
+    if not urdf.is_file():
+        return "(URDF file not found)"
+    try:
+        raw = urdf.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return "(URDF unreadable)"
+    joints = sorted(set(re.findall(r'<joint\s+name\s*=\s*"([^"]+)"', raw)))
+    links = sorted(set(re.findall(r'<link\s+name\s*=\s*"([^"]+)"', raw)))
+    lines = [
+        f"Joints ({len(joints)}): {', '.join(joints)}",
+        f"Links ({len(links)}): {', '.join(links)}",
+    ]
+    return "\n".join(lines)[:max_chars]
+
+
+def _parse_json_array_from_llm_text(raw: str) -> list | None:
+    """
+    Первый валидный JSON-массив в ответе модели (без жадного regex на весь текст).
+    Перебирает позиции '[' до успешного json.JSONDecoder.raw_decode.
+    """
+    dec = json.JSONDecoder()
+    i = 0
+    while True:
+        j = raw.find("[", i)
+        if j < 0:
+            return None
+        try:
+            obj, _end = dec.raw_decode(raw, j)
+        except json.JSONDecodeError:
+            i = j + 1
+            continue
+        if isinstance(obj, list):
+            return obj
+        i = j + 1
+
+
+def _dedupe_cap_edges(
+    pairs: list[tuple[str, str, float]],
+    valid: set[str],
+    max_total: int,
+    max_per_source: int,
+) -> list[tuple[str, str, float]]:
+    seen: set[tuple[str, str]] = set()
+    per_src: dict[str, int] = {}
+    out: list[tuple[str, str, float]] = []
+    for from_, to, w in pairs:
+        if from_ not in valid or to not in valid or from_ == to:
+            continue
+        key = (from_, to)
+        if key in seen:
+            continue
+        if per_src.get(from_, 0) >= max_per_source:
+            continue
+        seen.add(key)
+        per_src[from_] = per_src.get(from_, 0) + 1
+        w = float(np.clip(w, -0.95, 0.95))
+        out.append((from_, to, w))
+        if len(out) >= max_total:
+            break
+    return out
+
+
+async def extract_humanoid_structured_via_llm(
+    var_names: list[str],
+    llm_url: str,
+    model: str = "gemma4:e4b",
+    urdf_digest: str | None = None,
+) -> list[tuple[str, str, float]]:
+    """
+    Один вызов LLM: каузальный граф по списку переменных + дайджест URDF.
+    """
+    digest = urdf_digest if urdf_digest is not None else humanoid_urdf_digest()
+    var_json = json.dumps(var_names, ensure_ascii=False)
+    slot_hint = ""
+    if any(str(v).startswith("slot_") for v in var_names):
+        slot_hint = (
+            "\nThe list includes slot_* (visual attention indices) and physical/joint/COM variables; "
+            "you may propose edges between slot_* and physics (e.g. com_z, feet, cubes) where plausible.\n"
+        )
+    prompt = f"""You are a biomechanics and causal modeling expert for a PyBullet humanoid.
+
+The agent observes ONLY these variable ids (use EXACT strings for from_ and to, no typos):
+{var_json}
+{slot_hint}
+Robot kinematic names from URDF (for intuition; edges must still use the variable list above):
+{digest}
+
+Task: Output ONLY a JSON array of directed causal hypotheses for exploration.
+Cover: leg joints affecting com_x, com_y, com_z, lfoot_z, rfoot_z; knees and feet; spine/torso and balance;
+arms and cube interaction (cube0_x, cube1_y, etc.) where plausible.
+
+Format (example shape only — use real variable names from the list):
+[{{"from_":"lhip","to":"com_x","weight":0.25}},{{"from_":"lknee","to":"lfoot_z","weight":0.3}}]
+
+Rules:
+- from_ and to MUST be copied exactly from the JSON variable list (same spelling).
+- weight in [-1, 1]; sign = direction of positive association in normalized observation space.
+- 14 to 28 edges, diverse sources, no self-loops.
+- Output ONLY the JSON array. No markdown, no commentary."""
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.15, "num_predict": 2500},
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            resp = await client.post(llm_url, json=payload)
+            if resp.status_code != 200:
+                print(f"[RAG] humanoid LLM HTTP {resp.status_code}: {resp.text[:200]}")
+                return []
+            raw = resp.json().get("response", "") or ""
+            edges = _parse_json_array_from_llm_text(raw)
+            if not edges:
+                print("[RAG] humanoid LLM: no parseable JSON array in response")
+                return []
+            valid = set(var_names)
+            pairs: list[tuple[str, str, float]] = []
+            for e in edges:
+                if not isinstance(e, dict):
+                    continue
+                from_ = e.get("from_") or e.get("from")
+                to = e.get("to")
+                if not from_ or not to:
+                    continue
+                from_ = str(from_).strip()
+                to = str(to).strip()
+                w = float(e.get("weight", 0.25))
+                if from_ in valid and to in valid:
+                    pairs.append((from_, to, w))
+            return _dedupe_cap_edges(pairs, valid, max_total=32, max_per_source=5)
+        except json.JSONDecodeError as e:
+            print(f"[RAG] humanoid LLM JSON parse: {e}")
+            return []
+        except Exception as e:
+            print(f"[RAG] humanoid structured LLM failed: {e}")
+            return []
+
+
 # ─── Главный класс ────────────────────────────────────────────────────────────
 class RAGSeeder:
     """
@@ -260,7 +411,7 @@ class RAGSeeder:
     def __init__(
         self,
         llm_url:  str | None = None,   # None = только regex (без LLM)
-        llm_model: str = "qwen2.5:3b",
+        llm_model: str = "gemma4:e4b",
         backend: Literal["wikipedia", "ollama", "openai"] = "wikipedia",
     ):
         self.llm_url   = llm_url
@@ -275,6 +426,8 @@ class RAGSeeder:
                           "Arrhenius equation", "activation energy"],
             "logic":     ["boolean logic", "conditional branching", "logic gates",
                           "control flow programming"],
+            "humanoid":  ["humanoid balance", "bipedal locomotion", "inverted pendulum",
+                          "gait biomechanics", "center of mass stability"],
         }
 
     async def generate(
@@ -352,6 +505,45 @@ class RAGSeeder:
         print(f"[RAG] {env_preset}: generated {len(result)} hypotheses "
               f"from {len(all_text)} chars text")
         return result
+
+    async def generate_humanoid_structured(
+        self,
+        available_vars: list[str],
+        max_hypotheses: int = 28,
+    ) -> list[CausalHypothesis]:
+        """
+        Фаза 1: приоры для humanoid без Wikipedia — один структурный вызов LLM.
+
+        Веса в гипотезах умножаются на 0.32; затем inject_text_priors() снова
+        масштабирует (×0.28, клип) — итог слабые семена, как для остального RAG.
+        """
+        if not self.llm_url:
+            print("[RAG] humanoid_structured: llm_url not set")
+            return []
+
+        raw_pairs = await extract_humanoid_structured_via_llm(
+            available_vars,
+            self.llm_url,
+            self.llm_model,
+        )
+        if not raw_pairs:
+            return []
+
+        hypotheses: list[CausalHypothesis] = []
+        for from_, to, weight in raw_pairs[:max_hypotheses]:
+            w = float(np.clip(weight, -0.9, 0.9))
+            hypotheses.append(
+                CausalHypothesis(
+                    from_=from_,
+                    to=to,
+                    weight=w * 0.32,
+                    alpha=0.05,
+                    source="llm_humanoid",
+                    confidence=0.55,
+                )
+            )
+        print(f"[RAG] humanoid_structured: {len(hypotheses)} hypotheses from LLM")
+        return hypotheses
 
     async def generate_all_agents(
         self,

@@ -5,6 +5,10 @@ PowerShell:
   cd backend
   python run.py
 
+После старта API автоматически вызывается humanoid_structured LLM-bootstrap (Ollama).
+  Отключить: RKK_SKIP_AUTO_HUMANOID_LLM=1
+  URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL (по умолчанию localhost:11434, gemma4:e4b)
+
 Или через uvicorn напрямую:
   uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
 """

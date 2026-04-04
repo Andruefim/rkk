@@ -15,6 +15,8 @@ import asyncio
 import json
 import os
 import torch
+from contextlib import asynccontextmanager
+from typing import Literal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -22,17 +24,6 @@ from pydantic import BaseModel
 
 from engine.simulation import Simulation
 from engine.rag_seeder import RAGSeeder, HARDCODED_SEEDS
-
-app = FastAPI(title="RKK Singleton AGI Humanoid v12")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173", "http://127.0.0.1:5173",
-        "http://localhost:5174", "http://127.0.0.1:5174",
-    ],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 _sim:    Simulation | None = None
 _seeder: RAGSeeder  | None = None
@@ -48,14 +39,74 @@ def get_sim() -> Simulation:
         )
     return _sim
 
+
 def get_seeder() -> RAGSeeder:
     global _seeder
     if _seeder is None:
         _seeder = RAGSeeder(
             llm_url="http://localhost:11434/api/generate",
-            llm_model="qwen3.5:4b"
+            llm_model="gemma4:e4b"
         )
     return _seeder
+
+
+async def _startup_humanoid_llm_bootstrap() -> None:
+    """
+    После старта сервера: humanoid_structured через Ollama (как POST /bootstrap/llm).
+    Отключение: RKK_SKIP_AUTO_HUMANOID_LLM=1
+    URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL
+    """
+    skip = os.environ.get("RKK_SKIP_AUTO_HUMANOID_LLM", "").strip().lower()
+    if skip in ("1", "true", "yes", "on"):
+        print("[RKK] Auto humanoid_structured LLM skipped (RKK_SKIP_AUTO_HUMANOID_LLM)")
+        return
+    try:
+        sim = get_sim()
+        if sim.current_world != "humanoid":
+            return
+        ctx = sim.agent_seed_context(0)
+        if not ctx:
+            return
+        llm_url = os.environ.get("RKK_OLLAMA_URL", "http://localhost:11434/api/generate")
+        model = os.environ.get("RKK_OLLAMA_MODEL", "gemma4:e4b")
+        try:
+            max_h = int(os.environ.get("RKK_HUMANOID_LLM_MAX_HYPOTHESES", "28"))
+        except ValueError:
+            max_h = 28
+        vars_ = ctx["variables"]
+        seeder = RAGSeeder(llm_url=llm_url, llm_model=model)
+        from engine.environment_humanoid import humanoid_hardcoded_seeds
+
+        hyps = await seeder.generate_humanoid_structured(
+            available_vars=vars_, max_hypotheses=max_h,
+        )
+        edges = [h.to_dict() for h in hyps] if hyps else humanoid_hardcoded_seeds()
+        res = sim.inject_seeds(agent_id=0, edges=edges)
+        src = "llm_humanoid" if hyps else "hardcoded_fallback"
+        print(
+            f"[RKK] Auto humanoid_structured bootstrap: source={src}, "
+            f"injected={res.get('injected', 0)}, skipped={len(res.get('skipped', []))}"
+        )
+    except Exception as e:
+        print(f"[RKK] Auto humanoid_structured bootstrap error: {e}")
+
+
+@asynccontextmanager
+async def _app_lifespan(_: FastAPI):
+    asyncio.create_task(_startup_humanoid_llm_bootstrap())
+    yield
+
+
+app = FastAPI(title="RKK Singleton AGI Humanoid v12", lifespan=_app_lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:5174", "http://127.0.0.1:5174",
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ── Health / State ────────────────────────────────────────────────────────────
@@ -173,9 +224,11 @@ def bootstrap_robot():
     return get_sim().inject_seeds(agent_id=0, edges=seeds)
 
 class LLMBootstrapRequest(BaseModel):
-    world:     str | None = None
-    llm_model: str        = "qwen3.5:4b"
-    llm_url:   str        = "http://localhost:11434/api/generate"
+    world:          str | None = None
+    mode:           Literal["rag_wiki", "humanoid_structured"] = "humanoid_structured"
+    max_hypotheses: int        = 28
+    llm_model:      str        = "gemma4:e4b"
+    llm_url:        str        = "http://localhost:11434/api/generate"
 
 @app.post("/bootstrap/llm")
 async def bootstrap_llm(req: LLMBootstrapRequest):
@@ -186,6 +239,27 @@ async def bootstrap_llm(req: LLMBootstrapRequest):
     preset = req.world or sim.current_world
     vars_  = ctx["variables"]
     seeder = RAGSeeder(llm_url=req.llm_url, llm_model=req.llm_model)
+
+    if req.mode == "humanoid_structured":
+        # current_world остаётся humanoid и в visual/hybrid режиме
+        if preset != "humanoid":
+            return {"error": "humanoid_structured requires current_world humanoid"}
+        if not req.llm_url:
+            return {"error": "llm_url required for humanoid_structured"}
+        try:
+            from engine.environment_humanoid import humanoid_hardcoded_seeds
+
+            hyps = await seeder.generate_humanoid_structured(
+                available_vars=vars_,
+                max_hypotheses=req.max_hypotheses,
+            )
+            edges = [h.to_dict() for h in hyps] if hyps else humanoid_hardcoded_seeds()
+            res = sim.inject_seeds(agent_id=0, edges=edges)
+            src = "llm_humanoid" if hyps else "hardcoded_fallback"
+            return {"source": src, "preset": preset, **res}
+        except Exception as e:
+            return {"error": str(e)}
+
     try:
         hyps  = await seeder.generate(env_preset=preset, available_vars=vars_, max_hypotheses=8)
         edges = [h.to_dict() for h in hyps] if hyps else HARDCODED_SEEDS.get(preset, [])
@@ -207,11 +281,28 @@ async def rag_auto_seed_all():
     preset = ctx["preset"]
     _rag_status["running"] = True
     try:
-        hyps   = await seeder.generate(env_preset=preset, available_vars=ctx["variables"], max_hypotheses=6)
-        edges  = [h.to_dict() for h in hyps] if hyps else HARDCODED_SEEDS.get(preset, [])
-        source = hyps[0].source if hyps else "hardcoded"
+        if preset == "humanoid" and seeder.llm_url:
+            from engine.environment_humanoid import humanoid_hardcoded_seeds
+
+            hyps = await seeder.generate_humanoid_structured(
+                available_vars=ctx["variables"],
+                max_hypotheses=28,
+            )
+            edges = [h.to_dict() for h in hyps] if hyps else humanoid_hardcoded_seeds()
+            source = "llm_humanoid" if hyps else "hardcoded_fallback"
+        else:
+            hyps = await seeder.generate(
+                env_preset=preset, available_vars=ctx["variables"], max_hypotheses=6
+            )
+            edges = [h.to_dict() for h in hyps] if hyps else HARDCODED_SEEDS.get(preset, [])
+            source = hyps[0].source if hyps else "hardcoded"
     except Exception:
-        edges, source = HARDCODED_SEEDS.get(preset, []), "hardcoded"
+        if preset == "humanoid":
+            from engine.environment_humanoid import humanoid_hardcoded_seeds
+
+            edges, source = humanoid_hardcoded_seeds(), "hardcoded_fallback"
+        else:
+            edges, source = HARDCODED_SEEDS.get(preset, []), "hardcoded"
     finally:
         _rag_status["running"] = False
 
