@@ -50,7 +50,7 @@ class VisionConfig:
     feat_dim:    int   = 32      # F: размер фичи на позицию
     n_slots:     int   = 8       # K: количество слотов (объектов)
     slot_dim:    int   = 64      # D: размер вектора слота
-    n_iters:     int   = 3       # итерации SlotAttention
+    n_iters:     int   = 2       # итерации SlotAttention (2 достаточно для 64×64)
     lr:          float = 3e-4
     recon_weight: float = 0.1    # вес reconstruction loss (опционально)
 
@@ -248,13 +248,19 @@ class CausalVisualCortex(nn.Module):
         """
         frame_rgb: (H, W, 3) uint8
         → (1, 3, cfg.frame_h, cfg.frame_w) float32 на device
+
+        Ресайз на GPU (F.interpolate), без cv2 — меньше CPU и копий.
         """
-        import cv2
-        resized = cv2.resize(frame_rgb, (self.cfg.frame_w, self.cfg.frame_h),
-                             interpolation=cv2.INTER_LINEAR)
-        t = torch.from_numpy(resized).float().div_(255.0)   # (H,W,3)
-        t = t.permute(2, 0, 1).unsqueeze(0)                 # (1,3,H,W)
-        return t.to(self.device)
+        arr = np.ascontiguousarray(frame_rgb)
+        x = torch.from_numpy(arr).to(self.device, non_blocking=True)
+        x = x.permute(2, 0, 1).unsqueeze(0).float()  # (1,3,H,W)
+        x = F.interpolate(
+            x,
+            size=(self.cfg.frame_h, self.cfg.frame_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return x * (1.0 / 255.0)
 
     # ── Encode ────────────────────────────────────────────────────────────────
     @torch.no_grad()

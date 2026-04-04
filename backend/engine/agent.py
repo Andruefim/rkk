@@ -23,9 +23,9 @@ from engine.value_layer  import ValueLayer, HomeostaticBounds, BlockReason
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
 NOTEARS_EVERY = 16
-MAX_FALLBACK_TRIES = 12  # больше кандидатов, чтобы пройти Value Layer в начале обучения
+MAX_FALLBACK_TRIES = 5  # больше кандидатов, чтобы пройти Value Layer в начале обучения
 # Вес slot_* в actual_ig для System 1; основной сигнал — не-визуальные узлы (RKK_VISUAL_IG_WEIGHT=0 → только физика).
-VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.18"))
+VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.1"))
 
 
 def _imagination_horizon_from_env() -> int:

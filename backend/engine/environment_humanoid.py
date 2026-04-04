@@ -1098,11 +1098,26 @@ class _PyBulletHumanoid:
             pm   = pb.computeProjectionMatrixFOV(
                 fov=60, aspect=width/height, nearVal=0.1, farVal=15.0,
                 physicsClientId=self.client)
-            _, _, rgba, _, _ = pb.getCameraImage(
-                width, height, vm, pm,
-                renderer=pb.ER_TINY_RENDERER,
-                physicsClientId=self.client,
-            )
+            need = width * height * 4
+            rgba = None
+            hwgl = getattr(pb, "ER_BULLET_HARDWARE_OPENGL", None)
+            for renderer in (hwgl, pb.ER_TINY_RENDERER):
+                if renderer is None:
+                    continue
+                try:
+                    _, _, rgba_try, _, _ = pb.getCameraImage(
+                        width, height, vm, pm,
+                        renderer=renderer,
+                        physicsClientId=self.client,
+                    )
+                    pix_try = np.asarray(rgba_try, dtype=np.uint8).reshape(-1)
+                    if pix_try.size >= need:
+                        rgba = rgba_try
+                        break
+                except Exception:
+                    continue
+            if rgba is None:
+                raise ValueError("getCameraImage: all renderers failed")
             # PyBullet может вернуть tuple/list/1D-массив — не индексировать как (H,W,4)
             pix = np.asarray(rgba, dtype=np.uint8).reshape(-1)
             need = width * height * 4

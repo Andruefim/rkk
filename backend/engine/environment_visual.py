@@ -37,6 +37,8 @@ VISION_PIPELINE_CAM_H = 216
 VISION_PIPELINE_JPEG_Q = 72
 # Полные маски для UI — не на каждый _refresh (дорого: 8× JPEG + upscale)
 VISION_UI_MASK_EVERY = 3
+# Полный камера+encode раз в N интервенций (между — старые слоты, свежие phys_*)
+VISION_ENCODE_EVERY = 6
 
 _HYBRID_PHYS_KEYS = (
     "com_z", "torso_roll", "lknee", "rknee",
@@ -111,9 +113,10 @@ class EnvironmentVisual:
         self._hybrid_phys_obs: dict[str, float] | None = None
         self._hybrid_phys_gen = -1
         self._refresh_index = 0
+        self._vision_stride_counter = 0
 
         # Начальная инициализация
-        self._refresh()
+        self._refresh(run_encode=True)
 
     # ── Frame acquisition ─────────────────────────────────────────────────────
     def _get_raw_frame(self) -> np.ndarray | None:
@@ -156,12 +159,18 @@ class EnvironmentVisual:
         except Exception:
             return None
 
-    def _refresh(self):
-        """Обновляем слоты из нового кадра."""
-        frame = self._get_raw_frame()
-        self._last_frame = frame
+    def _refresh(self, run_encode: bool = True) -> None:
+        """
+        run_encode=True: камера + cortex.encode + UI-кэш.
+        False: только смена поколения hybrid (свежий base_env.observe), слоты с прошлого encode.
+        """
         self._vision_generation += 1
         self._hybrid_phys_gen = -1
+        if not run_encode:
+            return
+
+        frame = self._get_raw_frame()
+        self._last_frame = frame
         self._refresh_index += 1
 
         if frame is not None:
@@ -218,7 +227,7 @@ class EnvironmentVisual:
     # ── Observe ───────────────────────────────────────────────────────────────
     def observe(self) -> dict[str, float]:
         if self._last_slots is None:
-            self._refresh()
+            self._refresh(run_encode=True)
         slots = self._last_slots
         obs = {f"slot_{k}": float(slots[k].item()) for k in range(self.n_slots)}
 
@@ -247,7 +256,7 @@ class EnvironmentVisual:
     # ── do() ──────────────────────────────────────────────────────────────────
     def intervene(self, variable: str, value: float) -> dict[str, float]:
         """
-        Интервенция через физику + re-encode нового кадра.
+        Интервенция через физику; полный камера+encode — раз в VISION_ENCODE_EVERY шагов.
 
         Slot → physical action mapping:
           "slot_K" → маппим на ближайший joint base_env по вариабельности
@@ -273,11 +282,12 @@ class EnvironmentVisual:
         else:
             self.base_env.intervene(variable, value)
 
-        # Рендерим новый кадр и кодируем
-        self._refresh()
+        self._vision_stride_counter += 1
+        run_encode = (self._vision_stride_counter % VISION_ENCODE_EVERY == 1)
+        self._refresh(run_encode=run_encode)
 
-        # Predictive coding: обучаем зрение на prediction error
-        if (frame_before is not None and self._last_frame is not None
+        # Predictive coding только когда был свежий кадр/slots
+        if (run_encode and frame_before is not None and self._last_frame is not None
                 and self._gnn_predicted is not None):
             try:
                 loss = self.cortex.train_on_prediction_error(
@@ -377,7 +387,8 @@ class EnvironmentVisual:
         fn = getattr(self.base_env, "reset_stance", None)
         if callable(fn):
             fn()
-        self._refresh()
+        self._vision_stride_counter = 0
+        self._refresh(run_encode=True)
 
     # ── Seeds для visual env ─────────────────────────────────────────────────
     def hardcoded_seeds(self) -> list[dict]:
