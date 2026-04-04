@@ -3,13 +3,15 @@ causal_graph.py — NOTEARS / GNN как nn.Module.
 
 Фаза 10+: GNN заменяет NOTEARS как ядро каузального графа.
 
-  USE_GNN = True   → CausalGNNCore  (message passing, нелинейный)
-  USE_GNN = False  → NOTEARSCore    (линейный SCM, как было до фазы 10)
+Фаза B (Predictive World Model):
+  Обучение на переходах (X_t, a_t) → X_{t+1} из intervention buffer:
+    X_pred = core.forward_dynamics(X_t, a_t),  L_rec = MSE(X_pred, X_{t+1}).
+  propagate / imagination: то же f(state, action); rollout_step_free — f(X, 0).
 
-Публичный интерфейс CausalGraph не изменился.
-В to_dict() добавлено поле "core_type": "gnn" | "notears".
+  USE_GNN = True   → CausalGNNCore  (message passing + action_enc)
+  USE_GNN = False  → NOTEARSCore    (forward_dynamics ≈ forward(X+a))
 
-L_total = L_rec + λ_dag*h(W) + λ_int*L_int + λ_l1*|W|₁
+L_total = L_rec + λ_dag*h(W) + λ_l1*|W|₁
 h(W)    = tr(exp(W∘W)) - d
 """
 from __future__ import annotations
@@ -64,9 +66,18 @@ class NOTEARSCore(nn.Module):
         return exp.trace() - self.d
 
     def intervention_loss(self, X_obs, X_int, int_var_idx, int_val):
-        X_do = X_obs.clone()
-        X_do[:, int_var_idx] = int_val
-        return F.mse_loss(self.forward(X_do), X_int)
+        a = torch.zeros_like(X_obs)
+        a[:, int_var_idx] = int_val
+        return F.mse_loss(self.forward_dynamics(X_obs, a), X_int)
+
+    def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """
+        X' ≈ forward(X_do), где в координатах с ненулевым a подставляется абсолютное
+        целевое значение do (как в старом X_do[:, idx] = val); иначе — пассивный шаг.
+        """
+        m = (torch.abs(a) > 1e-8).float()
+        x_in = X * (1.0 - m) + a * m
+        return self.forward(x_in)
 
     def l1_reg(self) -> torch.Tensor:
         return self.W_masked().abs().sum()
@@ -171,30 +182,40 @@ class CausalGraph:
             self._int_buffer = self._int_buffer[-self.BUFFER_SIZE:]
 
     def train_step(self) -> dict[str, float] | None:
-        if self._core is None or len(self._obs_buffer) < 8:
+        """
+        World model: батч из _int_buffer — (obs_before, do(idx,val), obs_after).
+        L_rec = MSE(f(X_t, a_t), X_{t+1}). Без отдельного L_int (уже в переходах).
+        """
+        if self._core is None or len(self._int_buffer) < 4:
             return None
 
-        obs_t = torch.tensor(
-            self._obs_buffer[-self.BUFFER_SIZE:],
-            dtype=torch.float32, device=self.device
+        batch = self._int_buffer[-min(32, len(self._int_buffer)) :]
+        X_t = torch.tensor(
+            [item["obs_before"] for item in batch],
+            dtype=torch.float32, device=self.device,
         )
+        X_tp1 = torch.tensor(
+            [item["obs_after"] for item in batch],
+            dtype=torch.float32, device=self.device,
+        )
+        a_t = torch.zeros_like(X_t)
+        for i, item in enumerate(batch):
+            a_t[i, item["idx"]] = item["val"]
+
         self._optim.zero_grad()
 
-        X_pred = self._core(obs_t)
-        l_rec  = F.mse_loss(X_pred, obs_t)
+        fd = getattr(self._core, "forward_dynamics", None)
+        if callable(fd):
+            X_pred = fd(X_t, a_t)
+        else:
+            X_pred = self._core(X_t + a_t)
+        l_rec = F.mse_loss(X_pred, X_tp1)
 
         h_W   = self._core.dag_constraint()
         l_dag = self.LAMBDA_DAG * h_W.abs()
         l_l1  = self.LAMBDA_L1  * self._core.l1_reg()
 
         l_int = torch.tensor(0.0, device=self.device)
-        if len(self._int_buffer) >= 4:
-            batch = self._int_buffer[-min(16, len(self._int_buffer)):]
-            for item in batch:
-                X_obs = torch.tensor([item["obs_before"]], dtype=torch.float32, device=self.device)
-                X_int = torch.tensor([item["obs_after"]],  dtype=torch.float32, device=self.device)
-                l_int = l_int + self._core.intervention_loss(X_obs, X_int, item["idx"], item["val"])
-            l_int = self.LAMBDA_INT * l_int / len(batch)
 
         loss = l_rec + l_dag + l_l1 + l_int
         loss.backward()
@@ -300,10 +321,12 @@ class CausalGraph:
             [[float(base.get(n, 0.0)) for n in self._node_ids]],
             dtype=torch.float32, device=self.device,
         )
+        a_vec = torch.zeros(1, self._d, dtype=torch.float32, device=self.device)
         if variable in self._node_ids:
-            state_vec[0, self._node_ids.index(variable)] = float(value)
+            a_vec[0, self._node_ids.index(variable)] = float(value)
         with torch.no_grad():
-            pred = self._core(state_vec)
+            fd = getattr(self._core, "forward_dynamics", None)
+            pred = fd(state_vec, a_vec) if callable(fd) else self._core(state_vec + a_vec)
         result = {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
         return result
 
@@ -318,8 +341,10 @@ class CausalGraph:
             [[float(base.get(n, 0.0)) for n in self._node_ids]],
             dtype=torch.float32, device=self.device,
         )
+        z = torch.zeros_like(state_vec)
         with torch.no_grad():
-            pred = self._core(state_vec)
+            fd = getattr(self._core, "forward_dynamics", None)
+            pred = fd(state_vec, z) if callable(fd) else self._core(state_vec)
         return {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
 
     def _invalidate_cache(self):

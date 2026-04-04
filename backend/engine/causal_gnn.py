@@ -17,10 +17,11 @@ Drop-in замена NOTEARSCore в causal_graph.py.
   .W                   → nn.Parameter (d×d), имеет .grad
   .W_masked()          → W * mask (без диагонали)
   .dag_constraint()    → tr(exp(W∘W)) - d
-  .intervention_loss() → MSE после do()
+  .intervention_loss() → MSE(forward_dynamics(X,a), X_int)
   .l1_reg()            → |W_masked|₁
   .alpha_trust_matrix() → нормированные абсолютные веса
-  .forward(X)          → X_pred через message passing
+  .forward_dynamics(X, a) → X_{t+1} pred (world model)
+  .forward(X)          → forward_dynamics(X, 0) — пассивный шаг
 
 Масштабируемость:
   d=6   (physics/chemistry/logic): быстрее чем NOTEARS за счёт меньшего hidden
@@ -96,6 +97,12 @@ class CausalGNNCore(nn.Module):
             nn.Tanh(),
         )
 
+        # Action encoder: то же измерение, что и состояние (a_t[i] — воздействие на i-ю ось)
+        self.action_enc = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.Tanh(),
+        )
+
         # Message function: j→i сообщение по ребру с весом W[j,i]
         self.msg_fn = _mlp(hidden * 2, hidden, hidden, nn.ReLU)
 
@@ -103,7 +110,7 @@ class CausalGNNCore(nn.Module):
         self.out_dec = _mlp(hidden * 2, hidden, 1, nn.ReLU)
 
         # Xavier initialization
-        for m in [self.node_enc, self.msg_fn, self.out_dec]:
+        for m in [self.node_enc, self.action_enc, self.msg_fn, self.out_dec]:
             for layer in m:
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight, gain=0.5)
@@ -122,42 +129,35 @@ class CausalGNNCore(nn.Module):
         """W без диагонали."""
         return self.W * self.mask
 
+    def _message_pass(self, h: torch.Tensor) -> torch.Tensor:
+        """h: (B, d, hidden) → (B, d) предсказание скаляров узлов."""
+        B, d, _hd = h.shape
+        h_src = h.unsqueeze(1).expand(B, d, d, self.hidden)
+        h_dst = h.unsqueeze(2).expand(B, d, d, self.hidden)
+        msg = self.msg_fn(torch.cat([h_src, h_dst], dim=-1))
+        A       = self.W_masked()
+        weights = A.t().unsqueeze(0).unsqueeze(-1)
+        agg     = (msg * weights).sum(dim=2)
+        out = self.out_dec(torch.cat([h, agg], dim=-1))
+        return out.squeeze(-1)
+
+    def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """
+        World model: X_{t+1} ≈ f(X_t, a_t).
+        X_t, a_t: (B, d) в масштабе наблюдений; a_t разрежен (do(var)=val по индексу).
+        Где |a_i|≈0, вклад action_enc не добавляется (чтобы f(X,0) не сдвигал bias’ом).
+        """
+        am = (torch.abs(a).unsqueeze(-1) > 1e-8).float()
+        h_a = self.action_enc(a.unsqueeze(-1))
+        h = self.node_enc(X.unsqueeze(-1)) + am * h_a
+        return self._message_pass(h)
+
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """
-        GNN message passing forward pass.
-
-        X: (B, d) — батч наблюдений
-        → X_pred: (B, d)
-
-        В отличие от NOTEARS (X @ W), здесь нелинейное message passing.
-        Это позволяет моделировать нелинейные каузальные взаимодействия:
-        например, столкновения в PyBullet (obj0_x влияет на obj1_vx нелинейно).
+        Один шаг «пассивной» динамики f(X, 0) — совместимость с вызовами без явного действия
+        (например подача предсказания в visual cortex).
         """
-        B, d = X.shape
-
-        # 1. Кодируем значения узлов: (B, d, 1) → (B, d, hidden)
-        h = self.node_enc(X.unsqueeze(-1))
-
-        # 2. Строим сообщения для всех пар (j → i)
-        #    h_j: (B, d, 1, hidden) → (B, d, d, hidden)  [источники в dim=2]
-        #    h_i: (B, 1, d, hidden) → (B, d, d, hidden)  [получатели в dim=1]
-        #    Внимание: dim 1 = получатель i, dim 2 = источник j
-        h_src = h.unsqueeze(1).expand(B, d, d, self.hidden)  # j → broadcast по i
-        h_dst = h.unsqueeze(2).expand(B, d, d, self.hidden)  # i → broadcast по j
-
-        # msg[b, i, j, :] = сообщение от j к i
-        msg = self.msg_fn(torch.cat([h_src, h_dst], dim=-1))  # (B, d, d, hidden)
-
-        # 3. Взвешиваем сообщения матрицей смежности
-        #    W[j, i] = каузальный вес j → i
-        #    weights[b, i, j, :] = W[j, i]
-        A       = self.W_masked()                            # (d, d), A[j,i] = j→i
-        weights = A.t().unsqueeze(0).unsqueeze(-1)           # (1, d, d, 1): [i, j]
-        agg     = (msg * weights).sum(dim=2)                 # (B, d, hidden): Σ_j
-
-        # 4. Декодируем предсказание: h_i + Σ(сообщений) → x_i_pred
-        out = self.out_dec(torch.cat([h, agg], dim=-1))      # (B, d, 1)
-        return out.squeeze(-1)                               # (B, d)
+        return self.forward_dynamics(X, torch.zeros_like(X))
 
     def dag_constraint(self) -> torch.Tensor:
         """
@@ -176,9 +176,9 @@ class CausalGNNCore(nn.Module):
         int_val:     float,
     ) -> torch.Tensor:
         """L_intervention: после do(var=val) предсказание совпадает с наблюдением."""
-        X_do = X_obs.clone()
-        X_do[:, int_var_idx] = int_val
-        predicted = self.forward(X_do)
+        a = torch.zeros_like(X_obs)
+        a[:, int_var_idx] = int_val
+        predicted = self.forward_dynamics(X_obs, a)
         return F.mse_loss(predicted, X_int)
 
     def l1_reg(self) -> torch.Tensor:
@@ -212,6 +212,7 @@ class CausalGNNCore(nn.Module):
 
         # Переносим обученные MLP (архитектура не изменилась)
         new_core.node_enc.load_state_dict(self.node_enc.state_dict())
+        new_core.action_enc.load_state_dict(self.action_enc.state_dict())
         new_core.msg_fn.load_state_dict(self.msg_fn.state_dict())
         new_core.out_dec.load_state_dict(self.out_dec.state_dict())
 
