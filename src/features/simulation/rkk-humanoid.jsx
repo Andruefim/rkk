@@ -5,6 +5,8 @@ import { useRKKStream } from "../../hooks/useRKKStream";
 const API = "http://localhost:8000";
 /** Опрос PyBullet-превью (не связан с тиками симуляции) */
 const CAMERA_PREVIEW_MS = 500;
+/** query `view` для /camera/frame (бэкенд гуманоида пока игнорирует — всегда first-person) */
+const CAM_VIEW = "fp";
 
 const WORLD_COLORS = {
   humanoid:"#cc44ff", robot:"#aa22dd", pybullet:"#ff44aa",
@@ -67,9 +69,9 @@ const sep  = {borderTop:"1px solid #0a1a2e",marginTop:4,paddingTop:4};
 const mono = {fontFamily:"'Courier New',monospace"};
 
 const SKELETON_BONES = [
-  [0,1],[1,2],
-  [1,3],[3,5],[5,7], [1,4],[4,6],[6,8],
-  [2,9],[9,11],[11,13], [2,10],[10,12],[12,14],
+  [0,1],[1,2],[2,3],
+  [1,4],[4,6],[6,8], [1,5],[5,7],[7,9],
+  [3,10],[10,12],[12,14], [3,11],[11,13],[13,15],
 ];
 
 export default function RKKHumanoid() {
@@ -111,7 +113,7 @@ export default function RKKHumanoid() {
     if (!connected || !showCam) return;
     const iv = setInterval(async () => {
       try {
-        const d = await fetch(`${API}/camera/frame?view=${camView}`).then(r=>r.json());
+        const d = await fetch(`${API}/camera/frame?view=${CAM_VIEW}`).then(r=>r.json());
         if (d.available) setCamFrame(d.frame);
       } catch {}
     }, CAMERA_PREVIEW_MS);
@@ -244,9 +246,9 @@ export default function RKKHumanoid() {
     ramp.position.set(3,0.38,0); ramp.rotation.x=-0.26; scene.add(ramp);
 
     // Гуманоид
-    const JOINT_COUNT = 17;
+    const JOINT_COUNT = 18;
     const jointMeshes = Array.from({length:JOINT_COUNT},(_,i)=>{
-      if (i >= 15) {
+      if (i >= 16) {
         const o = new THREE.Object3D();
         o.visible = false;
         scene.add(o);
@@ -388,7 +390,7 @@ export default function RKKHumanoid() {
           jointPositions.push(v);
           if(i<jointMeshes.length){
             jointMeshes[i].position.copy(v);
-            if(i<15) jointMeshes[i].visible=true;
+            if(i<16) jointMeshes[i].visible=true;
             if(i===0){
               jointMeshes[i].material.emissiveIntensity=0.3+(ag.phi??0.1)*0.4+Math.sin(frame*0.08)*0.1;
               jointMeshes[i].material.emissive.setHex(fallen?0xff2200:isVis?0x22ccaa:0x6622aa);
@@ -402,7 +404,7 @@ export default function RKKHumanoid() {
         const t=frame*0.025;
         const comH=1.2+(fallen?-0.8:0);
         const poses=[
-          [0,comH+0.26,0],[0,comH+0.13,0],[0,comH-0.10,0],
+          [0,comH+0.26,0],[0,comH+0.13,0],[0,comH+0.02,0],[0,comH-0.10,0],
           [-0.26,comH+0.11,0],[0.26,comH+0.11,0],
           [-0.42,comH+0.05+Math.sin(t+1)*0.06,0],[0.42,comH+0.05+Math.sin(t+2)*0.06,0],
           [-0.50,comH-0.18,0],[0.50,comH-0.18,0],
@@ -416,7 +418,7 @@ export default function RKKHumanoid() {
           jointPositions.push(v);
           if(i<jointMeshes.length){
             jointMeshes[i].position.copy(v);
-            if(i<15) jointMeshes[i].visible=true;
+            if(i<16) jointMeshes[i].visible=true;
           }
         });
       }

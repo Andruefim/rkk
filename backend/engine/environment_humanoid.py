@@ -12,7 +12,8 @@ environment_humanoid.py — Humanoid Robot Sandbox (Фаза 11).
 
 Редуцированные переменные:
   Торс:  com_x, com_y, com_z, torso_roll, torso_pitch       (5)
-  Голова: neck_yaw, neck_pitch                                (2)
+  Позвоночник: spine_yaw, spine_pitch                       (2)  сферический spine
+  Голова: neck_yaw, neck_pitch                              (2)
   Ноги:  lhip, lknee, lankle, rhip, rknee, rankle            (6)
   Руки:  lshoulder, lelbow, rshoulder, relbow                 (4)
   Стопы: lfoot_z, rfoot_z                                     (2)
@@ -35,8 +36,9 @@ do() оператор:
   только first-person из головы (neck→верх, вперёд по корпусу); view игнорируется.
   get_frame_base64(...) → JPEG base64
 
-Голова:
-  neck_yaw, neck_pitch — сферический neck (два скаляра → локальный euler XYZ).
+Позвоночник / голова:
+  spine_yaw, spine_pitch — сферический spine; neck_yaw, neck_pitch — neck
+  (два скаляра на сустав → локальный euler XYZ).
 """
 from __future__ import annotations
 
@@ -63,12 +65,13 @@ except ImportError:
 
 # ─── Переменные ───────────────────────────────────────────────────────────────
 TORSO_VARS  = ["com_x", "com_y", "com_z", "torso_roll", "torso_pitch"]
+SPINE_VARS  = ["spine_yaw", "spine_pitch"]
 HEAD_VARS   = ["neck_yaw", "neck_pitch"]
 LEG_VARS    = ["lhip", "lknee", "lankle", "rhip", "rknee", "rankle"]
 ARM_VARS    = ["lshoulder", "lelbow", "rshoulder", "relbow"]
 FOOT_VARS   = ["lfoot_z", "rfoot_z"]
 CUBE_VARS   = [f"cube{i}_{d}" for i in range(3) for d in ["x","y","z"]]
-VAR_NAMES   = TORSO_VARS + HEAD_VARS + LEG_VARS + ARM_VARS + FOOT_VARS + CUBE_VARS
+VAR_NAMES   = TORSO_VARS + SPINE_VARS + HEAD_VARS + LEG_VARS + ARM_VARS + FOOT_VARS + CUBE_VARS
 
 # Нормализация диапазонов
 _RANGES = {}
@@ -76,6 +79,7 @@ for v in TORSO_VARS[:2]:  _RANGES[v] = (-1.5, 1.5)   # COM xy
 _RANGES["com_z"]          = (0.0,  1.5)                # высота
 _RANGES["torso_roll"]     = (-1.2, 1.2)
 _RANGES["torso_pitch"]    = (-1.2, 1.2)
+for v in SPINE_VARS:       _RANGES[v] = (-1.2, 1.2)
 for v in HEAD_VARS:        _RANGES[v] = (-1.2, 1.2)
 for v in LEG_VARS:         _RANGES[v] = (-1.5, 1.5)   # angles rad
 for v in ARM_VARS:         _RANGES[v] = (-2.0, 2.0)
@@ -163,19 +167,21 @@ def _forward_kinematics_skeleton(
     cx: float, cy: float, cz: float, joints: dict[str, float]
 ) -> list[dict]:
     """
-    17 точек в том же порядке, что rkk-humanoid.jsx:
-    0 голова, 1 шея, 2 таз, 3–8 руки, 9–14 ноги, 15–16 центры подошв.
+    18 точек в том же порядке, что rkk-humanoid.jsx:
+    0 голова, 1 шея, 2 позвоночник, 3 таз, 4–9 руки, 10–15 ноги, 16–17 центры подошв.
     Оси: x,y горизонталь, z вверх.
     """
     j = joints
     pelvis_z = cz - 0.12
     neck_z = cz + 0.17
+    spine_z = 0.5 * (neck_z + pelvis_z)
     head_z = cz + 0.29
     sh_z = neck_z - 0.02  # плечи у шейного узла
     hip_z = pelvis_z - 0.08
 
     head = [cx, cy, head_z]
     neck = [cx, cy, neck_z]
+    spine = [cx, cy, spine_z]
     pelvis = [cx, cy, pelvis_z]
     lshld = [cx - 0.26, cy, sh_z]
     rshld = [cx + 0.26, cy, sh_z]
@@ -225,7 +231,7 @@ def _forward_kinematics_skeleton(
     lsole = [lfoot[0] - 0.05 * sc, lfoot[1], lfoot[2] - 0.12 * sc]
     rsole = [rfoot[0] + 0.05 * sc, rfoot[1], rfoot[2] - 0.12 * sc]
     pts = [
-        head, neck, pelvis,
+        head, neck, spine, pelvis,
         lshld, rshld, lelbow, relbow, lhand, rhand,
         lhip_p, rhip_p, lknee_p, rknee_p, lfoot, rfoot,
         lsole, rsole,
@@ -238,7 +244,7 @@ class _FallbackHumanoid:
     """Простая кинематическая модель без физики."""
 
     def __init__(self):
-        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS + HEAD_VARS}
+        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS}
         self.com    = np.array([0.0, 0.0, STAND_Z])
         self.torso_euler = np.zeros(3)
         self.cubes  = np.array([
@@ -277,7 +283,7 @@ class _FallbackHumanoid:
         return (max(0, 0.1 - k_l * 0.05), max(0, 0.1 - k_r * 0.05))
 
     def get_all_link_positions(self) -> list[dict]:
-        """Скелетон для Three.js: 17 точек (+ подошвы), порядок как на фронте."""
+        """Скелетон для Three.js: 18 точек (+ подошвы), порядок как на фронте."""
         cx, cy, cz = float(self.com[0]), float(self.com[1]), float(self.com[2])
         return _forward_kinematics_skeleton(cx, cy, cz, self.joints)
 
@@ -289,7 +295,7 @@ class _FallbackHumanoid:
         s["com_z"]        = float(self.com[2])
         s["torso_roll"]   = float(self.torso_euler[0])
         s["torso_pitch"]  = float(self.torso_euler[1])
-        for v in LEG_VARS + ARM_VARS + HEAD_VARS:
+        for v in LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS:
             s[v] = float(self.joints.get(v, 0.0))
         s["lfoot_z"]  = float(lf_z)
         s["rfoot_z"]  = float(rf_z)
@@ -312,7 +318,7 @@ class _FallbackHumanoid:
         ]
 
     def reset_stance(self) -> None:
-        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS + HEAD_VARS}
+        self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS}
         self.com = np.array([0.0, 0.0, STAND_Z], dtype=np.float64)
         self.torso_euler = np.zeros(3)
         self._vel = np.zeros(3)
@@ -409,13 +415,16 @@ class _PyBulletHumanoid:
             self._joint_types.append(int(info[2]))
 
         self._neck_euler = np.zeros(3, dtype=float)
+        self._spine_euler = np.zeros(3, dtype=float)
         for i in range(self.n_joints):
             info = pb.getJointInfo(self.robot_id, i, physicsClientId=self.client)
-            jname = info[1].decode("utf-8")
-            if jname.lower() == "neck":
+            jname = info[1].decode("utf-8").lower()
+            if jname == "neck":
                 self.joint_by_var["neck_yaw"] = i
                 self.joint_by_var["neck_pitch"] = i
-                break
+            elif jname == "spine":
+                self.joint_by_var["spine_yaw"] = i
+                self.joint_by_var["spine_pitch"] = i
 
         # Без «прогрева» на VELOCITY для всех суставов: для spherical это ломает осанку.
         # Сразу нейтральная стойка (как при резете после падения).
@@ -648,6 +657,7 @@ class _PyBulletHumanoid:
         POSITION_CONTROL, иначе гравитация снова ломает осанку при слабом VELOCITY.
         """
         self._neck_euler[:] = 0.0
+        self._spine_euler[:] = 0.0
         rid = self.robot_id
         cid = self.client
         pb.resetBasePositionAndOrientation(
@@ -724,6 +734,27 @@ class _PyBulletHumanoid:
             )
             return
 
+        if var_name in ("spine_yaw", "spine_pitch"):
+            if not callable(motor_m) or jt != pb.JOINT_SPHERICAL:
+                return
+            if var_name == "spine_yaw":
+                self._spine_euler[2] = 0.50 * real_pos
+            else:
+                self._spine_euler[0] = 0.40 * real_pos
+            ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
+            q = pb.getQuaternionFromEuler((ex, ey, ez))
+            motor_m(
+                rid, jid,
+                pb.POSITION_CONTROL,
+                targetPosition=list(q),
+                positionGain=0.70,
+                velocityGain=0.20,
+                maxVelocity=3.5,
+                force=[180.0, 180.0, 180.0],
+                physicsClientId=cid,
+            )
+            return
+
         if jt == pb.JOINT_SPHERICAL and callable(motor_m):
             # Один нормализованный скаляр → локальный euler (порядок Bullet XYZ)
             if var_name == "lshoulder":
@@ -776,6 +807,10 @@ class _PyBulletHumanoid:
             return float(self._neck_euler[2])
         if var_name == "neck_pitch":
             return float(self._neck_euler[0])
+        if var_name == "spine_yaw":
+            return float(self._spine_euler[2])
+        if var_name == "spine_pitch":
+            return float(self._spine_euler[0])
         if var_name not in self.joint_by_var:
             return 0.0
         jid = self.joint_by_var[var_name]
@@ -836,7 +871,7 @@ class _PyBulletHumanoid:
         s["com_z"]       = float(com[2])
         s["torso_roll"]  = float(euler[0])
         s["torso_pitch"] = float(euler[1])
-        for v in HEAD_VARS:
+        for v in SPINE_VARS + HEAD_VARS:
             s[v] = self.get_joint_angle(v)
         for v in LEG_VARS + ARM_VARS:
             s[v] = self.get_joint_angle(v)
@@ -904,7 +939,7 @@ class _PyBulletHumanoid:
         что цепочка идёт вдоль Z — см. HUMANOID_URDF_STAND_EULER при loadURDF.
         """
         need = {
-            "neck", "chest", "root",
+            "neck", "spine", "chest", "root",
             "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
             "left_wrist", "right_wrist",
             "left_hip", "right_hip", "left_knee", "right_knee",
@@ -931,6 +966,7 @@ class _PyBulletHumanoid:
         order = [
             head_v,
             neck_v,
+            vec("spine"),
             vec("root"),
             vec("left_shoulder"),
             vec("right_shoulder"),
@@ -954,7 +990,7 @@ class _PyBulletHumanoid:
 
     def get_all_link_positions(self) -> list[dict]:
         """
-        17 точек (как rkk-humanoid.jsx): + центры подошв после лодыжек.
+        18 точек (как rkk-humanoid.jsx): + центры подошв после лодыжек.
         Для URDF humanoid — getLinkState; иначе FK от базы (кастомный multi-body).
         """
         urdf_pts = self._skeleton_from_urdf_links()
@@ -962,7 +998,7 @@ class _PyBulletHumanoid:
             return urdf_pts
         pos, _ = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
         cx, cy, cz = float(pos[0]), float(pos[1]), float(pos[2])
-        j = {v: self.get_joint_angle(v) for v in LEG_VARS + ARM_VARS + HEAD_VARS}
+        j = {v: self.get_joint_angle(v) for v in LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS}
         return _forward_kinematics_skeleton(cx, cy, cz, j)
 
     def get_cube_positions(self) -> list[dict]:
@@ -1140,7 +1176,7 @@ class EnvironmentHumanoid:
     # ── do() ──────────────────────────────────────────────────────────────────
     def intervene(self, variable: str, value: float) -> dict[str, float]:
         self.n_interventions += 1
-        if variable in LEG_VARS + ARM_VARS + HEAD_VARS:
+        if variable in LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS:
             self._sim.set_joint(variable, value)
         self._sim.step(self.steps_per_do)
         return self.observe()

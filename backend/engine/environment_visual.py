@@ -176,7 +176,8 @@ class EnvironmentVisual:
             raw = self.base_env.observe()
             for key in [
                 "com_z", "torso_roll", "lknee", "rknee",
-                "neck_yaw", "neck_pitch", "lshoulder", "rshoulder",
+                "spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch",
+                "lshoulder", "rshoulder",
             ]:
                 if key in raw:
                     obs[f"phys_{key}"] = raw[key]
@@ -193,7 +194,8 @@ class EnvironmentVisual:
             raw = self.base_env.observe()
             for key in [
                 "com_z", "torso_roll", "lknee", "rknee",
-                "neck_yaw", "neck_pitch", "lshoulder", "rshoulder",
+                "spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch",
+                "lshoulder", "rshoulder",
             ]:
                 if key in raw:
                     ids.append(f"phys_{key}")
