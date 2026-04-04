@@ -270,7 +270,7 @@ def vision_slots():
     """
     Текущие данные Visual Cortex:
       frame:       base64 JPEG
-      masks:       list[base64 PNG] — attention mask per slot
+      masks:       list[base64 JPEG] — миниатюры масок (48×48), UI масштабирует
       slot_values: list[float]
       variability: list[float] — насколько активен слот
       active_slots: int

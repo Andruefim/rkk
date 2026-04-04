@@ -25,6 +25,9 @@ PHASE_HOLD_TICKS = 12
 PHASE_NAMES      = ["", "Causal Crib", "Robotic Explorer",
                     "Social Sandbox", "Value Lock", "Open Reality"]
 
+# Visual mode: полный GNN→cortex на каждом тике дорог; предсказание для PC обновляем реже
+VISION_GNN_FEED_EVERY = 2
+
 
 def resolve_torch_device(requested: str | None = None) -> torch.device:
     """
@@ -356,10 +359,11 @@ class Simulation:
                         "#ff2244", "value"
                     )
 
-        # Фаза 12: передаём GNN prediction в visual env перед шагом
+        # Фаза 12: передаём GNN prediction в visual env (не каждый тик — см. VISION_GNN_FEED_EVERY)
         if self._visual_mode and self._visual_env is not None:
             self._vision_ticks += 1
-            self._feed_gnn_prediction_to_visual()
+            if self._vision_ticks % VISION_GNN_FEED_EVERY == 0:
+                self._feed_gnn_prediction_to_visual()
 
         self.agent.other_agents_phi = []
         result = self.agent.step(engine_tick=self.tick)

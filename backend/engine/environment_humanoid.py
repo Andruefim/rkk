@@ -308,7 +308,7 @@ class _FallbackHumanoid:
     def get_cube_positions(self) -> list[dict]:
         return [{"x":float(c[0]),"y":float(c[1]),"z":float(c[2])} for c in self.cubes]
 
-    def get_frame_base64(self, view="side") -> str | None:
+    def get_frame_base64(self, view="side", **kwargs) -> str | None:
         return None
 
     def get_ankle_quaternions_three_js(self) -> list[dict[str, float]]:
@@ -1073,9 +1073,14 @@ class _PyBulletHumanoid:
         target = eye + 2.4 * fwd
         return eye.tolist(), target.tolist(), up.tolist()
 
-    def get_frame_base64(self, view: str | None = None,
-                         width: int = 480, height: int = 360) -> str | None:
-        """Всегда first-person из головы; аргумент view оставлен для совместимости API."""
+    def get_frame_base64(
+        self,
+        view: str | None = None,
+        width: int = 480,
+        height: int = 360,
+        jpeg_quality: int = 85,
+    ) -> str | None:
+        """Всегда first-person из головы; view — для совместимости API; jpeg_quality 60–95."""
         if not PIL_AVAILABLE:
             return None
         try:
@@ -1108,7 +1113,8 @@ class _PyBulletHumanoid:
                 rgb = np.ascontiguousarray(rgb[:, ::-1, :])
             img = PILImage.fromarray(rgb)
             buf = BytesIO()
-            img.save(buf, format="JPEG", quality=85)
+            q = int(np.clip(jpeg_quality, 40, 95))
+            img.save(buf, format="JPEG", quality=q, optimize=True)
             return base64.b64encode(buf.getvalue()).decode()
         except Exception as e:
             print(f"[HumanoidEnv] Camera error: {e}")
@@ -1212,8 +1218,8 @@ class EnvironmentHumanoid:
         self._sim.reset_stance()
 
     # ── Camera / Skeleton ──────────────────────────────────────────────────────
-    def get_frame_base64(self, view: str | None = None) -> str | None:
-        return self._sim.get_frame_base64(view)
+    def get_frame_base64(self, view: str | None = None, **kwargs) -> str | None:
+        return self._sim.get_frame_base64(view, **kwargs)
 
     def get_joint_positions_world(self) -> list[dict]:
         return self._sim.get_all_link_positions()

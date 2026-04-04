@@ -31,6 +31,19 @@ from typing import Callable
 
 from engine.causal_vision import CausalVisualCortex, make_visual_cortex
 
+# Рендер камеры для слотов: меньше пикселей → быстрее PyBullet + JPEG (превью /camera — отдельно)
+VISION_PIPELINE_CAM_W = 288
+VISION_PIPELINE_CAM_H = 216
+VISION_PIPELINE_JPEG_Q = 72
+# Полные маски для UI — не на каждый _refresh (дорого: 8× JPEG + upscale)
+VISION_UI_MASK_EVERY = 3
+
+_HYBRID_PHYS_KEYS = (
+    "com_z", "torso_roll", "lknee", "rknee",
+    "spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch",
+    "lshoulder", "rshoulder",
+)
+
 
 # ─── Имена переменных ─────────────────────────────────────────────────────────
 def slot_var_ids(n_slots: int) -> list[str]:
@@ -93,6 +106,12 @@ class EnvironmentVisual:
         # GNN prediction для текущего шага (заполняется агентом)
         self._gnn_predicted: torch.Tensor | None  = None
 
+        # Поколение «визуального» снимка: кэш base_env.observe() в hybrid между вызовами observe()
+        self._vision_generation = 0
+        self._hybrid_phys_obs: dict[str, float] | None = None
+        self._hybrid_phys_gen = -1
+        self._refresh_index = 0
+
         # Начальная инициализация
         self._refresh()
 
@@ -103,7 +122,15 @@ class EnvironmentVisual:
         fn = getattr(self.base_env, "get_frame_base64", None)
         if callable(fn):
             b64 = None
-            b64 = fn(None)
+            try:
+                b64 = fn(
+                    None,
+                    width=VISION_PIPELINE_CAM_W,
+                    height=VISION_PIPELINE_CAM_H,
+                    jpeg_quality=VISION_PIPELINE_JPEG_Q,
+                )
+            except TypeError:
+                b64 = fn(None)
             if b64:
                 import base64 as _b64
                 from io import BytesIO
@@ -116,20 +143,37 @@ class EnvironmentVisual:
                     pass
         return None
 
+    def _encode_frame_jpeg_only(self, frame: np.ndarray, quality: int = 65) -> str | None:
+        import base64 as _b64
+        from io import BytesIO
+        try:
+            from PIL import Image as PILImage
+            buf = BytesIO()
+            PILImage.fromarray(frame).save(
+                buf, format="JPEG", quality=quality, optimize=True
+            )
+            return _b64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            return None
+
     def _refresh(self):
         """Обновляем слоты из нового кадра."""
         frame = self._get_raw_frame()
         self._last_frame = frame
+        self._vision_generation += 1
+        self._hybrid_phys_gen = -1
+        self._refresh_index += 1
 
         if frame is not None:
             vals, vecs, attn = self.cortex.encode(frame)
             self._last_slots     = vals    # (K,) float in (0,1)
             self._last_slot_vecs = vecs    # (K,D)
             self._last_attn      = attn    # (K,H',W')
-            # JPEG + PNG масок только здесь (раньше дублировались на каждый tick_step)
-            self._cached_frame_b64, self._cached_masks_b64 = (
-                self._encode_frame_and_masks_for_ui(frame, attn)
-            )
+            self._cached_frame_b64 = self._encode_frame_jpeg_only(frame, quality=68)
+            if self._refresh_index % VISION_UI_MASK_EVERY == 0:
+                _, self._cached_masks_b64 = self._encode_frame_and_masks_for_ui(frame, attn)
+            elif not self._cached_masks_b64:
+                _, self._cached_masks_b64 = self._encode_frame_and_masks_for_ui(frame, attn)
         else:
             self._last_attn = None
             self._cached_frame_b64 = None
@@ -152,9 +196,8 @@ class EnvironmentVisual:
         frame_b64: str | None = None
         try:
             from PIL import Image as PILImage
-            img = PILImage.fromarray(frame)
             buf = BytesIO()
-            img.save(buf, format="JPEG", quality=65, optimize=True)
+            PILImage.fromarray(frame).save(buf, format="JPEG", quality=65, optimize=True)
             frame_b64 = _b64.b64encode(buf.getvalue()).decode()
         except Exception:
             pass
@@ -164,6 +207,14 @@ class EnvironmentVisual:
             masks = []
         return frame_b64, masks
 
+    def _hybrid_phys_snapshot(self) -> dict[str, float]:
+        if self._hybrid_phys_gen != self._vision_generation:
+            self._hybrid_phys_obs = self.base_env.observe()
+            self._hybrid_phys_gen = self._vision_generation
+        if self._hybrid_phys_obs is None:
+            self._hybrid_phys_obs = self.base_env.observe()
+        return self._hybrid_phys_obs
+
     # ── Observe ───────────────────────────────────────────────────────────────
     def observe(self) -> dict[str, float]:
         if self._last_slots is None:
@@ -171,14 +222,10 @@ class EnvironmentVisual:
         slots = self._last_slots
         obs = {f"slot_{k}": float(slots[k].item()) for k in range(self.n_slots)}
 
-        # Hybrid mode: добавляем несколько ключевых ручных переменных
+        # Hybrid mode: один вызов base_env.observe() на поколение кадра (много обращений за тик)
         if self.mode == "hybrid":
-            raw = self.base_env.observe()
-            for key in [
-                "com_z", "torso_roll", "lknee", "rknee",
-                "spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch",
-                "lshoulder", "rshoulder",
-            ]:
+            raw = self._hybrid_phys_snapshot()
+            for key in _HYBRID_PHYS_KEYS:
                 if key in raw:
                     obs[f"phys_{key}"] = raw[key]
         return obs
@@ -191,12 +238,8 @@ class EnvironmentVisual:
     def variable_ids(self) -> list[str]:
         ids = slot_var_ids(self.n_slots)
         if self.mode == "hybrid":
-            raw = self.base_env.observe()
-            for key in [
-                "com_z", "torso_roll", "lknee", "rknee",
-                "spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch",
-                "lshoulder", "rshoulder",
-            ]:
+            raw = self._hybrid_phys_snapshot()
+            for key in _HYBRID_PHYS_KEYS:
                 if key in raw:
                     ids.append(f"phys_{key}")
         return ids

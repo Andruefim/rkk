@@ -239,6 +239,10 @@ class CausalVisualCortex(nn.Module):
         # История slot values для обнаружения каузальных изменений
         self._slot_history: deque[torch.Tensor] = deque(maxlen=32)
 
+        # Кэш std по истории — пересчёт только после нового encode (частые вызовы discovery_rate / UI)
+        self._variability_cache: np.ndarray | None = None
+        self._variability_cache_at_encode: int = -1
+
     # ── Frame preprocessing ────────────────────────────────────────────────────
     def preprocess(self, frame_rgb: np.ndarray) -> torch.Tensor:
         """
@@ -285,6 +289,7 @@ class CausalVisualCortex(nn.Module):
         self._prev_slot_vecs = slot_vecs.detach().clone()
         self._slot_history.append(values.detach().clone())
         self.n_encode += 1
+        self._variability_cache = None
 
         return values.detach(), slot_vecs.detach(), attn_spatial.detach()
 
@@ -363,10 +368,16 @@ class CausalVisualCortex(nn.Module):
         Насколько каждый слот изменялся — мера "информативности".
         Возвращает (K,) variability scores.
         """
+        if self._variability_cache is not None and self._variability_cache_at_encode == self.n_encode:
+            return self._variability_cache
         if len(self._slot_history) < 4:
-            return np.ones(self.cfg.n_slots) * 0.5
-        hist = torch.stack(list(self._slot_history), dim=0)   # (T, K)
-        return hist.std(dim=0).cpu().numpy()
+            out = np.ones(self.cfg.n_slots) * 0.5
+        else:
+            hist = torch.stack(list(self._slot_history), dim=0)   # (T, K)
+            out = hist.std(dim=0).cpu().numpy()
+        self._variability_cache = out
+        self._variability_cache_at_encode = self.n_encode
+        return out
 
     # ── Attention maps for UI ─────────────────────────────────────────────────
     def get_slot_masks_base64(self, attn_masks: torch.Tensor) -> list[str]:
@@ -385,17 +396,17 @@ class CausalVisualCortex(nn.Module):
         K = attn_masks.shape[0]
         attn_np = attn_masks.cpu().float().numpy()
 
-        # Upscale to cfg.frame_h × cfg.frame_w
+        # Миниатюры масок: меньше resize/PNG → быстрее сериализация; UI масштабирует до кадра
         import cv2
+        mw, mh = 48, 48
         for k in range(K):
             mask = attn_np[k]                                      # (H', W')
             mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
-            mask_up = cv2.resize(mask, (self.cfg.frame_w, self.cfg.frame_h),
-                                 interpolation=cv2.INTER_NEAREST)
+            mask_up = cv2.resize(mask, (mw, mh), interpolation=cv2.INTER_LINEAR)
             img_arr = (mask_up * 255).astype(np.uint8)
             img = PILImage.fromarray(img_arr, mode="L")
             buf = BytesIO()
-            img.save(buf, format="PNG")
+            img.save(buf, format="JPEG", quality=82, optimize=True)
             masks_b64.append(base64.b64encode(buf.getvalue()).decode())
         return masks_b64
 
