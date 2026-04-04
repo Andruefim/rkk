@@ -94,6 +94,8 @@ export default function RKKHumanoid() {
   // Фаза 12
   const [visionData,   setVisionData]   = useState(null);
   const [visionLoading,setVisionLoading]= useState(false);
+  const [vlmLoading,    setVlmLoading]    = useState(false);
+  const [vlmWeakEdges,  setVlmWeakEdges]  = useState(false);
   const [selectedSlot, setSelectedSlot] = useState(0);
   const [attnFrame,    setAttnFrame]    = useState(null);
   const [visionEnabled,setVisionEnabled]= useState(false);
@@ -194,6 +196,38 @@ export default function RKKHumanoid() {
       }
     } catch(e) { setStatus(`✗ ${e.message}`); }
     finally { setVisionLoading(false); }
+  };
+
+  const runVlmSlotLabels = async () => {
+    setVlmLoading(true);
+    try {
+      const d = await fetch(`${API}/vision/vlm-label`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          llm_url: "http://localhost:11434/api/generate",
+          llm_model: "gemma4:e4b",
+          max_mask_images: 4,
+          text_only: false,
+          inject_weak_edges: vlmWeakEdges,
+        }),
+      }).then((r) => r.json());
+      if (d.ok) {
+        const w = d.weak_edges_injected ? ` · +${d.weak_edges_injected} weak edges` : "";
+        const warn = d.warning ? ` (${d.warning})` : "";
+        setStatus(`🔬 VLM ${d.mode}: ${d.n_slots_labeled} labels${w}${warn}`);
+        try {
+          const refresh = await fetch(`${API}/vision/slots`).then((r) => r.json());
+          if (refresh.visual_mode !== false) setVisionData(refresh);
+        } catch {}
+      } else {
+        setStatus(`✗ VLM: ${d.error || "failed"}`);
+      }
+    } catch (e) {
+      setStatus(`✗ ${e.message}`);
+    } finally {
+      setVlmLoading(false);
+    }
   };
 
   const disableVision = async () => {
@@ -633,6 +667,38 @@ export default function RKKHumanoid() {
             </div>
           </div>
 
+          {isVis&&(
+            <div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center",marginBottom:10}}>
+              <button
+                type="button"
+                onClick={runVlmSlotLabels}
+                disabled={vlmLoading}
+                style={{
+                  padding: "4px 10px",
+                  borderRadius: 2,
+                  fontSize: 9,
+                  cursor: vlmLoading ? "wait" : "pointer",
+                  background: "#001828",
+                  border: `1px solid ${visColor}`,
+                  color: visColor,
+                }}
+              >
+                {vlmLoading ? "⏳ VLM…" : "🔬 VLM label slots (Фаза 2)"}
+              </button>
+              <label style={{ fontSize: 8, color: "#336655", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={vlmWeakEdges}
+                  onChange={(e) => setVlmWeakEdges(e.target.checked)}
+                />
+                weak slot→phys edges
+              </label>
+              <span style={{ fontSize: 7, color: "#224433" }}>
+                Ollama /api/chat + images; иначе текстовый fallback
+              </span>
+            </div>
+          )}
+
           {isVis&&visionData&&(
             <>
               {/* Slot Values & Variability */}
@@ -646,6 +712,8 @@ export default function RKKHumanoid() {
                     const varV = visionData.variability?.[k]??0;
                     const active = varV > 0.02;
                     const col = SLOT_COLORS[k%SLOT_COLORS.length];
+                    const sl = visionData.slot_labels?.[k];
+                    const lbl = sl?.label;
                     return(
                       <div key={k} onClick={()=>setSelectedSlot(k)}
                         style={{background:selectedSlot===k?"rgba(68,255,204,0.08)":"rgba(0,10,12,0.8)",
@@ -655,6 +723,14 @@ export default function RKKHumanoid() {
                           <span style={{color:col,fontSize:8,fontWeight:"bold"}}>S{k}</span>
                           <span style={{color:active?"#44ffcc":"#334444",fontSize:7}}>{active?"●":"○"}</span>
                         </div>
+                        {lbl ? (
+                          <div style={{ fontSize: 6, color: "#66bbaa", marginBottom: 2, lineHeight: 1.2, minHeight: 14 }} title={sl?.likely_phys?.join(", ") || ""}>
+                            {lbl}
+                            {typeof sl?.confidence === "number" ? ` · ${(sl.confidence * 100).toFixed(0)}%` : ""}
+                          </div>
+                        ) : (
+                          <div style={{ fontSize: 6, color: "#223333", marginBottom: 2, minHeight: 14 }}>—</div>
+                        )}
                         {/* Value bar */}
                         <div style={{height:3,background:"#0a1a1a",borderRadius:2,overflow:"hidden",marginBottom:2}}>
                           <div style={{width:`${val*100}%`,height:"100%",background:col,transition:"width 0.5s"}}/>
@@ -676,7 +752,13 @@ export default function RKKHumanoid() {
               {/* Attention frame для выбранного слота */}
               <div style={{...sep,paddingTop:8}}>
                 <div style={{fontSize:9,color:"#336655",marginBottom:4,display:"flex",justifyContent:"space-between"}}>
-                  <span>ATTENTION MASK — <span style={{color:SLOT_COLORS[selectedSlot%8]}}>slot_{selectedSlot}</span></span>
+                  <span>ATTENTION MASK — <span style={{color:SLOT_COLORS[selectedSlot%8]}}>slot_{selectedSlot}</span>
+                    {visionData.slot_labels?.[selectedSlot]?.label ? (
+                      <span style={{ color: "#66bbaa", marginLeft: 6 }}>
+                        ({visionData.slot_labels[selectedSlot].label})
+                      </span>
+                    ) : null}
+                  </span>
                   <span style={{color:"#224433",fontSize:8}}>что видит этот слот</span>
                 </div>
                 {attnFrame?(
