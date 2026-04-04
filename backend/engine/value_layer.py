@@ -285,7 +285,8 @@ class ValueLayer:
                 variable, value,
             )
 
-        slot_action = variable.startswith("slot_")
+        # slot_* и self_* — «внутренние» оси; не жмём узкий predict_band как у физики.
+        slot_action = variable.startswith("slot_") or variable.startswith("self_")
 
         # §2–4 Виртуальный do() + imagination rollout
         S = dict(current_nodes)

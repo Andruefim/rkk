@@ -14,13 +14,23 @@ server.py — FastAPI для Singleton AGI Humanoid (Фаза 11 + 12).
   RKK_SKIP_AUTO_VISION=1, RKK_SKIP_AUTO_VLM_BOOTSTRAP=1 — отключить шаги.
   RKK_AUTO_VISION_N_SLOTS, RKK_AUTO_VISION_MODE (hybrid|visual)
 
+Этап D: RKK_LLM_LOOP=1 — фоновые L2/L3 консультации Ollama в tick_step (см. engine/simulation.py, engine/llm_loop.py).
+
 Установить для Фазы 12: pip install opencv-python scipy
 """
 from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 import torch
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+except ImportError:
+    pass
 from contextlib import asynccontextmanager
 from typing import Literal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query

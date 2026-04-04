@@ -3,12 +3,12 @@ environment_humanoid.py — Humanoid Robot Sandbox (Фаза 11 + fixed_root).
 
 Добавлен fixed_root mode:
   - PyBullet JOINT_FIXED constraint фиксирует base в воздухе
-  - variable_ids → FIXED_BASE_VARS (17 переменных вместо 26)
+  - variable_ids → FIXED_BASE_VARS (+ self_* самомодель)
   - is_fallen() всегда False → ValueLayer не блокирует
-  - GNN учит только arms→cubes, spine/neck pose
+  - GNN: arms→cubes + self_*→суставы/кубы (self задаёт агент, не PyBullet)
   - EnvironmentHumanoid.set_fixed_root(bool) — переключение в runtime
 
-FIXED_BASE_VARS = ARM + SPINE + HEAD + CUBE_VARS + SANDBOX_VARS (фикс. база + песочница)
+FIXED_BASE_VARS = ARM + SPINE + HEAD + CUBE_VARS + SANDBOX_VARS + SELF_VARS (самомодель)
 """
 from __future__ import annotations
 
@@ -43,14 +43,21 @@ FOOT_VARS   = ["lfoot_z", "rfoot_z"]
 CUBE_VARS   = [f"cube{i}_{d}" for i in range(3) for d in ["x","y","z"]]
 # Песочница: мяч, рычаг (проксимити), расстояние до зоны доставки — обогащают каузальный граф.
 SANDBOX_VARS = ["ball_x", "ball_y", "ball_z", "lever_pin", "target_dist"]
+# Этап Г — самомодель: внутренние узлы «я», задаёт агент (не физика). GNN учит self_* → суставы → кубы.
+SELF_VARS: tuple[str, ...] = (
+    "self_intention_larm",
+    "self_intention_rarm",
+    "self_energy",
+    "self_attention",
+)
 VAR_NAMES   = (
     TORSO_VARS + SPINE_VARS + HEAD_VARS + LEG_VARS + ARM_VARS + FOOT_VARS
-    + CUBE_VARS + SANDBOX_VARS
+    + CUBE_VARS + SANDBOX_VARS + list(SELF_VARS)
 )
 
 # Fixed-base mode: таз зафиксирован в воздухе, баланс исключён.
-# Агент учит arms/spine/neck → кубы + сигналы песочницы (мяч, рычаг, цель).
-FIXED_BASE_VARS: list[str] = ARM_VARS + SPINE_VARS + HEAD_VARS + CUBE_VARS + SANDBOX_VARS
+# Агент учит arms/spine/neck → кубы + сигналы песочницы (мяч, рычаг, цель) + self_*.
+FIXED_BASE_VARS: list[str] = ARM_VARS + SPINE_VARS + HEAD_VARS + CUBE_VARS + SANDBOX_VARS + list(SELF_VARS)
 
 # Нормализация диапазонов
 _RANGES = {}
@@ -71,6 +78,8 @@ for v in ("ball_x", "ball_y"):
 _RANGES["ball_z"]       = (0.0, 2.0)
 _RANGES["lever_pin"]    = (0.0, 1.0)
 _RANGES["target_dist"]  = (0.0, 4.0)
+for _sv in SELF_VARS:
+    _RANGES[_sv] = (0.0, 1.0)
 
 # Масштаб URDF относительно прежнего «эталона» 0.36 (0.18 = ровно в 2× меньше по линейным размерам).
 HUMANOID_URDF_LEGACY_SCALE = 0.36
@@ -1232,7 +1241,7 @@ class EnvironmentHumanoid:
     """
     Среда гуманоида для Singleton AGI.
 
-    fixed_root=True: база зафиксирована, variable_ids = FIXED_BASE_VARS (17 vars).
+    fixed_root=True: база зафиксирована, variable_ids = FIXED_BASE_VARS (вкл. self_*).
     set_fixed_root(bool): переключение в runtime.
     """
 
@@ -1260,6 +1269,8 @@ class EnvironmentHumanoid:
         mode_label = "fixed_root" if fixed_root else "full"
         var_count  = len(FIXED_BASE_VARS if fixed_root else VAR_NAMES)
         print(f"[HumanoidEnv] backend={self._backend}, mode={mode_label}, vars={var_count}")
+        # Самомодель: значения держим в среде, observe() мержит с физикой; intervene(self_*) не трогает суставы.
+        self._self_state: dict[str, float] = {k: 0.5 for k in SELF_VARS}
 
     # ── Fixed root switch ─────────────────────────────────────────────────────
     @property
@@ -1296,7 +1307,11 @@ class EnvironmentHumanoid:
     def observe(self) -> dict[str, float]:
         raw = self._sim.get_state()
         active = set(FIXED_BASE_VARS if self._fixed_root else VAR_NAMES)
-        return {k: self._norm(k, v) for k, v in raw.items() if k in active}
+        out = {k: self._norm(k, v) for k, v in raw.items() if k in active}
+        for sk in SELF_VARS:
+            if sk in active:
+                out[sk] = float(np.clip(self._self_state.get(sk, 0.5), 0.05, 0.95))
+        return out
 
     @property
     def variables(self) -> dict[str, float]:
@@ -1309,6 +1324,11 @@ class EnvironmentHumanoid:
     # ── do() ─────────────────────────────────────────────────────────────────
     def intervene(self, variable: str, value: float) -> dict[str, float]:
         self.n_interventions += 1
+
+        if variable in SELF_VARS:
+            self._self_state[variable] = float(np.clip(value, 0.05, 0.95))
+            self._sim.step(self.steps_per_do)
+            return self.observe()
 
         # В fixed_root mode управляем только руками и головой (ноги зафиксированы)
         if self._fixed_root:
@@ -1331,8 +1351,14 @@ class EnvironmentHumanoid:
 
     def gt_edges(self) -> list[dict]:
         if self._fixed_root:
-            # В fixed_root: только arm→cube каузальность
+            # В fixed_root: arm→cube + самомодель (намерение → тело → мир)
             return [
+                {"from_": "self_intention_larm", "to": "lshoulder", "weight": 0.55},
+                {"from_": "self_intention_larm", "to": "cube0_x", "weight": 0.35},
+                {"from_": "self_intention_rarm", "to": "rshoulder", "weight": 0.55},
+                {"from_": "self_intention_rarm", "to": "cube1_x", "weight": 0.35},
+                {"from_": "self_attention", "to": "neck_yaw", "weight": 0.35},
+                {"from_": "self_energy", "to": "lshoulder", "weight": 0.25},
                 {"from_": "lshoulder", "to": "cube0_x", "weight": 0.6},
                 {"from_": "lshoulder", "to": "cube0_y", "weight": 0.4},
                 {"from_": "rshoulder", "to": "cube1_x", "weight": 0.6},
@@ -1354,6 +1380,11 @@ class EnvironmentHumanoid:
         edges.append({"from_": "lshoulder",   "to": "cube0_x",  "weight": 0.6})
         edges.append({"from_": "rshoulder",   "to": "cube1_x",  "weight": 0.6})
         edges.append({"from_": "com_z",       "to": "torso_roll","weight": -0.4})
+        edges.extend([
+            {"from_": "self_intention_larm", "to": "lshoulder", "weight": 0.5},
+            {"from_": "self_intention_rarm", "to": "rshoulder", "weight": 0.5},
+            {"from_": "self_attention", "to": "neck_yaw", "weight": 0.3},
+        ])
         return edges
 
     # ── Упал? ─────────────────────────────────────────────────────────────────
@@ -1366,6 +1397,8 @@ class EnvironmentHumanoid:
 
     def reset_stance(self) -> None:
         self._sim.reset_stance()
+        for k in SELF_VARS:
+            self._self_state[k] = 0.5
 
     # ── Camera / Skeleton ─────────────────────────────────────────────────────
     def get_frame_base64(self, view: str | None = None, **kwargs) -> str | None:
@@ -1409,6 +1442,10 @@ def humanoid_hardcoded_seeds() -> list[dict]:
         {"from_": "lshoulder",  "to": "cube0_x",  "weight": 0.20, "alpha": 0.05},
         {"from_": "rshoulder",  "to": "cube1_x",  "weight": 0.20, "alpha": 0.05},
         {"from_": "com_z",      "to": "torso_roll","weight":-0.15, "alpha": 0.05},
+        {"from_": "self_intention_larm", "to": "lshoulder", "weight": 0.18, "alpha": 0.05},
+        {"from_": "self_intention_rarm", "to": "rshoulder", "weight": 0.18, "alpha": 0.05},
+        {"from_": "self_attention", "to": "neck_yaw", "weight": 0.12, "alpha": 0.04},
+        {"from_": "self_energy", "to": "lshoulder", "weight": 0.10, "alpha": 0.04},
     ]
 
 
@@ -1439,6 +1476,12 @@ def fixed_root_seeds() -> list[dict]:
         {"from_": "spine_pitch",  "to": "cube2_z", "weight": 0.16, "alpha": 0.05},
         # Шея → куб (при взгляде / наклоне)
         {"from_": "neck_yaw",   "to": "cube0_x", "weight": 0.12, "alpha": 0.04},
+        # Самомодель (слабые семена)
+        {"from_": "self_intention_larm", "to": "lshoulder", "weight": 0.22, "alpha": 0.05},
+        {"from_": "self_intention_larm", "to": "cube0_x", "weight": 0.16, "alpha": 0.04},
+        {"from_": "self_intention_rarm", "to": "rshoulder", "weight": 0.22, "alpha": 0.05},
+        {"from_": "self_attention", "to": "neck_yaw", "weight": 0.14, "alpha": 0.04},
+        {"from_": "self_energy", "to": "lshoulder", "weight": 0.12, "alpha": 0.04},
     ]
 
 

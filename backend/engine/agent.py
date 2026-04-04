@@ -7,6 +7,14 @@ agent_v4.py — RKKAgent с Value Layer (Шаг А).
   - LLM/RAG seed interface: inject_text_priors(edges_json)
   - Fallback scorer когда System 1 буфер ещё мал
   - other_agents_phi передаётся из Simulation для ΔΦ≥0 constraint
+
+Этап B (гипотезо-ориентированное исследование):
+  score_interventions() может ранжировать кандидатов по аппроксимации EIG относительно
+  posterior на рёбрах (1−α_trust), а не только по System1.predict(features).
+  Переключатель: RKK_HYPOTHESIS_EIG=1 (по умолчанию) | 0 | system1 | off | false
+  В snapshot: h_W_edge_entropy — сумма бинарных энтропий по α_trust рёбер (диагностика неопределённости W).
+
+Этап Г (самомодель): узлы self_* в humanoid задаются средой/агентом; см. engine.environment_humanoid.SELF_VARS.
 """
 from __future__ import annotations
 
@@ -21,12 +29,27 @@ from engine.system1      import System1
 from engine.temporal     import TemporalBlankets
 from engine.value_layer  import ValueLayer, HomeostaticBounds, BlockReason
 from engine.phase3_teacher import TeacherIGRule
+from engine.environment_humanoid import SELF_VARS
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
 NOTEARS_EVERY = 16
 MAX_FALLBACK_TRIES = 5  # больше кандидатов, чтобы пройти Value Layer в начале обучения
 # Вес slot_* в actual_ig для System 1; основной сигнал — не-визуальные узлы (RKK_VISUAL_IG_WEIGHT=0 → только физика).
 VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.1"))
+_SELF_VAR_SET = frozenset(SELF_VARS)
+
+
+def _hypothesis_eig_from_env() -> bool:
+    """Этап B: байесовский выбор эксперимента (EIG) вместо только System 1."""
+    v = os.environ.get("RKK_HYPOTHESIS_EIG", "1").strip().lower()
+    return v not in ("0", "false", "off", "system1", "no", "s1")
+
+
+def _eig_chunk_size() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_EIG_BATCH", "256")))
+    except ValueError:
+        return 256
 
 
 def _imagination_horizon_from_env() -> int:
@@ -148,6 +171,59 @@ class RKKAgent:
             return 0.0
         return float(self.graph._core.dag_constraint().item())
 
+    @staticmethod
+    def _marginal_node_uncertainty(unc_m: np.ndarray) -> np.ndarray:
+        """
+        Маргинальная неопределённость по узлу j: max по всем рёбрам (j→·) и (·→j).
+        unc_m[i,j] — epistemic mass на ребре i→j (posterior proxy: 1 − α_trust).
+        """
+        row_max = unc_m.max(axis=1)
+        col_max = unc_m.max(axis=0)
+        return np.maximum(row_max, col_max).astype(np.float64, copy=False)
+
+    def _batch_hypothesis_eig(
+        self,
+        candidates: list[dict],
+        X_np: np.ndarray,
+        u_node: np.ndarray,
+        nid_to_i: dict[str, int],
+    ) -> list[float]:
+        """
+        Аппроксимация EIG(a) ≈ Σ_j u(j) · E[|X'_j − X_j| | a] с одним предсказанием
+        world model (среднее предсказательного распределения).
+
+        u(j) снимает неопределённость по инцидентным рёбрам; большой |ΔX| при высоком u
+        соответствует эксперименту, который сильнее «разрешает» неизвестную структуру.
+        """
+        core = self.graph._core
+        if core is None or not candidates:
+            return []
+        fd = getattr(core, "forward_dynamics", None)
+        if not callable(fd):
+            return []
+
+        d = int(X_np.shape[0])
+        device = self.device
+        chunk = _eig_chunk_size()
+        eigs: list[float] = []
+        x0 = torch.from_numpy(X_np).to(dtype=torch.float32, device=device).unsqueeze(0)
+
+        for start in range(0, len(candidates), chunk):
+            sub = candidates[start : start + chunk]
+            b = len(sub)
+            x_batch = x0.expand(b, -1)
+            a_batch = torch.zeros(b, d, device=device, dtype=torch.float32)
+            for bi, cand in enumerate(sub):
+                idx = nid_to_i.get(cand["variable"])
+                if idx is not None:
+                    a_batch[bi, idx] = float(cand["value"])
+            with torch.no_grad():
+                pred = fd(x_batch, a_batch)
+            delta = (pred - x_batch).abs().cpu().numpy()
+            u = u_node.reshape(1, -1)
+            eigs.extend((delta * u).sum(axis=1).tolist())
+        return eigs
+
     # ── Epistemic scoring ─────────────────────────────────────────────────────
     def score_interventions(self) -> list[dict]:
         var_ids   = self.env.variable_ids
@@ -219,9 +295,34 @@ class RKKAgent:
         if not features_batch:
             return []
 
-        scores = self.system1.score(features_batch)
-        for i, cand in enumerate(candidates):
-            cand["expected_ig"] = scores[i]
+        use_eig = _hypothesis_eig_from_env() and W_m is not None and unc_m is not None
+        if use_eig:
+            x_vec = np.array(
+                [float(self.graph.nodes.get(n, 0.0)) for n in self.graph._node_ids],
+                dtype=np.float64,
+            )
+            u_node = self._marginal_node_uncertainty(unc_m)
+            eigs = self._batch_hypothesis_eig(candidates, x_vec, u_node, nid_to_i)
+            if len(eigs) == len(candidates):
+                # Учитываем гипотезу «это ребро неизвестно»: масштаб EIG по unc(v_from→v_to).
+                for i, cand in enumerate(candidates):
+                    eigs[i] *= 1.0 + float(cand["uncertainty"])
+                arr = np.array(eigs, dtype=np.float64)
+                lo, hi = float(arr.min()), float(arr.max())
+                if hi > lo + 1e-12:
+                    normed = (arr - lo) / (hi - lo)
+                else:
+                    normed = np.full_like(arr, 0.5)
+                for i, cand in enumerate(candidates):
+                    cand["eig_raw"] = float(eigs[i])
+                    cand["expected_ig"] = float(normed[i])
+            else:
+                use_eig = False
+
+        if not use_eig:
+            scores = self.system1.score(features_batch)
+            for i, cand in enumerate(candidates):
+                cand["expected_ig"] = scores[i]
 
         return sorted(candidates, key=lambda x: -x["expected_ig"])
 
@@ -254,7 +355,7 @@ class RKKAgent:
         self._last_engine_tick = engine_tick
         scores = self.score_interventions()
         if not scores:
-            return {"blocked": False, "skipped": True}
+            return {"blocked": False, "skipped": True, "prediction_error": 0.0, "cf_predicted": {}, "cf_observed": {}}
 
         current_phi = self.phi_approx()
         chosen      = None
@@ -302,6 +403,8 @@ class RKKAgent:
                 "updated_edges": [],
                 "compression_delta": 0.0,
                 "prediction_error":  0.0,
+                "cf_predicted": {},
+                "cf_observed": {},
             }
 
         # ── Выполняем допустимое действие ────────────────────────────────────
@@ -337,9 +440,12 @@ class RKKAgent:
         compression_delta = mdl_before - mdl_after
         self._cg_history.append(compression_delta)
 
-        # System 1: IG в основном по физическим узлам; slot_* — вспомогательный канал (не единственный реворд).
+        # System 1: IG по физике; slot_* и self_* не доминируют метрику (self — прямое задание агентом).
         nids = self.graph._node_ids
-        phys_ids = [k for k in nids if not str(k).startswith("slot_")]
+        phys_ids = [
+            k for k in nids
+            if k not in _SELF_VAR_SET and not str(k).startswith("slot_")
+        ]
         slot_ids = [k for k in nids if str(k).startswith("slot_")]
 
         def _mean_abs_err(keys: list) -> float:
@@ -383,6 +489,7 @@ class RKKAgent:
         if cur_dr > self._peak_discovery_rate:
             self._peak_discovery_rate = cur_dr
 
+        _cf_keys = list(self.graph._node_ids)[:48]
         self._last_result = {
             "blocked":           False,
             "blocked_count":     blocked_count,
@@ -394,6 +501,8 @@ class RKKAgent:
             "prediction_error":  float(np.mean([
                 abs(predicted.get(k, 0) - v) for k, v in observed.items()
             ])),
+            "cf_predicted": {k: float(round(float(predicted.get(k, 0.0)), 4)) for k in _cf_keys},
+            "cf_observed":  {k: float(round(float(observed.get(k, 0.0)), 4)) for k in _cf_keys},
             "notears":           notears_result,
         }
         return self._last_result
@@ -464,6 +573,14 @@ class RKKAgent:
                 "l_int":  self._last_notears_loss.get("l_int", 0),
             }
 
+        h_W_edge_entropy = None
+        core = self.graph._core
+        if core is not None:
+            with torch.no_grad():
+                A = core.alpha_trust_matrix().detach().float().cpu().numpy()
+            p = np.clip(A, 1e-7, 1.0 - 1e-7)
+            h_W_edge_entropy = float(-(p * np.log(p) + (1.0 - p) * np.log(1.0 - p)).sum())
+
         snap: dict = {
             "id":                    self.id,
             "name":                  self.name,
@@ -490,6 +607,8 @@ class RKKAgent:
                 "weight":     round(self._teacher_weight, 4),
                 "rules":      len(self._teacher_rules),
             },
+            "hypothesis_eig": _hypothesis_eig_from_env(),
+            "h_W_edge_entropy": None if h_W_edge_entropy is None else round(h_W_edge_entropy, 4),
             "edges": [e.as_dict() for e in self.graph.edges],
         }
         if self.env.preset == "pybullet":

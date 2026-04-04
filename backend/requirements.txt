@@ -10,6 +10,7 @@ numpy==1.26.4
 scipy==1.13.0
 networkx==3.3
 httpx>=0.27.0
+python-dotenv>=1.0.0
 pybullet            # Фаза 9+: pip install pybullet
 
 # Фаза 10+: GNN (опционально — без него pure PyTorch fallback в causal_gnn.py)

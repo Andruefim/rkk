@@ -1,9 +1,14 @@
 """
 run.py — точка входа для Windows.
 
-PowerShell:
+PowerShell (из каталога репозитория rkk):
   cd backend
   python run.py
+
+Переменные RKK_* можно держать в файле .env в корне rkk (рядом с backend/) — подхватывается при старте.
+Без .env, только для сессии PowerShell:
+  $env:RKK_LLM_LOOP = "1"
+  cd backend; python run.py
 
 После старта API (фоном): humanoid_structured LLM-bootstrap → автоматически vision ON → один VLM.
   Отключить LLM: RKK_SKIP_AUTO_HUMANOID_LLM=1
@@ -19,6 +24,12 @@ PowerShell:
 
 Ручной VLM: POST /vision/vlm-label. Повтор учителя: POST /teacher/refresh.
 
+Этап D — LLM в петле (не только bootstrap): RKK_LLM_LOOP=1
+  Уровень 2: контрфактуальная консультация при стагнации discovery (≥RKK_LLM_STAGNATION_TICKS),
+  rolling block_rate>0.4, VLM «неизвестный» слот, surprise PE>3σ.
+  Уровень 3 (humanoid): редко RKK_LLM_LEVEL3_INTERVAL тиков — перезапись гипотез.
+  Доп.: RKK_LLM_LEVEL2_COOLDOWN, RKK_LLM_MIN_INTERVENTIONS.
+
 Или через uvicorn напрямую:
   uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
 """
@@ -28,9 +39,19 @@ PowerShell:
 if __name__ == "__main__":
     import sys
     import os
+    from pathlib import Path
+
+    _backend_dir = Path(__file__).resolve().parent
+    _repo_root = _backend_dir.parent
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(_repo_root / ".env")
+    except ImportError:
+        pass
 
     # Добавляем backend/ в путь чтобы engine.* импортировался правильно
-    sys.path.insert(0, os.path.dirname(__file__))
+    sys.path.insert(0, str(_backend_dir))
 
     import torch
     print(f"[RKK] PyTorch: {torch.__version__}")
