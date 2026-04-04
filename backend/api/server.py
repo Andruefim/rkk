@@ -75,14 +75,20 @@ async def _startup_humanoid_llm_bootstrap() -> None:
             max_h = 28
         vars_ = ctx["variables"]
         seeder = RAGSeeder(llm_url=llm_url, llm_model=model)
-        from engine.environment_humanoid import humanoid_hardcoded_seeds
+        from engine.environment_humanoid import (
+            humanoid_hardcoded_seeds,
+            merge_humanoid_golden_with_llm_edges,
+        )
 
         hyps = await seeder.generate_humanoid_structured(
             available_vars=vars_, max_hypotheses=max_h,
         )
-        edges = [h.to_dict() for h in hyps] if hyps else humanoid_hardcoded_seeds()
-        res = sim.inject_seeds(agent_id=0, edges=edges)
-        src = "llm_humanoid" if hyps else "hardcoded_fallback"
+        if hyps:
+            edges = merge_humanoid_golden_with_llm_edges([h.to_dict() for h in hyps])
+            src = "llm_humanoid_merged"
+        else:
+            edges = humanoid_hardcoded_seeds()
+            src = "hardcoded_fallback"
         print(
             f"[RKK] Auto humanoid_structured bootstrap: source={src}, "
             f"injected={res.get('injected', 0)}, skipped={len(res.get('skipped', []))}"
@@ -247,15 +253,22 @@ async def bootstrap_llm(req: LLMBootstrapRequest):
         if not req.llm_url:
             return {"error": "llm_url required for humanoid_structured"}
         try:
-            from engine.environment_humanoid import humanoid_hardcoded_seeds
+            from engine.environment_humanoid import (
+                humanoid_hardcoded_seeds,
+                merge_humanoid_golden_with_llm_edges,
+            )
 
             hyps = await seeder.generate_humanoid_structured(
                 available_vars=vars_,
                 max_hypotheses=req.max_hypotheses,
             )
-            edges = [h.to_dict() for h in hyps] if hyps else humanoid_hardcoded_seeds()
+            if hyps:
+                edges = merge_humanoid_golden_with_llm_edges([h.to_dict() for h in hyps])
+                src = "llm_humanoid_merged"
+            else:
+                edges = humanoid_hardcoded_seeds()
+                src = "hardcoded_fallback"
             res = sim.inject_seeds(agent_id=0, edges=edges)
-            src = "llm_humanoid" if hyps else "hardcoded_fallback"
             return {"source": src, "preset": preset, **res}
         except Exception as e:
             return {"error": str(e)}
@@ -282,14 +295,21 @@ async def rag_auto_seed_all():
     _rag_status["running"] = True
     try:
         if preset == "humanoid" and seeder.llm_url:
-            from engine.environment_humanoid import humanoid_hardcoded_seeds
+            from engine.environment_humanoid import (
+                humanoid_hardcoded_seeds,
+                merge_humanoid_golden_with_llm_edges,
+            )
 
             hyps = await seeder.generate_humanoid_structured(
                 available_vars=ctx["variables"],
                 max_hypotheses=28,
             )
-            edges = [h.to_dict() for h in hyps] if hyps else humanoid_hardcoded_seeds()
-            source = "llm_humanoid" if hyps else "hardcoded_fallback"
+            if hyps:
+                edges = merge_humanoid_golden_with_llm_edges([h.to_dict() for h in hyps])
+                source = "llm_humanoid_merged"
+            else:
+                edges = humanoid_hardcoded_seeds()
+                source = "hardcoded_fallback"
         else:
             hyps = await seeder.generate(
                 env_preset=preset, available_vars=ctx["variables"], max_hypotheses=6

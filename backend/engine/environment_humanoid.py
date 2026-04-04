@@ -1272,3 +1272,27 @@ def humanoid_hardcoded_seeds() -> list[dict]:
         {"from_": "rshoulder",  "to": "cube1_x",  "weight": 0.20, "alpha": 0.05},
         {"from_": "com_z",      "to": "torso_roll","weight":-0.15, "alpha": 0.05},
     ]
+
+
+def merge_humanoid_golden_with_llm_edges(llm_edges: list[dict]) -> list[dict]:
+    """
+    Фаза 1 (опциональный шаг плана): золотой минимум + вывод LLM.
+    Пара (from_, to) из humanoid_hardcoded_seeds сохраняется; LLM не перезаписывает те же пары.
+    Порядок: сначала все golden, затем уникальные рёбра LLM.
+    """
+    golden = humanoid_hardcoded_seeds()
+    seen = {(e["from_"], e["to"]) for e in golden}
+    out = list(golden)
+    for e in llm_edges:
+        from_ = e.get("from_") or e.get("from")
+        to = e.get("to")
+        if not from_ or not to:
+            continue
+        from_, to = str(from_).strip(), str(to).strip()
+        key = (from_, to)
+        if key in seen:
+            continue
+        seen.add(key)
+        row = {"from_": from_, "to": to, "weight": float(e.get("weight", 0.25)), "alpha": float(e.get("alpha", 0.05))}
+        out.append(row)
+    return out

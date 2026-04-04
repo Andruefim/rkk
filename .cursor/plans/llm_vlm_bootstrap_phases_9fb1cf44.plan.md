@@ -66,7 +66,7 @@ flowchart LR
 
 3. **Валидация:** повторно использовать логику отклонения неизвестных узлов из `inject_text_priors`; опционально пост-фильтр: не более N рёбер на узел-источник, клип весов.
 
-4. **Расширение `humanoid_hardcoded_seeds`:** по желанию — второй шаг после LLM: ручной/полуавтоматический merge «золотого минимума» и вывод LLM (не блокер Фазы 1).
+4. **Расширение `humanoid_hardcoded_seeds`:** второй шаг после LLM — `merge_humanoid_golden_with_llm_edges()` в `environment_humanoid.py`: золотой минимум всегда в инжекте, уникальные пары LLM добавляются; совпадающие `(from_, to)` остаются с весами golden.
 
 **Критерий готовности:** после `bootstrap` на `humanoid` (и в hybrid visual) в ответе `injected > 0`, мало `skipped`, граф содержит связи суставы↔COM/стопы/торс, совместимые с [`gt_edges`-подобной логикой](c:\Users\Andrey\Desktop\agi\rkk\backend\engine\environment_humanoid.py).
 
