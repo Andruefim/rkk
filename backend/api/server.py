@@ -129,6 +129,7 @@ async def _startup_auto_vision_and_one_vlm() -> None:
     RKK_SKIP_AUTO_VLM_BOOTSTRAP=1 — зрение да, VLM один раз пропустить.
     RKK_AUTO_VLM_WEAK_EDGES=1 — как у ручного POST: слабые slot→phys.
     RKK_AUTO_VLM_TEXT_ONLY=1 — только текстовый режим (без картинок в chat).
+    RKK_AUTO_VLM_MAX_MASKS — маски в chat (0 = только кадр при bootstrap, быстрее; по умолчанию 0).
     """
     if _env_flag("RKK_SKIP_AUTO_VISION"):
         print("[RKK] Auto vision skipped (RKK_SKIP_AUTO_VISION)")
@@ -168,9 +169,9 @@ async def _startup_auto_vision_and_one_vlm() -> None:
         llm_url = get_ollama_generate_url()
         model = get_ollama_model()
         try:
-            max_masks = int(os.environ.get("RKK_AUTO_VLM_MAX_MASKS", "4"))
+            max_masks = int(os.environ.get("RKK_AUTO_VLM_MAX_MASKS", "0"))
         except ValueError:
-            max_masks = 4
+            max_masks = 0
 
         vlm_out = await sim.vlm_label_slots(
             llm_url=llm_url,

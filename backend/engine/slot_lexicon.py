@@ -171,7 +171,7 @@ async def _ollama_chat_multimodal(
     model: str,
     prompt: str,
     images_b64: list[str],
-    timeout: float = 180.0,
+    timeout: float = 300.0,
 ) -> str:
     images_clean = [normalize_ollama_image_b64(x) for x in images_b64]
     images_clean = [x for x in images_clean if x]
@@ -179,7 +179,10 @@ async def _ollama_chat_multimodal(
         "model": model,
         "messages": [{"role": "user", "content": prompt, "images": images_clean}],
         "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 2400},
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 600,
+        },
         **ollama_json_format_teacher_vlm_payload(),
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -195,13 +198,16 @@ async def _ollama_generate_text(
     generate_url: str,
     model: str,
     prompt: str,
-    timeout: float = 120.0,
+    timeout: float = 240.0,
 ) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 2200},
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 600,
+        },
         **ollama_json_format_teacher_vlm_payload(),
     }
     async with httpx.AsyncClient(timeout=timeout) as client:

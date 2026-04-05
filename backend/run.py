@@ -15,7 +15,7 @@ PowerShell (из каталога репозитория rkk):
   Отключить авто-зрение: RKK_SKIP_AUTO_VISION=1
   Зрение да, без авто-VLM: RKK_SKIP_AUTO_VLM_BOOTSTRAP=1
   Слоты/режим: RKK_AUTO_VISION_N_SLOTS=8, RKK_AUTO_VISION_MODE=hybrid
-  VLM как в UI: RKK_AUTO_VLM_WEAK_EDGES=1, RKK_AUTO_VLM_TEXT_ONLY=1, RKK_AUTO_VLM_MAX_MASKS=4
+  VLM: по умолчанию только кадр (RKK_AUTO_VLM_MAX_MASKS=0); кадр+маски как в UI: MAX_MASKS=4, при желании TEXT_ONLY=1
   URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL (или OLLAMA_MODEL) — один раз в корневом .env
   Парсинг JSON: RKK_OLLAMA_JSON_FORMAT (bootstrap/LLM loop); Phase3/VLM — RKK_OLLAMA_JSON_FORMAT_TEACHER_VLM (по умолч. без format=json).
 
