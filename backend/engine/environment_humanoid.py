@@ -12,6 +12,7 @@ FIXED_BASE_VARS = ARM + SPINE + HEAD + CUBE_VARS + SANDBOX_VARS + SELF_VARS (с�
 """
 from __future__ import annotations
 
+import os
 import numpy as np
 import torch
 import base64
@@ -1341,6 +1342,58 @@ class EnvironmentHumanoid:
 
         self._sim.step(self.steps_per_do)
         return self.observe()
+
+    def update_self_feedback(
+        self,
+        variable: str,
+        intended_norm: float,
+        observed: dict[str, float],
+        predicted: dict[str, float] | None = None,
+        prediction_error_phys: float = 0.0,
+    ) -> None:
+        """
+        Петля самомодели: «хотел / сделал / получил» и расхождение модели с миром → коррекция self_*.
+        """
+        if variable in SELF_VARS:
+            return
+        try:
+            lr = float(os.environ.get("RKK_SELF_FEEDBACK_LR", "0.18"))
+        except ValueError:
+            lr = 0.18
+        lr = max(0.0, min(0.5, lr))
+        st = self._self_state
+        pred = predicted or {}
+
+        if variable in ("lshoulder", "lelbow"):
+            actual = float(observed.get(variable, intended_norm))
+            gap = actual - intended_norm
+            st["self_intention_larm"] = float(
+                np.clip(st["self_intention_larm"] + lr * gap, 0.05, 0.95)
+            )
+        elif variable in ("rshoulder", "relbow"):
+            actual = float(observed.get(variable, intended_norm))
+            gap = actual - intended_norm
+            st["self_intention_rarm"] = float(
+                np.clip(st["self_intention_rarm"] + lr * gap, 0.05, 0.95)
+            )
+
+        if variable in SPINE_VARS or variable in HEAD_VARS:
+            actual = float(observed.get(variable, intended_norm))
+            gap = actual - intended_norm
+            st["self_attention"] = float(
+                np.clip(st["self_attention"] + 0.1 * lr * gap, 0.05, 0.95)
+            )
+
+        pe = float(np.clip(prediction_error_phys, 0.0, 1.0))
+        st["self_energy"] = float(np.clip(st["self_energy"] - 0.07 * pe, 0.05, 0.95))
+        st["self_attention"] = float(np.clip(st["self_attention"] + 0.055 * pe, 0.05, 0.95))
+
+        for arm, ski in (("lshoulder", "self_intention_larm"), ("rshoulder", "self_intention_rarm")):
+            if arm not in observed or arm not in pred:
+                continue
+            pgap = float(observed[arm]) - float(pred.get(arm, observed[arm]))
+            if abs(pgap) > 0.08:
+                st[ski] = float(np.clip(st[ski] + 0.12 * lr * pgap, 0.05, 0.95))
 
     # ── Discovery rate ────────────────────────────────────────────────────────
     def discovery_rate(self, agent_edges: list[dict]) -> float:

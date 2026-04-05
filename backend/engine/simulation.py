@@ -600,7 +600,7 @@ class Simulation:
         if self._llm_level2_inflight or self._pending_llm_bundle is not None:
             return
         try:
-            cooldown = int(os.environ.get("RKK_LLM_LEVEL2_COOLDOWN", "720"))
+            cooldown = int(os.environ.get("RKK_LLM_LEVEL2_COOLDOWN", "240"))
         except ValueError:
             cooldown = 720
         if self.tick - self._last_level2_schedule_tick < cooldown:

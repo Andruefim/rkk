@@ -9,12 +9,14 @@ agent_v4.py — RKKAgent с Value Layer (Шаг А).
   - other_agents_phi передаётся из Simulation для ΔΦ≥0 constraint
 
 Этап B (гипотезо-ориентированное исследование):
-  score_interventions() может ранжировать кандидатов по аппроксимации EIG относительно
-  posterior на рёбрах (1−α_trust), а не только по System1.predict(features).
+  score_interventions() — аппроксимация информационного выигрыша: чувствительность по узлам
+  плюс суррогат снижения суммарной epistemic mass по рёбрам при предсказанном obs (не полный
+  байесовский H(W)−E[H(W|obs)]). RKK_EIG_ENTROPY_TERM, RKK_EIG_POSTERIOR_ETA.
   Переключатель: RKK_HYPOTHESIS_EIG=1 (по умолчанию) | 0 | system1 | off | false
   В snapshot: h_W_edge_entropy — сумма бинарных энтропий по α_trust рёбер (диагностика неопределённости W).
 
-Этап Г (самомодель): узлы self_* в humanoid задаются средой/агентом; см. engine.environment_humanoid.SELF_VARS.
+Этап Г (самомодель): self_* + update_self_feedback() в humanoid — коррекция намерений по исходу do()
+  и по промаху GNN (RKK_SELF_FEEDBACK_LR).
 """
 from __future__ import annotations
 
@@ -187,13 +189,12 @@ class RKKAgent:
         X_np: np.ndarray,
         u_node: np.ndarray,
         nid_to_i: dict[str, int],
+        unc_m: np.ndarray,
     ) -> list[float]:
         """
-        Аппроксимация EIG(a) ≈ Σ_j u(j) · E[|X'_j − X_j| | a] с одним предсказанием
-        world model (среднее предсказательного распределения).
-
-        u(j) снимает неопределённость по инцидентным рёбрам; большой |ΔX| при высоком u
-        соответствует эксперименту, который сильнее «разрешает» неизвестную структуру.
+        Суррогат «информативности» действия: (1) чувствительность Σ_j u(j)|ΔX_j|;
+        (2) суррогат снижения неопределённости по рёбрам после гипотетического наблюдения
+        (масштабирование unc_ij пропорционально |ΔX_i|+|ΔX_j|). Это не точный EIG по H(W).
         """
         core = self.graph._core
         if core is None or not candidates:
@@ -202,11 +203,23 @@ class RKKAgent:
         if not callable(fd):
             return []
 
+        try:
+            lam = float(os.environ.get("RKK_EIG_ENTROPY_TERM", "0.22"))
+        except ValueError:
+            lam = 0.22
+        try:
+            eta = float(os.environ.get("RKK_EIG_POSTERIOR_ETA", "0.18"))
+        except ValueError:
+            eta = 0.18
+        lam = max(0.0, lam)
+        eta = max(0.0, min(0.95, eta))
+
         d = int(X_np.shape[0])
         device = self.device
         chunk = _eig_chunk_size()
         eigs: list[float] = []
         x0 = torch.from_numpy(X_np).to(dtype=torch.float32, device=device).unsqueeze(0)
+        uu = unc_m.reshape(1, d, d)
 
         for start in range(0, len(candidates), chunk):
             sub = candidates[start : start + chunk]
@@ -220,8 +233,13 @@ class RKKAgent:
             with torch.no_grad():
                 pred = fd(x_batch, a_batch)
             delta = (pred - x_batch).abs().cpu().numpy()
-            u = u_node.reshape(1, -1)
-            eigs.extend((delta * u).sum(axis=1).tolist())
+            ab = np.abs(delta)
+            S = np.clip(ab[:, :, None] + ab[:, None, :], 0.0, 1.0)
+            new_u = uu * (1.0 - eta * S)
+            new_u = np.maximum(new_u, 0.0)
+            reduction = (uu - new_u).sum(axis=(1, 2))
+            sens = (delta * u_node.reshape(1, -1)).sum(axis=1)
+            eigs.extend((sens + lam * reduction).tolist())
         return eigs
 
     # ── Epistemic scoring ─────────────────────────────────────────────────────
@@ -302,7 +320,7 @@ class RKKAgent:
                 dtype=np.float64,
             )
             u_node = self._marginal_node_uncertainty(unc_m)
-            eigs = self._batch_hypothesis_eig(candidates, x_vec, u_node, nid_to_i)
+            eigs = self._batch_hypothesis_eig(candidates, x_vec, u_node, nid_to_i, unc_m)
             if len(eigs) == len(candidates):
                 # Учитываем гипотезу «это ребро неизвестно»: масштаб EIG по unc(v_from→v_to).
                 for i, cand in enumerate(candidates):
@@ -457,6 +475,24 @@ class RKKAgent:
             ]))
 
         pe_phys = _mean_abs_err(phys_ids)
+
+        # Этап Г: петля «намерение ↔ исход» + ошибка модели → self_* (только среды с методом).
+        fn_sf = getattr(self.env, "update_self_feedback", None)
+        if callable(fn_sf):
+            try:
+                fn_sf(
+                    variable=var,
+                    intended_norm=value,
+                    observed=observed,
+                    predicted=predicted,
+                    prediction_error_phys=pe_phys,
+                )
+            except Exception:
+                pass
+            obs_self = dict(self.env.observe())
+            for sk in _SELF_VAR_SET:
+                if sk in self.graph.nodes and sk in obs_self:
+                    self.graph.nodes[sk] = float(obs_self[sk])
         pe_slot = _mean_abs_err(slot_ids)
         w_vis = min(0.45, max(0.0, VISUAL_IG_WEIGHT))
         if slot_ids and phys_ids:

@@ -4,8 +4,9 @@ causal_graph.py — NOTEARS / GNN как nn.Module.
 Фаза 10+: GNN заменяет NOTEARS как ядро каузального графа.
 
 Фаза B (Predictive World Model):
-  Обучение на переходах (X_t, a_t) → X_{t+1} из intervention buffer:
-    X_pred = core.forward_dynamics(X_t, a_t),  L_rec = MSE(X_pred, X_{t+1}).
+  train_step: смесь интервенций (_int_buffer) и пассивных пар подряд из _obs_buffer
+    (X_t, a=0)→X_{t+1} — физика/кубы без явного do. Доля пассива: RKK_WM_PASSIVE_MIX (по умолч. 0.35).
+  Интервенции: X_pred = forward_dynamics(X_t, a_t), L_rec = MSE(X_pred, X_{t+1}).
   propagate / imagination: то же f(state, action); rollout_step_free — f(X, 0).
 
   USE_GNN = True   → CausalGNNCore  (message passing + action_enc)
@@ -16,6 +17,7 @@ h(W)    = tr(exp(W∘W)) - d
 """
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -183,24 +185,53 @@ class CausalGraph:
 
     def train_step(self) -> dict[str, float] | None:
         """
-        World model: батч из _int_buffer — (obs_before, do(idx,val), obs_after).
-        L_rec = MSE(f(X_t, a_t), X_{t+1}). Без отдельного L_int (уже в переходах).
+        World model: батч = интервенции + пассивные переходы из подряд идущих наблюдений.
+        Пассив: a=0, L_rec штрафует f(X_t,0) vs X_{t+1} (кубы/физика между тиками).
         """
-        if self._core is None or len(self._int_buffer) < 4:
+        if self._core is None:
             return None
 
-        batch = self._int_buffer[-min(32, len(self._int_buffer)) :]
-        X_t = torch.tensor(
-            [item["obs_before"] for item in batch],
-            dtype=torch.float32, device=self.device,
-        )
-        X_tp1 = torch.tensor(
-            [item["obs_after"] for item in batch],
-            dtype=torch.float32, device=self.device,
-        )
-        a_t = torch.zeros_like(X_t)
-        for i, item in enumerate(batch):
-            a_t[i, item["idx"]] = item["val"]
+        int_b = self._int_buffer
+        obs_b = self._obs_buffer
+        batch_cap = 32
+        try:
+            passive_ratio = float(os.environ.get("RKK_WM_PASSIVE_MIX", "0.35"))
+        except ValueError:
+            passive_ratio = 0.35
+        passive_ratio = max(0.0, min(0.75, passive_ratio))
+
+        L = len(obs_b)
+        max_pairs = max(0, L - 1)
+        n_p = min(int(round(batch_cap * passive_ratio)), max_pairs)
+        n_i = min(batch_cap - n_p, len(int_b))
+
+        if n_p + n_i < 4:
+            n_i = min(batch_cap, len(int_b))
+            n_p = min(max_pairs, batch_cap - n_i)
+        if n_p + n_i < 4:
+            return None
+
+        rows_X: list[list[float]] = []
+        rows_Y: list[list[float]] = []
+        rows_a: list[list[float]] = []
+
+        for item in int_b[-n_i:] if n_i > 0 else []:
+            rows_X.append(item["obs_before"])
+            rows_Y.append(item["obs_after"])
+            arow = [0.0] * self._d
+            arow[item["idx"]] = item["val"]
+            rows_a.append(arow)
+
+        if n_p > 0:
+            start_t = L - n_p - 1
+            for k in range(n_p):
+                rows_X.append(obs_b[start_t + k])
+                rows_Y.append(obs_b[start_t + k + 1])
+                rows_a.append([0.0] * self._d)
+
+        X_t = torch.tensor(rows_X, dtype=torch.float32, device=self.device)
+        X_tp1 = torch.tensor(rows_Y, dtype=torch.float32, device=self.device)
+        a_t = torch.tensor(rows_a, dtype=torch.float32, device=self.device)
 
         self._optim.zero_grad()
 
@@ -234,6 +265,8 @@ class CausalGraph:
             "l_int": round(l_int.item(), 5),
             "l_l1":  round(l_l1.item(), 5),
             "h_W":   round(h_W.item(), 5),
+            "batch_int": n_i,
+            "batch_passive": n_p,
         }
 
     def set_edge(self, from_: str, to: str, weight: float, alpha: float) -> None:

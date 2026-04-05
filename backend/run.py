@@ -28,7 +28,8 @@ PowerShell (из каталога репозитория rkk):
   Уровень 2: контрфактуальная консультация при стагнации discovery (≥RKK_LLM_STAGNATION_TICKS),
   rolling block_rate>0.4, VLM «неизвестный» слот, surprise PE>3σ.
   Уровень 3 (humanoid): редко RKK_LLM_LEVEL3_INTERVAL тиков — перезапись гипотез.
-  Доп.: RKK_LLM_LEVEL2_COOLDOWN, RKK_LLM_MIN_INTERVENTIONS.
+  Доп.: RKK_LLM_LEVEL2_COOLDOWN (по умолч. 240 тиков), RKK_LLM_MIN_INTERVENTIONS.
+  World model: RKK_WM_PASSIVE_MIX — доля пассивных переходов в train_step GNN.
 
 Или через uvicorn напрямую:
   uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
