@@ -841,14 +841,14 @@ export default function RKKHumanoid() {
       </div>
 
       {/* Event log */}
-      <div style={{position:"absolute",bottom:14,left:14,right:14,background:"rgba(2,5,14,0.92)",border:"1px solid #0a1a2e",padding:"8px 14px",borderRadius:3,maxHeight:100,overflow:"hidden"}}>
+      <div style={{position:"absolute",bottom:14,left:14,right:14,background:"rgba(2,5,14,0.92)",border:"1px solid #0a1a2e",padding:"8px 14px",borderRadius:3,maxHeight:220,overflowY:"auto",overflowX:"hidden"}}>
         <div style={{color:"#0a1a2e",fontSize:9,letterSpacing:"0.1em",marginBottom:4}}>
           CAUSAL STREAM {connected?"● ONLINE":"○ OFFLINE"}
           {isFR&&<span style={{color:frColor}}> · 📌 FIXED BASE</span>}
           {isVis&&<span style={{color:visColor}}> · 👁 VISUAL</span>}
         </div>
         {ui.events.map((ev,i)=>(
-          <div key={i} style={{color:ev.color??"#334455",fontSize:9,marginBottom:2,opacity:Math.max(0.15,1-i*.12)}}>
+          <div key={i} style={{color:ev.color??"#334455",fontSize:9,marginBottom:2,opacity:Math.max(0.15,1-i*.12),wordBreak:"break-word",whiteSpace:"pre-wrap"}}>
             [{String(ev.tick??0).padStart(5,"0")}] › {ev.text}
           </div>
         ))}

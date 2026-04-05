@@ -8,6 +8,8 @@ causal_graph.py — NOTEARS / GNN как nn.Module.
     (X_t, a=0)→X_{t+1} — физика/кубы без явного do. Доля пассива: RKK_WM_PASSIVE_MIX (по умолч. 0.35).
   Интервенции: X_pred = forward_dynamics(X_t, a_t), L_rec = MSE(X_pred, X_{t+1}).
   propagate / imagination: то же f(state, action); rollout_step_free — f(X, 0).
+  Neural ODE (опционально): RKK_WM_NEURAL_ODE=1 + torchdiffeq — интеграл
+  dY/dτ = forward_dynamics(Y,a) − Y по τ (см. engine.wm_neural_ode).
 
   USE_GNN = True   → CausalGNNCore  (message passing + action_enc)
   USE_GNN = False  → NOTEARSCore    (forward_dynamics ≈ forward(X+a))
@@ -23,6 +25,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
+
+from engine.wm_neural_ode import integrate_world_model_step
 
 # ── Переключение ядра ─────────────────────────────────────────────────────────
 USE_GNN = True   # False → NOTEARS (откат к фазам 1-9)
@@ -235,11 +239,7 @@ class CausalGraph:
 
         self._optim.zero_grad()
 
-        fd = getattr(self._core, "forward_dynamics", None)
-        if callable(fd):
-            X_pred = fd(X_t, a_t)
-        else:
-            X_pred = self._core(X_t + a_t)
+        X_pred = integrate_world_model_step(self._core, X_t, a_t)
         l_rec = F.mse_loss(X_pred, X_tp1)
 
         h_W   = self._core.dag_constraint()
@@ -358,8 +358,7 @@ class CausalGraph:
         if variable in self._node_ids:
             a_vec[0, self._node_ids.index(variable)] = float(value)
         with torch.no_grad():
-            fd = getattr(self._core, "forward_dynamics", None)
-            pred = fd(state_vec, a_vec) if callable(fd) else self._core(state_vec + a_vec)
+            pred = integrate_world_model_step(self._core, state_vec, a_vec)
         result = {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
         return result
 
@@ -376,8 +375,7 @@ class CausalGraph:
         )
         z = torch.zeros_like(state_vec)
         with torch.no_grad():
-            fd = getattr(self._core, "forward_dynamics", None)
-            pred = fd(state_vec, z) if callable(fd) else self._core(state_vec)
+            pred = integrate_world_model_step(self._core, state_vec, z)
         return {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
 
     def _invalidate_cache(self):

@@ -4,7 +4,7 @@ simulation_singleton_v2.py — Singleton AGI с гуманоидом (Фаза 1
 Фаза 12 добавляет:
   - visual_mode toggle: enable_visual() / disable_visual()
   - EnvironmentVisual wrapper активируется без перезапуска агента
-  - Predictive coding loop: GNN prediction → visual cortex feedback
+  - Predictive coding loop: GNN prediction → visual cortex feedback (опц. Neural ODE sub-steps, RKK_WM_NEURAL_ODE)
   - /vision/slots endpoint data через get_vision_state()
   - vision_stats в snapshot
 
@@ -30,6 +30,7 @@ from engine.demon       import AdversarialDemon
 from engine.environment import Environment
 from engine.ollama_env  import get_ollama_generate_url, get_ollama_model
 from engine.value_layer import HomeostaticBounds
+from engine.wm_neural_ode import integrate_world_model_step
 
 PHASE_THRESHOLDS = [0.0, 0.15, 0.30, 0.50, 0.70, 0.88]
 PHASE_HOLD_TICKS = 12
@@ -521,12 +522,12 @@ class Simulation:
             if edges:
                 inj = self.agent.inject_text_priors(edges)
                 n = inj.get("injected", 0)
-                ex = (l2.get("explanation") or "")[:140].replace("\n", " ")
+                ex = (l2.get("explanation") or "").strip()
                 self._add_event(f"🧠 LLM L2 (+{n} priors): {ex}", "#9bdcff", "phase")
             self._llm_loop_stats["level2_runs"] = int(self._llm_loop_stats.get("level2_runs", 0)) + 1
-            self._llm_loop_stats["last_level2_explanation"] = (l2.get("explanation") or "")[:400]
+            self._llm_loop_stats["last_level2_explanation"] = (l2.get("explanation") or "").strip()
         elif l2.get("error"):
-            self._add_event(f"LLM L2 error: {str(l2.get('error'))[:100]}", "#cc6666", "phase")
+            self._add_event(f"LLM L2 error: {l2.get('error')}", "#cc6666", "phase")
 
         l3 = b.get("l3")
         if isinstance(l3, dict) and l3.get("ok"):
@@ -788,13 +789,16 @@ class Simulation:
             slot_ids    = [f"slot_{k}" for k in range(self._visual_env.n_slots)]
             values_list = [current_obs.get(sid, 0.5) for sid in slot_ids]
             current_t   = torch.tensor(values_list, dtype=torch.float32, device=self.device)
-            # Прогоняем текущие значения через GNN → получаем предсказания
+            # Прогоняем текущие значения через GNN (опционально Neural ODE sub-steps)
             with torch.inference_mode():
                 full_state = torch.tensor(
                     [self.agent.graph.nodes.get(n, 0.5) for n in node_ids],
                     dtype=torch.float32, device=self.device
                 ).unsqueeze(0)
-                pred_full = self.agent.graph._core(full_state).squeeze(0)
+                z = torch.zeros_like(full_state)
+                pred_full = integrate_world_model_step(
+                    self.agent.graph._core, full_state, z
+                ).squeeze(0)
             # Выбираем только slot_ переменные
             slot_pred = torch.tensor(values_list, dtype=torch.float32, device=self.device)
             for i, sid in enumerate(slot_ids):

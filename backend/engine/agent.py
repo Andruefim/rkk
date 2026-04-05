@@ -55,6 +55,7 @@ from engine.symbolic_verifier import (
     symbolic_verifier_enabled,
     verify_normalized_prediction,
 )
+from engine.wm_neural_ode import integrate_world_model_step
 from engine.rsi_lite import (
     rsi_buffer_cap,
     rsi_imagination_cap,
@@ -270,7 +271,7 @@ class RKKAgent:
                 if idx is not None:
                     a_batch[bi, idx] = float(cand["value"])
             with torch.no_grad():
-                pred = fd(x_batch, a_batch)
+                pred = integrate_world_model_step(core, x_batch, a_batch)
             delta = (pred - x_batch).abs().cpu().numpy()
             ab = np.abs(delta)
             S = np.clip(ab[:, :, None] + ab[:, None, :], 0.0, 1.0)

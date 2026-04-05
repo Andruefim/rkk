@@ -16,3 +16,6 @@ pybullet            # Фаза 9+: pip install pybullet
 # Фаза 10+: GNN (опционально — без него pure PyTorch fallback в causal_gnn.py)
 # pip install torch-geometric
 # или: pip install torch-geometric -f https://data.pyg.org/whl/torch-2.6.0+rocm6.2.html
+
+# Neural ODE world model: RKK_WM_NEURAL_ODE=1
+torchdiffeq>=0.2.3

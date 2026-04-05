@@ -94,8 +94,8 @@ def parse_counterfactual_response(
     obj = parse_json_object_loose(raw_text)
     if not obj:
         return "", [], ""
-    expl = str(obj.get("explanation", "")).strip()[:1200]
-    nxt = str(obj.get("next_probe_suggestion", "")).strip()[:400]
+    expl = str(obj.get("explanation", "")).strip()
+    nxt = str(obj.get("next_probe_suggestion", "")).strip()
     edges_out: list[dict[str, Any]] = []
     for e in obj.get("candidate_edges") or []:
         if not isinstance(e, dict):
