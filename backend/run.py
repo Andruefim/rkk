@@ -30,6 +30,8 @@ PowerShell (из каталога репозитория rkk):
   Уровень 3 (humanoid): редко RKK_LLM_LEVEL3_INTERVAL тиков — перезапись гипотез.
   Доп.: RKK_LLM_LEVEL2_COOLDOWN (по умолч. 240 тиков), RKK_LLM_MIN_INTERVENTIONS.
   World model: RKK_WM_PASSIVE_MIX — доля пассивных переходов в train_step GNN.
+  Цель (Этап E): self_goal_active / self_goal_target_dist в humanoid; RKK_GOAL_PLANNING, RKK_PLAN_DEPTH, RKK_PLAN_VALUES.
+  RSI lite (Этап G): плато discovery_rate → L1/BUFFER/imagination; RKK_RSI_LITE, RKK_RSI_PLATEAU_TICKS, RKK_RSI_MIN_INTERVENTIONS.
 
 Или через uvicorn напрямую:
   uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload

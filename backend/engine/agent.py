@@ -17,6 +17,15 @@ agent_v4.py — RKKAgent с Value Layer (Шаг А).
 
 Этап Г (самомодель): self_* + update_self_feedback() в humanoid — коррекция намерений по исходу do()
   и по промаху GNN (RKK_SELF_FEEDBACK_LR).
+
+Этап E (целевое планирование): при self_goal_active и наличии target_dist в графе — поиск действия
+  через imagination (propagate_from + rollout_step_free), см. engine.goal_planning; RKK_GOAL_PLANNING=0 отключает.
+
+Этап F (символьный верификатор): проверка предсказания propagate на PHYSICS_CONSTRAINTS (engine.symbolic_verifier);
+  нарушение → не prepend goal-plan, смешивание expected_ig с uncertainty на следующем шаге; RKK_SYMBOLIC_VERIFY=0 отключает.
+
+Этап G (RSI lite): плато discovery_rate → агент усиливает L1, удваивает BUFFER_SIZE графа (до капа), +1 imagination;
+  engine.rsi_lite, RKK_RSI_LITE=0 отключает; RKK_RSI_PLATEAU_TICKS, RKK_RSI_MIN_INTERVENTIONS.
 """
 from __future__ import annotations
 
@@ -32,6 +41,30 @@ from engine.temporal     import TemporalBlankets
 from engine.value_layer  import ValueLayer, HomeostaticBounds, BlockReason
 from engine.phase3_teacher import TeacherIGRule
 from engine.environment_humanoid import SELF_VARS
+from engine.goal_planning import (
+    goal_planning_globally_disabled,
+    parse_plan_value_levels,
+    plan_beam_k,
+    plan_depth,
+    plan_max_branch,
+    planning_graph_motor_vars,
+)
+from engine.symbolic_verifier import (
+    downrank_factor_for_violation,
+    exploration_blend_from_uncertainty,
+    symbolic_verifier_enabled,
+    verify_normalized_prediction,
+)
+from engine.rsi_lite import (
+    rsi_buffer_cap,
+    rsi_imagination_cap,
+    rsi_improvement_eps,
+    rsi_l1_max,
+    rsi_l1_scale,
+    rsi_lite_enabled,
+    rsi_min_interventions,
+    rsi_plateau_interventions,
+)
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
 NOTEARS_EVERY = 16
@@ -93,7 +126,11 @@ class RKKAgent:
         self._last_do             = "—"
         self._last_blocked_reason = ""
         self._last_result: dict | None = None
+        self._symbolic_prediction_bad = False
         self._peak_discovery_rate: float = 0.0
+        self._rsi_ref_discovery: float = 0.0
+        self._rsi_plateau_count: int = 0
+        self._rsi_adjustment_count: int = 0
         self._notears_steps  = 0
         self._last_notears_loss: dict | None = None
 
@@ -190,6 +227,8 @@ class RKKAgent:
         u_node: np.ndarray,
         nid_to_i: dict[str, int],
         unc_m: np.ndarray,
+        node_ids: list[str],
+        env: Environment,
     ) -> list[float]:
         """
         Суррогат «информативности» действия: (1) чувствительность Σ_j u(j)|ΔX_j|;
@@ -239,8 +278,160 @@ class RKKAgent:
             new_u = np.maximum(new_u, 0.0)
             reduction = (uu - new_u).sum(axis=(1, 2))
             sens = (delta * u_node.reshape(1, -1)).sum(axis=1)
-            eigs.extend((sens + lam * reduction).tolist())
+            total = sens + lam * reduction
+            if symbolic_verifier_enabled():
+                fac = downrank_factor_for_violation()
+                d_nodes = len(node_ids)
+                for bi in range(b):
+                    pd = {
+                        node_ids[j]: float(pred[bi, j].item())
+                        for j in range(min(d_nodes, int(pred.shape[1])))
+                    }
+                    ok, _ = verify_normalized_prediction(pd, env)
+                    if not ok:
+                        total[bi] *= fac
+            eigs.extend(total.tolist())
         return eigs
+
+    def _rollout_imagination_state(
+        self, base: dict[str, float], var: str, val: float
+    ) -> dict[str, float]:
+        """Этап E: один мысленный do + столько же свободных шагов, сколько в VL imagination."""
+        s = self.graph.propagate_from(dict(base), var, float(val))
+        for _ in range(max(0, self._imagination_horizon)):
+            s = self.graph.rollout_step_free(s)
+        return s
+
+    def _features_for_intervention_pair(self, v_from: str, v_to: str) -> list[float]:
+        """Один вектор признаков System1 для пары (в_from→в_to), как в score_interventions."""
+        h_W_norm = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
+        disc_rate = self.discovery_rate
+        ic_map: dict[tuple[str, str], int] = {}
+        for e in self.graph.edges:
+            ic_map[(e.from_, e.to)] = e.intervention_count
+        nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
+        core = self.graph._core
+        ii, jj = nid_to_i.get(v_from), nid_to_i.get(v_to)
+        if core is not None and ii is not None and jj is not None:
+            with torch.no_grad():
+                unc_t = (1.0 - core.alpha_trust_matrix()).detach().float().cpu().numpy()
+                W_m = core.W_masked().detach().float().cpu().numpy()
+                g_m = None
+                if core.W.grad is not None:
+                    g_m = core.W.grad.detach().float().abs().cpu().numpy()
+            uncertainty = float(unc_t[ii, jj])
+            w_ij = float(W_m[ii, jj])
+            grad_norm = float(g_m[ii, jj]) if g_m is not None else 0.0
+        else:
+            uncertainty, w_ij, grad_norm = 1.0, 0.0, 0.0
+        alpha = 1.0 - uncertainty
+        val_from = self.graph.nodes.get(v_from, 0.5)
+        val_to = self.graph.nodes.get(v_to, 0.5)
+        ic = ic_map.get((v_from, v_to), 0)
+        return self.system1.build_features(
+            w_ij=w_ij, alpha_ij=alpha,
+            val_from=val_from, val_to=val_to,
+            uncertainty=uncertainty, h_W_norm=h_W_norm,
+            grad_norm_ij=grad_norm,
+            intervention_count=ic,
+            discovery_rate=disc_rate,
+        )
+
+    def _build_goal_planned_candidate(self, var: str, val: float) -> dict:
+        feat = self._features_for_intervention_pair(var, "target_dist")
+        return {
+            "variable":    var,
+            "target":      "target_dist",
+            "value":       float(val),
+            "uncertainty": 0.35,
+            "features":    feat,
+            "expected_ig": 1.0,
+            "from_goal_plan": True,
+        }
+
+    def _maybe_goal_planned_candidate(self) -> dict | None:
+        if goal_planning_globally_disabled():
+            return None
+        if self.graph._core is None:
+            return None
+        if self.graph.nodes.get("self_goal_active") is None:
+            return None
+        if float(self.graph.nodes.get("self_goal_active", 0)) <= 0.45:
+            return None
+        if "target_dist" not in self.graph.nodes:
+            return None
+
+        state0 = dict(self.graph.nodes)
+        cur_td = float(state0.get("target_dist", 0.5))
+        goal_thr = float(state0.get("self_goal_target_dist", 0.42))
+        if cur_td <= goal_thr + 0.015:
+            return None
+
+        motor = planning_graph_motor_vars(self.env, list(self.graph._node_ids))
+        if not motor:
+            return None
+
+        levels = parse_plan_value_levels()
+        actions = [(v, x) for v in motor for x in levels]
+        max_b = plan_max_branch()
+        if len(actions) > max_b:
+            idx = np.random.choice(len(actions), size=max_b, replace=False)
+            actions = [actions[i] for i in idx]
+
+        depth = plan_depth()
+        beam_k = plan_beam_k()
+
+        def _td(s: dict[str, float]) -> float:
+            return float(s.get("target_dist", cur_td))
+
+        best_td = cur_td
+        best_first: tuple[str, float] | None = None
+
+        if depth <= 1:
+            for var, val in actions:
+                try:
+                    sfin = self._rollout_imagination_state(state0, var, val)
+                except Exception:
+                    continue
+                if symbolic_verifier_enabled():
+                    ok, _ = verify_normalized_prediction(dict(sfin), self.env)
+                    if not ok:
+                        continue
+                td = _td(sfin)
+                if td < best_td - 1e-6:
+                    best_td = td
+                    best_first = (var, val)
+        else:
+            scored: list[tuple[float, str, float, dict[str, float]]] = []
+            for var, val in actions:
+                try:
+                    s1 = self._rollout_imagination_state(state0, var, val)
+                except Exception:
+                    continue
+                if symbolic_verifier_enabled():
+                    ok, _ = verify_normalized_prediction(dict(s1), self.env)
+                    if not ok:
+                        continue
+                scored.append((_td(s1), var, val, dict(s1)))
+            scored.sort(key=lambda t: t[0])
+            for _td1, v1, x1, s1 in scored[:beam_k]:
+                for v2, x2 in actions:
+                    try:
+                        sfin = self._rollout_imagination_state(s1, v2, x2)
+                    except Exception:
+                        continue
+                    if symbolic_verifier_enabled():
+                        ok, _ = verify_normalized_prediction(dict(sfin), self.env)
+                        if not ok:
+                            continue
+                    td = _td(sfin)
+                    if td < best_td - 1e-6:
+                        best_td = td
+                        best_first = (v1, x1)
+
+        if best_first is None:
+            return None
+        return self._build_goal_planned_candidate(best_first[0], best_first[1])
 
     # ── Epistemic scoring ─────────────────────────────────────────────────────
     def score_interventions(self) -> list[dict]:
@@ -320,7 +511,10 @@ class RKKAgent:
                 dtype=np.float64,
             )
             u_node = self._marginal_node_uncertainty(unc_m)
-            eigs = self._batch_hypothesis_eig(candidates, x_vec, u_node, nid_to_i, unc_m)
+            eigs = self._batch_hypothesis_eig(
+                candidates, x_vec, u_node, nid_to_i, unc_m,
+                list(self.graph._node_ids), self.env,
+            )
             if len(eigs) == len(candidates):
                 # Учитываем гипотезу «это ребро неизвестно»: масштаб EIG по unc(v_from→v_to).
                 for i, cand in enumerate(candidates):
@@ -341,6 +535,12 @@ class RKKAgent:
             scores = self.system1.score(features_batch)
             for i, cand in enumerate(candidates):
                 cand["expected_ig"] = scores[i]
+
+        if symbolic_verifier_enabled() and self._symbolic_prediction_bad:
+            a, b = exploration_blend_from_uncertainty()
+            for cand in candidates:
+                unc = float(cand.get("uncertainty", 0.5))
+                cand["expected_ig"] = a * float(cand["expected_ig"]) + b * unc
 
         return sorted(candidates, key=lambda x: -x["expected_ig"])
 
@@ -372,8 +572,16 @@ class RKKAgent:
     def step(self, engine_tick: int = 0) -> dict:
         self._last_engine_tick = engine_tick
         scores = self.score_interventions()
+        gp = self._maybe_goal_planned_candidate()
+        if gp is not None and not (
+            symbolic_verifier_enabled() and self._symbolic_prediction_bad
+        ):
+            scores.insert(0, gp)
         if not scores:
-            return {"blocked": False, "skipped": True, "prediction_error": 0.0, "cf_predicted": {}, "cf_observed": {}}
+            return {
+                "blocked": False, "skipped": True, "prediction_error": 0.0,
+                "cf_predicted": {}, "cf_observed": {}, "goal_planned": False,
+            }
 
         current_phi = self.phi_approx()
         chosen      = None
@@ -423,6 +631,7 @@ class RKKAgent:
                 "prediction_error":  0.0,
                 "cf_predicted": {},
                 "cf_observed": {},
+                "goal_planned": False,
             }
 
         # ── Выполняем допустимое действие ────────────────────────────────────
@@ -432,6 +641,12 @@ class RKKAgent:
         mdl_before = self.graph.mdl_size
         obs_before = dict(self.env.observe())
         predicted  = self.graph.propagate(var, value)
+        sym_ok, sym_fail = True, []
+        if symbolic_verifier_enabled():
+            sym_ok, sym_fail = verify_normalized_prediction(dict(predicted), self.env)
+            self._symbolic_prediction_bad = not sym_ok
+        else:
+            self._symbolic_prediction_bad = False
         observed   = self.env.intervene(var, value)
 
         # Temporal step
@@ -525,6 +740,8 @@ class RKKAgent:
         if cur_dr > self._peak_discovery_rate:
             self._peak_discovery_rate = cur_dr
 
+        rsi_event = self._tick_rsi_lite_discovery(cur_dr)
+
         _cf_keys = list(self.graph._node_ids)[:48]
         self._last_result = {
             "blocked":           False,
@@ -539,6 +756,10 @@ class RKKAgent:
             ])),
             "cf_predicted": {k: float(round(float(predicted.get(k, 0.0)), 4)) for k in _cf_keys},
             "cf_observed":  {k: float(round(float(observed.get(k, 0.0)), 4)) for k in _cf_keys},
+            "goal_planned":  bool(chosen.get("from_goal_plan")),
+            "symbolic_ok": sym_ok,
+            "symbolic_violations": sym_fail,
+            "rsi_lite": rsi_event,
             "notears":           notears_result,
         }
         return self._last_result
@@ -578,6 +799,39 @@ class RKKAgent:
     @property
     def peak_discovery_rate(self) -> float:
         return self._peak_discovery_rate
+
+    def _apply_rsi_lite(self) -> dict[str, float | int]:
+        g = self.graph
+        cur_l1 = float(getattr(g, "LAMBDA_L1", CausalGraph.LAMBDA_L1))
+        new_l1 = min(cur_l1 * rsi_l1_scale(), rsi_l1_max())
+        g.LAMBDA_L1 = new_l1
+        cap_b = rsi_buffer_cap()
+        g.BUFFER_SIZE = min(cap_b, int(g.BUFFER_SIZE) * 2)
+        cap_i = rsi_imagination_cap()
+        self._imagination_horizon = min(cap_i, self._imagination_horizon + 1)
+        self._rsi_adjustment_count += 1
+        return {
+            "LAMBDA_L1": float(new_l1),
+            "BUFFER_SIZE": int(g.BUFFER_SIZE),
+            "imagination_horizon": int(self._imagination_horizon),
+        }
+
+    def _tick_rsi_lite_discovery(self, cur_dr: float) -> dict[str, float | int] | None:
+        if not rsi_lite_enabled():
+            return None
+        if self._total_interventions < rsi_min_interventions():
+            return None
+        eps = rsi_improvement_eps()
+        if cur_dr > self._rsi_ref_discovery + eps:
+            self._rsi_ref_discovery = float(cur_dr)
+            self._rsi_plateau_count = 0
+            return None
+        self._rsi_plateau_count += 1
+        if self._rsi_plateau_count < rsi_plateau_interventions():
+            return None
+        self._rsi_plateau_count = 0
+        self._rsi_ref_discovery = float(cur_dr)
+        return self._apply_rsi_lite()
 
     def phi_approx(self) -> float:
         return self.temporal.phi_approx()
@@ -645,6 +899,15 @@ class RKKAgent:
             },
             "hypothesis_eig": _hypothesis_eig_from_env(),
             "h_W_edge_entropy": None if h_W_edge_entropy is None else round(h_W_edge_entropy, 4),
+            "rsi_lite": {
+                "enabled": rsi_lite_enabled(),
+                "plateau_count": self._rsi_plateau_count,
+                "ref_discovery": round(self._rsi_ref_discovery, 5),
+                "adjustments": self._rsi_adjustment_count,
+                "LAMBDA_L1": round(float(getattr(self.graph, "LAMBDA_L1", CausalGraph.LAMBDA_L1)), 5),
+                "graph_BUFFER_SIZE": int(self.graph.BUFFER_SIZE),
+                "imagination_horizon": int(self._imagination_horizon),
+            },
             "edges": [e.as_dict() for e in self.graph.edges],
         }
         if self.env.preset == "pybullet":

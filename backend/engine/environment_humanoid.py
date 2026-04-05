@@ -44,12 +44,15 @@ FOOT_VARS   = ["lfoot_z", "rfoot_z"]
 CUBE_VARS   = [f"cube{i}_{d}" for i in range(3) for d in ["x","y","z"]]
 # Песочница: мяч, рычаг (проксимити), расстояние до зоны доставки — обогащают каузальный граф.
 SANDBOX_VARS = ["ball_x", "ball_y", "ball_z", "lever_pin", "target_dist"]
-# Этап Г — самомодель: внутренние узлы «я», задаёт агент (не физика). GNN учит self_* → суставы → кубы.
+# Этап Г — самомодель; Этап E — self_goal_* + imagination-планирование к target_dist (см. goal_planning.py).
 SELF_VARS: tuple[str, ...] = (
     "self_intention_larm",
     "self_intention_rarm",
     "self_energy",
     "self_attention",
+    # Этап E: цель (нормализованный порог target_dist + включение планировщика)
+    "self_goal_target_dist",
+    "self_goal_active",
 )
 VAR_NAMES   = (
     TORSO_VARS + SPINE_VARS + HEAD_VARS + LEG_VARS + ARM_VARS + FOOT_VARS
