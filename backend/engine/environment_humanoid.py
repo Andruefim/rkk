@@ -1356,6 +1356,7 @@ class EnvironmentHumanoid:
     ) -> None:
         """
         Петля самомодели: «хотел / сделал / получил» и расхождение модели с миром → коррекция self_*.
+        При активной цели (self_goal_active): наблюдаемый target_dist подстраивает self_goal_target_dist.
         """
         if variable in SELF_VARS:
             return
@@ -1385,6 +1386,14 @@ class EnvironmentHumanoid:
             gap = actual - intended_norm
             st["self_attention"] = float(
                 np.clip(st["self_attention"] + 0.1 * lr * gap, 0.05, 0.95)
+            )
+
+        # Self-goal refinement: фактический target_dist → подстроить порог цели.
+        if "target_dist" in observed and float(st.get("self_goal_active", 0.0)) > 0.5:
+            actual_td = float(observed["target_dist"])
+            gap_td = actual_td - float(st["self_goal_target_dist"])
+            st["self_goal_target_dist"] = float(
+                np.clip(st["self_goal_target_dist"] + 0.08 * gap_td, 0.05, 0.95)
             )
 
         pe = float(np.clip(prediction_error_phys, 0.0, 1.0))

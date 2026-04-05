@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import traceback
 from typing import Any
 
@@ -18,6 +19,7 @@ from engine.llm_json_extract import (
     parse_json_object_loose,
     scan_json_objects_having_any_key,
 )
+from engine.ollama_env import ollama_think_disabled_payload
 
 
 def frame_content_hash(frame_b64: str | None) -> str:
@@ -25,6 +27,20 @@ def frame_content_hash(frame_b64: str | None) -> str:
         return ""
     raw = frame_b64.encode("utf-8", errors="ignore")[:8192]
     return hashlib.sha256(raw + str(len(frame_b64)).encode()).hexdigest()[:16]
+
+
+def _vlm_num_predict() -> int:
+    """
+    Ollama options.num_predict — верхняя граница числа генерируемых токенов (не минимум).
+    Слишком мало: ответ обрезается до JSON → пустой/битый parse. Раньше 600 резали для скорости;
+    модели с преамбулой/thinking съедают лимит до фактического JSON.
+    Задать: RKK_VLM_NUM_PREDICT (128..32768).
+    """
+    try:
+        v = int(os.environ.get("RKK_VLM_NUM_PREDICT", "1600"))
+    except ValueError:
+        v = 1600
+    return max(128, min(v, 32768))
 
 
 def normalize_ollama_image_b64(s: str) -> str:
@@ -179,9 +195,10 @@ async def _ollama_chat_multimodal(
         "model": model,
         "messages": [{"role": "user", "content": prompt, "images": images_clean}],
         "stream": False,
+        **ollama_think_disabled_payload(),
         "options": {
             "temperature": 0.2,
-            "num_predict": 600,
+            "num_predict": _vlm_num_predict(),
         },
         **ollama_json_format_teacher_vlm_payload(),
     }
@@ -198,15 +215,16 @@ async def _ollama_generate_text(
     generate_url: str,
     model: str,
     prompt: str,
-    timeout: float = 240.0,
+    timeout: float = 1000.0,
 ) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
+        **ollama_think_disabled_payload(),
         "options": {
             "temperature": 0.2,
-            "num_predict": 600,
+            "num_predict": _vlm_num_predict(),
         },
         **ollama_json_format_teacher_vlm_payload(),
     }

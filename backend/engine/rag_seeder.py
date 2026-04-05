@@ -30,8 +30,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from engine.llm_json_extract import ollama_json_format_payload, parse_json_array_loose
-from engine.ollama_env import get_ollama_model
+from engine.llm_json_extract import (
+    ollama_json_format_humanoid_bootstrap_payload,
+    parse_json_array_loose,
+)
+from engine.ollama_env import get_ollama_model, ollama_think_disabled_payload
 
 
 # ─── Causal edge из RAG ───────────────────────────────────────────────────────
@@ -226,6 +229,7 @@ Rules:
         "model": model,
         "prompt": prompt,
         "stream": False,
+        **ollama_think_disabled_payload(),
         "options": {"temperature": 0.1, "num_predict": 300},
     }
 
@@ -322,7 +326,12 @@ async def extract_humanoid_structured_via_llm(
             "\nThe list includes slot_* (visual attention indices) and physical/joint/COM variables; "
             "you may propose edges between slot_* and physics (e.g. com_z, feet, cubes) where plausible.\n"
         )
-    prompt = f"""You are a biomechanics and causal modeling expert for a PyBullet humanoid.
+    prompt = f"""CRITICAL OUTPUT RULE: Reply with NOTHING except one JSON value — either a JSON array or one JSON object. No other text.
+Forbidden: markdown, headings, "Final Answer", self-correction, analysis, numbered prose, emojis, code fences, English essays about the prompt.
+
+The first non-whitespace character of your reply MUST be `[` or `{{`.
+
+You are a biomechanics and causal modeling expert for a PyBullet humanoid.
 
 The agent observes ONLY these variable ids (use EXACT strings for from_ and to, no typos):
 {var_json}
@@ -334,7 +343,7 @@ Task: Output directed causal hypotheses for exploration.
 Cover: leg joints affecting com_x, com_y, com_z, lfoot_z, rfoot_z; knees and feet; spine/torso and balance;
 arms and cube interaction (cube0_x, cube1_y, etc.) where plausible.
 
-Return valid JSON only (no markdown). Either:
+Format: valid JSON only. Either:
   (A) a JSON array of edges, OR
   (B) one object: {{"edges":[...]}} with the same elements.
 
@@ -349,8 +358,9 @@ Rules:
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.15, "num_predict": 3200},
-        **ollama_json_format_payload(),
+        **ollama_think_disabled_payload(),
+        "options": {"temperature": 0.08, "num_predict": 3200},
+        **ollama_json_format_humanoid_bootstrap_payload(),
     }
 
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -362,7 +372,13 @@ Rules:
             raw = resp.json().get("response", "") or ""
             edges = _parse_json_array_from_llm_text(raw)
             if not edges:
-                print("[RAG] humanoid LLM: no parseable JSON array in response")
+                _max = 4000
+                tail = "" if len(raw) <= _max else "\n... [truncated]"
+                body = (raw[:_max] if raw else "(empty)") + tail
+                print(
+                    f"[RAG] humanoid LLM: no parseable JSON array in response "
+                    f"(raw_len={len(raw)})\n[Ollama response]\n{body}"
+                )
                 return []
             valid = set(var_names)
             pairs: list[tuple[str, str, float]] = []

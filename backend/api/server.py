@@ -207,6 +207,8 @@ async def _startup_phase3_teacher() -> None:
         if sim.current_world != "humanoid":
             print("[RKK] Phase3 teacher: only humanoid, skipping")
             return
+        # Сразу после VLM Ollama иногда отдаёт пустой response; короткая пауза + retry в fetch.
+        await asyncio.sleep(2.5)
         out = await sim.refresh_phase3_teacher_llm()
         if out.get("ok"):
             print(

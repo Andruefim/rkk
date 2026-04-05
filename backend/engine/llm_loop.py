@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from engine.llm_json_extract import ollama_json_format_payload, parse_json_object_loose
+from engine.ollama_env import ollama_think_disabled_payload
 from engine.rag_seeder import (
     _dedupe_cap_edges,
     _parse_json_array_from_llm_text,
@@ -129,6 +130,7 @@ def consult_counterfactual_sync(
         "model": llm_model,
         "prompt": prompt,
         "stream": False,
+        **ollama_think_disabled_payload(),
         "options": {
             "temperature": float(os.environ.get("RKK_LLM_LOOP_TEMP", "0.22")),
             "num_predict": int(os.environ.get("RKK_LLM_LEVEL2_NUM_PREDICT", "1800")),
@@ -187,6 +189,7 @@ def structure_revision_sync(
         "model": llm_model,
         "prompt": prompt,
         "stream": False,
+        **ollama_think_disabled_payload(),
         "options": {"temperature": 0.14, "num_predict": 2600},
         **ollama_json_format_payload(),
     }

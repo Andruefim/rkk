@@ -14,6 +14,7 @@ def ollama_json_format_enabled() -> bool:
     """RKK_OLLAMA_JSON_FORMAT=0 — без format=json в generate (bootstrap/LLM loop).
 
     Phase3/VLM: ollama_json_format_teacher_vlm_payload() — отдельно, по умолчанию без format.
+    Humanoid RAG edges: ollama_json_format_humanoid_bootstrap_payload() — отдельно, по умолчанию без format.
     """
     return os.environ.get("RKK_OLLAMA_JSON_FORMAT", "1").strip().lower() not in (
         "0",
@@ -35,6 +36,23 @@ def ollama_json_format_teacher_vlm_payload() -> dict[str, Any]:
     Включить принудительно: RKK_OLLAMA_JSON_FORMAT_TEACHER_VLM=1 при RKK_OLLAMA_JSON_FORMAT=1.
     """
     if os.environ.get("RKK_OLLAMA_JSON_FORMAT_TEACHER_VLM", "0").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return {}
+    return ollama_json_format_payload()
+
+
+def ollama_json_format_humanoid_bootstrap_payload() -> dict[str, Any]:
+    """
+    Humanoid structured bootstrap (/api/generate): при format=json многие локальные модели
+    отдают шаблонные объекты (key, key_2, …) вместо массива рёбер — по умолчанию не шлём format.
+
+    Включить: RKK_OLLAMA_JSON_FORMAT_HUMANOID=1 (учитывается только при RKK_OLLAMA_JSON_FORMAT=1).
+    """
+    if os.environ.get("RKK_OLLAMA_JSON_FORMAT_HUMANOID", "0").strip().lower() not in (
         "1",
         "true",
         "yes",

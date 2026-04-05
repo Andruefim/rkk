@@ -6,7 +6,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +19,7 @@ from engine.llm_json_extract import (
     parse_json_object_loose,
     scan_json_objects_having_any_key,
 )
+from engine.ollama_env import ollama_think_disabled_payload
 from engine.value_layer import TeacherVLOverlay
 
 
@@ -81,11 +84,14 @@ Most uncertain vars (by edge uncertainty proxy):
 
 
 def build_phase3_prompt(digest: str) -> str:
-    return f"""You are a cautious robotics curriculum advisor for a causal discovery humanoid agent.
+    return f"""CRITICAL OUTPUT RULE: Reply with NOTHING except one JSON object. No markdown, no headings, no "Final Answer", no analysis.
+The first non-whitespace character of your reply MUST be `{{`.
+
+You are a cautious robotics curriculum advisor for a causal discovery humanoid agent.
 
 {digest}
 
-Return valid JSON only (one object, no markdown). Shape:
+Return valid JSON only (one object). Shape:
 {{
   "ig_rules": [
     {{
@@ -115,6 +121,22 @@ Rules:
 - vl_overlay: mild adjustments only; ttl_ticks reasonable for early training help."""
 
 _PHASE3_ROOT_KEYS = frozenset({"ig_rules", "vl_overlay"})
+
+
+def _phase3_num_predict() -> int:
+    try:
+        v = int(os.environ.get("RKK_PHASE3_NUM_PREDICT", "2400"))
+    except ValueError:
+        v = 2400
+    return max(256, min(v, 8192))
+
+
+def _phase3_http_timeout() -> float:
+    try:
+        v = float(os.environ.get("RKK_PHASE3_HTTP_TIMEOUT", "300"))
+    except ValueError:
+        v = 300.0
+    return max(45.0, min(v, 3600.0))
 
 
 def _phase3_parsed_root_usable(obj: dict[str, Any] | None) -> bool:
@@ -212,17 +234,23 @@ async def fetch_phase3_teacher_bundle(
     digest: str,
     valid_vars: set[str],
     current_tick: int,
-    timeout: float = 120.0,
+    timeout: float | None = None,
 ) -> tuple[list[TeacherIGRule], TeacherVLOverlay | None, str | None]:
     """
     Возвращает (rules, vl_overlay, error).
     """
+    if timeout is None:
+        timeout = _phase3_http_timeout()
     prompt = build_phase3_prompt(digest)
     payload = {
         "model": llm_model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.18, "num_predict": 2400},
+        **ollama_think_disabled_payload(),
+        "options": {
+            "temperature": 0.1,
+            "num_predict": _phase3_num_predict(),
+        },
         **ollama_json_format_teacher_vlm_payload(),
     }
     url = llm_url.strip().rstrip("/")
@@ -232,14 +260,38 @@ async def fetch_phase3_teacher_bundle(
         elif not url.endswith("/generate"):
             url = url.rsplit("/", 1)[0] + "/generate"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            resp = await client.post(url, json=payload)
-            if resp.status_code != 200:
-                return [], None, f"HTTP {resp.status_code}: {resp.text[:200]}"
-            raw = (resp.json().get("response") or "").strip()
-        except Exception as e:
-            return [], None, str(e)
+    raw = ""
+    data: dict[str, Any] = {}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for attempt in range(2):
+                resp = await client.post(url, json=payload)
+                if resp.status_code != 200:
+                    return [], None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+                try:
+                    data = resp.json()
+                except json.JSONDecodeError as e:
+                    return [], None, f"Ollama JSON body: {e}; text={resp.text[:300]!r}"
+                raw = (data.get("response") or "").strip()
+                if raw:
+                    break
+                err_o = data.get("error")
+                if attempt == 0:
+                    print(
+                        "[Phase3] Ollama returned empty `response` "
+                        f"(attempt 1). keys={list(data.keys())} error={err_o!r} "
+                        f"eval_count={data.get('eval_count')!r} — retry in 3s…"
+                    )
+                    await asyncio.sleep(3.0)
+            if not raw:
+                print(
+                    "[Phase3] Ollama still empty after retry. "
+                    f"keys={list(data.keys())} error={data.get('error')!r} "
+                    f"eval_count={data.get('eval_count')!r} "
+                    f"body_preview={resp.text[:500]!r}"
+                )
+    except Exception as e:
+        return [], None, str(e)
 
     rules, ov = parse_phase3_response(raw, valid_vars, current_tick)
     if not rules and ov is None:
