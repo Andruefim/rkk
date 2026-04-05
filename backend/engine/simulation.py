@@ -13,10 +13,16 @@ simulation_singleton_v2.py — Singleton AGI с гуманоидом (Фаза 1
   - tick_step: teacher_weight annealing (RKK_TEACHER_T_MAX), overlay на ValueLayer
 
 Phase A (locomotion):
-  - RKK_LOCOMOTION_CPG=1: CPG ноги после do() на humanoid без fixed_root (engine.cpg_locomotion).
+  - RKK_LOCOMOTION_CPG=1: CPG ноги на humanoid без fixed_root (engine.cpg_locomotion).
+  - RKK_CPG_LOOP_HZ>0 (напр. 60): Low-level CPG в daemon-потоке; снимок graph.nodes после agent/skill step.
+    По умолчанию 0 — CPG только сразу после agent.step (как раньше).
 
 Phase B (hierarchy):
-  - L3 goal_planning (agent), L2 skill_library, L1 CPG, L0 PyBullet.
+  - High ~1 Hz: GNN + EIG + goal_planning (agent tick / WS).
+  - Mid ~10–20 Hz: world model (можно отдельным потоком позже).
+  - Low ~60 Hz+: CPG (decoupled) + RKK_PHYSICS_BG_HZ PyBullet (уже в humanoid).
+
+  L3 goal_planning (agent), L2 skill_library, L1 CPG, L0 PyBullet.
   - RKK_SKILL_LIBRARY=1: моторная последовательность из библиотеки (тик = один кадр skill).
 
 Phase C (full RSI):
@@ -31,6 +37,8 @@ Phase C (full RSI):
 from __future__ import annotations
 
 import os
+import threading
+import time
 import torch
 import numpy as np
 from collections import deque
@@ -50,6 +58,15 @@ PHASE_NAMES      = ["", "Causal Crib", "Robotic Explorer",
 
 # Visual mode: полный GNN→cortex на каждом тике дорог; предсказание для PC обновляем реже
 VISION_GNN_FEED_EVERY = 2
+
+
+def _cpg_loop_hz_from_env() -> float:
+    """0 = CPG синхронно с тиком агента; >0 = отдельный поток (часто 60)."""
+    try:
+        hz = float(os.environ.get("RKK_CPG_LOOP_HZ", "0"))
+    except ValueError:
+        hz = 0.0
+    return max(0.0, min(hz, 240.0))
 
 
 def resolve_torch_device(requested: str | None = None) -> torch.device:
@@ -223,6 +240,10 @@ class Simulation:
         self._pe_history: deque[float] = deque(maxlen=200)
         # Phase A: CPG locomotion (humanoid, не fixed_root)
         self._locomotion_controller = None
+        self._cpg_loop_thread: threading.Thread | None = None
+        self._cpg_stop = threading.Event()
+        self._cpg_snapshot_lock = threading.Lock()
+        self._cpg_node_snapshot: dict[str, float] = {}
         # Phase B: skill library (L2), один кадр последовательности за тик
         self._skill_library = None
         self._skill_exec: dict | None = None
@@ -247,6 +268,7 @@ class Simulation:
 
         result = self.switcher.switch(new_world)
         if result.get("switched"):
+            self._stop_cpg_background_loop()
             self.current_world = new_world
             self._locomotion_controller = None
             self._skill_library = None
@@ -414,6 +436,7 @@ class Simulation:
 
         self._fixed_root_active = True
         self._fall_count = 0
+        self._stop_cpg_background_loop()
 
         self._add_event(
             f"📌 FIXED ROOT ON: d={self.agent.graph._d}, "
@@ -720,8 +743,94 @@ class Simulation:
         v = os.environ.get("RKK_LOCOMOTION_CPG", "0").strip().lower()
         return v in ("1", "true", "yes", "on")
 
+    def _cpg_decoupled_enabled(self) -> bool:
+        return self._locomotion_cpg_enabled() and _cpg_loop_hz_from_env() > 0.0
+
+    def _stop_cpg_background_loop(self) -> None:
+        self._cpg_stop.set()
+        th = self._cpg_loop_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=1.5)
+        self._cpg_loop_thread = None
+        self._cpg_stop.clear()
+
+    def _ensure_cpg_background_loop(self) -> None:
+        if not self._cpg_decoupled_enabled():
+            return
+        if self.current_world != "humanoid" or self._fixed_root_active:
+            return
+        base = self._unwrap_base_env(self.agent.env)
+        if not callable(getattr(base, "apply_cpg_leg_targets", None)):
+            return
+        if self._cpg_loop_thread is not None and self._cpg_loop_thread.is_alive():
+            return
+        self._cpg_stop.clear()
+        self._cpg_loop_thread = threading.Thread(
+            target=self._cpg_loop_worker,
+            daemon=True,
+            name="rkk-cpg-loop",
+        )
+        self._cpg_loop_thread.start()
+        print(
+            f"[Simulation] CPG low-level loop ~{_cpg_loop_hz_from_env():.0f} Hz "
+            f"(decoupled from agent tick; RKK_CPG_LOOP_HZ)"
+        )
+
+    def _publish_cpg_node_snapshot(self) -> None:
+        if not self._cpg_decoupled_enabled():
+            return
+        with self._cpg_snapshot_lock:
+            self._cpg_node_snapshot = dict(self.agent.graph.nodes)
+
+    def _cpg_loop_worker(self) -> None:
+        hz = _cpg_loop_hz_from_env()
+        dt = 1.0 / hz if hz > 0 else 0.05
+        from engine.cpg_locomotion import LocomotionController
+
+        while not self._cpg_stop.is_set():
+            t0 = time.perf_counter()
+            try:
+                if not self._locomotion_cpg_enabled():
+                    time.sleep(0.05)
+                    continue
+                if self.current_world != "humanoid" or self._fixed_root_active:
+                    time.sleep(0.05)
+                    continue
+                base = self._unwrap_base_env(self.agent.env)
+                fn = getattr(base, "apply_cpg_leg_targets", None)
+                if not callable(fn):
+                    time.sleep(0.05)
+                    continue
+                if self._locomotion_controller is None:
+                    self._locomotion_controller = LocomotionController(self.device)
+                with self._cpg_snapshot_lock:
+                    nodes = dict(self._cpg_node_snapshot)
+                if not nodes:
+                    nodes = dict(self.agent.graph.nodes)
+                targets = self._locomotion_controller.get_joint_targets(nodes)
+                fn(targets)
+                obs = self.agent.env.observe()
+                com_z = float(obs.get("com_z", 0.5))
+                com_x = float(obs.get("com_x", 0.5))
+                fallen = False
+                is_fn = getattr(self.agent.env, "is_fallen", None)
+                if callable(is_fn) and not self._fixed_root_active:
+                    fallen = bool(is_fn())
+                self._locomotion_controller.learn_from_reward(com_z, com_x, fallen)
+            except Exception as ex:
+                print(f"[Simulation] CPG loop: {ex}")
+            elapsed = time.perf_counter() - t0
+            wait = dt - elapsed
+            if wait > 0:
+                self._cpg_stop.wait(timeout=wait)
+
     def _maybe_apply_cpg_locomotion(self, fallen: bool) -> None:
-        """Phase A: CPG шаг ног после do() агента; reward обучает CPG отдельно от GNN."""
+        """
+        Phase A: CPG шаг ног + learn_from_reward в том же тике, что и agent.step.
+        Если включён RKK_CPG_LOOP_HZ>0, этот путь отключён — работает _cpg_loop_worker.
+        """
+        if self._cpg_decoupled_enabled():
+            return
         if not self._locomotion_cpg_enabled():
             return
         if self.current_world != "humanoid" or self._fixed_root_active:
@@ -944,6 +1053,8 @@ class Simulation:
         else:
             self.agent.value_layer.set_teacher_vl_overlay(None)
 
+        # Low-level CPG в фоне (RKK_CPG_LOOP_HZ), до тяжёлого agent.step — не ждёт GNN/EIG.
+        self._ensure_cpg_background_loop()
         self.agent.other_agents_phi = []
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
         fallen_locomotion = fallen
@@ -951,6 +1062,7 @@ class Simulation:
         if callable(is_fn2) and not self._fixed_root_active:
             fallen_locomotion = is_fn2()
         self._maybe_apply_cpg_locomotion(fallen_locomotion)
+        self._publish_cpg_node_snapshot()
         self._log_step(result, fallen)
         self._rolling_block_bits.append(1 if result.get("blocked") else 0)
 
@@ -1365,9 +1477,16 @@ class Simulation:
                 "rolling_block_rate": round(self._rolling_block_rate(), 4),
                 "stats":             dict(self._llm_loop_stats),
             },
-            "locomotion":    self._locomotion_controller.snapshot()
-            if self._locomotion_controller is not None
-            else None,
+            "locomotion":    (
+                {
+                    **self._locomotion_controller.snapshot(),
+                    "decoupled_loop_hz": round(_cpg_loop_hz_from_env(), 1)
+                    if self._cpg_decoupled_enabled()
+                    else 0.0,
+                }
+                if self._locomotion_controller is not None
+                else None
+            ),
             "skills":        self._skill_snapshot(),
             "rsi_full":      self._rsi_full.snapshot()
             if self._rsi_full_enabled() and self._rsi_full is not None
@@ -1382,6 +1501,7 @@ class Simulation:
         return self._build_snapshot(snap, {}, smoothed, scene)
 
     def shutdown(self):
+        self._stop_cpg_background_loop()
         try:
             self._llm_loop_executor.shutdown(wait=False, cancel_futures=False)
         except TypeError:
