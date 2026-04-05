@@ -138,6 +138,22 @@ class CausalGraph:
         self._optim = None
         self._rebuild_core()
 
+    def _maybe_compile_gnn_core(self) -> None:
+        if not USE_GNN or self._core is None:
+            return
+        v = os.environ.get("RKK_GNN_COMPILE", "0").strip().lower()
+        if v not in ("1", "true", "yes", "on"):
+            return
+        if self.device.type not in ("cuda", "mps"):
+            return
+        if not hasattr(torch, "compile"):
+            return
+        try:
+            self._core = torch.compile(self._core, mode="reduce-overhead")
+            print(f"[CausalGraph] GNN torch.compile (d={self._d}, device={self.device.type})")
+        except Exception as e:
+            print(f"[CausalGraph] torch.compile skipped: {e}")
+
     def _rebuild_core(self):
         if USE_GNN:
             from engine.causal_gnn import CausalGNNCore
@@ -147,6 +163,7 @@ class CausalGraph:
                 if hasattr(self._core, 'resize_to'):
                     new_core  = self._core.resize_to(self._d)
                     self._core = new_core
+                    self._maybe_compile_gnn_core()
                     self._optim = torch.optim.Adam(self._core.parameters(), lr=5e-3)
                     self._invalidate_cache()
                     return
@@ -162,6 +179,9 @@ class CausalGraph:
             old_d = old_W.shape[0]
             with torch.no_grad():
                 self._core.W[:old_d, :old_d] = old_W
+
+        if USE_GNN:
+            self._maybe_compile_gnn_core()
 
         self._optim = torch.optim.Adam(self._core.parameters(), lr=5e-3)
         self._invalidate_cache()

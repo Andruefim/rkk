@@ -24,6 +24,9 @@ Fallback:
 """
 from __future__ import annotations
 
+import os
+import queue
+import threading
 import numpy as np
 import torch
 import base64
@@ -40,6 +43,10 @@ VISION_PIPELINE_JPEG_Q = 72
 VISION_UI_MASK_EVERY = 3
 # Полный камера+encode раз в N интервенций (между — старые слоты, свежие phys_*)
 VISION_ENCODE_EVERY = 6
+# Фоновый cortex.encode + JPEG (очередь maxsize=1); GPU с второго потока — только если устраивает драйвер
+VISION_ASYNC_ENCODE = os.environ.get("RKK_VISION_ASYNC_ENCODE", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 _HYBRID_PHYS_KEYS = (
     "com_z", "torso_roll", "lknee", "rknee",
@@ -121,8 +128,19 @@ class EnvironmentVisual:
         self._slot_lexicon_tick: int = -1
         self._slot_lexicon_frame_hash: str = ""
 
-        # Начальная инициализация
-        self._refresh(run_encode=True)
+        self._async_encode = VISION_ASYNC_ENCODE
+        self._encode_queue: queue.Queue[tuple[int, np.ndarray] | None] | None = None
+        self._encode_thread: threading.Thread | None = None
+        self._encode_ui_lock = threading.Lock()
+        if self._async_encode:
+            self._encode_queue = queue.Queue(maxsize=1)
+            self._encode_thread = threading.Thread(
+                target=self._encode_worker, daemon=True, name="RKK-vision-encode"
+            )
+            self._encode_thread.start()
+
+        # Начальная инициализация (первый проход синхронно, чтобы слоты были заданы)
+        self._refresh(run_encode=True, force_sync=True)
 
     # ── Frame acquisition ─────────────────────────────────────────────────────
     def _get_raw_frame(self) -> np.ndarray | None:
@@ -165,10 +183,40 @@ class EnvironmentVisual:
         except Exception:
             return None
 
-    def _refresh(self, run_encode: bool = True) -> None:
+    def _encode_worker(self) -> None:
+        q = self._encode_queue
+        if q is None:
+            return
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            _gen, frame = item
+            try:
+                vals, vecs, attn = self.cortex.encode(frame)
+                self._last_slots = vals
+                self._last_slot_vecs = vecs
+                self._last_attn = attn
+                self._cached_frame_b64 = self._encode_frame_jpeg_only(frame, quality=68)
+                with self._encode_ui_lock:
+                    self._refresh_index += 1
+                    ri = self._refresh_index
+                    if ri % VISION_UI_MASK_EVERY == 0:
+                        _, self._cached_masks_b64 = self._encode_frame_and_masks_for_ui(
+                            frame, attn
+                        )
+                    elif not self._cached_masks_b64:
+                        _, self._cached_masks_b64 = self._encode_frame_and_masks_for_ui(
+                            frame, attn
+                        )
+            except Exception:
+                pass
+
+    def _refresh(self, run_encode: bool = True, force_sync: bool = False) -> None:
         """
         run_encode=True: камера + cortex.encode + UI-кэш.
         False: только смена поколения hybrid (свежий base_env.observe), слоты с прошлого encode.
+        force_sync: игнорировать фоновый encode (первый кадр, смена fixed_root).
         """
         self._vision_generation += 1
         self._hybrid_phys_gen = -1
@@ -177,6 +225,30 @@ class EnvironmentVisual:
 
         frame = self._get_raw_frame()
         self._last_frame = frame
+
+        use_async = (
+            self._async_encode
+            and self._encode_queue is not None
+            and not force_sync
+        )
+        if use_async and frame is not None:
+            try:
+                self._encode_queue.put_nowait(
+                    (self._vision_generation, np.ascontiguousarray(frame))
+                )
+            except queue.Full:
+                try:
+                    _ = self._encode_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._encode_queue.put_nowait(
+                        (self._vision_generation, np.ascontiguousarray(frame))
+                    )
+                except queue.Full:
+                    pass
+            return
+
         self._refresh_index += 1
 
         if frame is not None:
@@ -233,7 +305,7 @@ class EnvironmentVisual:
     # ── Observe ───────────────────────────────────────────────────────────────
     def observe(self) -> dict[str, float]:
         if self._last_slots is None:
-            self._refresh(run_encode=True)
+            self._refresh(run_encode=True, force_sync=True)
         slots = self._last_slots
         obs = {f"slot_{k}": float(slots[k].item()) for k in range(self.n_slots)}
 
@@ -371,7 +443,7 @@ class EnvironmentVisual:
         self._hybrid_phys_gen = -1
         self._hybrid_phys_obs = None
         self.clear_slot_lexicon()
-        self._refresh(run_encode=True)
+        self._refresh(run_encode=True, force_sync=True)
 
     def get_slot_visualization(self) -> dict:
         """Данные для UI: кадр + slot masks (кэш из _refresh, без PIL/cv2 на каждый тик)."""
@@ -452,7 +524,7 @@ class EnvironmentVisual:
             fn()
         self._vision_stride_counter = 0
         self.clear_slot_lexicon()
-        self._refresh(run_encode=True)
+        self._refresh(run_encode=True, force_sync=True)
 
     # ── Seeds для visual env ─────────────────────────────────────────────────
     def hardcoded_seeds(self) -> list[dict]:

@@ -13,6 +13,8 @@ FIXED_BASE_VARS = ARM + SPINE + HEAD + CUBE_VARS + SANDBOX_VARS + SELF_VARS (с�
 from __future__ import annotations
 
 import os
+import threading
+import time
 import numpy as np
 import torch
 import base64
@@ -378,6 +380,11 @@ class _PyBulletHumanoid:
 
     def __init__(self, fixed_root: bool = False):
         # ── PyBullet init ────────────────────────────────────────────────────
+        self._physics_lock = threading.RLock()
+        self._bg_running = False
+        self._bg_thread: threading.Thread | None = None
+        self._bg_hz = 0.0
+
         self.client = pb.connect(pb.DIRECT)
         pb.setGravity(0, 0, -9.81, physicsClientId=self.client)
         pb.setAdditionalSearchPath(pbd.getDataPath(), physicsClientId=self.client)
@@ -476,47 +483,92 @@ class _PyBulletHumanoid:
         if fixed_root:
             self.enable_fixed_root()
 
+        self._maybe_start_physics_bg()
+
+    def _maybe_start_physics_bg(self) -> None:
+        """
+        Опционально: непрерывный stepSimulation в фоне (RKK_PHYSICS_BG_HZ, напр. 120).
+        Тогда step(n) на главном потоке не вызывается — физика идёт между тиками агента.
+        Все вызовы PyBullet сериализуются через _physics_lock (в т.ч. камера, reset).
+        """
+        try:
+            hz = float(os.environ.get("RKK_PHYSICS_BG_HZ", "0"))
+        except ValueError:
+            hz = 0.0
+        if hz <= 0 or hz > 480:
+            return
+        self._bg_hz = hz
+        self._bg_running = True
+        dt = 1.0 / hz
+        cid = self.client
+
+        def _loop() -> None:
+            while self._bg_running:
+                t0 = time.perf_counter()
+                with self._physics_lock:
+                    pb.stepSimulation(physicsClientId=cid)
+                elapsed = time.perf_counter() - t0
+                slp = dt - elapsed
+                if slp > 0:
+                    time.sleep(slp)
+
+        self._bg_thread = threading.Thread(
+            target=_loop, daemon=True, name="RKK-PyBullet-bg-physics"
+        )
+        self._bg_thread.start()
+        print(f"[HumanoidEnv] Background physics ~{hz:.0f} Hz (RKK_PHYSICS_BG_HZ); main step() is no-op")
+
+    def _stop_physics_bg(self) -> None:
+        self._bg_running = False
+        th = self._bg_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=1.0)
+        self._bg_thread = None
+        self._bg_hz = 0.0
+
     # ── Fixed root constraint ─────────────────────────────────────────────────
     def enable_fixed_root(self) -> None:
         """
         Фиксируем базу робота в мировых координатах через JOINT_FIXED constraint.
         Вызывается ПОСЛЕ reset_stance() чтобы зафиксировать стабильную позу.
         """
-        if self._root_constraint is not None:
-            return  # уже зафиксирован
+        with self._physics_lock:
+            if self._root_constraint is not None:
+                return  # уже зафиксирован
 
-        pos, orn = pb.getBasePositionAndOrientation(
-            self.robot_id, physicsClientId=self.client
-        )
-        self._root_constraint = pb.createConstraint(
-            self.robot_id, -1,           # parent: robot base link
-            -1, -1,                       # child: world frame
-            pb.JOINT_FIXED,
-            [0, 0, 0],                    # joint axis (unused for fixed)
-            [0, 0, 0],                    # parent frame position (local)
-            list(pos),                    # child frame position (world)
-            parentFrameOrientation=[0, 0, 0, 1],
-            childFrameOrientation=list(orn),
-            physicsClientId=self.client,
-        )
-        # Снижаем максимальную силу constraint чтобы не было артефактов
-        pb.changeConstraint(
-            self._root_constraint,
-            maxForce=5000.0,
-            physicsClientId=self.client,
-        )
-        print(f"[HumanoidEnv] Fixed root constraint #{self._root_constraint} at z={pos[2]:.3f}")
+            pos, orn = pb.getBasePositionAndOrientation(
+                self.robot_id, physicsClientId=self.client
+            )
+            self._root_constraint = pb.createConstraint(
+                self.robot_id, -1,           # parent: robot base link
+                -1, -1,                       # child: world frame
+                pb.JOINT_FIXED,
+                [0, 0, 0],                    # joint axis (unused for fixed)
+                [0, 0, 0],                    # parent frame position (local)
+                list(pos),                    # child frame position (world)
+                parentFrameOrientation=[0, 0, 0, 1],
+                childFrameOrientation=list(orn),
+                physicsClientId=self.client,
+            )
+            # Снижаем максимальную силу constraint чтобы не было артефактов
+            pb.changeConstraint(
+                self._root_constraint,
+                maxForce=5000.0,
+                physicsClientId=self.client,
+            )
+            print(f"[HumanoidEnv] Fixed root constraint #{self._root_constraint} at z={pos[2]:.3f}")
 
     def disable_fixed_root(self) -> None:
         """Снимаем фиксацию базы — робот снова свободно движется."""
-        if self._root_constraint is None:
-            return
-        try:
-            pb.removeConstraint(self._root_constraint, physicsClientId=self.client)
-        except Exception as e:
-            print(f"[HumanoidEnv] removeConstraint error: {e}")
-        self._root_constraint = None
-        print("[HumanoidEnv] Fixed root constraint removed")
+        with self._physics_lock:
+            if self._root_constraint is None:
+                return
+            try:
+                pb.removeConstraint(self._root_constraint, physicsClientId=self.client)
+            except Exception as e:
+                print(f"[HumanoidEnv] removeConstraint error: {e}")
+            self._root_constraint = None
+            print("[HumanoidEnv] Fixed root constraint removed")
 
     @property
     def fixed_root(self) -> bool:
@@ -678,8 +730,11 @@ class _PyBulletHumanoid:
         return robot
 
     def step(self, n: int = 10):
-        for _ in range(n):
-            pb.stepSimulation(physicsClientId=self.client)
+        if self._bg_hz > 0:
+            return
+        with self._physics_lock:
+            for _ in range(n):
+                pb.stepSimulation(physicsClientId=self.client)
 
     def _motor_relax_velocity(self) -> None:
         rid, cid = self.robot_id, self.client
@@ -764,9 +819,18 @@ class _PyBulletHumanoid:
         Сброс позы. Если fixed_root был активен — временно снимаем constraint,
         сбрасываем, и заново применяем.
         """
+        with self._physics_lock:
+            self._reset_stance_locked()
+
+    def _reset_stance_locked(self) -> None:
         had_fixed = self._root_constraint is not None
         if had_fixed:
-            self.disable_fixed_root()
+            if self._root_constraint is not None:
+                try:
+                    pb.removeConstraint(self._root_constraint, physicsClientId=self.client)
+                except Exception as e:
+                    print(f"[HumanoidEnv] removeConstraint error: {e}")
+                self._root_constraint = None
 
         self._neck_euler[:] = 0.0
         self._spine_euler[:] = 0.0
@@ -808,9 +872,23 @@ class _PyBulletHumanoid:
             pb.stepSimulation(physicsClientId=cid)
         pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
 
-        # Восстанавливаем fixed_root если был
+        # Восстанавливаем fixed_root если был (уже под lock — RLock)
         if had_fixed:
-            self.enable_fixed_root()
+            pos, orn = pb.getBasePositionAndOrientation(
+                self.robot_id, physicsClientId=cid
+            )
+            self._root_constraint = pb.createConstraint(
+                self.robot_id, -1, -1, -1,
+                pb.JOINT_FIXED,
+                [0, 0, 0], [0, 0, 0],
+                list(pos),
+                parentFrameOrientation=[0, 0, 0, 1],
+                childFrameOrientation=list(orn),
+                physicsClientId=cid,
+            )
+            pb.changeConstraint(
+                self._root_constraint, maxForce=5000.0, physicsClientId=cid,
+            )
 
         if getattr(self, "ball_id", None) is not None:
             pb.resetBasePositionAndOrientation(
@@ -824,67 +902,68 @@ class _PyBulletHumanoid:
             )
 
     def set_joint(self, var_name: str, target_pos: float):
-        if var_name not in self.joint_by_var:
-            return
-        jid = self.joint_by_var[var_name]
-        lo, hi = _RANGES.get(var_name, (-2.0, 2.0))
-        real_pos = float(np.clip(target_pos * (hi - lo) + lo, lo, hi))
-        rid, cid = self.robot_id, self.client
-        jt = self._joint_types[jid]
-        motor_m = getattr(pb, "setJointMotorControlMultiDof", None)
-
-        if var_name in ("neck_yaw", "neck_pitch"):
-            if not callable(motor_m) or jt != pb.JOINT_SPHERICAL:
+        with self._physics_lock:
+            if var_name not in self.joint_by_var:
                 return
-            if var_name == "neck_yaw":
-                self._neck_euler[2] = 0.55 * real_pos
-            else:
-                self._neck_euler[0] = 0.45 * real_pos
-            ex, ey, ez = float(self._neck_euler[0]), float(self._neck_euler[1]), float(self._neck_euler[2])
-            q = pb.getQuaternionFromEuler((ex, ey, ez))
-            motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                    positionGain=0.62, velocityGain=0.18, maxVelocity=4.0,
-                    force=[110.0, 110.0, 110.0], physicsClientId=cid)
-            return
+            jid = self.joint_by_var[var_name]
+            lo, hi = _RANGES.get(var_name, (-2.0, 2.0))
+            real_pos = float(np.clip(target_pos * (hi - lo) + lo, lo, hi))
+            rid, cid = self.robot_id, self.client
+            jt = self._joint_types[jid]
+            motor_m = getattr(pb, "setJointMotorControlMultiDof", None)
 
-        if var_name in ("spine_yaw", "spine_pitch"):
-            if not callable(motor_m) or jt != pb.JOINT_SPHERICAL:
+            if var_name in ("neck_yaw", "neck_pitch"):
+                if not callable(motor_m) or jt != pb.JOINT_SPHERICAL:
+                    return
+                if var_name == "neck_yaw":
+                    self._neck_euler[2] = 0.55 * real_pos
+                else:
+                    self._neck_euler[0] = 0.45 * real_pos
+                ex, ey, ez = float(self._neck_euler[0]), float(self._neck_euler[1]), float(self._neck_euler[2])
+                q = pb.getQuaternionFromEuler((ex, ey, ez))
+                motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
+                        positionGain=0.62, velocityGain=0.18, maxVelocity=4.0,
+                        force=[110.0, 110.0, 110.0], physicsClientId=cid)
                 return
-            if var_name == "spine_yaw":
-                self._spine_euler[2] = 0.50 * real_pos
-            else:
-                self._spine_euler[0] = 0.40 * real_pos
-            ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
-            q = pb.getQuaternionFromEuler((ex, ey, ez))
-            motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                    positionGain=0.70, velocityGain=0.20, maxVelocity=3.5,
-                    force=[180.0, 180.0, 180.0], physicsClientId=cid)
-            return
 
-        if jt == pb.JOINT_SPHERICAL and callable(motor_m):
-            if var_name == "lshoulder":
-                q = pb.getQuaternionFromEuler((0.32 * real_pos, 0.42 * real_pos, 0.28 * real_pos))
-            elif var_name == "rshoulder":
-                q = pb.getQuaternionFromEuler((0.32 * real_pos, -0.42 * real_pos, -0.28 * real_pos))
-            elif var_name == "lhip":
-                q = pb.getQuaternionFromEuler((0.1 * real_pos, 0.42 * real_pos, 0.05 * real_pos))
-            elif var_name == "rhip":
-                q = pb.getQuaternionFromEuler((0.1 * real_pos, -0.42 * real_pos, -0.05 * real_pos))
-            elif var_name == "lankle":
-                q = pb.getQuaternionFromEuler((-0.22 * real_pos, 0.1 * real_pos, 0.0))
-            elif var_name == "rankle":
-                q = pb.getQuaternionFromEuler((-0.22 * real_pos, -0.1 * real_pos, 0.0))
+            if var_name in ("spine_yaw", "spine_pitch"):
+                if not callable(motor_m) or jt != pb.JOINT_SPHERICAL:
+                    return
+                if var_name == "spine_yaw":
+                    self._spine_euler[2] = 0.50 * real_pos
+                else:
+                    self._spine_euler[0] = 0.40 * real_pos
+                ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
+                q = pb.getQuaternionFromEuler((ex, ey, ez))
+                motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
+                        positionGain=0.70, velocityGain=0.20, maxVelocity=3.5,
+                        force=[180.0, 180.0, 180.0], physicsClientId=cid)
+                return
+
+            if jt == pb.JOINT_SPHERICAL and callable(motor_m):
+                if var_name == "lshoulder":
+                    q = pb.getQuaternionFromEuler((0.32 * real_pos, 0.42 * real_pos, 0.28 * real_pos))
+                elif var_name == "rshoulder":
+                    q = pb.getQuaternionFromEuler((0.32 * real_pos, -0.42 * real_pos, -0.28 * real_pos))
+                elif var_name == "lhip":
+                    q = pb.getQuaternionFromEuler((0.1 * real_pos, 0.42 * real_pos, 0.05 * real_pos))
+                elif var_name == "rhip":
+                    q = pb.getQuaternionFromEuler((0.1 * real_pos, -0.42 * real_pos, -0.05 * real_pos))
+                elif var_name == "lankle":
+                    q = pb.getQuaternionFromEuler((-0.22 * real_pos, 0.1 * real_pos, 0.0))
+                elif var_name == "rankle":
+                    q = pb.getQuaternionFromEuler((-0.22 * real_pos, -0.1 * real_pos, 0.0))
+                else:
+                    q = [0.0, 0.0, 0.0, 1.0]
+                motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
+                        positionGain=0.52, velocityGain=0.15, maxVelocity=5.5,
+                        force=[165.0, 165.0, 165.0], physicsClientId=cid)
             else:
-                q = [0.0, 0.0, 0.0, 1.0]
-            motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                    positionGain=0.52, velocityGain=0.15, maxVelocity=5.5,
-                    force=[165.0, 165.0, 165.0], physicsClientId=cid)
-        else:
-            pb.setJointMotorControl2(
-                rid, jid, controlMode=pb.POSITION_CONTROL,
-                targetPosition=real_pos,
-                positionGain=0.5, velocityGain=0.1, force=80.0, physicsClientId=cid,
-            )
+                pb.setJointMotorControl2(
+                    rid, jid, controlMode=pb.POSITION_CONTROL,
+                    targetPosition=real_pos,
+                    positionGain=0.5, velocityGain=0.1, force=80.0, physicsClientId=cid,
+                )
 
     def get_com(self) -> tuple[np.ndarray, np.ndarray]:
         pos, orn = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
@@ -974,35 +1053,36 @@ class _PyBulletHumanoid:
         return float(best)
 
     def get_state(self) -> dict:
-        com, euler = self.get_com()
-        lf, rf = self.get_foot_heights()
-        s = {}
-        s["com_x"]       = float(com[0])
-        s["com_y"]       = float(com[1])
-        s["com_z"]       = float(com[2])
-        s["torso_roll"]  = float(euler[0])
-        s["torso_pitch"] = float(euler[1])
-        for v in SPINE_VARS + HEAD_VARS:
-            s[v] = self.get_joint_angle(v)
-        for v in LEG_VARS + ARM_VARS:
-            s[v] = self.get_joint_angle(v)
-        s["lfoot_z"] = lf
-        s["rfoot_z"] = rf
-        for i, cp in enumerate(self.get_cube_state()):
-            s[f"cube{i}_x"] = float(cp[0])
-            s[f"cube{i}_y"] = float(cp[1])
-            s[f"cube{i}_z"] = float(cp[2])
-        if getattr(self, "ball_id", None) is not None:
-            bp, _ = pb.getBasePositionAndOrientation(self.ball_id, physicsClientId=self.client)
-            s["ball_x"] = float(bp[0])
-            s["ball_y"] = float(bp[1])
-            s["ball_z"] = float(bp[2])
-        else:
-            s["ball_x"] = s["ball_y"] = 0.0
-            s["ball_z"] = 0.12
-        s["lever_pin"] = self._compute_lever_pin()
-        s["target_dist"] = self._compute_target_dist()
-        return s
+        with self._physics_lock:
+            com, euler = self.get_com()
+            lf, rf = self.get_foot_heights()
+            s = {}
+            s["com_x"]       = float(com[0])
+            s["com_y"]       = float(com[1])
+            s["com_z"]       = float(com[2])
+            s["torso_roll"]  = float(euler[0])
+            s["torso_pitch"] = float(euler[1])
+            for v in SPINE_VARS + HEAD_VARS:
+                s[v] = self.get_joint_angle(v)
+            for v in LEG_VARS + ARM_VARS:
+                s[v] = self.get_joint_angle(v)
+            s["lfoot_z"] = lf
+            s["rfoot_z"] = rf
+            for i, cp in enumerate(self.get_cube_state()):
+                s[f"cube{i}_x"] = float(cp[0])
+                s[f"cube{i}_y"] = float(cp[1])
+                s[f"cube{i}_z"] = float(cp[2])
+            if getattr(self, "ball_id", None) is not None:
+                bp, _ = pb.getBasePositionAndOrientation(self.ball_id, physicsClientId=self.client)
+                s["ball_x"] = float(bp[0])
+                s["ball_y"] = float(bp[1])
+                s["ball_z"] = float(bp[2])
+            else:
+                s["ball_x"] = s["ball_y"] = 0.0
+                s["ball_z"] = 0.12
+            s["lever_pin"] = self._compute_lever_pin()
+            s["target_dist"] = self._compute_target_dist()
+            return s
 
     def _named_link_world_positions(self) -> dict[str, np.ndarray]:
         out: dict[str, np.ndarray] = {}
@@ -1025,19 +1105,20 @@ class _PyBulletHumanoid:
         return lw + R @ local
 
     def get_ankle_quaternions_three_js(self) -> list[dict[str, float]]:
-        out: list[dict[str, float]] = []
-        rid, cid = self.robot_id, self.client
-        for name in ("left_ankle", "right_ankle"):
-            if name not in self.link_names:
-                out.append({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0})
-                continue
-            i = self.link_names.index(name)
-            st = pb.getLinkState(rid, i, computeForwardKinematics=1, physicsClientId=cid)
-            R = np.array(pb.getMatrixFromQuaternion(st[5]), dtype=float).reshape(3, 3)
-            R3 = _PB_VEC_TO_THREE @ R @ _PB_VEC_TO_THREE.T
-            x, y, z, w = _rotmat_to_xyzw(R3)
-            out.append({"x": float(x), "y": float(y), "z": float(z), "w": float(w)})
-        return out
+        with self._physics_lock:
+            out: list[dict[str, float]] = []
+            rid, cid = self.robot_id, self.client
+            for name in ("left_ankle", "right_ankle"):
+                if name not in self.link_names:
+                    out.append({"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0})
+                    continue
+                i = self.link_names.index(name)
+                st = pb.getLinkState(rid, i, computeForwardKinematics=1, physicsClientId=cid)
+                R = np.array(pb.getMatrixFromQuaternion(st[5]), dtype=float).reshape(3, 3)
+                R3 = _PB_VEC_TO_THREE @ R @ _PB_VEC_TO_THREE.T
+                x, y, z, w = _rotmat_to_xyzw(R3)
+                out.append({"x": float(x), "y": float(y), "z": float(z), "w": float(w)})
+            return out
 
     def _skeleton_from_urdf_links(self) -> list[dict] | None:
         need = {
@@ -1082,42 +1163,45 @@ class _PyBulletHumanoid:
         return [{"x": float(v[0]), "y": float(v[1]), "z": float(v[2])} for v in order]
 
     def get_all_link_positions(self) -> list[dict]:
-        urdf_pts = self._skeleton_from_urdf_links()
-        if urdf_pts is not None:
-            return urdf_pts
-        pos, _ = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
-        cx, cy, cz = float(pos[0]), float(pos[1]), float(pos[2])
-        j = {v: self.get_joint_angle(v) for v in LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS}
-        return _forward_kinematics_skeleton(cx, cy, cz, j)
+        with self._physics_lock:
+            urdf_pts = self._skeleton_from_urdf_links()
+            if urdf_pts is not None:
+                return urdf_pts
+            pos, _ = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
+            cx, cy, cz = float(pos[0]), float(pos[1]), float(pos[2])
+            j = {v: self.get_joint_angle(v) for v in LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS}
+            return _forward_kinematics_skeleton(cx, cy, cz, j)
 
     def get_cube_positions(self) -> list[dict]:
-        result = []
-        for cid in self.cube_ids:
-            pos, _ = pb.getBasePositionAndOrientation(cid, physicsClientId=self.client)
-            result.append({"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])})
-        return result
+        with self._physics_lock:
+            result = []
+            for cid in self.cube_ids:
+                pos, _ = pb.getBasePositionAndOrientation(cid, physicsClientId=self.client)
+                result.append({"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])})
+            return result
 
     def get_sandbox_scene_extras(self) -> dict:
-        ball = {"x": 0.0, "y": 0.0, "z": 0.12}
-        if getattr(self, "ball_id", None) is not None:
-            p, _ = pb.getBasePositionAndOrientation(self.ball_id, physicsClientId=self.client)
-            ball = {"x": float(p[0]), "y": float(p[1]), "z": float(p[2])}
-        lp = self._compute_lever_pin()
-        return {
-            "ball": ball,
-            "lever": {
-                "x": float(self.lever_center[0]),
-                "y": float(self.lever_center[1]),
-                "z": float(self.lever_center[2]),
-                "pressed": lp > 0.75,
-                "pin": round(lp, 3),
-            },
-            "delivery_target": {
-                "x": float(self.target_pad[0]),
-                "y": float(self.target_pad[1]),
-                "z": float(self.target_pad[2]),
-            },
-        }
+        with self._physics_lock:
+            ball = {"x": 0.0, "y": 0.0, "z": 0.12}
+            if getattr(self, "ball_id", None) is not None:
+                p, _ = pb.getBasePositionAndOrientation(self.ball_id, physicsClientId=self.client)
+                ball = {"x": float(p[0]), "y": float(p[1]), "z": float(p[2])}
+            lp = self._compute_lever_pin()
+            return {
+                "ball": ball,
+                "lever": {
+                    "x": float(self.lever_center[0]),
+                    "y": float(self.lever_center[1]),
+                    "z": float(self.lever_center[2]),
+                    "pressed": lp > 0.75,
+                    "pin": round(lp, 3),
+                },
+                "delivery_target": {
+                    "x": float(self.target_pad[0]),
+                    "y": float(self.target_pad[1]),
+                    "z": float(self.target_pad[2]),
+                },
+            }
 
     def _link_world_pos(self, link_name: str) -> np.ndarray | None:
         if link_name not in self.link_names:
@@ -1184,58 +1268,61 @@ class _PyBulletHumanoid:
         if not PIL_AVAILABLE:
             return None
         try:
-            eg = self._ego_camera_rt()
-            if eg is None:
-                vm = pb.computeViewMatrix(
-                    [2.2, -2.2, 1.6], [0, 0, 0.75], [0, 0, 1],
-                    physicsClientId=self.client,
-                )
-                ego_cam = False
-            else:
-                eye, tgt, cup = eg
-                vm = pb.computeViewMatrix(eye, tgt, cup, physicsClientId=self.client)
-                ego_cam = True
-            pm = pb.computeProjectionMatrixFOV(
-                fov=60, aspect=width/height, nearVal=0.1, farVal=15.0,
-                physicsClientId=self.client)
-            need = width * height * 4
-            rgba = None
-            hwgl = getattr(pb, "ER_BULLET_HARDWARE_OPENGL", None)
-            for renderer in (hwgl, pb.ER_TINY_RENDERER):
-                if renderer is None:
-                    continue
-                try:
-                    _, _, rgba_try, _, _ = pb.getCameraImage(
-                        width, height, vm, pm,
-                        renderer=renderer,
+            with self._physics_lock:
+                eg = self._ego_camera_rt()
+                if eg is None:
+                    vm = pb.computeViewMatrix(
+                        [2.2, -2.2, 1.6], [0, 0, 0.75], [0, 0, 1],
                         physicsClientId=self.client,
                     )
-                    pix_try = np.asarray(rgba_try, dtype=np.uint8).reshape(-1)
-                    if pix_try.size >= need:
-                        rgba = rgba_try
-                        break
-                except Exception:
-                    continue
-            if rgba is None:
-                raise ValueError("getCameraImage: all renderers failed")
-            pix = np.asarray(rgba, dtype=np.uint8).reshape(-1)
-            if pix.size < need:
-                raise ValueError(f"camera pixels {pix.size} < expected {need}")
-            rgb = pix[:need].reshape((height, width, 4))[:, :, :3]
-            if ego_cam:
-                rgb = np.ascontiguousarray(rgb[:, ::-1, :])
-            img = PILImage.fromarray(rgb)
-            buf = BytesIO()
-            q = int(np.clip(jpeg_quality, 40, 95))
-            img.save(buf, format="JPEG", quality=q, optimize=True)
-            return base64.b64encode(buf.getvalue()).decode()
+                    ego_cam = False
+                else:
+                    eye, tgt, cup = eg
+                    vm = pb.computeViewMatrix(eye, tgt, cup, physicsClientId=self.client)
+                    ego_cam = True
+                pm = pb.computeProjectionMatrixFOV(
+                    fov=60, aspect=width/height, nearVal=0.1, farVal=15.0,
+                    physicsClientId=self.client)
+                need = width * height * 4
+                rgba = None
+                hwgl = getattr(pb, "ER_BULLET_HARDWARE_OPENGL", None)
+                for renderer in (hwgl, pb.ER_TINY_RENDERER):
+                    if renderer is None:
+                        continue
+                    try:
+                        _, _, rgba_try, _, _ = pb.getCameraImage(
+                            width, height, vm, pm,
+                            renderer=renderer,
+                            physicsClientId=self.client,
+                        )
+                        pix_try = np.asarray(rgba_try, dtype=np.uint8).reshape(-1)
+                        if pix_try.size >= need:
+                            rgba = rgba_try
+                            break
+                    except Exception:
+                        continue
+                if rgba is None:
+                    raise ValueError("getCameraImage: all renderers failed")
+                pix = np.asarray(rgba, dtype=np.uint8).reshape(-1)
+                if pix.size < need:
+                    raise ValueError(f"camera pixels {pix.size} < expected {need}")
+                rgb = pix[:need].reshape((height, width, 4))[:, :, :3]
+                if ego_cam:
+                    rgb = np.ascontiguousarray(rgb[:, ::-1, :])
+                img = PILImage.fromarray(rgb)
+                buf = BytesIO()
+                q = int(np.clip(jpeg_quality, 40, 95))
+                img.save(buf, format="JPEG", quality=q, optimize=True)
+                return base64.b64encode(buf.getvalue()).decode()
         except Exception as e:
             print(f"[HumanoidEnv] Camera error: {e}")
             return None
 
     def __del__(self):
         try:
-            pb.disconnect(self.client)
+            self._stop_physics_bg()
+            with self._physics_lock:
+                pb.disconnect(self.client)
         except Exception:
             pass
 
@@ -1257,8 +1344,12 @@ class EnvironmentHumanoid:
         steps_per_do: int = 12,
         fixed_root: bool = False,
     ):
-        self.device       = device or torch.device("cpu")
-        self.steps_per_do = steps_per_do
+        self.device = device or torch.device("cpu")
+        try:
+            spd = int(os.environ.get("RKK_STEPS_PER_DO", str(steps_per_do)))
+        except ValueError:
+            spd = steps_per_do
+        self.steps_per_do = max(1, min(int(spd), 64))
         self.preset       = self.PRESET
         self.n_interventions = 0
         self._fixed_root  = fixed_root

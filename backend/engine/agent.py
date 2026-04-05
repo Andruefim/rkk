@@ -88,6 +88,14 @@ def _eig_chunk_size() -> int:
         return 256
 
 
+def _score_cache_every() -> int:
+    """Пересчёт score_interventions не чаще чем раз в N тиков движка (RKK_SCORE_CACHE_EVERY; 1 = каждый тик)."""
+    try:
+        return max(1, int(os.environ.get("RKK_SCORE_CACHE_EVERY", "1")))
+    except ValueError:
+        return 1
+
+
 def _imagination_horizon_from_env() -> int:
     """Фаза 13: RKK_IMAGINATION_STEPS — число шагов core(X) после мысленного do(); 0 = как раньше."""
     raw = os.environ.get("RKK_IMAGINATION_STEPS", "2")
@@ -138,6 +146,8 @@ class RKKAgent:
         # Φ других агентов (заполняется Simulation-ом перед step())
         self.other_agents_phi: list[float] = []
         self._last_engine_tick = 0
+        self._score_cache: list[dict] = []
+        self._score_cache_tick: int = -9_999_999
 
         # Фаза 3: LLM-учитель (IG-бонус затухает с числом интервенций)
         self._teacher_rules: list[TeacherIGRule] = []
@@ -460,47 +470,89 @@ class RKKAgent:
             if core.W.grad is not None:
                 g_m = core.W.grad.detach().float().abs().cpu().numpy()
 
-        features_batch: list[list[float]] = []
-        candidates:     list[dict]        = []
+        d = len(var_ids)
+        if d == 0:
+            return []
 
-        for v_from in var_ids:
-            for v_to in var_ids:
-                if v_from == v_to:
-                    continue
+        # Счётчики интервенций по парам (только известные рёбра — O(|E|))
+        ic_mat = np.zeros((d, d), dtype=np.float64)
+        v2i = {v: i for i, v in enumerate(var_ids)}
+        for (vf, vt), c in ic_map.items():
+            i = v2i.get(vf)
+            j = v2i.get(vt)
+            if i is not None and j is not None and i != j:
+                ic_mat[i, j] = float(c)
 
-                ii = nid_to_i.get(v_from)
-                jj = nid_to_i.get(v_to)
-                if W_m is not None and ii is not None and jj is not None:
-                    uncertainty = float(unc_m[ii, jj])
-                    w_ij      = float(W_m[ii, jj])
-                    grad_norm = float(g_m[ii, jj]) if g_m is not None else 0.0
-                else:
-                    uncertainty = 1.0
-                    w_ij = grad_norm = 0.0
+        ridx = np.zeros(d, dtype=np.int64)
+        valid_node = np.zeros(d, dtype=bool)
+        for i, v in enumerate(var_ids):
+            ji = nid_to_i.get(v)
+            if ji is not None:
+                ridx[i] = ji
+                valid_node[i] = True
 
-                alpha    = 1.0 - uncertainty
-                val_from = self.graph.nodes.get(v_from, 0.5)
-                val_to   = self.graph.nodes.get(v_to, 0.5)
-                ic       = ic_map.get((v_from, v_to), 0)
+        nodes_arr = np.array(
+            [float(self.graph.nodes.get(v, 0.5)) for v in var_ids],
+            dtype=np.float64,
+        )
+        mask = ~np.eye(d, dtype=bool)
+        fi, fj = np.where(mask)
+        n_pairs = len(fi)
 
-                feat = self.system1.build_features(
-                    w_ij=w_ij, alpha_ij=alpha,
-                    val_from=val_from, val_to=val_to,
-                    uncertainty=uncertainty, h_W_norm=h_W_norm,
-                    grad_norm_ij=grad_norm,
-                    intervention_count=ic,
-                    discovery_rate=disc_rate,
-                )
-                features_batch.append(feat)
-                # Умеренные интервенции ближе к 0.5 — меньше скачков propagate и entropy (anti-deadlock)
-                candidates.append({
-                    "variable":    v_from,
-                    "target":      v_to,
-                    "value":       float(np.clip(np.random.uniform(0.22, 0.78), 0.06, 0.94)),
-                    "uncertainty": uncertainty,
-                    "features":    feat,
-                    "expected_ig": 0.0,
-                })
+        if W_m is not None:
+            ii_n = ridx[fi]
+            jj_n = ridx[fj]
+            ok = valid_node[fi] & valid_node[fj]
+            w_ij = np.zeros(n_pairs, dtype=np.float64)
+            uncertainty = np.ones(n_pairs, dtype=np.float64)
+            grad_norm = np.zeros(n_pairs, dtype=np.float64)
+            w_ij[ok] = W_m[ii_n[ok], jj_n[ok]]
+            uncertainty[ok] = unc_m[ii_n[ok], jj_n[ok]]
+            if g_m is not None:
+                grad_norm[ok] = g_m[ii_n[ok], jj_n[ok]]
+        else:
+            w_ij = np.zeros(n_pairs, dtype=np.float64)
+            uncertainty = np.ones(n_pairs, dtype=np.float64)
+            grad_norm = np.zeros(n_pairs, dtype=np.float64)
+
+        alpha = 1.0 - uncertainty
+        val_from = nodes_arr[fi]
+        val_to = nodes_arr[fj]
+        ic_v = ic_mat[fi, fj]
+        h_clip = float(np.clip(h_W_norm, 0.0, 1.0))
+        disc_v = float(np.clip(disc_rate, 0.0, 1.0))
+
+        feats_arr = np.column_stack(
+            [
+                np.tanh(w_ij),
+                np.clip(alpha, 0.0, 1.0),
+                np.clip(val_from, 0.0, 1.0),
+                np.clip(val_to, 0.0, 1.0),
+                np.clip(uncertainty, 0.0, 1.0),
+                np.full(n_pairs, h_clip, dtype=np.float64),
+                np.tanh(grad_norm),
+                np.clip(ic_v / 100.0, 0.0, 1.0),
+                np.full(n_pairs, disc_v, dtype=np.float64),
+            ]
+        )
+        features_batch = feats_arr.tolist()
+
+        rng = np.random.default_rng()
+        rand_v = np.clip(rng.uniform(0.22, 0.78, size=n_pairs), 0.06, 0.94)
+        candidates: list[dict] = []
+        for k in range(n_pairs):
+            i, j = int(fi[k]), int(fj[k])
+            vf, vt = var_ids[i], var_ids[j]
+            unc_k = float(uncertainty[k])
+            feat_k = features_batch[k]
+            candidates.append({
+                "variable":    vf,
+                "target":      vt,
+                "value":       float(rand_v[k]),
+                "uncertainty": unc_k,
+                "features":    feat_k,
+                "expected_ig": 0.0,
+            })
 
         if not features_batch:
             return []
@@ -572,7 +624,18 @@ class RKKAgent:
     # ── Один шаг с Value Layer ────────────────────────────────────────────────
     def step(self, engine_tick: int = 0) -> dict:
         self._last_engine_tick = engine_tick
-        scores = self.score_interventions()
+        sce = _score_cache_every()
+        if (
+            sce > 1
+            and self._score_cache
+            and (engine_tick - self._score_cache_tick) < sce
+        ):
+            scores = list(self._score_cache)
+        else:
+            scores = self.score_interventions()
+            if sce > 1:
+                self._score_cache = scores
+                self._score_cache_tick = engine_tick
         gp = self._maybe_goal_planned_candidate()
         if gp is not None and not (
             symbolic_verifier_enabled() and self._symbolic_prediction_bad
