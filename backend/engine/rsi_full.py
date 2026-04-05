@@ -63,14 +63,20 @@ def _migrate_gnn_expand_hidden(old: CausalGNNCore, new_hidden: int) -> CausalGNN
         new.W.copy_(old.W)
 
     def copy_linear(src: nn.Linear, dst: nn.Linear) -> None:
+        """Нельзя dst.weight[s].copy_(…) — это in-place на view nn.Parameter."""
         so, si = src.weight.shape
         do, di = dst.weight.shape
         o_ = min(so, do)
         i_ = min(si, di)
-        dst.weight[:o_, :i_].copy_(src.weight[:o_, :i_])
-        if src.bias is not None and dst.bias is not None:
-            b_ = min(src.bias.shape[0], dst.bias.shape[0])
-            dst.bias[:b_].copy_(src.bias[:b_])
+        with torch.no_grad():
+            w = dst.weight.detach().clone()
+            w[:o_, :i_].copy_(src.weight[:o_, :i_].detach())
+            dst.weight.copy_(w)
+            if src.bias is not None and dst.bias is not None:
+                b_ = min(src.bias.shape[0], dst.bias.shape[0])
+                b = dst.bias.detach().clone()
+                b[:b_].copy_(src.bias[:b_].detach())
+                dst.bias.copy_(b)
 
     # node_enc / action_enc: Linear(1, hidden)
     copy_linear(old.node_enc[0], new.node_enc[0])
@@ -84,20 +90,40 @@ def _migrate_gnn_expand_hidden(old: CausalGNNCore, new_hidden: int) -> CausalGNN
     copy_linear(old.out_dec[0], new.out_dec[0])
     copy_linear(old.out_dec[2], new.out_dec[2])
 
-    # Остальные параметры уже инициализированы Xavier; при nh>oh новые строки — свежие.
+    # Новые строки/столбцы hidden: инициализация только на клоне, затем copy_ в Parameter.
     if nh > oh:
         with torch.no_grad():
+
+            def xavier_rows(p: nn.Parameter, r0: int, r1: int) -> None:
+                w = p.detach().clone()
+                chunk = torch.empty(r1 - r0, w.shape[1], device=w.device, dtype=w.dtype)
+                nn.init.xavier_uniform_(chunk, gain=0.5)
+                w[r0:r1, :] = chunk
+                p.copy_(w)
+
+            def xavier_cols(p: nn.Parameter, c0: int, c1: int) -> None:
+                w = p.detach().clone()
+                chunk = torch.empty(w.shape[0], c1 - c0, device=w.device, dtype=w.dtype)
+                nn.init.xavier_uniform_(chunk, gain=0.5)
+                w[:, c0:c1] = chunk
+                p.copy_(w)
+
+            def zero_bias_rows(p: nn.Parameter, r0: int, r1: int) -> None:
+                b = p.detach().clone()
+                b[r0:r1] = 0.0
+                p.copy_(b)
+
             for seq in (new.node_enc, new.action_enc):
-                nn.init.xavier_uniform_(seq[0].weight[oh:nh], gain=0.5)
-                nn.init.zeros_(seq[0].bias[oh:nh])
-            nn.init.xavier_uniform_(new.msg_fn[0].weight[oh:nh], gain=0.5)
-            nn.init.zeros_(new.msg_fn[0].bias[oh:nh])
-            nn.init.xavier_uniform_(new.msg_fn[2].weight[oh:nh, :], gain=0.5)
-            nn.init.xavier_uniform_(new.msg_fn[2].weight[:, oh:nh], gain=0.5)
-            nn.init.zeros_(new.msg_fn[2].bias[oh:nh])
-            nn.init.xavier_uniform_(new.out_dec[0].weight[oh:nh], gain=0.5)
-            nn.init.zeros_(new.out_dec[0].bias[oh:nh])
-            nn.init.xavier_uniform_(new.out_dec[2].weight[:, oh:nh], gain=0.5)
+                xavier_rows(seq[0].weight, oh, nh)
+                zero_bias_rows(seq[0].bias, oh, nh)
+            xavier_rows(new.msg_fn[0].weight, oh, nh)
+            zero_bias_rows(new.msg_fn[0].bias, oh, nh)
+            xavier_rows(new.msg_fn[2].weight, oh, nh)
+            xavier_cols(new.msg_fn[2].weight, oh, nh)
+            zero_bias_rows(new.msg_fn[2].bias, oh, nh)
+            xavier_rows(new.out_dec[0].weight, oh, nh)
+            zero_bias_rows(new.out_dec[0].bias, oh, nh)
+            xavier_cols(new.out_dec[2].weight, oh, nh)
 
     return new
 
@@ -225,8 +251,11 @@ class RSIController:
         pb = float(_env_float("RKK_RSI_FULL_CPG_PHASE_NOISE", 0.3))
         fq = float(_env_float("RKK_RSI_FULL_CPG_FREQ_NOISE", 0.1))
         with torch.no_grad():
-            cpg.phase_bias.add_(torch.randn_like(cpg.phase_bias) * pb)
-            cpg.frequency.add_(torch.randn_like(cpg.frequency) * fq)
+            # add_ на Parameter допустим, но при torch.compile/обёртках безопаснее copy_.
+            p = cpg.phase_bias
+            f = cpg.frequency
+            cpg.phase_bias.copy_(p.detach() + torch.randn_like(p) * pb)
+            cpg.frequency.copy_(f.detach() + torch.randn_like(f) * fq)
 
     def tick(
         self,

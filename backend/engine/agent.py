@@ -14,6 +14,8 @@ agent_v4.py — RKKAgent с Value Layer (Шаг А).
   байесовский H(W)−E[H(W|obs)]). RKK_EIG_ENTROPY_TERM, RKK_EIG_POSTERIOR_ETA.
   Переключатель: RKK_HYPOTHESIS_EIG=1 (по умолчанию) | 0 | system1 | off | false
   В snapshot: h_W_edge_entropy — сумма бинарных энтропий по α_trust рёбер (диагностика неопределённости W).
+  RKK_SCORE_ASYNC=1: score_interventions в фоновом daemon-потоке (тик не ждёт; возможна гонка с train_step — не рекомендуется).
+  По умолчанию RKK_SCORE_ASYNC=0 — синхронный пересчёт в главном потоке (стабильно, без общего lock на граф).
 
 Этап Г (самомодель): self_* + update_self_feedback() в humanoid — коррекция намерений по исходу do()
   и по промаху GNN (RKK_SELF_FEEDBACK_LR).
@@ -30,6 +32,7 @@ agent_v4.py — RKKAgent с Value Layer (Шаг А).
 from __future__ import annotations
 
 import os
+import threading
 import torch
 import numpy as np
 from collections import deque
@@ -96,6 +99,12 @@ def _score_cache_every() -> int:
         return 1
 
 
+def _score_async_enabled() -> bool:
+    """Фоновый поток для score_interventions; по умолчанию выкл. (лок на весь WM давал рывки UI)."""
+    v = os.environ.get("RKK_SCORE_ASYNC", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def _imagination_horizon_from_env() -> int:
     """Фаза 13: RKK_IMAGINATION_STEPS — число шагов core(X) после мысленного do(); 0 = как раньше."""
     raw = os.environ.get("RKK_IMAGINATION_STEPS", "2")
@@ -148,6 +157,9 @@ class RKKAgent:
         self._last_engine_tick = 0
         self._score_cache: list[dict] = []
         self._score_cache_tick: int = -9_999_999
+        self._score_thread: threading.Thread | None = None
+        self._score_result: list[dict] = []
+        self._score_lock = threading.Lock()
 
         # Фаза 3: LLM-учитель (IG-бонус затухает с числом интервенций)
         self._teacher_rules: list[TeacherIGRule] = []
@@ -597,6 +609,15 @@ class RKKAgent:
 
         return sorted(candidates, key=lambda x: -x["expected_ig"])
 
+    def _score_async_worker(self) -> None:
+        try:
+            with torch.no_grad():
+                result = self.score_interventions()
+            with self._score_lock:
+                self._score_result = result
+        except Exception as ex:
+            print(f"[RKKAgent] score_interventions (async): {ex}")
+
     def set_teacher_state(self, rules: list[TeacherIGRule], weight: float) -> None:
         """Фаза 3: правила от LLM и текущий teacher_weight (симуляция считает annealing)."""
         self._teacher_rules = list(rules)
@@ -631,10 +652,33 @@ class RKKAgent:
             and (engine_tick - self._score_cache_tick) < sce
         ):
             scores = list(self._score_cache)
-        else:
-            scores = self.score_interventions()
+        elif _score_async_enabled():
+            if self._score_thread is None or not self._score_thread.is_alive():
+                self._score_thread = threading.Thread(
+                    target=self._score_async_worker,
+                    name="rkk_score_interventions",
+                    daemon=True,
+                )
+                self._score_thread.start()
+            with self._score_lock:
+                have = list(self._score_result) if self._score_result else []
+            if have:
+                scores = have
+            elif self._score_cache:
+                scores = list(self._score_cache)
+            else:
+                with torch.no_grad():
+                    scores = self.score_interventions()
+                with self._score_lock:
+                    self._score_result = list(scores)
             if sce > 1:
-                self._score_cache = scores
+                self._score_cache = list(scores)
+                self._score_cache_tick = engine_tick
+        else:
+            with torch.no_grad():
+                scores = self.score_interventions()
+            if sce > 1:
+                self._score_cache = list(scores)
                 self._score_cache_tick = engine_tick
         gp = self._maybe_goal_planned_candidate()
         if gp is not None and not (
@@ -833,14 +877,17 @@ class RKKAgent:
         if self.graph._core is None:
             return "no core"
         with torch.no_grad():
-            W   = self.graph._core.W
+            W = self.graph._core.W
             sig = (W.abs() > 0.05).nonzero(as_tuple=False)
             if len(sig) == 0:
                 return "no significant edges"
-            idx  = sig[np.random.randint(len(sig))]
+            idx = sig[np.random.randint(len(sig))]
             i, j = idx[0].item(), idx[1].item()
             noise = (np.random.rand() - 0.5) * 0.3
-            W[i, j] += noise
+            # Нельзя W[i,j] += … — это in-place на view листа с requires_grad.
+            w_new = W.detach().clone()
+            w_new[i, j] = w_new[i, j] + float(noise)
+            W.copy_(w_new)
             fn = self.graph._node_ids[i] if i < len(self.graph._node_ids) else f"v{i}"
             tn = self.graph._node_ids[j] if j < len(self.graph._node_ids) else f"v{j}"
         self.graph._invalidate_cache()

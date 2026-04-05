@@ -207,8 +207,10 @@ class CausalGNNCore(nn.Module):
         old_d = self.d
 
         with torch.no_grad():
-            # Переносим W для уже известных узлов
-            new_core.W[:old_d, :old_d] = self.W.detach()
+            # Нельзя W[slice]=… на nn.Parameter — только через клон + copy_.
+            w = new_core.W.detach().clone()
+            w[:old_d, :old_d] = self.W.detach()
+            new_core.W.copy_(w)
 
         # Переносим обученные MLP (архитектура не изменилась)
         new_core.node_enc.load_state_dict(self.node_enc.state_dict())

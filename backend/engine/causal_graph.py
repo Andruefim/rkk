@@ -178,7 +178,10 @@ class CausalGraph:
         if old_W is not None:
             old_d = old_W.shape[0]
             with torch.no_grad():
-                self._core.W[:old_d, :old_d] = old_W
+                W = self._core.W
+                w = W.detach().clone()
+                w[:old_d, :old_d] = old_W.to(w.device, dtype=w.dtype)
+                W.copy_(w)
 
         if USE_GNN:
             self._maybe_compile_gnn_core()
@@ -294,8 +297,11 @@ class CausalGraph:
             return
         i, j = self._node_ids.index(from_), self._node_ids.index(to)
         with torch.no_grad():
-            old_w = self._core.W[i, j].item()
-            self._core.W[i, j] = 0.7 * old_w + 0.3 * weight
+            W = self._core.W
+            w = W.detach().clone()
+            old_w = float(w[i, j].item())
+            w[i, j] = 0.7 * old_w + 0.3 * float(weight)
+            W.copy_(w)
         self._invalidate_cache()
 
     def remove_edge(self, from_: str, to: str) -> None:
@@ -303,7 +309,10 @@ class CausalGraph:
             return
         i, j = self._node_ids.index(from_), self._node_ids.index(to)
         with torch.no_grad():
-            self._core.W[i, j] = 0.0
+            W = self._core.W
+            w = W.detach().clone()
+            w[i, j] = 0.0
+            W.copy_(w)
         self._invalidate_cache()
 
     @property
