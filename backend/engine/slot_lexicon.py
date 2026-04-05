@@ -12,6 +12,12 @@ from typing import Any
 
 import httpx
 
+from engine.llm_json_extract import (
+    ollama_json_format_teacher_vlm_payload,
+    parse_json_object_loose,
+    scan_json_objects_having_any_key,
+)
+
 
 def frame_content_hash(frame_b64: str | None) -> str:
     if not frame_b64:
@@ -64,23 +70,6 @@ def normalize_phys_target(name: str, allowed: set[str]) -> str | None:
     if cand in allowed:
         return cand
     return None
-
-
-def _parse_json_object(raw: str) -> dict[str, Any] | None:
-    dec = json.JSONDecoder()
-    i = 0
-    while True:
-        j = raw.find("{", i)
-        if j < 0:
-            return None
-        try:
-            obj, _end = dec.raw_decode(raw, j)
-        except json.JSONDecodeError:
-            i = j + 1
-            continue
-        if isinstance(obj, dict):
-            return obj
-        i = j + 1
 
 
 def validate_slot_labels(
@@ -175,7 +164,8 @@ async def _ollama_chat_multimodal(
         "model": model,
         "messages": [{"role": "user", "content": prompt, "images": images_b64}],
         "stream": False,
-        "options": {"temperature": 0.2},
+        "options": {"temperature": 0.2, "num_predict": 2400},
+        **ollama_json_format_teacher_vlm_payload(),
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(chat_url, json=payload)
@@ -196,7 +186,8 @@ async def _ollama_generate_text(
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 1400},
+        "options": {"temperature": 0.2, "num_predict": 2200},
+        **ollama_json_format_teacher_vlm_payload(),
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(generate_url, json=payload)
@@ -237,13 +228,23 @@ async def run_slot_vlm_labeling(
     gen_url = ollama_generate_url(llm_url)
     chat_url = ollama_chat_url(gen_url)
 
+    slot_key_set = set(slot_ids)
+
     def _finalize(raw_text: str) -> tuple[dict[str, dict[str, Any]], str | None]:
-        obj = _parse_json_object(raw_text)
+        obj = parse_json_object_loose(raw_text)
+        if not obj or not (slot_key_set & obj.keys()):
+            alt = scan_json_objects_having_any_key(raw_text, slot_key_set)
+            if alt:
+                obj = alt
         if not obj:
             return {}, "no JSON object in model response"
         validated = validate_slot_labels(obj, slot_ids, allowed)
         if not validated:
-            return {}, "no valid slot entries after validation"
+            alt = scan_json_objects_having_any_key(raw_text, slot_key_set)
+            if alt is not None and alt is not obj:
+                validated = validate_slot_labels(alt, slot_ids, allowed)
+            if not validated:
+                return {}, "no valid slot entries after validation"
         return validated, None
 
     if not text_only and frame_b64:

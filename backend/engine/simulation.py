@@ -27,8 +27,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from engine.agent       import RKKAgent
 from engine.demon       import AdversarialDemon
-from engine.value_layer import HomeostaticBounds
 from engine.environment import Environment
+from engine.ollama_env  import get_ollama_generate_url, get_ollama_model
+from engine.value_layer import HomeostaticBounds
 
 PHASE_THRESHOLDS = [0.0, 0.15, 0.30, 0.50, 0.70, 0.88]
 PHASE_HOLD_TICKS = 12
@@ -653,8 +654,8 @@ class Simulation:
             "cf_observed": result.get("cf_observed") or {},
             "slot_lexicon": _slot_lexicon_summary(self._visual_env),
             "run_level3": self._should_run_level3(triggers),
-            "llm_url": os.environ.get("RKK_OLLAMA_URL", "http://localhost:11434/api/generate"),
-            "llm_model": os.environ.get("RKK_OLLAMA_MODEL", "gemma4:e4b"),
+            "llm_url": get_ollama_generate_url(),
+            "llm_model": get_ollama_model(),
         }
 
         self._llm_loop_executor.submit(self._llm_bundle_worker, ctx)
@@ -975,8 +976,8 @@ class Simulation:
             _slot_lexicon_summary,
         )
 
-        llm_url = os.environ.get("RKK_OLLAMA_URL", "http://localhost:11434/api/generate")
-        model = os.environ.get("RKK_OLLAMA_MODEL", "gemma4:e4b")
+        llm_url = get_ollama_generate_url()
+        model = get_ollama_model()
         agent = self.agent
         valid = set(agent.graph.nodes.keys())
         if not valid:

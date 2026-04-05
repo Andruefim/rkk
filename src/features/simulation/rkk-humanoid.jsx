@@ -197,8 +197,7 @@ export default function RKKHumanoid() {
     try {
       const d = await fetch(`${API}/vision/vlm-label`,{method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({llm_url:"http://localhost:11434/api/generate",
-          llm_model:"gemma4:e4b",max_mask_images:4,text_only:false,
+        body:JSON.stringify({max_mask_images:4,text_only:false,
           inject_weak_edges:vlmWeakEdges})}).then(r=>r.json());
       if (d.ok) {
         setStatus(`🔬 VLM ${d.mode}: ${d.n_slots_labeled} labels${d.warning?` (${d.warning})`:""}`);

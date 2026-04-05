@@ -1,7 +1,8 @@
 """
 Фаза 3 — виртуальный учитель: LLM → правила для System1 (IG-бонус) + мягкие дельты Value Layer.
 
-Один вызов Ollama /api/generate, строгий JSON. Дельты VL накладываются с TTL тиков и клипами в value_layer.merge_teacher_vl.
+Один вызов Ollama /api/generate; разбор через llm_json_extract + поиск объекта с ig_rules/vl_overlay.
+По умолчанию без format=json (RKK_OLLAMA_JSON_FORMAT_TEACHER_VLM). Дельты VL — merge_teacher_vl.
 """
 from __future__ import annotations
 
@@ -11,6 +12,11 @@ from typing import Any
 
 import httpx
 
+from engine.llm_json_extract import (
+    ollama_json_format_teacher_vlm_payload,
+    parse_json_object_loose,
+    scan_json_objects_having_any_key,
+)
 from engine.value_layer import TeacherVLOverlay
 
 
@@ -23,23 +29,6 @@ class TeacherIGRule:
     when_min: float | None
     when_max: float | None
     bonus: float
-
-
-def _parse_json_object(raw: str) -> dict[str, Any] | None:
-    dec = json.JSONDecoder()
-    i = 0
-    while True:
-        j = raw.find("{", i)
-        if j < 0:
-            return None
-        try:
-            obj, _end = dec.raw_decode(raw, j)
-        except json.JSONDecodeError:
-            i = j + 1
-            continue
-        if isinstance(obj, dict):
-            return obj
-        i = j + 1
 
 
 def _slot_lexicon_summary(visual_env) -> str:
@@ -96,7 +85,7 @@ def build_phase3_prompt(digest: str) -> str:
 
 {digest}
 
-Return ONLY a JSON object with this shape (no markdown):
+Return valid JSON only (one object, no markdown). Shape:
 {{
   "ig_rules": [
     {{
@@ -125,13 +114,29 @@ Rules:
 - when_var null means rule always applies to target_var (use sparingly, low bonus).
 - vl_overlay: mild adjustments only; ttl_ticks reasonable for early training help."""
 
+_PHASE3_ROOT_KEYS = frozenset({"ig_rules", "vl_overlay"})
+
+
+def _phase3_parsed_root_usable(obj: dict[str, Any] | None) -> bool:
+    if not isinstance(obj, dict) or not obj:
+        return False
+    if "@rev" in obj:
+        return False
+    if "ig_rules" in obj or "vl_overlay" in obj:
+        return True
+    if obj.get("type") == "object" and "properties" in obj:
+        return False
+    return False
+
 
 def parse_phase3_response(
     raw_text: str,
     valid_vars: set[str],
     current_tick: int,
 ) -> tuple[list[TeacherIGRule], TeacherVLOverlay | None]:
-    obj = _parse_json_object(raw_text)
+    obj = parse_json_object_loose(raw_text)
+    if not _phase3_parsed_root_usable(obj):
+        obj = scan_json_objects_having_any_key(raw_text, set(_PHASE3_ROOT_KEYS))
     if not obj:
         return [], None
 
@@ -217,7 +222,8 @@ async def fetch_phase3_teacher_bundle(
         "model": llm_model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.18, "num_predict": 1600},
+        "options": {"temperature": 0.18, "num_predict": 2400},
+        **ollama_json_format_teacher_vlm_payload(),
     }
     url = llm_url.strip().rstrip("/")
     if not url.endswith("/generate"):
@@ -237,7 +243,8 @@ async def fetch_phase3_teacher_bundle(
 
     rules, ov = parse_phase3_response(raw, valid_vars, current_tick)
     if not rules and ov is None:
-        return [], None, "no parseable ig_rules/vl_overlay"
+        tail = (raw[-400:] if raw else "").replace("\n", " ")
+        return [], None, f"no parseable ig_rules/vl_overlay; response_tail={tail!r}"
     return rules, ov, None
 
 

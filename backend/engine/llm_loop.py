@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from engine.llm_json_extract import ollama_json_format_payload, parse_json_object_loose
 from engine.rag_seeder import (
     _dedupe_cap_edges,
     _parse_json_array_from_llm_text,
@@ -28,23 +29,6 @@ def _normalize_generate_url(llm_url: str) -> str:
     if "/api/" not in url:
         return url + "/api/generate"
     return url.rsplit("/", 1)[0] + "/generate"
-
-
-def _parse_json_object(raw: str) -> dict[str, Any] | None:
-    dec = json.JSONDecoder()
-    i = 0
-    while True:
-        j = raw.find("{", i)
-        if j < 0:
-            return None
-        try:
-            obj, _end = dec.raw_decode(raw, j)
-        except json.JSONDecodeError:
-            i = j + 1
-            continue
-        if isinstance(obj, dict):
-            return obj
-        i = j + 1
 
 
 def build_counterfactual_prompt(ctx: dict[str, Any]) -> str:
@@ -106,7 +90,7 @@ def parse_counterfactual_response(
     Returns (explanation, edges_for_inject, next_probe).
     edges_for_inject: dicts with from_, to, weight (scaled for inject_text_priors).
     """
-    obj = _parse_json_object(raw_text.strip())
+    obj = parse_json_object_loose(raw_text)
     if not obj:
         return "", [], ""
     expl = str(obj.get("explanation", "")).strip()[:1200]
@@ -149,6 +133,7 @@ def consult_counterfactual_sync(
             "temperature": float(os.environ.get("RKK_LLM_LOOP_TEMP", "0.22")),
             "num_predict": int(os.environ.get("RKK_LLM_LEVEL2_NUM_PREDICT", "1800")),
         },
+        **ollama_json_format_payload(),
     }
     with httpx.Client(timeout=timeout) as client:
         resp = client.post(url, json=payload)
@@ -179,16 +164,14 @@ Variables (use EXACT strings for from_ and to):
 URDF / kinematic hint (names for intuition only):
 {digest}
 
-Task: Output ONLY a JSON array of directed edges to refresh exploration priors (not final truth).
+Task: Output directed edges to refresh exploration priors (not final truth).
 Include self_* intention nodes if present in the variable list, linked to shoulders/cubes where plausible.
 
-Format:
-[{{"from_":"lshoulder","to":"cube0_x","weight":0.25}},...]
+Valid JSON only: either a JSON array of edges, or {{"edges":[...]}} with the same elements.
 
 Rules:
 - 12–28 edges, diverse, no self-loops, from_/to must appear in the variable list.
-- weight in [-1,1].
-- Output ONLY the JSON array. No markdown."""
+- weight in [-1,1]."""
 
 
 def structure_revision_sync(
@@ -205,6 +188,7 @@ def structure_revision_sync(
         "prompt": prompt,
         "stream": False,
         "options": {"temperature": 0.14, "num_predict": 2600},
+        **ollama_json_format_payload(),
     }
     valid = set(var_names)
     with httpx.Client(timeout=timeout) as client:

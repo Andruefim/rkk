@@ -36,8 +36,9 @@ from typing import Literal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from engine.ollama_env import get_ollama_generate_url, get_ollama_model
 from engine.simulation import Simulation
 from engine.rag_seeder import RAGSeeder, HARDCODED_SEEDS
 
@@ -60,8 +61,8 @@ def get_seeder() -> RAGSeeder:
     global _seeder
     if _seeder is None:
         _seeder = RAGSeeder(
-            llm_url="http://localhost:11434/api/generate",
-            llm_model="gemma4:e4b"
+            llm_url=get_ollama_generate_url(),
+            llm_model=get_ollama_model(),
         )
     return _seeder
 
@@ -74,7 +75,7 @@ async def _startup_humanoid_llm_bootstrap() -> None:
     """
     После старта сервера: humanoid_structured через Ollama (как POST /bootstrap/llm).
     Отключение: RKK_SKIP_AUTO_HUMANOID_LLM=1
-    URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL
+    URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL (или OLLAMA_MODEL) — см. engine/ollama_env.py
     """
     skip = os.environ.get("RKK_SKIP_AUTO_HUMANOID_LLM", "").strip().lower()
     if skip in ("1", "true", "yes", "on"):
@@ -87,8 +88,8 @@ async def _startup_humanoid_llm_bootstrap() -> None:
         ctx = sim.agent_seed_context(0)
         if not ctx:
             return
-        llm_url = os.environ.get("RKK_OLLAMA_URL", "http://localhost:11434/api/generate")
-        model = os.environ.get("RKK_OLLAMA_MODEL", "gemma4:e4b")
+        llm_url = get_ollama_generate_url()
+        model = get_ollama_model()
         try:
             max_h = int(os.environ.get("RKK_HUMANOID_LLM_MAX_HYPOTHESES", "28"))
         except ValueError:
@@ -158,8 +159,8 @@ async def _startup_auto_vision_and_one_vlm() -> None:
             print("[RKK] Auto VLM bootstrap skipped (RKK_SKIP_AUTO_VLM_BOOTSTRAP)")
             return
 
-        llm_url = os.environ.get("RKK_OLLAMA_URL", "http://localhost:11434/api/generate")
-        model = os.environ.get("RKK_OLLAMA_MODEL", "gemma4:e4b")
+        llm_url = get_ollama_generate_url()
+        model = get_ollama_model()
         try:
             max_masks = int(os.environ.get("RKK_AUTO_VLM_MAX_MASKS", "4"))
         except ValueError:
@@ -363,8 +364,8 @@ class LLMBootstrapRequest(BaseModel):
     world:          str | None = None
     mode:           Literal["rag_wiki", "humanoid_structured"] = "humanoid_structured"
     max_hypotheses: int        = 28
-    llm_model:      str        = "gemma4:e4b"
-    llm_url:        str        = "http://localhost:11434/api/generate"
+    llm_model:      str        = Field(default_factory=get_ollama_model)
+    llm_url:        str        = Field(default_factory=get_ollama_generate_url)
 
 @app.post("/bootstrap/llm")
 async def bootstrap_llm(req: LLMBootstrapRequest):
@@ -482,8 +483,8 @@ class VisionEnableRequest(BaseModel):
 
 class VisionVLMRequest(BaseModel):
     """Фаза 2: разметка slot_k через Ollama (/api/chat + images или текстовый fallback)."""
-    llm_url: str = "http://localhost:11434/api/generate"
-    llm_model: str = "gemma4:e4b"
+    llm_url: str = Field(default_factory=get_ollama_generate_url)
+    llm_model: str = Field(default_factory=get_ollama_model)
     max_mask_images: int = 4
     text_only: bool = False
     inject_weak_edges: bool = False

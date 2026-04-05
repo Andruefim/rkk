@@ -16,7 +16,8 @@ PowerShell (из каталога репозитория rkk):
   Зрение да, без авто-VLM: RKK_SKIP_AUTO_VLM_BOOTSTRAP=1
   Слоты/режим: RKK_AUTO_VISION_N_SLOTS=8, RKK_AUTO_VISION_MODE=hybrid
   VLM как в UI: RKK_AUTO_VLM_WEAK_EDGES=1, RKK_AUTO_VLM_TEXT_ONLY=1, RKK_AUTO_VLM_MAX_MASKS=4
-  URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL
+  URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL (или OLLAMA_MODEL) — один раз в корневом .env
+  Парсинг JSON: RKK_OLLAMA_JSON_FORMAT (bootstrap/LLM loop); Phase3/VLM — RKK_OLLAMA_JSON_FORMAT_TEACHER_VLM (по умолч. без format=json).
 
 Фаза 3 (после VLM): LLM-учитель для System1 + мягкий VL-overlay (TTL).
   Отключить авто: RKK_SKIP_PHASE3_LLM=1

@@ -16,7 +16,7 @@ rag_seeder.py — RAG Pipeline для генерации каузальных se
 
 Поддерживаемые backends:
   - "wikipedia" : Wikipedia REST API (бесплатно, без LLM)
-  - "ollama"    : локальная LLM через Ollama (gemma4:e4b и т.д.)
+  - "ollama"    : локальная LLM через Ollama (имя модели: RKK_OLLAMA_MODEL в .env)
   - "openai"    : OpenAI-compatible API
 """
 from __future__ import annotations
@@ -29,6 +29,9 @@ import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+
+from engine.llm_json_extract import ollama_json_format_payload, parse_json_array_loose
+from engine.ollama_env import get_ollama_model
 
 
 # ─── Causal edge из RAG ───────────────────────────────────────────────────────
@@ -195,7 +198,7 @@ async def extract_via_llm(
     text:     str,
     var_names: list[str],
     llm_url:  str,
-    model:    str = "gemma4:e4b",
+    model:    str | None = None,
 ) -> list[tuple[str, str, float]]:
     """
     Используем LLM (Ollama/OpenAI-compatible) для извлечения каузальных пар.
@@ -217,6 +220,7 @@ Rules:
 - weight: positive = increases, negative = decreases, range [-1, 1]
 - Include only edges you are confident about
 - Output ONLY the JSON array, no other text"""
+    model = (model or "").strip() or get_ollama_model()
 
     payload = {
         "model": model,
@@ -270,24 +274,8 @@ def humanoid_urdf_digest(max_chars: int = 2800) -> str:
 
 
 def _parse_json_array_from_llm_text(raw: str) -> list | None:
-    """
-    Первый валидный JSON-массив в ответе модели (без жадного regex на весь текст).
-    Перебирает позиции '[' до успешного json.JSONDecoder.raw_decode.
-    """
-    dec = json.JSONDecoder()
-    i = 0
-    while True:
-        j = raw.find("[", i)
-        if j < 0:
-            return None
-        try:
-            obj, _end = dec.raw_decode(raw, j)
-        except json.JSONDecodeError:
-            i = j + 1
-            continue
-        if isinstance(obj, list):
-            return obj
-        i = j + 1
+    """См. engine.llm_json_extract — фенсы, object.edges, хвостовые запятые."""
+    return parse_json_array_loose(raw)
 
 
 def _dedupe_cap_edges(
@@ -319,12 +307,13 @@ def _dedupe_cap_edges(
 async def extract_humanoid_structured_via_llm(
     var_names: list[str],
     llm_url: str,
-    model: str = "gemma4:e4b",
+    model: str | None = None,
     urdf_digest: str | None = None,
 ) -> list[tuple[str, str, float]]:
     """
     Один вызов LLM: каузальный граф по списку переменных + дайджест URDF.
     """
+    model = (model or "").strip() or get_ollama_model()
     digest = urdf_digest if urdf_digest is not None else humanoid_urdf_digest()
     var_json = json.dumps(var_names, ensure_ascii=False)
     slot_hint = ""
@@ -341,24 +330,27 @@ The agent observes ONLY these variable ids (use EXACT strings for from_ and to, 
 Robot kinematic names from URDF (for intuition; edges must still use the variable list above):
 {digest}
 
-Task: Output ONLY a JSON array of directed causal hypotheses for exploration.
+Task: Output directed causal hypotheses for exploration.
 Cover: leg joints affecting com_x, com_y, com_z, lfoot_z, rfoot_z; knees and feet; spine/torso and balance;
 arms and cube interaction (cube0_x, cube1_y, etc.) where plausible.
 
-Format (example shape only — use real variable names from the list):
-[{{"from_":"lhip","to":"com_x","weight":0.25}},{{"from_":"lknee","to":"lfoot_z","weight":0.3}}]
+Return valid JSON only (no markdown). Either:
+  (A) a JSON array of edges, OR
+  (B) one object: {{"edges":[...]}} with the same elements.
+
+Each element: {{"from_":"lhip","to":"com_x","weight":0.25}} — use real names from the variable list.
 
 Rules:
 - from_ and to MUST be copied exactly from the JSON variable list (same spelling).
 - weight in [-1, 1]; sign = direction of positive association in normalized observation space.
-- 14 to 28 edges, diverse sources, no self-loops.
-- Output ONLY the JSON array. No markdown, no commentary."""
+- 14 to 28 edges, diverse sources, no self-loops."""
 
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.15, "num_predict": 2500},
+        "options": {"temperature": 0.15, "num_predict": 3200},
+        **ollama_json_format_payload(),
     }
 
     async with httpx.AsyncClient(timeout=120.0) as client:
@@ -411,11 +403,11 @@ class RAGSeeder:
     def __init__(
         self,
         llm_url:  str | None = None,   # None = только regex (без LLM)
-        llm_model: str = "gemma4:e4b",
+        llm_model: str | None = None,
         backend: Literal["wikipedia", "ollama", "openai"] = "wikipedia",
     ):
         self.llm_url   = llm_url
-        self.llm_model = llm_model
+        self.llm_model = (llm_model or "").strip() or get_ollama_model()
         self.backend   = backend
 
         # Темы поиска для каждой среды
