@@ -332,22 +332,32 @@ class EnvironmentVisual:
         return ids
 
     # ── do() ──────────────────────────────────────────────────────────────────
-    def intervene(self, variable: str, value: float) -> dict[str, float]:
+    def intervene(
+        self, variable: str, value: float, *, count_intervention: bool = True
+    ) -> dict[str, float]:
         """
         Интервенция через физику; полный камера+encode — раз в VISION_ENCODE_EVERY шагов.
 
         Slot → physical action mapping:
           "slot_K" → маппим на ближайший joint base_env по вариабельности
+        count_intervention=False — Phase B skills: не увеличивать счётчик интервенций.
         """
-        self.n_interventions += 1
+        if count_intervention:
+            self.n_interventions += 1
         frame_before = self._last_frame
+
+        def _base_iv(v: str, x: float) -> None:
+            try:
+                self.base_env.intervene(v, x, count_intervention=count_intervention)
+            except TypeError:
+                self.base_env.intervene(v, x)
 
         # Маппинг слота на физическое действие
         if variable.startswith("slot_"):
             slot_idx = int(variable.split("_")[1])
             phys_var = self._slot_to_physical(slot_idx, value)
             if phys_var is not None:
-                self.base_env.intervene(phys_var, value)
+                _base_iv(phys_var, value)
             else:
                 # Нет маппинга — шагаем физику без воздействия
                 step_fn = getattr(self.base_env, "_sim", None)
@@ -356,9 +366,9 @@ class EnvironmentVisual:
         elif variable.startswith("phys_"):
             # Hybrid mode: прямое воздействие на физическую переменную
             phys_key = variable[5:]
-            self.base_env.intervene(phys_key, value)
+            _base_iv(phys_key, value)
         else:
-            self.base_env.intervene(variable, value)
+            _base_iv(variable, value)
 
         self._vision_stride_counter += 1
         run_encode = (self._vision_stride_counter % VISION_ENCODE_EVERY == 1)

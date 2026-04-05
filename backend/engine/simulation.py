@@ -12,6 +12,17 @@ simulation_singleton_v2.py — Singleton AGI с гуманоидом (Фаза 1
   - refresh_phase3_teacher_llm(): LLM → правила IG + VL overlay (TTL)
   - tick_step: teacher_weight annealing (RKK_TEACHER_T_MAX), overlay на ValueLayer
 
+Phase A (locomotion):
+  - RKK_LOCOMOTION_CPG=1: CPG ноги после do() на humanoid без fixed_root (engine.cpg_locomotion).
+
+Phase B (hierarchy):
+  - L3 goal_planning (agent), L2 skill_library, L1 CPG, L0 PyBullet.
+  - RKK_SKILL_LIBRARY=1: моторная последовательность из библиотеки (тик = один кадр skill).
+
+Phase C (full RSI):
+  - RKK_RSI_FULL=1: engine.rsi_full — плато discovery → расширение GNN hidden; плато loco → CPG noise;
+    плато walk skills → harder variants; падение phi → временное смягчение VL bounds.
+
 Этап D (LLM в петле, RKK_LLM_LOOP=1):
   Уровень 1: каждый тик — GNN + System1 (как раньше).
   Уровень 2: фоновый Ollama по триггерам (стагнация discovery, block_rate, VLM unknown, surprise PE).
@@ -210,12 +221,19 @@ class Simulation:
         self._last_dr_gain_tick = 0
         self._rolling_block_bits: deque[int] = deque(maxlen=80)
         self._pe_history: deque[float] = deque(maxlen=200)
+        # Phase A: CPG locomotion (humanoid, не fixed_root)
+        self._locomotion_controller = None
+        # Phase B: skill library (L2), один кадр последовательности за тик
+        self._skill_library = None
+        self._skill_exec: dict | None = None
         self._llm_loop_stats: dict = {
             "level2_runs": 0,
             "level3_runs": 0,
             "last_triggers": [],
             "last_level2_explanation": "",
         }
+        # Phase C: full RSI (GNN NAS-lite, CPG perturb, skill curriculum, VL relax)
+        self._rsi_full = None
 
     # ── World switch ──────────────────────────────────────────────────────────
     def switch_world(self, new_world: str) -> dict:
@@ -230,6 +248,10 @@ class Simulation:
         result = self.switcher.switch(new_world)
         if result.get("switched"):
             self.current_world = new_world
+            self._locomotion_controller = None
+            self._skill_library = None
+            self._skill_exec = None
+            self._rsi_full = None
             self._fixed_root_active = False
             self._phase3_teacher_rules = []
             self._phase3_vl_overlay = None
@@ -687,6 +709,195 @@ class Simulation:
         finally:
             self._llm_level2_inflight = False
 
+    @staticmethod
+    def _unwrap_base_env(env):
+        e = env
+        while hasattr(e, "base_env"):
+            e = e.base_env
+        return e
+
+    def _locomotion_cpg_enabled(self) -> bool:
+        v = os.environ.get("RKK_LOCOMOTION_CPG", "0").strip().lower()
+        return v in ("1", "true", "yes", "on")
+
+    def _maybe_apply_cpg_locomotion(self, fallen: bool) -> None:
+        """Phase A: CPG шаг ног после do() агента; reward обучает CPG отдельно от GNN."""
+        if not self._locomotion_cpg_enabled():
+            return
+        if self.current_world != "humanoid" or self._fixed_root_active:
+            return
+        base = self._unwrap_base_env(self.agent.env)
+        fn = getattr(base, "apply_cpg_leg_targets", None)
+        if not callable(fn):
+            return
+        if self._locomotion_controller is None:
+            from engine.cpg_locomotion import LocomotionController
+
+            self._locomotion_controller = LocomotionController(self.device)
+        try:
+            nodes = dict(self.agent.graph.nodes)
+            targets = self._locomotion_controller.get_joint_targets(nodes)
+            fn(targets)
+            obs = self.agent.env.observe()
+            com_z = float(obs.get("com_z", 0.5))
+            com_x = float(obs.get("com_x", 0.5))
+            self._locomotion_controller.learn_from_reward(com_z, com_x, fallen)
+        except Exception as ex:
+            print(f"[Simulation] CPG locomotion: {ex}")
+
+    def _rsi_full_enabled(self) -> bool:
+        v = os.environ.get("RKK_RSI_FULL", "0").strip().lower()
+        return v in ("1", "true", "yes", "on")
+
+    def _locomotion_reward_ema(self) -> float:
+        lc = self._locomotion_controller
+        if lc is None or not lc._reward_history:
+            return 0.0
+        w = min(32, len(lc._reward_history))
+        return float(np.mean(lc._reward_history[-w:]))
+
+    def _skill_library_enabled(self) -> bool:
+        v = os.environ.get("RKK_SKILL_LIBRARY", "0").strip().lower()
+        return v in ("1", "true", "yes", "on")
+
+    def _skill_start_prob(self) -> float:
+        try:
+            p = float(os.environ.get("RKK_SKILL_LIBRARY_PROB", "0.1"))
+        except ValueError:
+            p = 0.1
+        return float(np.clip(p, 0.0, 1.0))
+
+    def _ensure_skill_library(self):
+        if self._skill_library is None:
+            from engine.skill_library import SkillLibrary
+
+            self._skill_library = SkillLibrary()
+        return self._skill_library
+
+    @staticmethod
+    def _skill_state_dict(obs: dict) -> dict:
+        out = dict(obs)
+        for k, v in list(obs.items()):
+            if isinstance(k, str) and k.startswith("phys_"):
+                out.setdefault(k[5:], v)
+        return out
+
+    def _skill_goal_hint(self, st: dict) -> str:
+        cz = float(st.get("com_z", st.get("phys_com_z", 0.5)))
+        if cz < 0.36:
+            return "stand"
+        g = os.environ.get("RKK_SKILL_GOAL", "walk").strip().lower()
+        return g if g else "walk"
+
+    def _sim_env_intervene(
+        self, var: str, val: float, *, count_intervention: bool
+    ) -> dict:
+        env = self.agent.env
+        fn = getattr(env, "intervene", None)
+        if not callable(fn):
+            return {}
+        try:
+            return fn(var, val, count_intervention=count_intervention)
+        except TypeError:
+            return fn(var, val)
+
+    def _execute_skill_frame(self) -> dict:
+        pack = self._skill_exec
+        if pack is None:
+            return self.agent.step(engine_tick=self.tick)
+        skill = pack["skill"]
+        idx: int = pack["index"]
+        obs_before_init: dict = pack["obs_before"]
+        var, val = skill.action_sequence[idx]
+        obs_after = self._sim_env_intervene(var, val, count_intervention=False)
+        if not obs_after:
+            obs_after = self.agent.env.observe()
+        st_after = self._skill_state_dict(obs_after)
+        for k, v in obs_after.items():
+            if k in self.agent.graph.nodes:
+                self.agent.graph.nodes[k] = v
+        self.agent.graph.record_observation(obs_after)
+        self.agent.temporal.step(obs_after)
+
+        idx += 1
+        done = idx >= len(skill.action_sequence)
+        if done:
+            cz_a = float(st_after.get("com_z", st_after.get("phys_com_z", 0.5)))
+            cz_b = float(
+                obs_before_init.get(
+                    "com_z", obs_before_init.get("phys_com_z", 0.5)
+                )
+            )
+            reward = cz_a - cz_b
+            self._ensure_skill_library().record_outcome(skill, st_after, reward)
+            self._skill_exec = None
+        else:
+            self._skill_exec = {
+                "skill": skill,
+                "index": idx,
+                "obs_before": obs_before_init,
+            }
+
+        return {
+            "blocked": False,
+            "skipped": True,
+            "hierarchy": "skill",
+            "skill": skill.name,
+            "skill_step": idx,
+            "skill_done": done,
+            "variable": var,
+            "value": float(val),
+            "updated_edges": [],
+            "compression_delta": 0.0,
+            "prediction_error": 0.0,
+            "cf_predicted": {},
+            "cf_observed": {},
+            "goal_planned": False,
+        }
+
+    def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
+        """L3 внутри agent.step; L2 skill — один шаг последовательности за тик."""
+        if (
+            self._skill_library_enabled()
+            and self.current_world == "humanoid"
+            and not self._fixed_root_active
+        ):
+            if self._skill_exec is not None:
+                return self._execute_skill_frame()
+            if self._skill_start_prob() > 0.0 and np.random.random() < self._skill_start_prob():
+                obs = self.agent.env.observe()
+                st = self._skill_state_dict(obs)
+                goal = self._skill_goal_hint(st)
+                sk = self._ensure_skill_library().select_skill(st, goal)
+                if sk is not None:
+                    self._skill_exec = {
+                        "skill": sk,
+                        "index": 0,
+                        "obs_before": dict(st),
+                    }
+                    return self._execute_skill_frame()
+        return self.agent.step(engine_tick=engine_tick)
+
+    def _skill_snapshot(self) -> dict | None:
+        if not self._skill_library_enabled():
+            return None
+        lib = self._skill_library
+        out: dict = {"enabled": True, "active": None}
+        if lib is not None:
+            out.update(lib.snapshot())
+        else:
+            out["n_skills"] = 0
+            out["skills"] = []
+            out["history_len"] = 0
+        if self._skill_exec is not None:
+            sk = self._skill_exec["skill"]
+            out["active"] = {
+                "name": sk.name,
+                "step": self._skill_exec["index"],
+                "total": len(sk.action_sequence),
+            }
+        return out
+
     # ── Tick ──────────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
         self.tick += 1
@@ -734,7 +945,12 @@ class Simulation:
             self.agent.value_layer.set_teacher_vl_overlay(None)
 
         self.agent.other_agents_phi = []
-        result = self.agent.step(engine_tick=self.tick)
+        result = self._run_agent_or_skill_step(engine_tick=self.tick)
+        fallen_locomotion = fallen
+        is_fn2 = getattr(self.agent.env, "is_fallen", None)
+        if callable(is_fn2) and not self._fixed_root_active:
+            fallen_locomotion = is_fn2()
+        self._maybe_apply_cpg_locomotion(fallen_locomotion)
         self._log_step(result, fallen)
         self._rolling_block_bits.append(1 if result.get("blocked") else 0)
 
@@ -742,6 +958,30 @@ class Simulation:
         snap["fallen"]     = fallen
         snap["fall_count"] = self._fall_count
         self._last_snapshot = snap
+
+        if self._rsi_full_enabled():
+            from engine.rsi_full import RSIController
+
+            if self._rsi_full is None:
+                sup = (
+                    self._ensure_skill_library
+                    if self._skill_library_enabled()
+                    else None
+                )
+                self._rsi_full = RSIController(
+                    self.agent,
+                    self._locomotion_controller,
+                    skill_library_supplier=sup,
+                )
+            rsi_ev = self._rsi_full.tick(
+                snap,
+                self._locomotion_reward_ema(),
+                tick=self.tick,
+                locomotion_ctrl=self._locomotion_controller,
+            )
+            if rsi_ev is not None:
+                t = rsi_ev.get("type", "?")
+                self._add_event(f"🔧 RSI [{t}]", "#66ccaa", "phase")
 
         dr = float(snap.get("discovery_rate", 0.0))
         if dr > self._best_discovery_rate + 1e-5:
@@ -858,6 +1098,17 @@ class Simulation:
             self._add_event(
                 f"🛡 [BLOCKED] Nova: {result.get('reason','?')}",
                 "#884400", "value"
+            )
+        elif result.get("hierarchy") == "skill":
+            sk = result.get("skill", "?")
+            var = result.get("variable", "?")
+            val = result.get("value", 0)
+            done = result.get("skill_done", False)
+            self._add_event(
+                f"🦿 Skill [{sk}] do({var}={float(val):.2f})"
+                f"{' ✓' if done else ' …'}",
+                "#66ccff",
+                "skill",
             )
         elif result.get("updated_edges"):
             cg  = result.get("compression_delta", 0)
@@ -1114,6 +1365,13 @@ class Simulation:
                 "rolling_block_rate": round(self._rolling_block_rate(), 4),
                 "stats":             dict(self._llm_loop_stats),
             },
+            "locomotion":    self._locomotion_controller.snapshot()
+            if self._locomotion_controller is not None
+            else None,
+            "skills":        self._skill_snapshot(),
+            "rsi_full":      self._rsi_full.snapshot()
+            if self._rsi_full_enabled() and self._rsi_full is not None
+            else None,
         }
 
     def public_state(self) -> dict:

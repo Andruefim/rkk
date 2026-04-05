@@ -1417,8 +1417,9 @@ class EnvironmentHumanoid:
         return list(FIXED_BASE_VARS if self._fixed_root else VAR_NAMES)
 
     # ── do() ─────────────────────────────────────────────────────────────────
-    def intervene(self, variable: str, value: float) -> dict[str, float]:
-        self.n_interventions += 1
+    def intervene(self, variable: str, value: float, *, count_intervention: bool = True) -> dict[str, float]:
+        if count_intervention:
+            self.n_interventions += 1
 
         if variable in SELF_VARS:
             self._self_state[variable] = float(np.clip(value, 0.05, 0.95))
@@ -1436,6 +1437,24 @@ class EnvironmentHumanoid:
 
         self._sim.step(self.steps_per_do)
         return self.observe()
+
+    def apply_cpg_leg_targets(self, targets: dict[str, float]) -> None:
+        """
+        Phase A locomotion: низкоуровневые цели на ноги без увеличения n_interventions.
+        """
+        if self._fixed_root:
+            return
+        try:
+            n_sub = int(os.environ.get("RKK_CPG_PHYS_SUBSTEPS", "0"))
+        except ValueError:
+            n_sub = 0
+        if n_sub <= 0:
+            n_sub = max(1, self.steps_per_do // 2)
+        n_sub = min(max(n_sub, 1), 32)
+        for name, val in targets.items():
+            if name in LEG_VARS:
+                self._sim.set_joint(name, float(np.clip(val, 0.05, 0.95)))
+        self._sim.step(n_sub)
 
     def update_self_feedback(
         self,
