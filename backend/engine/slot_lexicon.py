@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
 from typing import Any
 
 import httpx
@@ -24,6 +25,18 @@ def frame_content_hash(frame_b64: str | None) -> str:
         return ""
     raw = frame_b64.encode("utf-8", errors="ignore")[:8192]
     return hashlib.sha256(raw + str(len(frame_b64)).encode()).hexdigest()[:16]
+
+
+def normalize_ollama_image_b64(s: str) -> str:
+    """Ollama /api/chat ожидает сырой base64; префикс data:image/...;base64, ломает приём."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    if s.lower().startswith("data:"):
+        comma = s.find(",")
+        if comma >= 0:
+            s = s[comma + 1 :].strip()
+    return s
 
 
 def ollama_generate_url(url: str) -> str:
@@ -160,9 +173,11 @@ async def _ollama_chat_multimodal(
     images_b64: list[str],
     timeout: float = 180.0,
 ) -> str:
+    images_clean = [normalize_ollama_image_b64(x) for x in images_b64]
+    images_clean = [x for x in images_clean if x]
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt, "images": images_b64}],
+        "messages": [{"role": "user", "content": prompt, "images": images_clean}],
         "stream": False,
         "options": {"temperature": 0.2, "num_predict": 2400},
         **ollama_json_format_teacher_vlm_payload(),
@@ -261,7 +276,7 @@ async def run_slot_vlm_labeling(
             # fall through to text
             text_err = err
         except Exception as e:
-            text_err = str(e)
+            text_err = str(e) or repr(e)
             raw = ""
         # Text fallback after multimodal failure
         try:
@@ -274,7 +289,8 @@ async def run_slot_vlm_labeling(
                 return val2, "text", f"multimodal_failed:{text_err}"
             return {}, "failed", f"{text_err}; text:{err2}"
         except Exception as e2:
-            return {}, "failed", f"{text_err}; text_exc:{e2}"
+            print(f"[VLM] text fallback exception:\n{traceback.format_exc()}")
+            return {}, "failed", f"{text_err}; text_exc:{e2!r}"
 
     # Explicit text-only
     try:
@@ -287,7 +303,8 @@ async def run_slot_vlm_labeling(
             return val, "text", None
         return {}, "failed", err
     except Exception as e:
-        return {}, "failed", str(e)
+        print(f"[VLM] text-only exception:\n{traceback.format_exc()}")
+        return {}, "failed", repr(e)
 
 
 def weak_slot_to_phys_edges(

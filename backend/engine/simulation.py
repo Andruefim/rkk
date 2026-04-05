@@ -914,6 +914,14 @@ class Simulation:
         )
 
         vis = self._visual_env
+        if vis._last_slots is None or vis._cached_frame_b64 is None:
+            vis._refresh(run_encode=True)
+            if vis._cached_frame_b64 is None:
+                return {
+                    "ok": False,
+                    "error": "camera frame not available yet — retry after a few ticks",
+                }
+
         snap = vis.get_slot_visualization()
         var_ids = list(self.agent.graph.nodes.keys())
 

@@ -48,7 +48,8 @@ _T_OPEN, _T_CLOSE = "<" + "think" + ">", "</" + "think" + ">"
 _THINK_RE = re.compile(
     re.escape(_T_OPEN) + r"[\s\S]*?" + re.escape(_T_CLOSE) + r"|"
     r"<reasoning>[\s\S]*?</reasoning>|"
-    r"<thought>[\s\S]*?</thought>",
+    r"<thought>[\s\S]*?</thought>|"
+    r"<redacted_thinking>[\s\S]*?</redacted_thinking>",
     re.IGNORECASE,
 )
 
@@ -152,9 +153,21 @@ def parse_json_object_loose(raw: str) -> dict[str, Any] | None:
         return _strip_think_blocks(s).strip()
 
     candidates: list[str] = []
+    # Сначала варианты без вырезания think: JSON иногда целиком внутри
+    # <redacted_thinking>…</redacted_thinking> (Gemma 4 и др.).
     for block in _extract_markdown_json_blocks(raw):
-        candidates.append(_emit(block))
-    candidates.append(_emit(raw))
+        b = block.strip()
+        if b:
+            candidates.append(b)
+        eb = _emit(block)
+        if eb:
+            candidates.append(eb)
+    er = _emit(raw)
+    if er:
+        candidates.append(er)
+    tr = raw.strip()
+    if tr:
+        candidates.append(tr)
 
     for c in candidates:
         if not c or c in seen:
@@ -173,21 +186,28 @@ def scan_json_objects_having_any_key(raw: str, keys: set[str]) -> dict[str, Any]
     """
     if not raw or not keys:
         return None
-    text = _strip_think_blocks(raw)
     dec = json.JSONDecoder()
-    i = 0
-    while True:
-        j = text.find("{", i)
-        if j < 0:
-            return None
-        try:
-            obj, _end = dec.raw_decode(text, j)
-        except json.JSONDecodeError:
+
+    def _scan(text: str) -> dict[str, Any] | None:
+        i = 0
+        while True:
+            j = text.find("{", i)
+            if j < 0:
+                return None
+            try:
+                obj, _end = dec.raw_decode(text, j)
+            except json.JSONDecodeError:
+                i = j + 1
+                continue
+            if isinstance(obj, dict) and keys.intersection(obj.keys()):
+                return obj
             i = j + 1
-            continue
-        if isinstance(obj, dict) and keys.intersection(obj.keys()):
-            return obj
-        i = j + 1
+
+    for text in (raw, _strip_think_blocks(raw)):
+        got = _scan(text)
+        if got is not None:
+            return got
+    return None
 
 
 def parse_json_array_loose(raw: str) -> list[Any] | None:
@@ -201,8 +221,18 @@ def parse_json_array_loose(raw: str) -> list[Any] | None:
 
     candidates: list[str] = []
     for block in _extract_markdown_json_blocks(raw):
-        candidates.append(_emit(block))
-    candidates.append(_emit(raw))
+        b = block.strip()
+        if b:
+            candidates.append(b)
+        eb = _emit(block)
+        if eb:
+            candidates.append(eb)
+    er = _emit(raw)
+    if er:
+        candidates.append(er)
+    tr = raw.strip()
+    if tr:
+        candidates.append(tr)
 
     for c in candidates:
         if not c or c in seen:

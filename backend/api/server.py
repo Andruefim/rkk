@@ -159,6 +159,12 @@ async def _startup_auto_vision_and_one_vlm() -> None:
             print("[RKK] Auto VLM bootstrap skipped (RKK_SKIP_AUTO_VLM_BOOTSTRAP)")
             return
 
+        # PyBullet / cortex warmup: первый getCameraImage после старта может быть пустым.
+        await asyncio.sleep(3.0)
+        for _ in range(5):
+            sim.tick_step()
+        await asyncio.sleep(0.5)
+
         llm_url = get_ollama_generate_url()
         model = get_ollama_model()
         try:
