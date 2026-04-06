@@ -45,7 +45,14 @@ ARM_VARS    = ["lshoulder", "lelbow", "rshoulder", "relbow"]
 FOOT_VARS   = ["lfoot_z", "rfoot_z"]
 CUBE_VARS   = [f"cube{i}_{d}" for i in range(3) for d in ["x","y","z"]]
 # Песочница: мяч, рычаг (проксимити), расстояние до зоны доставки — обогащают каузальный граф.
-SANDBOX_VARS = ["ball_x", "ball_y", "ball_z", "lever_pin", "target_dist"]
+# Фаза 2 (часть 2): floor_friction / stack_height / stability_score — наблюдаемые эффекты скрытых cube_temp, spring_k.
+SANDBOX_VARS = [
+    "ball_x", "ball_y", "ball_z",
+    "lever_pin", "target_dist",
+    "floor_friction",
+    "stack_height",
+    "stability_score",
+]
 # Этап Г — самомодель; Этап E — self_goal_* + imagination-планирование к target_dist (см. goal_planning.py).
 SELF_VARS: tuple[str, ...] = (
     "self_intention_larm",
@@ -108,6 +115,9 @@ for v in ("ball_x", "ball_y"):
 _RANGES["ball_z"]       = (0.0, 2.0)
 _RANGES["lever_pin"]    = (0.0, 1.0)
 _RANGES["target_dist"]  = (0.0, 4.0)
+_RANGES["floor_friction"] = (0.1, 1.0)
+_RANGES["stack_height"] = (0.0, 0.8)
+_RANGES["stability_score"] = (0.0, 1.0)
 for _sv in SELF_VARS:
     _RANGES[_sv] = (0.0, 1.0)
 
@@ -255,8 +265,125 @@ def _forward_kinematics_skeleton(
     return [{"x": float(p[0]), "y": float(p[1]), "z": float(p[2])} for p in pts]
 
 
+# ─── Фаза 2 (часть 2): скрытые переменные песочницы ────────────────────────────
+class InstrumentalSandbox:
+    """
+    Скрытые: _cube_temp (нагрев от рычага), _spring_k_real (пружина cube0–cube1).
+    Наблюдаемые через get_state: floor_friction, stack_height, stability_score.
+    """
+
+    def _init_instrumental(self) -> None:
+        self._cube_temp: float = 0.0
+        self._floor_friction_base: float = 0.5
+        self._spring_k: float = 0.0
+        self._spring_k_real: float = float(np.random.uniform(0.1, 0.8))
+        self._stack_height: float = 0.0
+        self._stability_score: float = 0.0
+        self._ankle_friction_scale: float = 1.0
+
+    def _reset_instrumental_hidden(self) -> None:
+        self._cube_temp = 0.0
+        self._stack_height = 0.0
+        self._stability_score = 0.0
+        self._spring_k_real = float(np.random.uniform(0.1, 0.8))
+        self._ankle_friction_scale = 1.0
+
+    def _compute_floor_friction_effect(self) -> float:
+        return float(np.clip(1.0 - self._cube_temp * 0.65, 0.15, 1.0))
+
+    def _update_stack_metrics_pybullet(self) -> None:
+        if not getattr(self, "cube_ids", None):
+            return
+        cid = self.client
+        positions = [
+            pb.getBasePositionAndOrientation(c, physicsClientId=cid)[0]
+            for c in self.cube_ids
+        ]
+        zs = [p[2] for p in positions]
+        self._stack_height = float(max(zs) - min(zs))
+        xs = np.array([p[0] for p in positions], dtype=float)
+        ys = np.array([p[1] for p in positions], dtype=float)
+        spread = float(np.std(xs) + np.std(ys))
+        self._stability_score = float(np.clip(1.0 - spread / 1.5, 0.0, 1.0))
+
+    def _update_stack_metrics_fallback(self) -> None:
+        if not hasattr(self, "cubes") or len(self.cubes) == 0:
+            return
+        zs = [float(self.cubes[i][2]) for i in range(len(self.cubes))]
+        self._stack_height = float(max(zs) - min(zs))
+        xs = np.array([float(self.cubes[i][0]) for i in range(len(self.cubes))], dtype=float)
+        ys = np.array([float(self.cubes[i][1]) for i in range(len(self.cubes))], dtype=float)
+        spread = float(np.std(xs) + np.std(ys))
+        self._stability_score = float(np.clip(1.0 - spread / 1.5, 0.0, 1.0))
+
+    def _instrumental_spring_pybullet(self) -> None:
+        if len(getattr(self, "cube_ids", [])) < 2:
+            return
+        cid = self.client
+        p0, _ = pb.getBasePositionAndOrientation(self.cube_ids[0], physicsClientId=cid)
+        p1, _ = pb.getBasePositionAndOrientation(self.cube_ids[1], physicsClientId=cid)
+        delta = np.array(p1[:3], dtype=float) - np.array(p0[:3], dtype=float)
+        dist = float(np.linalg.norm(delta))
+        rest = 0.6
+        if dist > 1e-4:
+            force = -self._spring_k_real * (dist - rest) * (delta / dist)
+            pb.applyExternalForce(
+                self.cube_ids[1], -1,
+                force.tolist(), list(p1),
+                pb.WORLD_FRAME,
+                physicsClientId=cid,
+            )
+
+    def _instrumental_spring_fallback(self) -> None:
+        if not hasattr(self, "cubes") or len(self.cubes) < 2:
+            return
+        d = np.array(self.cubes[1], dtype=float) - np.array(self.cubes[0], dtype=float)
+        dist = float(np.linalg.norm(d))
+        rest = 0.6
+        if dist > 1e-4:
+            self.cubes[1] = self.cubes[1] + (
+                -self._spring_k_real * (dist - rest) * (d / dist) * 0.002
+            )
+
+    def _tick_hidden_state(self) -> None:
+        lp = float(self._compute_lever_pin())
+        tau_heat, tau_cool = 0.04, 0.008
+        if lp > 0.5:
+            self._cube_temp = min(1.0, self._cube_temp + tau_heat * (lp - 0.3))
+        else:
+            self._cube_temp = max(0.0, self._cube_temp - tau_cool)
+        if getattr(self, "client", None) is not None:
+            self._instrumental_spring_pybullet()
+            self._update_stack_metrics_pybullet()
+        else:
+            self._instrumental_spring_fallback()
+            self._update_stack_metrics_fallback()
+
+    def _apply_friction_to_ankle_joints(self) -> None:
+        friction = self._compute_floor_friction_effect()
+        if getattr(self, "client", None) is None:
+            self._ankle_friction_scale = float(friction)
+            return
+        rid, cid = self.robot_id, self.client
+        for var in ("lankle", "rankle"):
+            if var not in self.joint_by_var:
+                continue
+            jid = self.joint_by_var[var]
+            if jid >= len(self._joint_types):
+                continue
+            if self._joint_types[jid] == pb.JOINT_SPHERICAL:
+                continue
+            pb.setJointMotorControl2(
+                rid, jid,
+                controlMode=pb.VELOCITY_CONTROL,
+                targetVelocity=0,
+                force=50.0 * friction,
+                physicsClientId=cid,
+            )
+
+
 # ─── Fallback гуманоид ────────────────────────────────────────────────────────
-class _FallbackHumanoid:
+class _FallbackHumanoid(InstrumentalSandbox):
     def __init__(self, fixed_root: bool = False):
         self.fixed_root = fixed_root
         self.joints = {v: 0.0 for v in LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS}
@@ -272,11 +399,20 @@ class _FallbackHumanoid:
         self._target_pad = np.array([1.85, -0.75, 0.02], dtype=np.float64)
         self._vel   = np.zeros(3)
         self._dt    = 0.02
+        self._init_instrumental()
+
+    def _compute_lever_pin(self) -> float:
+        pts = [self.ball] + [self.cubes[i] for i in range(len(self.cubes))]
+        lc = self._lever_center[:2]
+        d = min(float(np.linalg.norm(p[:2] - lc[:2])) for p in pts)
+        return float(np.clip(1.0 - d / 0.35, 0.0, 1.0))
 
     def step(self, n: int = 10):
         if self.fixed_root:
             # В fixed_root mode нет гравитации на базу
             self.com[:2] += np.random.normal(0, 0.0005, 2)
+            self._tick_hidden_state()
+            self._apply_friction_to_ankle_joints()
             return
         for _ in range(n):
             balance = abs(self.torso_euler[0]) + abs(self.torso_euler[1])
@@ -285,6 +421,8 @@ class _FallbackHumanoid:
             self.com[:2] += np.random.normal(0, 0.002, 2)
             self.torso_euler[:2] += np.random.normal(0, 0.003, 2)
             self.torso_euler[:2] = np.clip(self.torso_euler[:2], -1.2, 1.2)
+        self._tick_hidden_state()
+        self._apply_friction_to_ankle_joints()
 
     def set_joint(self, name: str, val: float):
         if name in self.joints:
@@ -304,7 +442,11 @@ class _FallbackHumanoid:
     def get_foot_z(self) -> tuple[float, float]:
         k_l = self.joints.get("lknee", 0)
         k_r = self.joints.get("rknee", 0)
-        return (max(0, 0.1 - k_l * 0.05), max(0, 0.1 - k_r * 0.05))
+        f = float(getattr(self, "_ankle_friction_scale", 1.0))
+        return (
+            max(0, 0.1 - k_l * 0.05) * f,
+            max(0, 0.1 - k_r * 0.05) * f,
+        )
 
     def get_all_link_positions(self) -> list[dict]:
         cx, cy, cz = float(self.com[0]), float(self.com[1]), float(self.com[2])
@@ -337,6 +479,9 @@ class _FallbackHumanoid:
             for i in range(len(self.cubes))
         )
         s["target_dist"] = float(d_tg)
+        s["floor_friction"] = self._compute_floor_friction_effect()
+        s["stack_height"] = float(self._stack_height)
+        s["stability_score"] = float(self._stability_score)
         return s
 
     def get_cube_positions(self) -> list[dict]:
@@ -377,6 +522,7 @@ class _FallbackHumanoid:
         self.torso_euler = np.zeros(3)
         self._vel = np.zeros(3)
         self.ball = np.array([0.5, -0.35, 0.12], dtype=np.float64)
+        self._reset_instrumental_hidden()
 
     # fixed_root controls для fallback — только флаг
     def enable_fixed_root(self) -> None:
@@ -387,7 +533,7 @@ class _FallbackHumanoid:
 
 
 # ─── PyBullet гуманоид ────────────────────────────────────────────────────────
-class _PyBulletHumanoid:
+class _PyBulletHumanoid(InstrumentalSandbox):
 
     _JOINT_MAP = {
         "leftHip":     "lhip",   "left_hip":    "lhip",   "LeftHip":     "lhip",
@@ -508,6 +654,7 @@ class _PyBulletHumanoid:
             self.enable_fixed_root()
 
         self._maybe_start_physics_bg()
+        self._init_instrumental()
 
     def _maybe_start_physics_bg(self) -> None:
         """
@@ -531,6 +678,8 @@ class _PyBulletHumanoid:
                 t0 = time.perf_counter()
                 with self._physics_lock:
                     pb.stepSimulation(physicsClientId=cid)
+                    self._tick_hidden_state()
+                    self._apply_friction_to_ankle_joints()
                 elapsed = time.perf_counter() - t0
                 slp = dt - elapsed
                 if slp > 0:
@@ -759,6 +908,8 @@ class _PyBulletHumanoid:
         with self._physics_lock:
             for _ in range(n):
                 pb.stepSimulation(physicsClientId=self.client)
+                self._tick_hidden_state()
+                self._apply_friction_to_ankle_joints()
 
     def _motor_relax_velocity(self) -> None:
         rid, cid = self.robot_id, self.client
@@ -924,6 +1075,8 @@ class _PyBulletHumanoid:
             pb.resetBaseVelocity(
                 self.ball_id, [0, 0, 0], [0, 0, 0], physicsClientId=cid,
             )
+
+        self._reset_instrumental_hidden()
 
     def set_joint(self, var_name: str, target_pos: float):
         with self._physics_lock:
@@ -1106,6 +1259,9 @@ class _PyBulletHumanoid:
                 s["ball_z"] = 0.12
             s["lever_pin"] = self._compute_lever_pin()
             s["target_dist"] = self._compute_target_dist()
+            s["floor_friction"] = self._compute_floor_friction_effect()
+            s["stack_height"] = float(self._stack_height)
+            s["stability_score"] = float(self._stability_score)
             return s
 
     def _named_link_world_positions(self) -> dict[str, np.ndarray]:

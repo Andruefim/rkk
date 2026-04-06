@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import copy
 import os
+import queue
 import threading
 import time
 import torch
@@ -48,6 +49,8 @@ from concurrent.futures import ThreadPoolExecutor
 from engine.agent       import RKKAgent
 from engine.demon       import AdversarialDemon
 from engine.environment import Environment
+from engine.concept_store import ConceptStore
+from engine.hierarchical_graph import HierarchicalGraph, hierarchical_graph_enabled
 from engine.ollama_env  import get_ollama_generate_url, get_ollama_model
 from engine.value_layer import HomeostaticBounds
 from engine.wm_neural_ode import integrate_world_model_step
@@ -77,6 +80,24 @@ def _agent_loop_hz_from_env() -> float:
     except ValueError:
         hz = 0.0
     return max(0.0, min(hz, 60.0))
+
+
+def _l3_loop_hz_from_env() -> float:
+    """
+    Cadence для L3 planning/imagination.
+    0 = L3 выполняется на каждом тике agent.step (legacy).
+    >0 = L3 выполняется реже по wall-clock.
+    """
+    try:
+        hz = float(os.environ.get("RKK_L3_LOOP_HZ", "0"))
+    except ValueError:
+        hz = 0.0
+    return max(0.0, min(hz, 30.0))
+
+
+def _l4_worker_enabled() -> bool:
+    v = os.environ.get("RKK_L4_WORKER", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def resolve_torch_device(requested: str | None = None) -> torch.device:
@@ -275,6 +296,28 @@ class Simulation:
         self._materialized_detector_concept_ids: set[str] = set()
         self._discovery_plateau_count = 0
         self._last_dr_snapshot: float | None = None
+        # Фаза 2 (часть 1): L1 агрегаты → виртуальные узлы в основном GNN
+        self._hierarchical_graph: HierarchicalGraph | None = None
+        # Фаза 2 (часть 3): концепты из SlotAttention → узлы concept_* в GNN (visual humanoid)
+        self._concept_store: ConceptStore | None = None
+        try:
+            self._concept_inject_every = max(
+                1, int(os.environ.get("RKK_CONCEPT_INJECT_EVERY", "30"))
+            )
+        except ValueError:
+            self._concept_inject_every = 30
+        # L4 worker (концепты): single-writer graph apply в основном тике.
+        self._l4_thread: threading.Thread | None = None
+        self._l4_stop = threading.Event()
+        self._l4_in_q: queue.SimpleQueue = queue.SimpleQueue()
+        self._l4_out_q: queue.SimpleQueue = queue.SimpleQueue()
+        self._l4_task_pending = False
+        self._l4_last_snapshot: dict = {"n_concepts": 0, "concepts": []}
+        self._l4_last_submit_tick = 0
+        self._l4_last_apply_tick = 0
+        # L3 cadence без отдельного writer-потока (минимум гонок).
+        self._l3_next_due_ts = 0.0
+        self._l3_last_tick = 0
 
     # ── Фаза 1: память и концепты ─────────────────────────────────────────────
     def _annotate_concepts_with_graph_nodes(self) -> None:
@@ -412,7 +455,20 @@ class Simulation:
             return out
 
     def concepts_list_payload(self) -> dict:
-        return {"concepts": list(self._concepts_cache)}
+        phase2 = (
+            dict(self._l4_last_snapshot)
+            if _l4_worker_enabled()
+            else (
+                self._concept_store.snapshot()
+                if self._concept_store is not None
+                else {"n_concepts": 0, "concepts": []}
+            )
+        )
+        return {
+            "concepts": list(self._concepts_cache),  # legacy / Phase 1
+            "concept_store": phase2,                 # Phase 2 Part 3
+            "phase2_concepts": list(phase2.get("concepts", [])),
+        }
 
     def concept_subgraph_payload(self, cid: str) -> dict:
         from engine.concept_detector import concept_by_id
@@ -486,6 +542,251 @@ class Simulation:
             "local_reflex_train": getattr(self.agent, "_last_local_reflex_train", None),
         }
 
+    def _phase2_snapshot_meta(self) -> dict:
+        hg = self._hierarchical_graph
+        base = {
+            "hierarchical_graph_env": hierarchical_graph_enabled(),
+            "active": hg is not None,
+        }
+        concept_snapshot = (
+            dict(self._l4_last_snapshot)
+            if _l4_worker_enabled()
+            else (
+                self._concept_store.snapshot()
+                if self._concept_store is not None
+                else {"n_concepts": 0, "concepts": []}
+            )
+        )
+        if hg is None:
+            base["concept_store"] = concept_snapshot
+            if _l4_worker_enabled():
+                base["l4_worker"] = {
+                    "enabled": True,
+                    "pending": bool(self._l4_task_pending),
+                    "last_submit_tick": int(self._l4_last_submit_tick),
+                    "last_apply_tick": int(self._l4_last_apply_tick),
+                }
+            return base
+        out = {**base, **hg.snapshot()}
+        out["concept_store"] = concept_snapshot
+        if _l4_worker_enabled():
+            out["l4_worker"] = {
+                "enabled": True,
+                "pending": bool(self._l4_task_pending),
+                "last_submit_tick": int(self._l4_last_submit_tick),
+                "last_apply_tick": int(self._l4_last_apply_tick),
+            }
+        return out
+
+    def _ensure_phase2(self) -> None:
+        """Ленивая инициализация компонентов фазы 2 (humanoid)."""
+        if self.current_world != "humanoid":
+            return
+        if hierarchical_graph_enabled():
+            if self._hierarchical_graph is None:
+                self._hierarchical_graph = HierarchicalGraph(self.agent.graph, self.device)
+        cs_en = os.environ.get("RKK_CONCEPT_STORE", "1").strip().lower()
+        if cs_en in ("0", "false", "no", "off"):
+            self._stop_l4_worker()
+            self._concept_store = None
+            return
+        if not self._visual_mode or self._visual_env is None:
+            self._stop_l4_worker()
+            return
+        if _l4_worker_enabled():
+            self._ensure_l4_worker()
+            self._concept_store = None
+            return
+        if self._concept_store is None:
+            vids = [
+                v for v in self.agent.graph._node_ids
+                if not str(v).startswith("slot_") and not str(v).startswith("concept_")
+            ]
+            self._concept_store = ConceptStore(
+                n_slots=int(self._visual_env.n_slots),
+                variable_ids=vids,
+            )
+
+    def _maybe_step_hierarchical_l1(self) -> None:
+        if not hierarchical_graph_enabled():
+            return
+        if self.current_world != "humanoid":
+            return
+        if self._hierarchical_graph is None:
+            return
+        if self._visual_mode and self._visual_env is not None:
+            base_env = getattr(self._visual_env, "base_env", None)
+            if base_env is None:
+                return
+            raw_obs = dict(base_env.observe())
+        else:
+            raw_obs = dict(self.agent.env.observe())
+        self._hierarchical_graph.step_l1(raw_obs)
+        self._hierarchical_graph.inject_l1_virtual_nodes()
+
+    def _l3_planning_due(self) -> bool:
+        """
+        Разрешение запуска L3 (goal_planning + imagination horizon) в текущем тике.
+        Single-writer: только флаг для agent.step, без фоновых мутаций graph/env.
+        """
+        hz = _l3_loop_hz_from_env()
+        if hz <= 0.0:
+            self._l3_last_tick = self.tick
+            return True
+        now = time.perf_counter()
+        if now >= self._l3_next_due_ts:
+            self._l3_next_due_ts = now + (1.0 / hz)
+            self._l3_last_tick = self.tick
+            return True
+        return False
+
+    def _ensure_l4_worker(self) -> None:
+        if self._l4_thread is not None and self._l4_thread.is_alive():
+            return
+        self._l4_stop.clear()
+        self._l4_task_pending = False
+        self._l4_thread = threading.Thread(
+            target=self._l4_worker_loop,
+            daemon=True,
+            name="rkk-l4-concepts",
+        )
+        self._l4_thread.start()
+        print("[Simulation] L4 concept worker enabled (single-writer apply)")
+
+    def _stop_l4_worker(self) -> None:
+        self._l4_stop.set()
+        th = self._l4_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=1.5)
+        self._l4_thread = None
+        self._l4_stop.clear()
+        self._l4_task_pending = False
+
+    def _enqueue_l4_task(
+        self,
+        *,
+        slot_vecs: torch.Tensor,
+        slot_values: list[float],
+        variability: list[float],
+        phys_obs: dict[str, float],
+    ) -> None:
+        if self._l4_task_pending:
+            return
+        payload = {
+            "tick": int(self.tick),
+            "slot_vecs": slot_vecs.detach().cpu().float().numpy(),
+            "slot_values": [float(x) for x in list(slot_values)],
+            "variability": [float(x) for x in list(variability)],
+            "phys_obs": {str(k): float(v) for k, v in dict(phys_obs).items()},
+            "graph_node_ids": list(self.agent.graph._node_ids),
+            "n_slots": int(self._visual_env.n_slots) if self._visual_env is not None else 8,
+        }
+        self._l4_in_q.put(payload)
+        self._l4_task_pending = True
+        self._l4_last_submit_tick = self.tick
+
+    @staticmethod
+    def _serialize_l4_concept(c) -> dict:
+        return {
+            "cid": str(c.cid),
+            "label": c.label,
+            "slot_idx": int(c.slot_idx),
+            "phys_vars": list(c.phys_vars),
+            "corr_scores": {str(k): float(v) for k, v in dict(c.corr_scores).items()},
+            "uses": int(c.uses),
+            "stable_frames": int(c.stable_frames),
+            "created_tick": int(c.created_tick),
+        }
+
+    def _l4_worker_loop(self) -> None:
+        store: ConceptStore | None = None
+        while not self._l4_stop.is_set():
+            try:
+                task = self._l4_in_q.get(timeout=0.05)
+            except Exception:
+                continue
+            try:
+                n_slots = int(task.get("n_slots", 8))
+                graph_node_ids = list(task.get("graph_node_ids") or [])
+                if store is None or store.n_slots != n_slots:
+                    vids = [
+                        v for v in graph_node_ids
+                        if not str(v).startswith("slot_") and not str(v).startswith("concept_")
+                    ]
+                    store = ConceptStore(n_slots=n_slots, variable_ids=vids)
+                slot_vecs_np = task.get("slot_vecs")
+                slot_vecs = torch.from_numpy(slot_vecs_np).float()
+                new_concepts = store.update(
+                    slot_vecs=slot_vecs,
+                    slot_values=list(task.get("slot_values") or []),
+                    variability=list(task.get("variability") or []),
+                    phys_obs=dict(task.get("phys_obs") or {}),
+                    tick=int(task.get("tick", 0)),
+                    graph_node_ids=graph_node_ids,
+                )
+                self._l4_out_q.put({
+                    "tick": int(task.get("tick", 0)),
+                    "snapshot": store.snapshot(),
+                    "new_concepts": [self._serialize_l4_concept(c) for c in new_concepts],
+                })
+            except Exception as ex:
+                self._l4_out_q.put({"error": str(ex)})
+
+    def _apply_l4_concepts(self, concepts: list[dict]) -> int:
+        added = 0
+        for c in concepts:
+            cid = str(c.get("cid", ""))
+            if not cid:
+                continue
+            node_name = f"concept_{cid[:4]}"
+            if node_name in self.agent.graph.nodes:
+                continue
+            uses = int(c.get("uses", 0))
+            val = float(uses / (uses + 10)) if uses >= 0 else 0.0
+            self.agent.graph.set_node(node_name, val)
+            slot_idx = int(c.get("slot_idx", -1))
+            slot_key = f"slot_{slot_idx}"
+            if slot_key in self.agent.graph.nodes:
+                self.agent.graph.set_edge(slot_key, node_name, 0.15, 0.05)
+            corrs = dict(c.get("corr_scores") or {})
+            for phys_var, corr in corrs.items():
+                if phys_var not in self.agent.graph.nodes:
+                    continue
+                corr_f = float(corr)
+                w = float(np.clip(abs(corr_f) * 0.5, 0.06, 0.4))
+                sign = 1.0 if corr_f > 0 else -1.0
+                self.agent.graph.set_edge(node_name, phys_var, sign * w, 0.06)
+            added += 1
+        return added
+
+    def _drain_l4_results(self) -> None:
+        while True:
+            try:
+                msg = self._l4_out_q.get_nowait()
+            except Exception:
+                break
+            self._l4_task_pending = False
+            if not isinstance(msg, dict):
+                continue
+            err = msg.get("error")
+            if err:
+                print(f"[Simulation] L4 worker: {err}")
+                continue
+            snap = msg.get("snapshot")
+            if isinstance(snap, dict):
+                self._l4_last_snapshot = snap
+            new_concepts = list(msg.get("new_concepts") or [])
+            if new_concepts:
+                added = self._apply_l4_concepts(new_concepts)
+                c0 = new_concepts[0]
+                self._add_event(
+                    f"Concept formed: {str(c0.get('cid',''))[:4]}, "
+                    f"slot_{int(c0.get('slot_idx', -1))}, +{added} nodes",
+                    "#EF9F27",
+                    "phase",
+                )
+                self._l4_last_apply_tick = self.tick
+
     # ── World switch ──────────────────────────────────────────────────────────
     def switch_world(self, new_world: str) -> dict:
         if new_world not in WORLDS:
@@ -535,6 +836,12 @@ class Simulation:
                 self._materialized_detector_concept_ids.clear()
                 self._discovery_plateau_count = 0
                 self._last_dr_snapshot = None
+                self._hierarchical_graph = None
+                self._concept_store = None
+                self._stop_l4_worker()
+                self._l4_last_snapshot = {"n_concepts": 0, "concepts": []}
+                self._l3_next_due_ts = 0.0
+                self._l3_last_tick = 0
 
         # Восстанавливаем visual mode если был (вне lock: enable_visual сам берёт lock)
         if was_visual and result.get("switched"):
@@ -633,6 +940,9 @@ class Simulation:
             self.agent.graph.record_observation(base_obs)
         self._visual_mode = False
         self._visual_env  = None
+        self._concept_store = None
+        self._stop_l4_worker()
+        self._l3_next_due_ts = 0.0
 
     def disable_visual(self) -> dict:
         """Отключаем Visual Cortex, возвращаемся к ручным переменным."""
@@ -823,19 +1133,45 @@ class Simulation:
         l2 = b.get("l2") or {}
         if l2.get("ok"):
             edges = l2.get("candidate_edges") or []
+            ex = (l2.get("explanation") or "").strip()
+            next_probe = l2.get("next_probe") or {}
+            if ex or edges or next_probe:
+                edge_preview = [
+                    f"{e.get('from_')}->{e.get('to')}({float(e.get('weight', 0.0)):+.2f})"
+                    for e in list(edges)[:6]
+                    if isinstance(e, dict)
+                ]
+                print(
+                    "[LLM L2] "
+                    f"explanation={ex or '-'} | "
+                    f"next_probe={next_probe or {}} | "
+                    f"edges={len(edges)} | "
+                    f"preview={edge_preview}"
+                )
             if edges:
                 inj = self.agent.inject_text_priors(edges)
                 n = inj.get("injected", 0)
-                ex = (l2.get("explanation") or "").strip()
                 self._add_event(f"🧠 LLM L2 (+{n} priors): {ex}", "#9bdcff", "phase")
             self._llm_loop_stats["level2_runs"] = int(self._llm_loop_stats.get("level2_runs", 0)) + 1
             self._llm_loop_stats["last_level2_explanation"] = (l2.get("explanation") or "").strip()
         elif l2.get("error"):
+            print(f"[LLM L2] error={l2.get('error')}")
             self._add_event(f"LLM L2 error: {l2.get('error')}", "#cc6666", "phase")
 
         l3 = b.get("l3")
         if isinstance(l3, dict) and l3.get("ok"):
             edges3 = l3.get("edges") or []
+            if edges3:
+                edge_preview3 = [
+                    f"{e.get('from_')}->{e.get('to')}({float(e.get('weight', 0.0)):+.2f})"
+                    for e in list(edges3)[:8]
+                    if isinstance(e, dict)
+                ]
+                print(
+                    "[LLM L3] "
+                    f"edges={len(edges3)} | "
+                    f"preview={edge_preview3}"
+                )
             if edges3:
                 inj3 = self.agent.inject_text_priors(edges3)
                 self._add_event(
@@ -845,6 +1181,8 @@ class Simulation:
                 )
             self._last_level3_tick = self.tick
             self._llm_loop_stats["level3_runs"] = int(self._llm_loop_stats.get("level3_runs", 0)) + 1
+        elif isinstance(l3, dict) and l3.get("error"):
+            print(f"[LLM L3] error={l3.get('error')}")
 
     def _rolling_block_rate(self) -> float:
         if len(self._rolling_block_bits) < 24:
@@ -1250,7 +1588,10 @@ class Simulation:
                         "obs_before": dict(st),
                     }
                     return self._execute_skill_frame()
-        return self.agent.step(engine_tick=engine_tick)
+        return self.agent.step(
+            engine_tick=engine_tick,
+            enable_l3=self._l3_planning_due(),
+        )
 
     def _skill_snapshot(self) -> dict | None:
         if not self._skill_library_enabled():
@@ -1336,6 +1677,7 @@ class Simulation:
     def _run_single_agent_timestep_inner(self) -> dict:
         self.tick += 1
         self._apply_pending_llm_bundle()
+        self._ensure_phase2()
 
         # Fallen check + автосброс физики (иначе VL и block_rate залипают)
         fallen = False
@@ -1381,7 +1723,47 @@ class Simulation:
         # Low-level CPG в фоне (RKK_CPG_LOOP_HZ), до тяжёлого agent.step — не ждёт GNN/EIG.
         self._ensure_cpg_background_loop()
         self.agent.other_agents_phi = []
+        self._maybe_step_hierarchical_l1()
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
+
+        # Фаза 2 ч.3: L4 concept mining (sync fallback или async worker + single-writer apply)
+        if self._visual_env is not None and self.tick % self._concept_inject_every == 0:
+            vis = self._visual_env.get_slot_visualization()
+            slot_vecs = self._visual_env._last_slot_vecs
+            if slot_vecs is not None:
+                full_obs = dict(self._visual_env.observe())
+                phys_obs = {
+                    k: float(v)
+                    for k, v in full_obs.items()
+                    if not str(k).startswith("slot_")
+                }
+                if _l4_worker_enabled():
+                    self._enqueue_l4_task(
+                        slot_vecs=slot_vecs,
+                        slot_values=vis.get("slot_values", []),
+                        variability=vis.get("variability", []),
+                        phys_obs=phys_obs,
+                    )
+                elif self._concept_store is not None:
+                    new_concepts = self._concept_store.update(
+                        slot_vecs=slot_vecs,
+                        slot_values=vis.get("slot_values", []),
+                        variability=vis.get("variability", []),
+                        phys_obs=phys_obs,
+                        tick=self.tick,
+                        graph_node_ids=list(self.agent.graph._node_ids),
+                    )
+                    if new_concepts:
+                        added = self._concept_store.inject_into_graph(self.agent.graph)
+                        c0 = new_concepts[0]
+                        self._add_event(
+                            f"Concept formed: {c0.cid[:4]}, slot_{c0.slot_idx}, +{added} nodes",
+                            "#EF9F27",
+                            "phase",
+                        )
+        if _l4_worker_enabled():
+            self._drain_l4_results()
+
         fallen_locomotion = fallen
         is_fn2 = getattr(self.agent.env, "is_fallen", None)
         if callable(is_fn2) and not self._fixed_root_active:
@@ -1810,6 +2192,12 @@ class Simulation:
             "agent_loop":    {
                 "hz": round(_agent_loop_hz_from_env(), 1),
                 "decoupled": _agent_loop_hz_from_env() > 0.0,
+                "l3_hz": round(_l3_loop_hz_from_env(), 1),
+                "l3_last_tick": int(self._l3_last_tick),
+                "l4_worker": bool(_l4_worker_enabled()),
+                "l4_pending": bool(self._l4_task_pending),
+                "l4_last_submit_tick": int(self._l4_last_submit_tick),
+                "l4_last_apply_tick": int(self._l4_last_apply_tick),
             },
             "locomotion":    (
                 {
@@ -1837,6 +2225,7 @@ class Simulation:
             ],
             "memory":        self._memory_snapshot_meta(),
             "phase1":        self._phase1_snapshot_meta(),
+            "phase2":        self._phase2_snapshot_meta(),
         }
 
     def public_state(self) -> dict:

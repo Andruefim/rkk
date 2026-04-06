@@ -656,7 +656,7 @@ class RKKAgent:
         return min(0.28, acc)
 
     # ── Один шаг с Value Layer ────────────────────────────────────────────────
-    def step(self, engine_tick: int = 0) -> dict:
+    def step(self, engine_tick: int = 0, *, enable_l3: bool = True) -> dict:
         self._last_engine_tick = engine_tick
         try:
             self.graph.apply_env_observation(dict(self.env.observe()))
@@ -697,7 +697,7 @@ class RKKAgent:
             if sce > 1:
                 self._score_cache = list(scores)
                 self._score_cache_tick = engine_tick
-        gp = self._maybe_goal_planned_candidate()
+        gp = self._maybe_goal_planned_candidate() if enable_l3 else None
         if gp is not None and not (
             symbolic_verifier_enabled() and self._symbolic_prediction_bad
         ):
@@ -727,7 +727,7 @@ class RKKAgent:
                 current_phi=current_phi,
                 other_agents_phi=self.other_agents_phi,
                 engine_tick=engine_tick,
-                imagination_horizon=self._imagination_horizon,
+                imagination_horizon=(self._imagination_horizon if enable_l3 else 0),
             )
 
             if check_result.allowed:

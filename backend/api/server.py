@@ -690,7 +690,7 @@ def memory_load(path: str | None = Query(default=None)):
 
 @app.get("/concepts/list")
 def concepts_list():
-    """Фаза 1: список обнаруженных повторяющихся подграфов (кэш, обновляется по RKK_CONCEPT_EVERY)."""
+    """Список концептов: Phase 1 proto-concepts + Phase 2 ConceptStore snapshot."""
     return get_sim().concepts_list_payload()
 
 

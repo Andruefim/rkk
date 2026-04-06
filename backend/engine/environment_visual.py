@@ -48,11 +48,23 @@ VISION_ASYNC_ENCODE = os.environ.get("RKK_VISION_ASYNC_ENCODE", "0").strip().low
     "1", "true", "yes", "on",
 )
 
+# Hybrid: суставы/поза + sandbox наблюдаемые переменные, чтобы L4 концепты
+# могли коррелировать с lever_pin / floor_friction / target_dist и т.д.
 _HYBRID_PHYS_KEYS = (
     "com_z", "torso_roll", "lknee", "rknee",
     "spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch",
     "lshoulder", "rshoulder",
+    "lever_pin", "target_dist",
+    "floor_friction", "stack_height", "stability_score",
 )
+
+# do(phys_*) в hybrid: только реально управляемые моторные ключи;
+# прочие phys_* — наблюдаемые (для графа/концептов), не прямые actuators.
+_HYBRID_CONTROLLABLE_KEYS = {
+    "com_z", "torso_roll", "lknee", "rknee",
+    "spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch",
+    "lshoulder", "rshoulder",
+}
 
 
 # ─── Имена переменных ─────────────────────────────────────────────────────────
@@ -364,9 +376,15 @@ class EnvironmentVisual:
                 if step_fn is not None:
                     step_fn.step(8)
         elif variable.startswith("phys_"):
-            # Hybrid mode: прямое воздействие на физическую переменную
+            # Hybrid mode: прямое воздействие только на управляемые моторные phys_*.
+            # Наблюдаемые sandbox-переменные остаются read-only.
             phys_key = variable[5:]
-            _base_iv(phys_key, value)
+            if phys_key in _HYBRID_CONTROLLABLE_KEYS:
+                _base_iv(phys_key, value)
+            else:
+                step_fn = getattr(self.base_env, "_sim", None)
+                if step_fn is not None:
+                    step_fn.step(8)
         else:
             _base_iv(variable, value)
 
