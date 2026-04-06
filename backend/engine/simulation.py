@@ -19,7 +19,7 @@ Phase A (locomotion):
 
 Phase B (hierarchy):
   - High ~1 Hz: GNN + EIG + goal_planning (agent tick / WS).
-  - Mid ~10–20 Hz: world model (можно отдельным потоком позже).
+  - Mid ~10–20 Hz: RKK_AGENT_LOOP_HZ>0 — GNN/EIG/planning в daemon-потоке; tick_step() отдаёт кэш (UI не ждёт).
   - Low ~60 Hz+: CPG (decoupled) + RKK_PHYSICS_BG_HZ PyBullet (уже в humanoid).
 
   L3 goal_planning (agent), L2 skill_library, L1 CPG, L0 PyBullet.
@@ -36,6 +36,7 @@ Phase C (full RSI):
 """
 from __future__ import annotations
 
+import copy
 import os
 import threading
 import time
@@ -67,6 +68,15 @@ def _cpg_loop_hz_from_env() -> float:
     except ValueError:
         hz = 0.0
     return max(0.0, min(hz, 240.0))
+
+
+def _agent_loop_hz_from_env() -> float:
+    """0 = полный tick_step в вызывающем потоке (WS); >0 = high-level в daemon (часто 10–20)."""
+    try:
+        hz = float(os.environ.get("RKK_AGENT_LOOP_HZ", "0"))
+    except ValueError:
+        hz = 0.0
+    return max(0.0, min(hz, 60.0))
 
 
 def resolve_torch_device(requested: str | None = None) -> torch.device:
@@ -244,6 +254,11 @@ class Simulation:
         self._cpg_stop = threading.Event()
         self._cpg_snapshot_lock = threading.Lock()
         self._cpg_node_snapshot: dict[str, float] = {}
+        # High-level agent tick (GNN/EIG/do) vs HTTP/WS: одна критическая секция на симуляцию.
+        self._sim_step_lock = threading.RLock()
+        self._agent_loop_thread: threading.Thread | None = None
+        self._agent_stop = threading.Event()
+        self._agent_step_response: dict | None = None
         # Phase B: skill library (L2), один кадр последовательности за тик
         self._skill_library = None
         self._skill_exec: dict | None = None
@@ -261,33 +276,36 @@ class Simulation:
         if new_world not in WORLDS:
             return {"error": f"unknown world: {new_world}"}
 
-        # Если visual mode — сначала отключаем
-        was_visual = self._visual_mode
-        if was_visual:
-            self._disable_visual_internal()
+        self._stop_rkk_agent_loop_thread()
 
-        result = self.switcher.switch(new_world)
-        if result.get("switched"):
-            self._stop_cpg_background_loop()
-            self.current_world = new_world
-            self._locomotion_controller = None
-            self._skill_library = None
-            self._skill_exec = None
-            self._rsi_full = None
-            self._fixed_root_active = False
-            self._phase3_teacher_rules = []
-            self._phase3_vl_overlay = None
-            self.agent.value_layer.set_teacher_vl_overlay(None)
-            self._pending_llm_bundle = None
-            self._llm_level2_inflight = False
-            winfo = WORLDS[new_world]
-            self._add_event(
-                f"🌍 → {winfo['label']} "
-                f"(+{len(result.get('new_nodes',[]))} vars, d={result.get('gnn_d')})",
-                winfo["color"], "phase"
-            )
+        # Если visual mode — сначала отключаем; switch + сброс — под одним lock с тиком агента
+        with self._sim_step_lock:
+            was_visual = self._visual_mode
+            if was_visual:
+                self._disable_visual_internal()
 
-        # Восстанавливаем visual mode если был
+            result = self.switcher.switch(new_world)
+            if result.get("switched"):
+                self._stop_cpg_background_loop()
+                self.current_world = new_world
+                self._locomotion_controller = None
+                self._skill_library = None
+                self._skill_exec = None
+                self._rsi_full = None
+                self._fixed_root_active = False
+                self._phase3_teacher_rules = []
+                self._phase3_vl_overlay = None
+                self.agent.value_layer.set_teacher_vl_overlay(None)
+                self._pending_llm_bundle = None
+                self._llm_level2_inflight = False
+                winfo = WORLDS[new_world]
+                self._add_event(
+                    f"🌍 → {winfo['label']} "
+                    f"(+{len(result.get('new_nodes',[]))} vars, d={result.get('gnn_d')})",
+                    winfo["color"], "phase"
+                )
+
+        # Восстанавливаем visual mode если был (вне lock: enable_visual сам берёт lock)
         if was_visual and result.get("switched"):
             self.enable_visual()
 
@@ -309,59 +327,63 @@ class Simulation:
         except ImportError:
             return {"error": "causal_vision module not available (install: opencv-python, scipy)"}
 
-        # Сохраняем оригинальный env
-        self._base_env_ref = self.agent.env
+        with self._sim_step_lock:
+            if self._visual_mode:
+                return {"visual": True, "already_enabled": True}
 
-        # Оборачиваем
-        vis_env = EnvironmentVisual(
-            self._base_env_ref,
-            device=self.device,
-            n_slots=n_slots,
-            mode=mode,
-        )
-        self._visual_env = vis_env
+            # Сохраняем оригинальный env
+            self._base_env_ref = self.agent.env
 
-        # Меняем среду агента: граф только под variable_ids обёртки (не 26+K узлов)
-        new_vars  = list(vis_env.variable_ids)
-        init_obs  = vis_env.observe()
-        self.agent.graph.rebind_variables(new_vars, init_obs)
+            # Оборачиваем
+            vis_env = EnvironmentVisual(
+                self._base_env_ref,
+                device=self.device,
+                n_slots=n_slots,
+                mode=mode,
+            )
+            self._visual_env = vis_env
 
-        self.agent.env = vis_env
+            # Меняем среду агента: граф только под variable_ids обёртки (не 26+K узлов)
+            new_vars  = list(vis_env.variable_ids)
+            init_obs  = vis_env.observe()
+            self.agent.graph.rebind_variables(new_vars, init_obs)
 
-        # Пересоздаём Temporal для нового d
-        from engine.temporal import TemporalBlankets
-        new_d = len(new_vars)
-        if self.agent.temporal.d_input != new_d:
-            self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
+            self.agent.env = vis_env
 
-        self.agent.temporal.step(init_obs)
-        self.agent.graph.record_observation(init_obs)
+            # Пересоздаём Temporal для нового d
+            from engine.temporal import TemporalBlankets
+            new_d = len(new_vars)
+            if self.agent.temporal.d_input != new_d:
+                self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
 
-        # Инжектируем слабые seeds между слотами
-        seeds = vis_env.hardcoded_seeds()
-        self.agent.inject_text_priors(seeds)
+            self.agent.temporal.step(init_obs)
+            self.agent.graph.record_observation(init_obs)
 
-        self._visual_mode = True
-        self._vision_ticks = 0
+            # Инжектируем слабые seeds между слотами
+            seeds = vis_env.hardcoded_seeds()
+            self.agent.inject_text_priors(seeds)
 
-        self._add_event(
-            f"👁 Visual Cortex ENABLED: {n_slots} slots · {mode} mode",
-            "#44ffcc", "phase"
-        )
-        cd = str(next(vis_env.cortex.parameters()).device)
-        print(
-            f"[Simulation] Visual mode ON: {n_slots} slots, d={self.agent.graph._d}, "
-            f"cortex={cd}"
-        )
+            self._visual_mode = True
+            self._vision_ticks = 0
 
-        return {
-            "visual": True,
-            "n_slots": n_slots,
-            "mode": mode,
-            "new_vars": new_vars,
-            "gnn_d": self.agent.graph._d,
-            "cortex_device": cd,
-        }
+            self._add_event(
+                f"👁 Visual Cortex ENABLED: {n_slots} slots · {mode} mode",
+                "#44ffcc", "phase"
+            )
+            cd = str(next(vis_env.cortex.parameters()).device)
+            print(
+                f"[Simulation] Visual mode ON: {n_slots} slots, d={self.agent.graph._d}, "
+                f"cortex={cd}"
+            )
+
+            return {
+                "visual": True,
+                "n_slots": n_slots,
+                "mode": mode,
+                "new_vars": new_vars,
+                "gnn_d": self.agent.graph._d,
+                "cortex_device": cd,
+            }
 
     def _disable_visual_internal(self):
         """Внутреннее отключение без event."""
@@ -385,8 +407,11 @@ class Simulation:
         """Отключаем Visual Cortex, возвращаемся к ручным переменным."""
         if not self._visual_mode:
             return {"visual": False, "was_enabled": False}
-        self._disable_visual_internal()
-        self._add_event("👁 Visual Cortex DISABLED", "#cc44ff", "phase")
+        with self._sim_step_lock:
+            if not self._visual_mode:
+                return {"visual": False, "was_enabled": False}
+            self._disable_visual_internal()
+            self._add_event("👁 Visual Cortex DISABLED", "#cc44ff", "phase")
         return {"visual": False, "was_enabled": True}
 
     def enable_fixed_root(self) -> dict:
@@ -411,48 +436,49 @@ class Simulation:
         if base_env.fixed_root:
             return {"fixed_root": True, "already_enabled": True}
 
-        if self._visual_mode and self._visual_env is not None:
-            self._visual_env.set_fixed_root(True)
-        else:
-            base_env.set_fixed_root(True)
+        with self._sim_step_lock:
+            if self._visual_mode and self._visual_env is not None:
+                self._visual_env.set_fixed_root(True)
+            else:
+                base_env.set_fixed_root(True)
 
-        env = self.agent.env
-        new_vars = list(env.variable_ids)
-        init_obs = env.observe()
-        self.agent.graph.rebind_variables(new_vars, init_obs)
+            env = self.agent.env
+            new_vars = list(env.variable_ids)
+            init_obs = env.observe()
+            self.agent.graph.rebind_variables(new_vars, init_obs)
 
-        from engine.temporal import TemporalBlankets
-        new_d = len(new_vars)
-        if self.agent.temporal.d_input != new_d:
-            self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
-        self.agent.temporal.step(init_obs)
-        self.agent.graph.record_observation(init_obs)
+            from engine.temporal import TemporalBlankets
+            new_d = len(new_vars)
+            if self.agent.temporal.d_input != new_d:
+                self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
+            self.agent.temporal.step(init_obs)
+            self.agent.graph.record_observation(init_obs)
 
-        from engine.value_layer import HomeostaticBounds
-        self.agent.value_layer.bounds = HomeostaticBounds.for_fixed_root()
+            from engine.value_layer import HomeostaticBounds
+            self.agent.value_layer.bounds = HomeostaticBounds.for_fixed_root()
 
-        seeds = fixed_root_seeds()
-        result = self.agent.inject_text_priors(seeds)
+            seeds = fixed_root_seeds()
+            result = self.agent.inject_text_priors(seeds)
 
-        self._fixed_root_active = True
-        self._fall_count = 0
-        self._stop_cpg_background_loop()
+            self._fixed_root_active = True
+            self._fall_count = 0
+            self._stop_cpg_background_loop()
 
-        self._add_event(
-            f"📌 FIXED ROOT ON: d={self.agent.graph._d}, "
-            f"{len(new_vars)} vars, +{result.get('injected',0)} seeds",
-            "#ffcc44", "phase"
-        )
-        print(
-            f"[Simulation] fixed_root ON: vars={len(new_vars)}, "
-            f"d={self.agent.graph._d}, seeds={result.get('injected',0)}"
-        )
-        return {
-            "fixed_root": True,
-            "gnn_d":      self.agent.graph._d,
-            "new_vars":   new_vars,
-            "seeds_injected": result.get("injected", 0),
-        }
+            self._add_event(
+                f"📌 FIXED ROOT ON: d={self.agent.graph._d}, "
+                f"{len(new_vars)} vars, +{result.get('injected',0)} seeds",
+                "#ffcc44", "phase"
+            )
+            print(
+                f"[Simulation] fixed_root ON: vars={len(new_vars)}, "
+                f"d={self.agent.graph._d}, seeds={result.get('injected',0)}"
+            )
+            return {
+                "fixed_root": True,
+                "gnn_d":      self.agent.graph._d,
+                "new_vars":   new_vars,
+                "seeds_injected": result.get("injected", 0),
+            }
 
     def disable_fixed_root(self) -> dict:
         """
@@ -475,57 +501,59 @@ class Simulation:
         if not base_env.fixed_root:
             return {"fixed_root": False, "was_enabled": False}
 
-        if self._visual_mode and self._visual_env is not None:
-            self._visual_env.set_fixed_root(False)
-        else:
-            base_env.set_fixed_root(False)
+        with self._sim_step_lock:
+            if self._visual_mode and self._visual_env is not None:
+                self._visual_env.set_fixed_root(False)
+            else:
+                base_env.set_fixed_root(False)
 
-        env = self.agent.env
-        new_vars = list(env.variable_ids)
-        init_obs = env.observe()
-        self.agent.graph.rebind_variables(new_vars, init_obs)
+            env = self.agent.env
+            new_vars = list(env.variable_ids)
+            init_obs = env.observe()
+            self.agent.graph.rebind_variables(new_vars, init_obs)
 
-        from engine.temporal import TemporalBlankets
-        new_d = len(new_vars)
-        if self.agent.temporal.d_input != new_d:
-            self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
-        self.agent.temporal.step(init_obs)
-        self.agent.graph.record_observation(init_obs)
+            from engine.temporal import TemporalBlankets
+            new_d = len(new_vars)
+            if self.agent.temporal.d_input != new_d:
+                self.agent.temporal = TemporalBlankets(d_input=new_d, device=self.device)
+            self.agent.temporal.step(init_obs)
+            self.agent.graph.record_observation(init_obs)
 
-        from engine.value_layer import HomeostaticBounds
-        self.agent.value_layer.bounds = HomeostaticBounds(
-            var_min=0.05, var_max=0.95,
-            phi_min=0.01,
-            h_slow_max=14.0,
-            env_entropy_max_delta=0.96,
-            warmup_ticks=1500,
-            blend_ticks=500,
-            phi_min_steady=0.04,
-            env_entropy_max_delta_steady=0.60,
-            h_slow_max_steady=11.0,
-            predict_band_edge_steady=0.02,
-            fixed_root_mode=False,
-        )
+            from engine.value_layer import HomeostaticBounds
+            self.agent.value_layer.bounds = HomeostaticBounds(
+                var_min=0.05, var_max=0.95,
+                phi_min=0.01,
+                h_slow_max=14.0,
+                env_entropy_max_delta=0.96,
+                warmup_ticks=1500,
+                blend_ticks=500,
+                phi_min_steady=0.04,
+                env_entropy_max_delta_steady=0.60,
+                h_slow_max_steady=11.0,
+                predict_band_edge_steady=0.02,
+                fixed_root_mode=False,
+            )
 
-        result = self.agent.inject_text_priors(humanoid_hardcoded_seeds())
+            result = self.agent.inject_text_priors(humanoid_hardcoded_seeds())
 
-        self._fixed_root_active = False
-        self._add_event(
-            f"📌 FIXED ROOT OFF: d={self.agent.graph._d}, {len(new_vars)} vars",
-            "#cc44ff", "phase"
-        )
-        return {
-            "fixed_root": False,
-            "gnn_d":      self.agent.graph._d,
-            "new_vars":   new_vars,
-            "seeds_injected": result.get("injected", 0),
-        }
+            self._fixed_root_active = False
+            self._add_event(
+                f"📌 FIXED ROOT OFF: d={self.agent.graph._d}, {len(new_vars)} vars",
+                "#cc44ff", "phase"
+            )
+            return {
+                "fixed_root": False,
+                "gnn_d":      self.agent.graph._d,
+                "new_vars":   new_vars,
+                "seeds_injected": result.get("injected", 0),
+            }
 
     # ── Seeds ─────────────────────────────────────────────────────────────────
     def inject_seeds(self, agent_id: int, edges: list[dict]) -> dict:
-        result = self.agent.inject_text_priors(edges)
-        n = result.get("injected", 0)
-        self._add_event(f"💉 Seeds → Nova: {n} edges (α=0.05)", "#886600", "discovery")
+        with self._sim_step_lock:
+            result = self.agent.inject_text_priors(edges)
+            n = result.get("injected", 0)
+            self._add_event(f"💉 Seeds → Nova: {n} edges (α=0.05)", "#886600", "discovery")
         return {"injected": n, "agent": self.AGI_NAME,
                 "skipped": result.get("skipped", []),
                 "node_ids": result.get("node_ids", [])}
@@ -1009,6 +1037,66 @@ class Simulation:
 
     # ── Tick ──────────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
+        hz = _agent_loop_hz_from_env()
+        if hz > 0.0:
+            self._ensure_rkk_agent_loop_thread()
+            with self._sim_step_lock:
+                cached = self._agent_step_response
+            if cached is not None:
+                return copy.deepcopy(cached)
+            return self.public_state()
+        with self._sim_step_lock:
+            return self._run_single_agent_timestep_inner()
+
+    def advance_agent_steps(self, n: int) -> None:
+        """Синхронно выполнить n логических тиков агента (bootstrap при RKK_AGENT_LOOP_HZ>0)."""
+        n = max(0, int(n))
+        if n == 0:
+            return
+        with self._sim_step_lock:
+            for _ in range(n):
+                self._agent_step_response = self._run_single_agent_timestep_inner()
+
+    def _ensure_rkk_agent_loop_thread(self) -> None:
+        if _agent_loop_hz_from_env() <= 0.0:
+            return
+        if self._agent_loop_thread is not None and self._agent_loop_thread.is_alive():
+            return
+        self._agent_stop.clear()
+        self._agent_loop_thread = threading.Thread(
+            target=self._rkk_agent_loop_worker,
+            daemon=True,
+            name="rkk-agent-loop",
+        )
+        self._agent_loop_thread.start()
+        print(
+            f"[Simulation] Agent high-level loop ~{_agent_loop_hz_from_env():.1f} Hz "
+            f"(RKK_AGENT_LOOP_HZ; HTTP/WS tick_step → кэш)"
+        )
+
+    def _stop_rkk_agent_loop_thread(self) -> None:
+        self._agent_stop.set()
+        th = self._agent_loop_thread
+        if th is not None and th.is_alive():
+            th.join(timeout=2.5)
+        self._agent_loop_thread = None
+        self._agent_stop.clear()
+        self._agent_step_response = None
+
+    def _rkk_agent_loop_worker(self) -> None:
+        hz = _agent_loop_hz_from_env()
+        dt = 1.0 / hz if hz > 0 else 0.1
+        while not self._agent_stop.is_set():
+            t0 = time.perf_counter()
+            try:
+                with self._sim_step_lock:
+                    self._agent_step_response = self._run_single_agent_timestep_inner()
+            except Exception as e:
+                print(f"[Simulation] Agent loop: {e}")
+            elapsed = time.perf_counter() - t0
+            self._agent_stop.wait(timeout=max(0.0, dt - elapsed))
+
+    def _run_single_agent_timestep_inner(self) -> dict:
         self.tick += 1
         self._apply_pending_llm_bundle()
 
@@ -1319,9 +1407,10 @@ class Simulation:
         if inject_weak_edges:
             edges = weak_slot_to_phys_edges(labels)
             if edges:
-                r = self.agent.inject_text_priors(edges)
-                injected = int(r.get("injected", 0))
-                skipped = list(r.get("skipped") or [])
+                with self._sim_step_lock:
+                    r = self.agent.inject_text_priors(edges)
+                    injected = int(r.get("injected", 0))
+                    skipped = list(r.get("skipped") or [])
 
         self._add_event(
             f"🔬 VLM slots: {mode}, {len(labels)} labels"
@@ -1394,24 +1483,24 @@ class Simulation:
         if err and not rules and ov is None:
             return {"ok": False, "error": err}
 
-        self._phase3_teacher_rules = rules
-        self._phase3_vl_overlay = ov
-
         try:
             tmax = int(os.environ.get("RKK_TEACHER_T_MAX", "140"))
         except ValueError:
             tmax = 140
         tw = max(0.0, 1.0 - (agent._total_interventions / max(1, tmax)))
-        agent.set_teacher_state(rules, tw)
-        if ov is not None and self.tick <= ov.expires_at_tick and tw > 0:
-            agent.value_layer.set_teacher_vl_overlay(ov)
-        else:
-            agent.value_layer.set_teacher_vl_overlay(None)
+        with self._sim_step_lock:
+            self._phase3_teacher_rules = rules
+            self._phase3_vl_overlay = ov
+            agent.set_teacher_state(rules, tw)
+            if ov is not None and self.tick <= ov.expires_at_tick and tw > 0:
+                agent.value_layer.set_teacher_vl_overlay(ov)
+            else:
+                agent.value_layer.set_teacher_vl_overlay(None)
 
-        msg = f"📚 Phase3 teacher: {len(rules)} rules"
-        if ov is not None:
-            msg += f", VL overlay ttl={ov.expires_at_tick - self.tick}t"
-        self._add_event(msg, "#ddaa44", "phase")
+            msg = f"📚 Phase3 teacher: {len(rules)} rules"
+            if ov is not None:
+                msg += f", VL overlay ttl={ov.expires_at_tick - self.tick}t"
+            self._add_event(msg, "#ddaa44", "phase")
 
         return {
             "ok": True,
@@ -1477,6 +1566,10 @@ class Simulation:
                 "rolling_block_rate": round(self._rolling_block_rate(), 4),
                 "stats":             dict(self._llm_loop_stats),
             },
+            "agent_loop":    {
+                "hz": round(_agent_loop_hz_from_env(), 1),
+                "decoupled": _agent_loop_hz_from_env() > 0.0,
+            },
             "locomotion":    (
                 {
                     **self._locomotion_controller.snapshot(),
@@ -1501,6 +1594,7 @@ class Simulation:
         return self._build_snapshot(snap, {}, smoothed, scene)
 
     def shutdown(self):
+        self._stop_rkk_agent_loop_thread()
         self._stop_cpg_background_loop()
         try:
             self._llm_loop_executor.shutdown(wait=False, cancel_futures=False)

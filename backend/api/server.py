@@ -71,6 +71,13 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _agent_loop_hz() -> float:
+    try:
+        return max(0.0, float(os.environ.get("RKK_AGENT_LOOP_HZ", "0")))
+    except ValueError:
+        return 0.0
+
+
 async def _startup_humanoid_llm_bootstrap() -> None:
     """
     После старта сервера: humanoid_structured через Ollama (как POST /bootstrap/llm).
@@ -162,8 +169,11 @@ async def _startup_auto_vision_and_one_vlm() -> None:
 
         # PyBullet / cortex warmup: первый getCameraImage после старта может быть пустым.
         await asyncio.sleep(3.0)
-        for _ in range(5):
-            sim.tick_step()
+        if _agent_loop_hz() > 0:
+            sim.advance_agent_steps(5)
+        else:
+            for _ in range(5):
+                sim.tick_step()
         await asyncio.sleep(0.5)
 
         llm_url = get_ollama_generate_url()
