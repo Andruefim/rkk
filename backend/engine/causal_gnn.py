@@ -168,6 +168,13 @@ class CausalGNNCore(nn.Module):
         exp = torch.linalg.matrix_exp(W2)
         return exp.trace() - self.d
 
+    def dag_constraint_masked(self, free_mask: torch.Tensor) -> torch.Tensor:
+        """Фаза 1: DAG-штраф без замороженных позиций W (free_mask=0 на frozen i→j)."""
+        Wm = self.W_masked() * free_mask
+        W2 = Wm ** 2
+        exp = torch.linalg.matrix_exp(W2)
+        return exp.trace() - self.d
+
     def intervention_loss(
         self,
         X_obs:       torch.Tensor,

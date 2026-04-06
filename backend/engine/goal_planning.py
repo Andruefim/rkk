@@ -52,7 +52,7 @@ def planning_graph_motor_vars(env: Any, graph_node_ids: list[str]) -> list[str]:
     allow = motor_allow_set(base)
     out: list[str] = []
     for nid in graph_node_ids:
-        if nid.startswith("self_") or nid.startswith("slot_"):
+        if nid.startswith("self_") or nid.startswith("slot_") or nid.startswith("concept_"):
             continue
         if nid == "target_dist":
             continue

@@ -22,6 +22,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
 
+from engine.graph_constants import is_read_only_macro_var
+
 
 class BlockReason(Enum):
     OK               = "ok"
@@ -30,6 +32,7 @@ class BlockReason(Enum):
     ENTROPY_SPIKE    = "entropy_spike"
     AUTONOMY_HARM    = "autonomy_harm"
     REPEATED_FAIL    = "repeated_fail"
+    READ_ONLY_MACRO  = "read_only_macro"
 
 
 @dataclass
@@ -283,6 +286,16 @@ class ValueLayer:
                 BlockReason.VAR_OUT_OF_RANGE, current_nodes, current_phi,
                 f"value {value:.2f} out of [{self.bounds.var_min}, {self.bounds.var_max}]",
                 variable, value,
+            )
+
+        if is_read_only_macro_var(variable):
+            return self._block(
+                BlockReason.READ_ONLY_MACRO,
+                current_nodes,
+                current_phi,
+                "concept_* — read-only macro (aggregate); do() disabled",
+                variable,
+                value,
             )
 
         # slot_* и self_* — «внутренние» оси; не жмём узкий predict_band как у физики.

@@ -61,6 +61,30 @@ VAR_NAMES   = (
     + CUBE_VARS + SANDBOX_VARS + list(SELF_VARS)
 )
 
+# Фаза 1: URDF-топология → frozen_edges (meta: alpha_trust для отчёта; в W — clamp + mask L1/grad).
+# В графе нет узлов «spine/chest» — только spine_*, neck_*.
+URDF_FROZEN_EDGES: dict[tuple[str, str], dict[str, float]] = {
+    ("lhip", "lknee"): {"alpha_trust": 1.0},
+    ("lknee", "lankle"): {"alpha_trust": 1.0},
+    ("rhip", "rknee"): {"alpha_trust": 1.0},
+    ("rknee", "rankle"): {"alpha_trust": 1.0},
+    ("lshoulder", "lelbow"): {"alpha_trust": 1.0},
+    ("rshoulder", "relbow"): {"alpha_trust": 1.0},
+    ("spine_yaw", "spine_pitch"): {"alpha_trust": 1.0},
+    ("spine_pitch", "neck_yaw"): {"alpha_trust": 1.0},
+    ("neck_yaw", "neck_pitch"): {"alpha_trust": 1.0},
+}
+HUMANOID_KINEMATIC_EDGE_PRIORS: tuple[tuple[str, str], ...] = tuple(URDF_FROZEN_EDGES.keys())
+
+# LocalReflex (Фаза 1): только соседи по кинематике — отдельные цепи d=len(chain).
+KINEMATIC_CHAINS: tuple[tuple[str, ...], ...] = (
+    ("lhip", "lknee", "lankle"),
+    ("rhip", "rknee", "rankle"),
+    ("lshoulder", "lelbow"),
+    ("rshoulder", "relbow"),
+    ("spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch"),
+)
+
 # Fixed-base mode: таз зафиксирован в воздухе, баланс исключён.
 # Агент учит arms/spine/neck → кубы + сигналы песочницы (мяч, рычаг, цель) + self_*.
 FIXED_BASE_VARS: list[str] = ARM_VARS + SPINE_VARS + HEAD_VARS + CUBE_VARS + SANDBOX_VARS + list(SELF_VARS)

@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import os
 import threading
+from typing import Any
 import torch
 import numpy as np
 from collections import deque
 
 from engine.causal_graph import CausalGraph
+from engine.graph_constants import is_read_only_macro_var
 from engine.environment  import Environment
 from engine.system1      import System1
 from engine.temporal     import TemporalBlankets
@@ -69,6 +71,7 @@ from engine.rsi_lite import (
     rsi_min_interventions,
     rsi_plateau_interventions,
 )
+from engine.local_reflex import local_reflex_train_enabled, train_chains_parallel
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
 NOTEARS_EVERY = 16
@@ -151,6 +154,8 @@ class RKKAgent:
         self._rsi_adjustment_count: int = 0
         self._notears_steps  = 0
         self._last_notears_loss: dict | None = None
+        self._local_reflex_cores: dict[tuple[str, ...], Any] = {}
+        self._last_local_reflex_train: dict | None = None
 
         # Φ других агентов (заполняется Simulation-ом перед step())
         self.other_agents_phi: list[float] = []
@@ -187,6 +192,11 @@ class RKKAgent:
             self.graph.set_edge(var_ids[1], var_ids[3],  0.35, alpha=0.05)
             self.graph.set_edge(var_ids[2], var_ids[0], -0.20, alpha=0.04)
 
+        # Фаза 1: заморозка URDF-цепочек в L1 (humanoid VAR_NAMES).
+        fr = os.environ.get("RKK_FREEZE_URDF", "1").strip().lower()
+        if fr not in ("0", "false", "no", "off") and "lhip" in self.env.variable_ids:
+            self.graph.freeze_kinematic_priors()
+
     def inject_text_priors(self, edges: list[dict]) -> dict:
         """
         LLM/RAG seed interface.
@@ -211,6 +221,9 @@ class RKKAgent:
 
             if not from_ or not to:
                 skipped.append(f"нет from_/to: {e!r}")
+                continue
+            if is_read_only_macro_var(from_) or is_read_only_macro_var(to):
+                skipped.append(f"read-only macro: {from_!r}→{to!r}")
                 continue
             if from_ not in self.graph.nodes:
                 skipped.append(f"неизвестный узел «{from_}» (доступны: {sorted(valid)})")
@@ -645,6 +658,10 @@ class RKKAgent:
     # ── Один шаг с Value Layer ────────────────────────────────────────────────
     def step(self, engine_tick: int = 0) -> dict:
         self._last_engine_tick = engine_tick
+        try:
+            self.graph.apply_env_observation(dict(self.env.observe()))
+        except Exception:
+            pass
         sce = _score_cache_every()
         if (
             sce > 1
@@ -746,8 +763,25 @@ class RKKAgent:
         var   = chosen["variable"]
         value = chosen["value"]
 
+        if is_read_only_macro_var(var):
+            return {
+                "blocked": True,
+                "blocked_count": blocked_count + 1,
+                "reason": "read_only_macro",
+                "variable": var,
+                "value": float(value),
+                "updated_edges": [],
+                "compression_delta": 0.0,
+                "prediction_error": 0.0,
+                "cf_predicted": {},
+                "cf_observed": {},
+                "goal_planned": False,
+            }
+
         mdl_before = self.graph.mdl_size
-        obs_before = dict(self.env.observe())
+        obs_before_env = dict(self.env.observe())
+        self.graph.apply_env_observation(obs_before_env)
+        obs_before_full = self.graph.snapshot_vec_dict()
         predicted  = self.graph.propagate(var, value)
         sym_ok, sym_fail = True, []
         if symbolic_verifier_enabled():
@@ -755,15 +789,18 @@ class RKKAgent:
             self._symbolic_prediction_bad = not sym_ok
         else:
             self._symbolic_prediction_bad = False
-        observed   = self.env.intervene(var, value)
+        observed_env = self.env.intervene(var, value)
 
-        # Temporal step
-        self.temporal.step(observed)
+        # Temporal step (только размерность среды)
+        self.temporal.step(observed_env)
 
-        # NOTEARS буферы
-        self.graph.record_observation(obs_before)
-        self.graph.record_observation(observed)
-        self.graph.record_intervention(var, value, obs_before, observed)
+        self.graph.apply_env_observation(observed_env)
+        observed_full = self.graph.snapshot_vec_dict()
+
+        # NOTEARS / GNN буферы — полный вектор узлов (включая concept_*)
+        self.graph.record_observation(obs_before_full)
+        self.graph.record_observation(observed_full)
+        self.graph.record_intervention(var, value, obs_before_full, observed_full)
 
         # NOTEARS train
         notears_result = None
@@ -772,10 +809,7 @@ class RKKAgent:
             if notears_result:
                 self._notears_steps += 1
                 self._last_notears_loss = notears_result
-
-        # Обновляем узлы
-        for node_id, obs_val in observed.items():
-            self.graph.nodes[node_id] = obs_val
+            self._maybe_train_local_reflex()
 
         mdl_after         = self.graph.mdl_size
         compression_delta = mdl_before - mdl_after
@@ -793,7 +827,7 @@ class RKKAgent:
             if not keys:
                 return 0.0
             return float(np.mean([
-                abs(float(predicted.get(k, 0.5)) - float(observed.get(k, 0.5)))
+                abs(float(predicted.get(k, 0.5)) - float(observed_full.get(k, 0.5)))
                 for k in keys
             ]))
 
@@ -806,7 +840,7 @@ class RKKAgent:
                 fn_sf(
                     variable=var,
                     intended_norm=value,
-                    observed=observed,
+                    observed=observed_env,
                     predicted=predicted,
                     prediction_error_phys=pe_phys,
                 )
@@ -816,6 +850,7 @@ class RKKAgent:
             for sk in _SELF_VAR_SET:
                 if sk in self.graph.nodes and sk in obs_self:
                     self.graph.nodes[sk] = float(obs_self[sk])
+            self.graph.refresh_concept_aggregates()
         pe_slot = _mean_abs_err(slot_ids)
         w_vis = min(0.45, max(0.0, VISUAL_IG_WEIGHT))
         if slot_ids and phys_ids:
@@ -835,7 +870,7 @@ class RKKAgent:
 
         # SSM train
         u_next = torch.tensor(
-            [observed.get(n, 0.0) for n in self.env.variable_ids],
+            [observed_env.get(n, 0.0) for n in self.env.variable_ids],
             dtype=torch.float32, device=self.device
         )
         self.temporal.train_step(u_next)
@@ -860,10 +895,10 @@ class RKKAgent:
             "updated_edges":     [f"{e.from_}→{e.to}" for e in self.graph.edges[:4]],
             "pruned_edges":      [],
             "prediction_error":  float(np.mean([
-                abs(predicted.get(k, 0) - v) for k, v in observed.items()
+                abs(predicted.get(k, 0) - v) for k, v in observed_env.items()
             ])),
             "cf_predicted": {k: float(round(float(predicted.get(k, 0.0)), 4)) for k in _cf_keys},
-            "cf_observed":  {k: float(round(float(observed.get(k, 0.0)), 4)) for k in _cf_keys},
+            "cf_observed":  {k: float(round(float(observed_full.get(k, 0.0)), 4)) for k in _cf_keys},
             "goal_planned":  bool(chosen.get("from_goal_plan")),
             "symbolic_ok": sym_ok,
             "symbolic_violations": sym_fail,
@@ -944,6 +979,15 @@ class RKKAgent:
         self._rsi_ref_discovery = float(cur_dr)
         return self._apply_rsi_lite()
 
+    def _maybe_train_local_reflex(self) -> None:
+        if not local_reflex_train_enabled():
+            return
+        self._last_local_reflex_train = train_chains_parallel(
+            graph=self.graph,
+            device=self.graph.device,
+            cores=self._local_reflex_cores,
+        )
+
     def phi_approx(self) -> float:
         return self.temporal.phi_approx()
 
@@ -1019,6 +1063,7 @@ class RKKAgent:
                 "graph_BUFFER_SIZE": int(self.graph.BUFFER_SIZE),
                 "imagination_horizon": int(self._imagination_horizon),
             },
+            "local_reflex_train": self._last_local_reflex_train,
             "edges": [e.as_dict() for e in self.graph.edges],
         }
         if self.env.preset == "pybullet":

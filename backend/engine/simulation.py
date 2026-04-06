@@ -270,6 +270,198 @@ class Simulation:
         }
         # Phase C: full RSI (GNN NAS-lite, CPG perturb, skill curriculum, VL relax)
         self._rsi_full = None
+        # Фаза 1: зачатки понятий (кэш детектора), автосохранение памяти
+        self._concepts_cache: list[dict] = []
+        self._materialized_detector_concept_ids: set[str] = set()
+        self._discovery_plateau_count = 0
+        self._last_dr_snapshot: float | None = None
+
+    # ── Фаза 1: память и концепты ─────────────────────────────────────────────
+    def _annotate_concepts_with_graph_nodes(self) -> None:
+        for c in self._concepts_cache:
+            did = str(c.get("id", ""))
+            gn = None
+            for nid, meta in self.agent.graph._concept_meta.items():
+                if str(meta.get("detector_id", "")) == did:
+                    gn = nid
+                    break
+            c["graph_node"] = gn
+
+    def _maybe_materialize_concept_macros(self, concepts: list[dict]) -> None:
+        try:
+            max_n = int(os.environ.get("RKK_CONCEPT_MACRO_MAX", "3"))
+        except ValueError:
+            max_n = 3
+        if max_n <= 0:
+            return
+        try:
+            dplat = int(os.environ.get("RKK_CONCEPT_DISCOVERY_PLATEAU_TICKS", "0"))
+        except ValueError:
+            dplat = 0
+        if dplat > 0 and self._discovery_plateau_count < dplat:
+            return
+        try:
+            amin_edge = float(os.environ.get("RKK_CONCEPT_EDGE_ALPHA_MIN", "0"))
+        except ValueError:
+            amin_edge = 0.0
+        n_macro = sum(1 for x in self.agent.graph._node_ids if str(x).startswith("concept_"))
+        g = self.agent.graph
+        for c in concepts:
+            if n_macro >= max_n:
+                break
+            did = str(c.get("id", ""))
+            if not did or did in self._materialized_detector_concept_ids:
+                continue
+            members = list(c.get("pattern_nodes_example") or [])
+            if not members:
+                continue
+            if amin_edge > 0.0 and g._core is not None:
+                if g.path_min_alpha_trust_on_path(members) < amin_edge:
+                    continue
+            if did.startswith("c") and did[1:].isdigit():
+                macro = f"concept_{int(did[1:])}"
+            else:
+                macro = f"concept_{n_macro}"
+            if macro in g.nodes:
+                self._materialized_detector_concept_ids.add(did)
+                continue
+            ok = g.materialize_concept_macro(
+                macro,
+                members,
+                detector_id=did,
+                pattern=list(c.get("pattern") or []),
+            )
+            if ok:
+                self._materialized_detector_concept_ids.add(did)
+                n_macro += 1
+                self._add_event(
+                    f"🧩 Macro-node {macro} ← {len(members)} vars (detector {did})",
+                    "#88aaff",
+                    "phase",
+                )
+
+    def _maybe_refresh_concepts_cache(self) -> None:
+        try:
+            every = int(os.environ.get("RKK_CONCEPT_EVERY", "24"))
+        except ValueError:
+            every = 24
+        if every <= 0 or self.tick % every != 0:
+            return
+        from engine.concept_detector import detect_proto_concepts
+
+        try:
+            pt = int(os.environ.get("RKK_CONCEPT_PLATEAU_TICKS", "0"))
+        except ValueError:
+            pt = 0
+        self._concepts_cache = detect_proto_concepts(
+            self.agent.graph,
+            agent_plateau_counter=self.agent._rsi_plateau_count,
+            plateau_ticks_required=pt,
+        )
+        self._maybe_materialize_concept_macros(self._concepts_cache)
+        self._annotate_concepts_with_graph_nodes()
+
+    def _maybe_autosave_memory(self) -> None:
+        from engine.persistence import autosave_every_ticks, default_memory_path, save_simulation
+
+        n = autosave_every_ticks()
+        if n <= 0 or self.tick <= 0 or self.tick % n != 0:
+            return
+        try:
+            save_simulation(self, default_memory_path())
+        except Exception as e:
+            print(f"[RKK] memory autosave: {e}")
+
+    def memory_save(self, path: str | None = None) -> dict:
+        from pathlib import Path
+
+        from engine.persistence import save_simulation
+
+        with self._sim_step_lock:
+            return save_simulation(self, Path(path) if path else None)
+
+    def memory_load(self, path: str | None = None) -> dict:
+        from pathlib import Path
+
+        from engine.persistence import default_memory_path, load_simulation
+
+        with self._sim_step_lock:
+            return load_simulation(self, Path(path) if path else default_memory_path())
+
+    def concepts_list_payload(self) -> dict:
+        return {"concepts": list(self._concepts_cache)}
+
+    def concept_subgraph_payload(self, cid: str) -> dict:
+        from engine.concept_detector import concept_by_id
+
+        c = concept_by_id(self._concepts_cache, cid)
+        if c is None:
+            return {"ok": False, "error": f"unknown concept {cid!r}"}
+        nodes: list[str] = []
+        for e in c.get("edges", []):
+            for k in ("from_", "to"):
+                if k in e and e[k] not in nodes:
+                    nodes.append(e[k])
+        out = {k: v for k, v in c.items()}
+        out["ok"] = True
+        out["nodes"] = nodes
+        gn = c.get("graph_node")
+        if gn and gn in self.agent.graph.nodes:
+            out["graph_node_value"] = round(float(self.agent.graph.nodes[gn]), 4)
+        return out
+
+    def _memory_snapshot_meta(self) -> dict:
+        try:
+            from engine.persistence import autosave_every_ticks, default_memory_path
+
+            return {
+                "autosave_every": autosave_every_ticks(),
+                "default_path": str(default_memory_path().resolve()),
+            }
+        except Exception:
+            return {"autosave_every": 0, "default_path": ""}
+
+    def _tick_discovery_plateau(self, dr: float) -> None:
+        try:
+            eps = float(os.environ.get("RKK_CONCEPT_DR_EPS", "0.0015"))
+        except ValueError:
+            eps = 0.0015
+        ref = self._last_dr_snapshot
+        if ref is not None and abs(float(dr) - float(ref)) < eps:
+            self._discovery_plateau_count += 1
+        else:
+            self._discovery_plateau_count = 0
+        self._last_dr_snapshot = float(dr)
+
+    def _phase1_snapshot_meta(self) -> dict:
+        from engine.local_reflex import snapshot_chains_metadata
+
+        try:
+            dpt = int(os.environ.get("RKK_CONCEPT_DISCOVERY_PLATEAU_TICKS", "0"))
+        except ValueError:
+            dpt = 0
+        try:
+            amin = float(os.environ.get("RKK_CONCEPT_EDGE_ALPHA_MIN", "0"))
+        except ValueError:
+            amin = 0.0
+        dag_mask_frozen = os.environ.get("RKK_DAG_MASK_FROZEN", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        return {
+            "read_only_macro_prefix": "concept_",
+            "discovery_plateau_ticks": self._discovery_plateau_count,
+            "discovery_plateau_required": dpt,
+            "concept_edge_alpha_min": amin,
+            "urdf_frozen_pairs": len(
+                getattr(self.agent.graph, "_frozen_edge_set", set()) or set()
+            ),
+            "dag_mask_frozen": dag_mask_frozen,
+            "local_reflex": snapshot_chains_metadata(list(self.agent.graph._node_ids)),
+            "local_reflex_train": getattr(self.agent, "_last_local_reflex_train", None),
+        }
 
     # ── World switch ──────────────────────────────────────────────────────────
     def switch_world(self, new_world: str) -> dict:
@@ -304,6 +496,22 @@ class Simulation:
                     f"(+{len(result.get('new_nodes',[]))} vars, d={result.get('gnn_d')})",
                     winfo["color"], "phase"
                 )
+                if new_world == "humanoid":
+                    fr = os.environ.get("RKK_FREEZE_URDF", "1").strip().lower()
+                    if fr not in ("0", "false", "no", "off") and "lhip" in self.agent.graph.nodes:
+                        self.agent.graph.freeze_kinematic_priors()
+                else:
+                    self.agent.graph._frozen_edge_set.clear()
+                    nv = list(self.agent.env.variable_ids)
+                    obs = dict(self.agent.env.observe())
+                    vals = {
+                        k: float(obs.get(k, self.agent.graph.nodes.get(k, 0.5)))
+                        for k in nv
+                    }
+                    self.agent.graph.rebind_variables(nv, vals)
+                self._materialized_detector_concept_ids.clear()
+                self._discovery_plateau_count = 0
+                self._last_dr_snapshot = None
 
         # Восстанавливаем visual mode если был (вне lock: enable_visual сам берёт lock)
         if was_visual and result.get("switched"):
@@ -929,6 +1137,10 @@ class Simulation:
     def _sim_env_intervene(
         self, var: str, val: float, *, count_intervention: bool
     ) -> dict:
+        from engine.graph_constants import is_read_only_macro_var
+
+        if is_read_only_macro_var(var):
+            return dict(self.agent.env.observe())
         env = self.agent.env
         fn = getattr(env, "intervene", None)
         if not callable(fn):
@@ -946,14 +1158,16 @@ class Simulation:
         idx: int = pack["index"]
         obs_before_init: dict = pack["obs_before"]
         var, val = skill.action_sequence[idx]
+        self.agent.graph.apply_env_observation(dict(self.agent.env.observe()))
+        obs_before_full = self.agent.graph.snapshot_vec_dict()
         obs_after = self._sim_env_intervene(var, val, count_intervention=False)
         if not obs_after:
             obs_after = self.agent.env.observe()
         st_after = self._skill_state_dict(obs_after)
-        for k, v in obs_after.items():
-            if k in self.agent.graph.nodes:
-                self.agent.graph.nodes[k] = v
-        self.agent.graph.record_observation(obs_after)
+        self.agent.graph.apply_env_observation(obs_after)
+        obs_after_full = self.agent.graph.snapshot_vec_dict()
+        self.agent.graph.record_observation(obs_before_full)
+        self.agent.graph.record_observation(obs_after_full)
         self.agent.temporal.step(obs_after)
 
         idx += 1
@@ -1184,6 +1398,7 @@ class Simulation:
                 self._add_event(f"🔧 RSI [{t}]", "#66ccaa", "phase")
 
         dr = float(snap.get("discovery_rate", 0.0))
+        self._tick_discovery_plateau(dr)
         if dr > self._best_discovery_rate + 1e-5:
             self._best_discovery_rate = dr
             self._last_dr_gain_tick = self.tick
@@ -1216,6 +1431,9 @@ class Simulation:
                 pass
 
         self._maybe_schedule_llm_loop(result, snap)
+
+        self._maybe_refresh_concepts_cache()
+        self._maybe_autosave_memory()
 
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)
 
@@ -1584,6 +1802,18 @@ class Simulation:
             "rsi_full":      self._rsi_full.snapshot()
             if self._rsi_full_enabled() and self._rsi_full is not None
             else None,
+            "concepts":      [
+                {
+                    "id": c["id"],
+                    "pattern": c["pattern"],
+                    "uses": c["uses"],
+                    "alpha_mean": c["alpha_mean"],
+                    "graph_node": c.get("graph_node"),
+                }
+                for c in self._concepts_cache
+            ],
+            "memory":        self._memory_snapshot_meta(),
+            "phase1":        self._phase1_snapshot_meta(),
         }
 
     def public_state(self) -> dict:

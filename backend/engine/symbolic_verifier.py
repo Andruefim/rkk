@@ -52,7 +52,7 @@ def normalized_to_physical_dict(s_norm: dict[str, float], env: Any) -> dict[str,
 
     for k, v in s_norm.items():
         ks = str(k)
-        if ks.startswith("slot_"):
+        if ks.startswith("slot_") or ks.startswith("concept_"):
             continue
         key = ks[5:] if ks.startswith("phys_") else ks
         try:

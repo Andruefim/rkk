@@ -1,6 +1,9 @@
 """
 causal_graph.py — NOTEARS / GNN как nn.Module.
 
+Фаза 1: URDF-цепочки гуманоида — freeze_kinematic_priors (W≈0.85), нуление grad по этим
+  позициям в train_step и clamp после optimizer.step (RKK_FREEZE_URDF).
+
 Фаза 10+: GNN заменяет NOTEARS как ядро каузального графа.
 
 Фаза B (Predictive World Model):
@@ -14,7 +17,7 @@ causal_graph.py — NOTEARS / GNN как nn.Module.
   USE_GNN = True   → CausalGNNCore  (message passing + action_enc)
   USE_GNN = False  → NOTEARSCore    (forward_dynamics ≈ forward(X+a))
 
-L_total = L_rec + λ_dag*h(W) + λ_l1*|W|₁
+  L_total = L_rec + λ_dag*h(W_free) + λ_l1*|W|₁ (на frozen позициях L1 и DAG не давят; см. dag_constraint_masked)
 h(W)    = tr(exp(W∘W)) - d
 """
 from __future__ import annotations
@@ -26,10 +29,15 @@ import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
 
+from engine.environment_humanoid import HUMANOID_KINEMATIC_EDGE_PRIORS
+from engine.graph_constants import is_read_only_macro_var
 from engine.wm_neural_ode import integrate_world_model_step
 
 # ── Переключение ядра ─────────────────────────────────────────────────────────
 USE_GNN = True   # False → NOTEARS (откат к фазам 1-9)
+
+# Фаза 1: пары для freeze; dict { (f,t): {alpha_trust} } — см. environment_humanoid.URDF_FROZEN_EDGES
+URDF_FROZEN_EDGE_LIST: list[tuple[str, str]] = list(HUMANOID_KINEMATIC_EDGE_PRIORS)
 
 
 # ─── Edge ─────────────────────────────────────────────────────────────────────
@@ -71,6 +79,16 @@ class NOTEARSCore(nn.Module):
         exp = torch.linalg.matrix_exp(W2)
         return exp.trace() - self.d
 
+    def dag_constraint_masked(self, free_mask: torch.Tensor) -> torch.Tensor:
+        """
+        DAG-штраф только по «обучаемым» рёбрам: (W∘mask_diag)∘free_mask.
+        Замороженные URDF-позиции (free_mask=0) не входят в tr(exp(·)).
+        """
+        Wm = self.W_masked() * free_mask
+        W2 = Wm ** 2
+        exp = torch.linalg.matrix_exp(W2)
+        return exp.trace() - self.d
+
     def intervention_loss(self, X_obs, X_int, int_var_idx, int_val):
         a = torch.zeros_like(X_obs)
         a[:, int_var_idx] = int_val
@@ -99,6 +117,8 @@ class CausalGraph:
     LAMBDA_INT  = 2.0
     LAMBDA_L1   = 0.02
     EDGE_THRESH = 0.05
+    # Фаза 1: целевой вес замороженных рёбер в W (после каждого optim.step снова clamp).
+    FROZEN_EDGE_W = 0.85
 
     def __init__(self, device: torch.device):
         self.device     = device
@@ -113,6 +133,10 @@ class CausalGraph:
         self._edge_cache: list[Edge] | None = None
         self._mdl_cache:  float | None      = None
         self.train_losses: list[float]      = []
+        # (from, to) — не обновляются градиентом WM; W[i,j] фиксируется на FROZEN_EDGE_W.
+        self._frozen_edge_set: set[tuple[str, str]] = set()
+        # Макро-узлы concept_N: агрегат по members, метаданные детектора.
+        self._concept_meta: dict[str, dict] = {}
 
     def set_node(self, id_: str, value: float = 0.0) -> None:
         self._invalidate_cache()
@@ -132,11 +156,118 @@ class CausalGraph:
         self.nodes = {k: float(values.get(k, 0.5)) for k in ordered_ids}
         self._node_ids = list(ordered_ids)
         self._d = len(ordered_ids)
+        keep = set(ordered_ids)
+        self._concept_meta = {k: v for k, v in self._concept_meta.items() if k in keep}
         self._obs_buffer.clear()
         self._int_buffer.clear()
         self._core = None
         self._optim = None
         self._rebuild_core()
+
+    def apply_env_observation(self, env_obs: dict[str, float]) -> None:
+        """Обновить узлы из observe() среды; пересчитать значения concept_* (среднее по members)."""
+        for k, v in env_obs.items():
+            if k not in self.nodes:
+                continue
+            try:
+                self.nodes[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+        self.refresh_concept_aggregates()
+
+    def refresh_concept_aggregates(self) -> None:
+        for cid, meta in self._concept_meta.items():
+            if cid not in self.nodes:
+                continue
+            mems = meta.get("members") or []
+            if not mems:
+                continue
+            vals = [float(self.nodes.get(m, 0.5)) for m in mems]
+            self.nodes[cid] = float(np.clip(float(np.mean(vals)), 0.01, 0.99))
+
+    def snapshot_vec_dict(self) -> dict[str, float]:
+        return {nid: float(self.nodes.get(nid, 0.5)) for nid in self._node_ids}
+
+    def materialize_concept_macro(
+        self,
+        node_id: str,
+        member_nodes: list[str],
+        *,
+        detector_id: str = "",
+        pattern: list[str] | None = None,
+    ) -> bool:
+        """
+        Вставить макро-узел в GNN: rebind_variables(d+1), слабые рёбра member→concept.
+        Узел не участвует в env.intervene(); значение = mean(members) каждый тик.
+        """
+        if not str(node_id).startswith("concept_"):
+            return False
+        if node_id in self.nodes:
+            return False
+        base = [n for n in self._node_ids if not str(n).startswith("concept_")]
+        mems = [m for m in member_nodes if m]
+        if not mems or any(m not in base for m in mems):
+            return False
+        new_ids = base + [node_id]
+        vals: dict[str, float] = {k: float(self.nodes.get(k, 0.5)) for k in base}
+        mv = [float(self.nodes.get(m, 0.5)) for m in mems]
+        vals[node_id] = float(np.clip(float(np.mean(mv)), 0.05, 0.95))
+        self.rebind_variables(new_ids, vals)
+        try:
+            w_m = float(os.environ.get("RKK_CONCEPT_MACRO_EDGE_W", "0.18"))
+        except ValueError:
+            w_m = 0.18
+        try:
+            a_m = float(os.environ.get("RKK_CONCEPT_MACRO_EDGE_ALPHA", "0.08"))
+        except ValueError:
+            a_m = 0.08
+        for m in mems:
+            self.set_edge(m, node_id, w_m, a_m)
+        if mems:
+            self.set_edge(node_id, mems[-1], 0.06, 0.05)
+        self._concept_meta[node_id] = {
+            "members": list(mems),
+            "pattern": list(pattern or []),
+            "detector_id": detector_id,
+        }
+        self._sync_frozen_W_into_core()
+        return True
+
+    def freeze_kinematic_priors(
+        self, frozen: list[tuple[str, str]] | None = None
+    ) -> None:
+        """Биомеханические рёбра: высокий вес в W, градиент по ним нулится, после step — clamp."""
+        pairs = list(frozen) if frozen is not None else list(HUMANOID_KINEMATIC_EDGE_PRIORS)
+        self._frozen_edge_set = {(a, b) for a, b in pairs}
+        self._sync_frozen_W_into_core()
+
+    def _sync_frozen_W_into_core(self) -> None:
+        if self._core is None or not self._frozen_edge_set:
+            return
+        wval = float(self.FROZEN_EDGE_W)
+        with torch.no_grad():
+            W = self._core.W
+            w = W.detach().clone()
+            for f, t in self._frozen_edge_set:
+                if f in self._node_ids and t in self._node_ids:
+                    i, j = self._node_ids.index(f), self._node_ids.index(t)
+                    w[i, j] = wval
+            W.copy_(w)
+        self._invalidate_cache()
+
+    def _zero_grad_frozen_W(self) -> None:
+        if not self._frozen_edge_set or self._core is None:
+            return
+        W = self._core.W
+        if W.grad is None:
+            return
+        for f, t in self._frozen_edge_set:
+            if f in self._node_ids and t in self._node_ids:
+                i, j = self._node_ids.index(f), self._node_ids.index(t)
+                W.grad[i, j] = 0.0
+
+    def _clamp_frozen_W_after_step(self) -> None:
+        self._sync_frozen_W_into_core()
 
     def _maybe_compile_gnn_core(self) -> None:
         if not USE_GNN or self._core is None:
@@ -166,6 +297,7 @@ class CausalGraph:
                     self._maybe_compile_gnn_core()
                     self._optim = torch.optim.Adam(self._core.parameters(), lr=5e-3)
                     self._invalidate_cache()
+                    self._sync_frozen_W_into_core()
                     return
                 old_W = self._core.W_masked().detach().clone()
             self._core = CausalGNNCore(self._d, self.device)
@@ -188,6 +320,7 @@ class CausalGraph:
 
         self._optim = torch.optim.Adam(self._core.parameters(), lr=5e-3)
         self._invalidate_cache()
+        self._sync_frozen_W_into_core()
 
     def record_observation(self, obs: dict[str, float]) -> None:
         if not self._node_ids:
@@ -199,6 +332,8 @@ class CausalGraph:
 
     def record_intervention(self, var_name: str, val: float,
                             obs_before: dict, obs_after: dict) -> None:
+        if is_read_only_macro_var(var_name):
+            return
         if var_name not in self._node_ids:
             return
         self._int_buffer.append({
@@ -265,16 +400,39 @@ class CausalGraph:
         X_pred = integrate_world_model_step(self._core, X_t, a_t)
         l_rec = F.mse_loss(X_pred, X_tp1)
 
-        h_W   = self._core.dag_constraint()
+        dag_mask_frozen = os.environ.get("RKK_DAG_MASK_FROZEN", "1").strip().lower() not in (
+            "0", "false", "no", "off",
+        )
+        dag_free = torch.ones(self._d, self._d, device=self.device, dtype=torch.float32)
+        for f, t in self._frozen_edge_set:
+            if f in self._node_ids and t in self._node_ids:
+                i, j = self._node_ids.index(f), self._node_ids.index(t)
+                dag_free[i, j] = 0.0
+        if (
+            dag_mask_frozen
+            and self._frozen_edge_set
+            and hasattr(self._core, "dag_constraint_masked")
+        ):
+            h_W = self._core.dag_constraint_masked(dag_free)
+        else:
+            h_W = self._core.dag_constraint()
         l_dag = self.LAMBDA_DAG * h_W.abs()
-        l_l1  = self.LAMBDA_L1  * self._core.l1_reg()
+        wm = self._core.W_masked()
+        l1_mask = torch.ones_like(wm)
+        for f, t in self._frozen_edge_set:
+            if f in self._node_ids and t in self._node_ids:
+                i, j = self._node_ids.index(f), self._node_ids.index(t)
+                l1_mask[i, j] = 0.0
+        l_l1 = self.LAMBDA_L1 * (wm.abs() * l1_mask).sum()
 
         l_int = torch.tensor(0.0, device=self.device)
 
         loss = l_rec + l_dag + l_l1 + l_int
         loss.backward()
+        self._zero_grad_frozen_W()
         torch.nn.utils.clip_grad_norm_(self._core.parameters(), max_norm=1.0)
         self._optim.step()
+        self._clamp_frozen_W_after_step()
 
         self._invalidate_cache()
         self.train_losses.append(loss.item())
@@ -328,10 +486,11 @@ class CausalGraph:
             for j, to in enumerate(self._node_ids):
                 w = W[i, j].item()
                 if abs(w) >= self.EDGE_THRESH:
+                    a_tr = 1.0 if (from_, to) in self._frozen_edge_set else alpha[i, j].item()
                     result.append(Edge(
                         from_=from_, to=to,
                         weight=round(w, 4),
-                        alpha_trust=round(alpha[i, j].item(), 4),
+                        alpha_trust=round(float(a_tr), 4),
                         intervention_count=1,
                     ))
         self._edge_cache = result
@@ -341,6 +500,8 @@ class CausalGraph:
         if self._core is None or from_ not in self._node_ids or to not in self._node_ids:
             return 1.0
         i, j  = self._node_ids.index(from_), self._node_ids.index(to)
+        if (from_, to) in self._frozen_edge_set:
+            return 0.0
         alpha = self._core.alpha_trust_matrix()[i, j].item()
         return 1.0 - alpha
 
@@ -360,15 +521,35 @@ class CausalGraph:
             return 0.0
         W        = self._core.W_masked().detach()
         alpha    = self._core.alpha_trust_matrix().detach()
+        alpha_u  = alpha.clone()
+        for f, t in self._frozen_edge_set:
+            if f in self._node_ids and t in self._node_ids:
+                i, j = self._node_ids.index(f), self._node_ids.index(t)
+                alpha_u[i, j] = 1.0
         sig_mask = W.abs() >= self.EDGE_THRESH
         if sig_mask.sum() == 0:
             return 0.0
-        mdl = (1 + (1 - alpha[sig_mask])).sum().item()
+        mdl = (1 + (1 - alpha_u[sig_mask])).sum().item()
         self._mdl_cache = mdl
         return mdl
 
     def propagate(self, variable: str, value: float) -> dict[str, float]:
         return self.propagate_from(self.nodes, variable, value)
+
+    def path_min_alpha_trust_on_path(self, path_nodes: list[str]) -> float:
+        """Минимальный α_trust по ориентированным рёбрам цепочки (для условия macro-concept)."""
+        if self._core is None or len(path_nodes) < 2:
+            return 0.0
+        alpha = self._core.alpha_trust_matrix()
+        m = 1.0
+        for i in range(len(path_nodes) - 1):
+            a, b = path_nodes[i], path_nodes[i + 1]
+            if a not in self._node_ids or b not in self._node_ids:
+                return 0.0
+            ii, jj = self._node_ids.index(a), self._node_ids.index(b)
+            av = 1.0 if (a, b) in self._frozen_edge_set else float(alpha[ii, jj].item())
+            m = min(m, av)
+        return m
 
     def propagate_from(
         self, base: dict[str, float], variable: str, value: float
@@ -377,6 +558,8 @@ class CausalGraph:
         Предсказание после do(variable=value) от произвольного снимка узлов
         (Фаза 13: imagination rollout без мутации self.nodes).
         """
+        if is_read_only_macro_var(variable):
+            return dict(base)
         if self._core is None:
             return dict(base)
         state_vec = torch.tensor(
@@ -432,6 +615,8 @@ class CausalGraph:
         g.nodes      = dict(self.nodes)
         g._node_ids  = list(self._node_ids)
         g._d         = self._d
+        g._frozen_edge_set = set(self._frozen_edge_set)
+        g._concept_meta = {k: dict(v) for k, v in self._concept_meta.items()}
         if self._core is not None:
             g._rebuild_core()
             with torch.no_grad():

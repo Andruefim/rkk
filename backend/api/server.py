@@ -33,7 +33,7 @@ except ImportError:
     pass
 from contextlib import asynccontextmanager
 from typing import Literal
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -666,6 +666,38 @@ def fixed_root_status():
         "total_checked":        vl.total_checked,
         "total_blocked":        vl.total_blocked,
     }
+
+
+class MemorySaveBody(BaseModel):
+    path: str | None = None
+
+
+@app.post("/memory/save")
+def memory_save(
+    body: MemorySaveBody | None = Body(default=None),
+    path: str | None = Query(default=None),
+):
+    """Фаза 1: сохранить .rkk. Тело JSON {\"path\": \"...\"} или query ?path=…"""
+    p = path or (body.path if body and body.path else None)
+    return get_sim().memory_save(p)
+
+
+@app.get("/memory/load")
+def memory_load(path: str | None = Query(default=None)):
+    """Фаза 1: загрузка памяти; частичное совмещение весов при смене d."""
+    return get_sim().memory_load(path)
+
+
+@app.get("/concepts/list")
+def concepts_list():
+    """Фаза 1: список обнаруженных повторяющихся подграфов (кэш, обновляется по RKK_CONCEPT_EVERY)."""
+    return get_sim().concepts_list_payload()
+
+
+@app.get("/concepts/{cid}/subgraph")
+def concept_subgraph(cid: str):
+    """Фаза 1: узлы и рёбра одного proto-concept по id (например c0)."""
+    return get_sim().concept_subgraph_payload(cid)
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
