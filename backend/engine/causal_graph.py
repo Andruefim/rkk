@@ -147,21 +147,83 @@ class CausalGraph:
         if self._core is None or self._core.d != self._d:
             self._rebuild_core()
 
-    def rebind_variables(self, ordered_ids: list[str], values: dict[str, float]) -> None:
+    def rebind_variables(
+        self,
+        ordered_ids: list[str],
+        values: dict[str, float],
+        *,
+        preserve_state: bool = False,
+    ) -> None:
         """
         Полностью заменить набор узлов (например humanoid → только slot_* в visual mode).
-        Сбрасывает NOTEARS/GNN буферы, чтобы размеры строк совпадали с новым d.
+        По умолчанию сбрасывает NOTEARS/GNN буферы, чтобы размеры строк совпадали с новым d.
+        preserve_state=True: переносит пересекающуюся часть весов и ремапит буферы obs/int.
         """
+        old_ids = list(self._node_ids)
+        old_obs = [list(row) for row in self._obs_buffer] if preserve_state else []
+        old_int = [dict(item) for item in self._int_buffer] if preserve_state else []
+        old_core = self._core if preserve_state else None
+
         self._invalidate_cache()
         self.nodes = {k: float(values.get(k, 0.5)) for k in ordered_ids}
         self._node_ids = list(ordered_ids)
         self._d = len(ordered_ids)
         keep = set(ordered_ids)
         self._concept_meta = {k: v for k, v in self._concept_meta.items() if k in keep}
-        self._obs_buffer.clear()
-        self._int_buffer.clear()
-        self._core = None
-        self._optim = None
+        if preserve_state:
+            old_pos = {nid: i for i, nid in enumerate(old_ids)}
+            # Переносим пассивные буферы в новый порядок координат.
+            remapped_obs: list[list[float]] = []
+            for row in old_obs:
+                if not isinstance(row, list):
+                    continue
+                new_row = []
+                for nid in self._node_ids:
+                    if nid in old_pos and old_pos[nid] < len(row):
+                        new_row.append(float(row[old_pos[nid]]))
+                    else:
+                        new_row.append(float(self.nodes.get(nid, 0.5)))
+                remapped_obs.append(new_row)
+            self._obs_buffer = remapped_obs[-self.BUFFER_SIZE * 2 :]
+
+            remapped_int: list[dict] = []
+            for item in old_int:
+                idx = item.get("idx")
+                if not isinstance(idx, int) or idx < 0 or idx >= len(old_ids):
+                    continue
+                var_name = old_ids[idx]
+                if var_name not in self._node_ids:
+                    continue
+
+                obs_before_raw = item.get("obs_before")
+                obs_after_raw = item.get("obs_after")
+                if not isinstance(obs_before_raw, list) or not isinstance(obs_after_raw, list):
+                    continue
+
+                new_before = []
+                new_after = []
+                for nid in self._node_ids:
+                    if nid in old_pos and old_pos[nid] < len(obs_before_raw):
+                        new_before.append(float(obs_before_raw[old_pos[nid]]))
+                    else:
+                        new_before.append(float(self.nodes.get(nid, 0.5)))
+                    if nid in old_pos and old_pos[nid] < len(obs_after_raw):
+                        new_after.append(float(obs_after_raw[old_pos[nid]]))
+                    else:
+                        new_after.append(float(self.nodes.get(nid, 0.5)))
+
+                remapped_int.append({
+                    "idx": self._node_ids.index(var_name),
+                    "val": float(item.get("val", 0.0)),
+                    "obs_before": new_before,
+                    "obs_after": new_after,
+                })
+            self._int_buffer = remapped_int[-self.BUFFER_SIZE :]
+        else:
+            self._obs_buffer.clear()
+            self._int_buffer.clear()
+
+        self._core = old_core if preserve_state else None
         self._rebuild_core()
 
     def apply_env_observation(self, env_obs: dict[str, float]) -> None:
@@ -204,7 +266,7 @@ class CausalGraph:
             return False
         if node_id in self.nodes:
             return False
-        base = [n for n in self._node_ids if not str(n).startswith("concept_")]
+        base = list(self._node_ids)
         mems = [m for m in member_nodes if m]
         if not mems or any(m not in base for m in mems):
             return False
@@ -212,7 +274,7 @@ class CausalGraph:
         vals: dict[str, float] = {k: float(self.nodes.get(k, 0.5)) for k in base}
         mv = [float(self.nodes.get(m, 0.5)) for m in mems]
         vals[node_id] = float(np.clip(float(np.mean(mv)), 0.05, 0.95))
-        self.rebind_variables(new_ids, vals)
+        self.rebind_variables(new_ids, vals, preserve_state=True)
         try:
             w_m = float(os.environ.get("RKK_CONCEPT_MACRO_EDGE_W", "0.18"))
         except ValueError:

@@ -147,6 +147,7 @@ def save_simulation(sim, path: Path | str | None = None) -> dict[str, Any]:
         "materialized_detector_concept_ids": list(
             getattr(sim, "_materialized_detector_concept_ids", set())
         ),
+        "concepts_cache": list(getattr(sim, "_concepts_cache", [])),
     }
     torch.save(payload, path)
     return {"ok": True, "path": str(path.resolve())}
@@ -165,6 +166,7 @@ def load_simulation(sim, path: Path | str | None = None) -> dict[str, Any]:
     unpack_graph(sim.agent, payload["graph"])
     unpack_temporal(sim.agent, payload.get("temporal", {}), sim.device)
     sim.tick = int(payload.get("tick", sim.tick))
+    loaded_world = str(payload.get("current_world", getattr(sim, "current_world", "")) or "")
     mid = set(payload.get("materialized_detector_concept_ids", []))
     if hasattr(sim, "_materialized_detector_concept_ids"):
         sim._materialized_detector_concept_ids = {str(x) for x in mid}
@@ -172,7 +174,15 @@ def load_simulation(sim, path: Path | str | None = None) -> dict[str, Any]:
             d = str(meta.get("detector_id", ""))
             if d:
                 sim._materialized_detector_concept_ids.add(d)
-    return {"ok": True, "path": str(path.resolve()), "tick": sim.tick}
+    if hasattr(sim, "_concepts_cache"):
+        cc = payload.get("concepts_cache")
+        sim._concepts_cache = list(cc) if isinstance(cc, list) else []
+    return {
+        "ok": True,
+        "path": str(path.resolve()),
+        "tick": sim.tick,
+        "loaded_world": loaded_world,
+    }
 
 
 def autosave_every_ticks() -> int:

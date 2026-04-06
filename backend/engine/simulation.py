@@ -385,8 +385,31 @@ class Simulation:
 
         from engine.persistence import default_memory_path, load_simulation
 
+        p = Path(path) if path else default_memory_path()
+        target_world = None
+        if p.is_file():
+            try:
+                payload = torch.load(p, map_location="cpu", weights_only=False)
+                if isinstance(payload, dict):
+                    cw = payload.get("current_world")
+                    if isinstance(cw, str) and cw in WORLDS:
+                        target_world = cw
+            except Exception:
+                target_world = None
+
+        if target_world and target_world != self.current_world:
+            sw = self.switch_world(target_world)
+            if sw.get("error"):
+                return {
+                    "ok": False,
+                    "error": f"failed to switch world to {target_world!r} before load: {sw.get('error')}",
+                }
+
         with self._sim_step_lock:
-            return load_simulation(self, Path(path) if path else default_memory_path())
+            out = load_simulation(self, p)
+            if out.get("ok"):
+                self._annotate_concepts_with_graph_nodes()
+            return out
 
     def concepts_list_payload(self) -> dict:
         return {"concepts": list(self._concepts_cache)}
