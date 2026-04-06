@@ -133,7 +133,6 @@ def consult_counterfactual_sync(
         **ollama_think_disabled_payload(),
         "options": {
             "temperature": float(os.environ.get("RKK_LLM_LOOP_TEMP", "0.22")),
-            "num_predict": int(os.environ.get("RKK_LLM_LEVEL2_NUM_PREDICT", "1800")),
         },
         **ollama_json_format_payload(),
     }
@@ -190,7 +189,7 @@ def structure_revision_sync(
         "prompt": prompt,
         "stream": False,
         **ollama_think_disabled_payload(),
-        "options": {"temperature": 0.14, "num_predict": 2600},
+        "options": {"temperature": 0.14},
         **ollama_json_format_payload(),
     }
     valid = set(var_names)

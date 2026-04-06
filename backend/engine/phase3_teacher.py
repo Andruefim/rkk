@@ -123,14 +123,6 @@ Rules:
 _PHASE3_ROOT_KEYS = frozenset({"ig_rules", "vl_overlay"})
 
 
-def _phase3_num_predict() -> int:
-    try:
-        v = int(os.environ.get("RKK_PHASE3_NUM_PREDICT", "2400"))
-    except ValueError:
-        v = 2400
-    return max(256, min(v, 8192))
-
-
 def _phase3_http_timeout() -> float:
     try:
         v = float(os.environ.get("RKK_PHASE3_HTTP_TIMEOUT", "300"))
@@ -249,7 +241,6 @@ async def fetch_phase3_teacher_bundle(
         **ollama_think_disabled_payload(),
         "options": {
             "temperature": 0.1,
-            "num_predict": _phase3_num_predict(),
         },
         **ollama_json_format_teacher_vlm_payload(),
     }

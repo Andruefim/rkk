@@ -230,7 +230,7 @@ Rules:
         "prompt": prompt,
         "stream": False,
         **ollama_think_disabled_payload(),
-        "options": {"temperature": 0.1, "num_predict": 300},
+        "options": {"temperature": 0.1},
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -359,7 +359,7 @@ Rules:
         "prompt": prompt,
         "stream": False,
         **ollama_think_disabled_payload(),
-        "options": {"temperature": 0.08, "num_predict": 3200},
+        "options": {"temperature": 0.08},
         **ollama_json_format_humanoid_bootstrap_payload(),
     }
 
