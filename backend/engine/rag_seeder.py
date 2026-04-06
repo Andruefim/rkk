@@ -363,7 +363,7 @@ Rules:
         **ollama_json_format_humanoid_bootstrap_payload(),
     }
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=500) as client:
         try:
             resp = await client.post(llm_url, json=payload)
             if resp.status_code != 200:
