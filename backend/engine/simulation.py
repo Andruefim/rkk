@@ -392,6 +392,7 @@ class Simulation:
         self._l1_motor_q: queue.SimpleQueue = queue.SimpleQueue()
         self._l1_last_cmd_tick = 0
         self._l1_last_apply_tick = 0
+        self._l1_last_credit_tick = 0
         # High-level agent tick (GNN/EIG/do) vs HTTP/WS: одна критическая секция на симуляцию.
         self._sim_step_lock = threading.RLock()
         self._agent_loop_thread: threading.Thread | None = None
@@ -1398,20 +1399,20 @@ class Simulation:
         if self._llm_level2_inflight or self._pending_llm_bundle is not None:
             return
         try:
-            cooldown = int(os.environ.get("RKK_LLM_LEVEL2_COOLDOWN", "240"))
+            cooldown = int(os.environ.get("RKK_LLM_LEVEL2_COOLDOWN", "1200"))
         except ValueError:
-            cooldown = 720
+            cooldown = 1200
         if self.tick - self._last_level2_schedule_tick < cooldown:
             return
 
         try:
-            stagnation_ticks = int(os.environ.get("RKK_LLM_STAGNATION_TICKS", "500"))
+            stagnation_ticks = int(os.environ.get("RKK_LLM_STAGNATION_TICKS", "1400"))
         except ValueError:
-            stagnation_ticks = 500
+            stagnation_ticks = 1400
         try:
-            min_iv = int(os.environ.get("RKK_LLM_MIN_INTERVENTIONS", "36"))
+            min_iv = int(os.environ.get("RKK_LLM_MIN_INTERVENTIONS", "96"))
         except ValueError:
-            min_iv = 36
+            min_iv = 96
 
         triggers: list[str] = []
         if (
@@ -1421,13 +1422,17 @@ class Simulation:
             triggers.append("discovery_stagnation")
 
         vl = self.agent.value_layer
-        if vl.total_checked >= 48 and self._rolling_block_rate() > 0.4:
+        if (
+            vl.total_checked >= 128
+            and len(self.agent.graph.edges) >= 6
+            and self._rolling_block_rate() > 0.72
+        ):
             triggers.append("block_rate")
 
         if self._vlm_unknown_slot_trigger():
             triggers.append("vlm_unknown_object")
 
-        if self._prediction_surprise_trigger(result):
+        if self._prediction_surprise_trigger(result) and self.tick >= max(240, min_iv):
             triggers.append("prediction_surprise_3sigma")
 
         if not triggers:
@@ -1735,9 +1740,16 @@ class Simulation:
                 break
         if latest is None:
             return
-        obs_before = dict(self.agent.env.observe())
         targets = dict(latest.get("joint_targets") or {})
         intents = dict(latest.get("intents") or {})
+        try:
+            credit_every = int(os.environ.get("RKK_MOTOR_CREDIT_EVERY", "4"))
+        except ValueError:
+            credit_every = 4
+        credit_every = max(1, min(credit_every, 64))
+        strong_intent = any(abs(float(v) - 0.5) > 0.12 for v in intents.values())
+        should_credit = strong_intent and ((self.tick - self._l1_last_credit_tick) >= credit_every)
+        obs_before = dict(self.agent.env.observe()) if should_credit else None
         fn(targets)
         obs_after = dict(self.agent.env.observe())
         self._sync_motor_state(obs_after, source=str(latest.get("source", "cpg")), tick=self.tick)
@@ -1747,11 +1759,13 @@ class Simulation:
             intents=intents or None,
             obs=self._motor_obs_payload(obs_after),
         )
-        self._record_motor_burst_causal(
-            obs_before_env=obs_before,
-            obs_after_env=obs_after,
-            intents=intents,
-        )
+        if should_credit and obs_before is not None:
+            self._record_motor_burst_causal(
+                obs_before_env=obs_before,
+                obs_after_env=obs_after,
+                intents=intents,
+            )
+            self._l1_last_credit_tick = self.tick
         lc = self._locomotion_controller
         if lc is not None:
             fallen = False
@@ -1764,7 +1778,6 @@ class Simulation:
                 fallen,
                 motor_obs=self._motor_obs_payload(obs_after),
             )
-        self.agent.temporal.step(obs_after)
         self._l1_last_apply_tick = self.tick
 
     def _skill_library_enabled(self) -> bool:
