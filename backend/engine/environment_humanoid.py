@@ -154,8 +154,8 @@ for _sv in SELF_VARS:
     _RANGES[_sv] = (0.0, 1.0)
 
 # Масштаб URDF относительно прежнего «эталона» 0.36 (0.18 = ровно в 2× меньше по линейным размерам).
-HUMANOID_URDF_LEGACY_SCALE = 0.36
-HUMANOID_URDF_GLOBAL_SCALING = 0.18
+HUMANOID_URDF_LEGACY_SCALE = 0.45
+HUMANOID_URDF_GLOBAL_SCALING = 0.225
 _HSZ = HUMANOID_URDF_GLOBAL_SCALING / HUMANOID_URDF_LEGACY_SCALE
 
 FALLEN_Z     = 0.25 * _HSZ
@@ -598,9 +598,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
 
         self.cube_ids = []
         cube_configs = [
-            {"pos": [1.0,  0.3, 0.15], "size": 0.12, "mass": 2.0,  "color": [1.0, 0.4, 0.1, 1]},
-            {"pos": [-0.6, 0.8, 0.12], "size": 0.10, "mass": 0.5,  "color": [0.2, 0.7, 1.0, 1]},
-            {"pos": [0.3, -0.9, 0.20], "size": 0.16, "mass": 6.0,  "color": [0.25, 0.85, 0.35, 1]},
+            {"pos": [1.25,  0.375, 0.1875], "size": 0.15, "mass": 2.0,  "color": [1.0, 0.4, 0.1, 1]},
+            {"pos": [-0.75, 1.0, 0.15], "size": 0.125, "mass": 0.5,  "color": [0.2, 0.7, 1.0, 1]},
+            {"pos": [0.375, -1.125, 0.25], "size": 0.20, "mass": 6.0,  "color": [0.25, 0.85, 0.35, 1]},
         ]
         for cfg in cube_configs:
             hs = cfg["size"] / 2
@@ -621,8 +621,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self.lever_center = np.array([-1.05, 0.55, 0.10], dtype=np.float64)
         self.target_pad = np.array([1.85, -0.72, 0.02], dtype=np.float64)
         self.lever_trigger_r = 0.26
-        self._ball_start = [0.55, -0.45, 0.11]
-        br = 0.09
+        self._ball_start = [0.6875, -0.5625, 0.1375]
+        br = 0.1125
         col_ball = pb.createCollisionShape(pb.GEOM_SPHERE, radius=br, physicsClientId=self.client)
         vis_ball = pb.createVisualShape(
             pb.GEOM_SPHERE, radius=br,
@@ -980,7 +980,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, pb.POSITION_CONTROL,
                     targetPosition=quat_id,
                     positionGain=1.2, velocityGain=0.40,
-                    maxVelocity=6.0, force=[400.0, 400.0, 400.0],
+                    maxVelocity=6.0, force=[3000.0, 3000.0, 3000.0],
                     physicsClientId=cid,
                 )
             else:
@@ -988,7 +988,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, controlMode=pb.POSITION_CONTROL,
                     targetPosition=0.0,
                     positionGain=0.90, velocityGain=0.25,
-                    force=250.0, physicsClientId=cid,
+                    force=2000.0, physicsClientId=cid,
                 )
 
     def _snap_base_spine_vertical(self) -> None:
@@ -1146,7 +1146,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                         positionGain=0.85, velocityGain=0.25, maxVelocity=3.5,
-                        force=[280.0, 280.0, 280.0], physicsClientId=cid)
+                        force=[2200.0, 2200.0, 2200.0], physicsClientId=cid)
                 return
 
             is_leg = var_name in ("lhip", "rhip", "lknee", "rknee", "lankle", "rankle")
@@ -1168,7 +1168,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if is_leg:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                             positionGain=0.85, velocityGain=0.25, maxVelocity=4.0,
-                            force=[320.0, 320.0, 320.0], physicsClientId=cid)
+                            force=[2500.0, 2500.0, 2500.0], physicsClientId=cid)
                 else:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                             positionGain=0.52, velocityGain=0.15, maxVelocity=5.5,
@@ -1178,7 +1178,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
-                        positionGain=0.80, velocityGain=0.20, force=200.0, physicsClientId=cid,
+                        positionGain=0.80, velocityGain=0.20, force=1600.0, physicsClientId=cid,
                     )
                 else:
                     pb.setJointMotorControl2(
