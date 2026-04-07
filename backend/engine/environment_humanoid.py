@@ -1667,6 +1667,12 @@ class EnvironmentHumanoid:
         rknee = float(raw.get("rknee", 0.5))
         lankle = float(raw.get("lankle", 0.5))
         rankle = float(raw.get("rankle", 0.5))
+        lsh = float(raw.get("lshoulder", 0.0))
+        rsh = float(raw.get("rshoulder", 0.0))
+        lel = float(raw.get("lelbow", 0.0))
+        rel = float(raw.get("relbow", 0.0))
+        sp_pitch = float(raw.get("spine_pitch", 0.0))
+        sp_yaw = float(raw.get("spine_yaw", 0.0))
         lf = float(raw.get("lfoot_z", 0.05))
         rf = float(raw.get("rfoot_z", 0.05))
         support_l = float(np.clip(1.0 - lf / max(STAND_Z * 0.18, 1e-6), 0.0, 1.0))
@@ -1677,10 +1683,17 @@ class EnvironmentHumanoid:
         motor_drive_l = float(np.clip(np.mean([abs(lhip - 0.5), abs(lknee - 0.5), abs(lankle - 0.5)]) * 1.8, 0.0, 1.0))
         motor_drive_r = float(np.clip(np.mean([abs(rhip - 0.5), abs(rknee - 0.5), abs(rankle - 0.5)]) * 1.8, 0.0, 1.0))
         roll_from_upright = torso_roll - HUMANOID_URDF_STAND_EULER[0]
+        joint_deviations = [
+            abs(lsh) * 1.2, abs(rsh) * 1.2,
+            abs(lel) * 0.8, abs(rel) * 0.8,
+            abs(sp_pitch) * 2.0, abs(sp_yaw) * 2.0,
+        ]
+        joint_penalty = float(np.clip(np.mean(joint_deviations), 0.0, 1.0))
         posture_stability = float(np.clip(
             1.0
             - (abs(roll_from_upright) + abs(torso_pitch)) * 0.6
-            - abs(com_z - STAND_Z) / max(STAND_Z, 0.01) * 0.4,
+            - abs(com_z - STAND_Z) / max(STAND_Z, 0.01) * 0.4
+            - joint_penalty * 0.3,
             0.0, 1.0,
         ))
         return {
@@ -1695,6 +1708,16 @@ class EnvironmentHumanoid:
         }
 
     # ── do() ─────────────────────────────────────────────────────────────────
+    _JOINT_COMFORT_ZONE: dict[str, tuple[float, float]] = {
+        "lshoulder": (0.35, 0.65), "rshoulder": (0.35, 0.65),
+        "lelbow": (0.35, 0.65), "relbow": (0.35, 0.65),
+        "spine_pitch": (0.42, 0.58), "spine_yaw": (0.42, 0.58),
+        "neck_pitch": (0.40, 0.60), "neck_yaw": (0.40, 0.60),
+        "lhip": (0.35, 0.65), "rhip": (0.35, 0.65),
+        "lknee": (0.35, 0.65), "rknee": (0.35, 0.65),
+        "lankle": (0.38, 0.62), "rankle": (0.38, 0.62),
+    }
+
     def intervene(self, variable: str, value: float, *, count_intervention: bool = True) -> dict[str, float]:
         if count_intervention:
             self.n_interventions += 1
@@ -1710,14 +1733,15 @@ class EnvironmentHumanoid:
             self._sim.step(self.steps_per_do)
             return self.observe()
 
-        # В fixed_root mode управляем только руками и головой (ноги зафиксированы)
         if self._fixed_root:
             controllable = ARM_VARS + SPINE_VARS + HEAD_VARS
         else:
             controllable = LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS
 
         if variable in controllable:
-            self._sim.set_joint(variable, value)
+            lo, hi = self._JOINT_COMFORT_ZONE.get(variable, (0.05, 0.95))
+            clamped = float(np.clip(value, lo, hi))
+            self._sim.set_joint(variable, clamped)
 
         self._sim.step(self.steps_per_do)
         return self.observe()
@@ -1750,7 +1774,8 @@ class EnvironmentHumanoid:
                 self._motor_state[variable] = v
                 touched_intent = True
             elif variable in controllable:
-                joints_after.append((variable, v))
+                lo, hi = self._JOINT_COMFORT_ZONE.get(variable, (0.05, 0.95))
+                joints_after.append((variable, float(np.clip(v, lo, hi))))
         if touched_intent:
             self._apply_motor_intents()
         for variable, v in joints_after:
@@ -1780,10 +1805,10 @@ class EnvironmentHumanoid:
                 clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms),
             )
             self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
-            self._sim.set_joint("lshoulder", clip01(0.5 + 0.16 * arms + 0.09 * recover))
-            self._sim.set_joint("rshoulder", clip01(0.5 - 0.16 * arms + 0.09 * recover))
-            self._sim.set_joint("lelbow", clip01(0.5 + 0.14 * arms))
-            self._sim.set_joint("relbow", clip01(0.5 - 0.14 * arms))
+            self._sim.set_joint("lshoulder", clip01(0.5 + 0.10 * arms + 0.05 * recover))
+            self._sim.set_joint("rshoulder", clip01(0.5 - 0.10 * arms + 0.05 * recover))
+            self._sim.set_joint("lelbow", clip01(0.5 + 0.08 * arms))
+            self._sim.set_joint("relbow", clip01(0.5 - 0.08 * arms))
             return
 
         self._sim.set_joint(
@@ -1793,14 +1818,14 @@ class EnvironmentHumanoid:
         self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
         self._sim.set_joint(
             "lshoulder",
-            clip01(0.5 + 0.17 * arms + 0.03 * stride + 0.05 * recover),
+            clip01(0.5 + 0.08 * arms + 0.02 * stride + 0.03 * recover),
         )
         self._sim.set_joint(
             "rshoulder",
-            clip01(0.5 - 0.17 * arms - 0.03 * stride + 0.05 * recover),
+            clip01(0.5 - 0.08 * arms - 0.02 * stride + 0.03 * recover),
         )
-        self._sim.set_joint("lelbow", clip01(0.5 + 0.14 * arms))
-        self._sim.set_joint("relbow", clip01(0.5 - 0.14 * arms))
+        self._sim.set_joint("lelbow", clip01(0.5 + 0.06 * arms))
+        self._sim.set_joint("relbow", clip01(0.5 - 0.06 * arms))
 
     def _apply_motor_intents(self) -> None:
         """
