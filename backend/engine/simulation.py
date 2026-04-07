@@ -359,6 +359,10 @@ class Simulation:
         self._fixed_root_active = False
         self._stand_ticks = 0
         self._last_fall_reset_tick: int = -999
+        self._fall_recovery_active = False
+        self._fall_recovery_start_tick = 0
+        self._fall_recovery_last_progress_tick = 0
+        self._fall_recovery_best_score = 0.0
 
         # ── Фаза 12: Visual Cortex ────────────────────────────────────────────
         self._visual_mode   = False     # выкл по умолчанию
@@ -586,6 +590,7 @@ class Simulation:
             self._l4_last_apply_tick = 0
             self._l3_next_due_ts = 0.0
             self._motor_state = MotorState()
+            self._clear_fall_recovery()
             self._drain_simple_queue(self._l1_motor_q)
             self._l1_last_cmd_tick = 0
             self._l1_last_apply_tick = 0
@@ -994,6 +999,7 @@ class Simulation:
                 self._l3_next_due_ts = 0.0
                 self._l3_last_tick = 0
                 self._motor_state = MotorState()
+                self._clear_fall_recovery()
                 self._drain_simple_queue(self._l1_motor_q)
                 self._l1_last_cmd_tick = 0
                 self._l1_last_apply_tick = 0
@@ -1275,6 +1281,66 @@ class Simulation:
         self._last_fall_reset_tick = self.tick
         self._add_event("🔄 Сброс позы после падения", "#44aaff", "value")
         return True
+
+    @staticmethod
+    def _fall_recovery_score(obs: dict) -> float:
+        cz = float(obs.get("com_z", obs.get("phys_com_z", 0.0)))
+        posture = float(obs.get("posture_stability", obs.get("phys_posture_stability", 0.0)))
+        foot_l = float(obs.get("foot_contact_l", obs.get("phys_foot_contact_l", 0.0)))
+        foot_r = float(obs.get("foot_contact_r", obs.get("phys_foot_contact_r", 0.0)))
+        return 0.45 * cz + 0.35 * posture + 0.20 * min(foot_l, foot_r)
+
+    def _clear_fall_recovery(self) -> None:
+        self._fall_recovery_active = False
+        self._fall_recovery_start_tick = 0
+        self._fall_recovery_last_progress_tick = 0
+        self._fall_recovery_best_score = 0.0
+
+    def _maybe_recover_or_reset_after_fall(self, obs: dict) -> bool:
+        """
+        Recovery-first policy:
+        - give the agent time to stand up on its own,
+        - hard-reset only when recovery stalls for too long.
+        Returns True if a hard reset was performed.
+        """
+        score = self._fall_recovery_score(obs)
+        try:
+            max_ticks = int(os.environ.get("RKK_FALL_RECOVERY_TICKS", "90"))
+        except ValueError:
+            max_ticks = 90
+        try:
+            stall_ticks = int(os.environ.get("RKK_FALL_RECOVERY_STALL_TICKS", "28"))
+        except ValueError:
+            stall_ticks = 28
+        try:
+            min_gain = float(os.environ.get("RKK_FALL_RECOVERY_MIN_GAIN", "0.02"))
+        except ValueError:
+            min_gain = 0.02
+        max_ticks = max(8, min(max_ticks, 600))
+        stall_ticks = max(4, min(stall_ticks, max_ticks))
+        min_gain = float(np.clip(min_gain, 0.0, 0.25))
+
+        if not self._fall_recovery_active:
+            self._fall_recovery_active = True
+            self._fall_recovery_start_tick = self.tick
+            self._fall_recovery_last_progress_tick = self.tick
+            self._fall_recovery_best_score = score
+            self._add_event("🦿 Recovery window after fall", "#ffbb66", "value")
+            return False
+
+        if score > self._fall_recovery_best_score + min_gain:
+            self._fall_recovery_best_score = score
+            self._fall_recovery_last_progress_tick = self.tick
+
+        total_elapsed = self.tick - self._fall_recovery_start_tick
+        stalled_for = self.tick - self._fall_recovery_last_progress_tick
+        if total_elapsed < max_ticks and stalled_for < stall_ticks:
+            return False
+
+        if self._try_reset_pose_after_fall():
+            self._clear_fall_recovery()
+            return True
+        return False
 
     # ── Этап D: LLM в петле ────────────────────────────────────────────────────
     def _llm_loop_enabled(self) -> bool:
@@ -2044,9 +2110,12 @@ class Simulation:
         is_fn  = getattr(self.agent.env, "is_fallen", None)
         if callable(is_fn) and not self._fixed_root_active:
             fallen = is_fn()
+            if self._fall_recovery_active and not fallen:
+                self._clear_fall_recovery()
             if fallen:
                 self._fall_count += 1
-                if self._try_reset_pose_after_fall():
+                obs_fall = dict(self.agent.env.observe())
+                if self._maybe_recover_or_reset_after_fall(obs_fall):
                     obs = self.agent.env.observe()
                     self._sync_motor_state(obs, source="reset", tick=self.tick)
                     for nid in self.agent.graph._node_ids:
@@ -2536,6 +2605,12 @@ class Simulation:
             "gnn_d":         self.agent.graph._d,
             "fallen":        snap.get("fallen", False),
             "fall_count":    snap.get("fall_count", 0),
+            "fall_recovery": {
+                "active": bool(self._fall_recovery_active),
+                "start_tick": int(self._fall_recovery_start_tick),
+                "last_progress_tick": int(self._fall_recovery_last_progress_tick),
+                "best_score": round(float(self._fall_recovery_best_score), 4),
+            },
             "fixed_root":    self._fixed_root_active,
             "scene":         scene,
             # Фаза 12
