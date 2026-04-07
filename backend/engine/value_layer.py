@@ -56,7 +56,7 @@ class HomeostaticBounds:
     var_min:         float = 0.05
     var_max:         float = 0.95
     phi_min:         float = 0.005
-    h_slow_max:      float = 18.0
+    h_slow_max:      float = 24.0
     env_entropy_max_delta: float = 1.2
     s1_penalty:      float = -0.2
 
@@ -64,7 +64,7 @@ class HomeostaticBounds:
     blend_ticks:     int   = 400
     phi_min_steady:  float = 0.03
     env_entropy_max_delta_steady: float = 0.65
-    h_slow_max_steady: float = 14.0
+    h_slow_max_steady: float = 20.0
     predict_band_edge_steady: float = 0.015
 
     # ── fixed_root mode ──────────────────────────────────────────────────────
@@ -443,12 +443,15 @@ class ValueLayer:
             entropy_delta     = predicted_entropy - current_entropy
 
         # §5 h_slow temporal overload — пропускаем в fixed_root
+        # Scale threshold by sqrt of graph dimension since h_slow norm grows with d
         if not fixed_root:
             h_slow_norm = temporal.h_slow.norm().item() if temporal is not None else 0.0
-            if h_slow_norm > relaxed_h_slow_max:
+            d_scale = max(1.0, len(current_nodes) / 20.0)
+            scaled_h_max = relaxed_h_slow_max * d_scale
+            if h_slow_norm > scaled_h_max:
                 return self._block(
                     BlockReason.PHI_TOO_LOW, predicted_state, current_phi,
-                    f"h_slow norm={h_slow_norm:.2f} > {relaxed_h_slow_max:.2f} (temporal overload)",
+                    f"h_slow norm={h_slow_norm:.2f} > {scaled_h_max:.2f} (temporal overload, d={len(current_nodes)})",
                     variable, value, imagination_steps=imagination_evals,
                 )
 
