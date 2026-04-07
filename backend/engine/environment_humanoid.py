@@ -591,7 +591,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         pb.setGravity(0, 0, -9.81, physicsClientId=self.client)
         pb.setAdditionalSearchPath(pbd.getDataPath(), physicsClientId=self.client)
         pb.setTimeStep(1/240., physicsClientId=self.client)
-        pb.setPhysicsEngineParameter(numSolverIterations=50, physicsClientId=self.client)
+        pb.setPhysicsEngineParameter(numSolverIterations=80, physicsClientId=self.client)
 
         self.floor_id = pb.loadURDF("plane.urdf", physicsClientId=self.client)
         self._build_ramp()
@@ -675,6 +675,13 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             elif jname == "spine":
                 self.joint_by_var["spine_yaw"] = i
                 self.joint_by_var["spine_pitch"] = i
+
+        for i in range(self.n_joints):
+            jt = self._joint_types[i]
+            if jt != pb.JOINT_FIXED:
+                pb.changeDynamics(self.robot_id, i,
+                    jointDamping=0.5, linearDamping=0.04, angularDamping=0.04,
+                    physicsClientId=self.client)
 
         # ── Fixed root constraint (None = not applied) ───────────────────────
         self._root_constraint: int | None = None
