@@ -1592,6 +1592,7 @@ class EnvironmentHumanoid:
         Переключить fixed_root mode без пересоздания среды.
         Simulation.enable/disable_fixed_root() вызывает это и затем
         rebind_variables() на агенте.
+        When disabling: set neutral pose and settle BEFORE removing constraint.
         """
         if enabled == self._fixed_root:
             return
@@ -1600,7 +1601,9 @@ class EnvironmentHumanoid:
             if enabled:
                 self._sim.enable_fixed_root()
             else:
+                self._settle_after_reset()
                 self._sim.disable_fixed_root()
+                self._settle_after_reset()
         else:
             self._sim.fixed_root = enabled
 
