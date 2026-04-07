@@ -982,7 +982,17 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             jt = self._joint_types[i]
             if jt == pb.JOINT_FIXED:
                 continue
-            if jt == pb.JOINT_SPHERICAL and callable(motor_m):
+            var_name = self.joint_map.get(i, "")
+            if var_name in ("lshoulder", "rshoulder") and jt == pb.JOINT_SPHERICAL and callable(motor_m):
+                lo, hi = _RANGES.get(var_name, (-1.0, 1.0))
+                rp = float(0.20 * (hi - lo) + lo)
+                sign = 1.0 if var_name == "lshoulder" else -1.0
+                q = pb.getQuaternionFromEuler((0.32 * rp, sign * 0.42 * rp, sign * 0.28 * rp))
+                motor_m(rid, i, pb.POSITION_CONTROL, targetPosition=list(q),
+                        positionGain=1.2, velocityGain=0.40,
+                        maxVelocity=6.0, force=[12000.0, 12000.0, 12000.0],
+                        physicsClientId=cid)
+            elif jt == pb.JOINT_SPHERICAL and callable(motor_m):
                 motor_m(
                     rid, i, pb.POSITION_CONTROL,
                     targetPosition=quat_id,
@@ -1683,8 +1693,10 @@ class EnvironmentHumanoid:
         motor_drive_l = float(np.clip(np.mean([abs(lhip - 0.5), abs(lknee - 0.5), abs(lankle - 0.5)]) * 1.8, 0.0, 1.0))
         motor_drive_r = float(np.clip(np.mean([abs(rhip - 0.5), abs(rknee - 0.5), abs(rankle - 0.5)]) * 1.8, 0.0, 1.0))
         roll_from_upright = torso_roll - HUMANOID_URDF_STAND_EULER[0]
+        lsh_neutral = -0.60
+        rsh_neutral = 0.60
         joint_deviations = [
-            abs(lsh) * 1.2, abs(rsh) * 1.2,
+            abs(lsh - lsh_neutral) * 0.6, abs(rsh - rsh_neutral) * 0.6,
             abs(lel) * 0.8, abs(rel) * 0.8,
             abs(sp_pitch) * 2.0, abs(sp_yaw) * 2.0,
         ]
@@ -1708,15 +1720,30 @@ class EnvironmentHumanoid:
         }
 
     # ── do() ─────────────────────────────────────────────────────────────────
-    _JOINT_COMFORT_ZONE: dict[str, tuple[float, float]] = {
-        "lshoulder": (0.44, 0.56), "rshoulder": (0.44, 0.56),
-        "lelbow": (0.44, 0.56), "relbow": (0.44, 0.56),
-        "spine_pitch": (0.45, 0.55), "spine_yaw": (0.45, 0.55),
-        "neck_pitch": (0.44, 0.56), "neck_yaw": (0.44, 0.56),
-        "lhip": (0.38, 0.62), "rhip": (0.38, 0.62),
-        "lknee": (0.38, 0.62), "rknee": (0.38, 0.62),
-        "lankle": (0.40, 0.60), "rankle": (0.40, 0.60),
+    _JOINT_NEUTRAL: dict[str, float] = {
+        "lshoulder": 0.20, "rshoulder": 0.20,
+        "lelbow": 0.50, "relbow": 0.50,
+        "spine_pitch": 0.50, "spine_yaw": 0.50,
+        "neck_pitch": 0.50, "neck_yaw": 0.50,
+        "lhip": 0.50, "rhip": 0.50,
+        "lknee": 0.50, "rknee": 0.50,
+        "lankle": 0.50, "rankle": 0.50,
     }
+    _JOINT_COMFORT_RANGE: dict[str, float] = {
+        "lshoulder": 0.10, "rshoulder": 0.10,
+        "lelbow": 0.08, "relbow": 0.08,
+        "spine_pitch": 0.05, "spine_yaw": 0.05,
+        "neck_pitch": 0.06, "neck_yaw": 0.06,
+        "lhip": 0.12, "rhip": 0.12,
+        "lknee": 0.12, "rknee": 0.12,
+        "lankle": 0.10, "rankle": 0.10,
+    }
+
+    @classmethod
+    def _comfort_zone(cls, var: str) -> tuple[float, float]:
+        n = cls._JOINT_NEUTRAL.get(var, 0.5)
+        r = cls._JOINT_COMFORT_RANGE.get(var, 0.45)
+        return (max(0.05, n - r), min(0.95, n + r))
 
     def intervene(self, variable: str, value: float, *, count_intervention: bool = True) -> dict[str, float]:
         if count_intervention:
@@ -1739,7 +1766,7 @@ class EnvironmentHumanoid:
             controllable = LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS
 
         if variable in controllable:
-            lo, hi = self._JOINT_COMFORT_ZONE.get(variable, (0.05, 0.95))
+            lo, hi = self._comfort_zone(variable)
             clamped = float(np.clip(value, lo, hi))
             self._sim.set_joint(variable, clamped)
 
@@ -1774,7 +1801,7 @@ class EnvironmentHumanoid:
                 self._motor_state[variable] = v
                 touched_intent = True
             elif variable in controllable:
-                lo, hi = self._JOINT_COMFORT_ZONE.get(variable, (0.05, 0.95))
+                lo, hi = self._comfort_zone(variable)
                 joints_after.append((variable, float(np.clip(v, lo, hi))))
         if touched_intent:
             self._apply_motor_intents()
@@ -1805,10 +1832,10 @@ class EnvironmentHumanoid:
                 clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms),
             )
             self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
-            self._sim.set_joint("lshoulder", clip01(0.5 + 0.10 * arms + 0.05 * recover))
-            self._sim.set_joint("rshoulder", clip01(0.5 - 0.10 * arms + 0.05 * recover))
-            self._sim.set_joint("lelbow", clip01(0.5 + 0.08 * arms))
-            self._sim.set_joint("relbow", clip01(0.5 - 0.08 * arms))
+            self._sim.set_joint("lshoulder", clip01(0.20 + 0.08 * arms + 0.04 * recover))
+            self._sim.set_joint("rshoulder", clip01(0.20 - 0.08 * arms + 0.04 * recover))
+            self._sim.set_joint("lelbow", clip01(0.50 + 0.06 * arms))
+            self._sim.set_joint("relbow", clip01(0.50 - 0.06 * arms))
             return
 
         self._sim.set_joint(
@@ -1818,14 +1845,14 @@ class EnvironmentHumanoid:
         self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
         self._sim.set_joint(
             "lshoulder",
-            clip01(0.5 + 0.08 * arms + 0.02 * stride + 0.03 * recover),
+            clip01(0.20 + 0.06 * arms + 0.02 * stride + 0.03 * recover),
         )
         self._sim.set_joint(
             "rshoulder",
-            clip01(0.5 - 0.08 * arms - 0.02 * stride + 0.03 * recover),
+            clip01(0.20 - 0.06 * arms - 0.02 * stride + 0.03 * recover),
         )
-        self._sim.set_joint("lelbow", clip01(0.5 + 0.06 * arms))
-        self._sim.set_joint("relbow", clip01(0.5 - 0.06 * arms))
+        self._sim.set_joint("lelbow", clip01(0.50 + 0.05 * arms))
+        self._sim.set_joint("relbow", clip01(0.50 - 0.05 * arms))
 
     def _apply_motor_intents(self) -> None:
         """
