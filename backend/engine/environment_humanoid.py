@@ -1709,13 +1709,13 @@ class EnvironmentHumanoid:
 
     # ── do() ─────────────────────────────────────────────────────────────────
     _JOINT_COMFORT_ZONE: dict[str, tuple[float, float]] = {
-        "lshoulder": (0.35, 0.65), "rshoulder": (0.35, 0.65),
-        "lelbow": (0.35, 0.65), "relbow": (0.35, 0.65),
-        "spine_pitch": (0.42, 0.58), "spine_yaw": (0.42, 0.58),
-        "neck_pitch": (0.40, 0.60), "neck_yaw": (0.40, 0.60),
-        "lhip": (0.35, 0.65), "rhip": (0.35, 0.65),
-        "lknee": (0.35, 0.65), "rknee": (0.35, 0.65),
-        "lankle": (0.38, 0.62), "rankle": (0.38, 0.62),
+        "lshoulder": (0.44, 0.56), "rshoulder": (0.44, 0.56),
+        "lelbow": (0.44, 0.56), "relbow": (0.44, 0.56),
+        "spine_pitch": (0.45, 0.55), "spine_yaw": (0.45, 0.55),
+        "neck_pitch": (0.44, 0.56), "neck_yaw": (0.44, 0.56),
+        "lhip": (0.38, 0.62), "rhip": (0.38, 0.62),
+        "lknee": (0.38, 0.62), "rknee": (0.38, 0.62),
+        "lankle": (0.40, 0.60), "rankle": (0.40, 0.60),
     }
 
     def intervene(self, variable: str, value: float, *, count_intervention: bool = True) -> dict[str, float]:
