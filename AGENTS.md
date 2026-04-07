@@ -8,10 +8,13 @@ RKK is a two-part AGI simulation platform: a **Python backend** (FastAPI + PyBul
 
 ### Running services
 
-- **Backend**: `cd backend && RKK_DEVICE=cpu RKK_SKIP_AUTO_HUMANOID_LLM=1 RKK_SKIP_AUTO_VISION=1 RKK_SKIP_PHASE3_LLM=1 RKK_LLM_LOOP=0 RKK_MEMORY_RESUME_ON_START=0 python3 run.py`
+- **Backend**: `cd backend && RKK_DEVICE=cpu RKK_SKIP_AUTO_HUMANOID_LLM=1 RKK_SKIP_AUTO_VISION=1 RKK_SKIP_PHASE3_LLM=1 RKK_LLM_LOOP=0 RKK_MEMORY_RESUME_ON_START=0 RKK_LOCOMOTION_CPG=1 RKK_SKILL_LIBRARY=1 RKK_AUTO_FIXED_ROOT_TICKS=200 python3 run.py`
   - Starts FastAPI/Uvicorn on port 8000
   - `RKK_DEVICE=cpu` is required in the cloud VM (no GPU)
-  - The `RKK_SKIP_*` and `RKK_LLM_LOOP=0` flags disable Ollama-dependent features (LLM bootstrap, visual cortex auto-init, phase-3 teacher, LLM-in-the-loop) since Ollama is not available in the cloud VM
+  - The `RKK_SKIP_*` and `RKK_LLM_LOOP=0` flags disable Ollama-dependent features since Ollama is not available in the cloud VM
+  - `RKK_LOCOMOTION_CPG=1` enables the CPG locomotion controller for bipedal walking
+  - `RKK_SKILL_LIBRARY=1` enables motor skill sequences (stand, stabilize, walk)
+  - `RKK_AUTO_FIXED_ROOT_TICKS=200` uses fixed-root curriculum: 200 ticks of arm exploration, then release for full-body locomotion
   - `RKK_MEMORY_RESUME_ON_START=0` prevents loading stale autosave state
 - **Frontend**: `npm run dev` (Vite on port 5173, see `package.json` scripts)
 
