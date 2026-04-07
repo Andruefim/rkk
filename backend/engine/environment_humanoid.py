@@ -979,16 +979,16 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 motor_m(
                     rid, i, pb.POSITION_CONTROL,
                     targetPosition=quat_id,
-                    positionGain=1.0, velocityGain=0.35,
-                    maxVelocity=8.0, force=[220.0, 220.0, 220.0],
+                    positionGain=1.2, velocityGain=0.40,
+                    maxVelocity=6.0, force=[400.0, 400.0, 400.0],
                     physicsClientId=cid,
                 )
             else:
                 pb.setJointMotorControl2(
                     rid, i, controlMode=pb.POSITION_CONTROL,
                     targetPosition=0.0,
-                    positionGain=0.55, velocityGain=0.12,
-                    force=100.0, physicsClientId=cid,
+                    positionGain=0.90, velocityGain=0.25,
+                    force=250.0, physicsClientId=cid,
                 )
 
     def _snap_base_spine_vertical(self) -> None:
