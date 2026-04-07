@@ -507,7 +507,7 @@ export default function RKKHumanoid() {
         if(a<jointPositions.length&&b<jointPositions.length&&k<boneMeshes.length){
           updateBone(boneMeshes[k],jointPositions[a],jointPositions[b]);
           boneMeshes[k].visible=true;
-          const boneCol=fallen?0x993322:isFR?0xd0c0a0:isVis?parseInt(SLOT_COLORS[k%8].replace("#",""),16):0xe8e0d8;
+          const boneCol=fallen?0x993322:isFR?0xd0c0a0:isVis?parseInt(SLOT_COLORS[k%8].replace("#",""),16):0xddd5cd;
           boneMeshes[k].material.color.setHex(boneCol);
           boneMeshes[k].material.emissiveIntensity=fallen?0.1:0.02;
         }
