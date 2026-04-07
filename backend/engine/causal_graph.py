@@ -113,10 +113,10 @@ class NOTEARSCore(nn.Module):
 
 # ─── CausalGraph ──────────────────────────────────────────────────────────────
 class CausalGraph:
-    LAMBDA_DAG  = 0.5
-    LAMBDA_INT  = 2.0
-    LAMBDA_L1   = 0.02
-    EDGE_THRESH = 0.05
+    LAMBDA_DAG  = 0.3
+    LAMBDA_INT  = 4.0
+    LAMBDA_L1   = 0.005
+    EDGE_THRESH = 0.04
     # Фаза 1: целевой вес замороженных рёбер в W (после каждого optim.step снова clamp).
     FROZEN_EDGE_W = 0.85
 
@@ -419,7 +419,7 @@ class CausalGraph:
         obs_b = self._obs_buffer
         batch_cap = 32
         try:
-            passive_ratio = float(os.environ.get("RKK_WM_PASSIVE_MIX", "0.35"))
+            passive_ratio = float(os.environ.get("RKK_WM_PASSIVE_MIX", "0.15"))
         except ValueError:
             passive_ratio = 0.35
         passive_ratio = max(0.0, min(0.75, passive_ratio))
@@ -487,7 +487,12 @@ class CausalGraph:
                 l1_mask[i, j] = 0.0
         l_l1 = self.LAMBDA_L1 * (wm.abs() * l1_mask).sum()
 
-        l_int = torch.tensor(0.0, device=self.device)
+        if n_i > 0:
+            int_pred = X_pred[:n_i]
+            int_true = X_tp1[:n_i]
+            l_int = self.LAMBDA_INT * F.mse_loss(int_pred, int_true)
+        else:
+            l_int = torch.tensor(0.0, device=self.device)
 
         loss = l_rec + l_dag + l_l1 + l_int
         loss.backward()

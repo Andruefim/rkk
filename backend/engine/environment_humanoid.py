@@ -1781,7 +1781,7 @@ class EnvironmentHumanoid:
 
         self._sim.set_joint(
             "spine_pitch",
-            clip01(0.5 + 0.14 * torso + 0.16 * recover + 0.07 * arms),
+            clip01(0.54 + 0.14 * torso + 0.16 * recover + 0.07 * arms),
         )
         self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
         self._sim.set_joint(

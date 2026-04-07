@@ -122,35 +122,34 @@
 	</joint>
 	<link name="right_ankle" >
 		<inertial>
-				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
-			 <mass value = "1.000000" />
-			<inertia ixx = "0.1" ixy = "0" ixz = "0" iyy = "0.1" iyz = "0" izz = "0.1" />
+				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
+			 <mass value = "1.200000" />
+			<inertia ixx = "0.12" ixy = "0" ixz = "0" iyy = "0.12" iyz = "0" izz = "0.12" />
 		</inertial>
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
 			<geometry>
-				<box size="0.780000 0.300000 0.400000" />
+				<box size="1.100000 0.300000 0.500000" />
 			</geometry>
 			<material name="white"><color rgba="0.95 0.95 0.95 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
 			<geometry>
-				<box size="0.780000 0.300000 0.400000" />
+				<box size="1.100000 0.300000 0.500000" />
 			</geometry>
 		</collision>
-		<!-- Подошва: центр смещён назад (пятка), сустав ≈ задняя треть опоры — иначе COM падает назад «лыжами» -->
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.30 -0.09 -0.16" />
 			<geometry>
-				<box size="0.44 0.08 0.30" />
+				<box size="0.70 0.10 0.44" />
 			</geometry>
 			<material name="sole_r"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.30 -0.09 -0.16" />
 			<geometry>
-				<box size="0.44 0.08 0.30" />
+				<box size="0.70 0.10 0.44" />
 			</geometry>
 		</collision>
 	</link>
@@ -258,34 +257,34 @@
 	</joint>
 	<link name="left_ankle" >
 		<inertial>
-				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
-			 <mass value = "1.000000" />
-			<inertia ixx = "0.1" ixy = "0" ixz = "0" iyy = "0.1" iyz = "0" izz = "0.1" />
+				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
+			 <mass value = "1.200000" />
+			<inertia ixx = "0.12" ixy = "0" ixz = "0" iyy = "0.12" iyz = "0" izz = "0.12" />
 		</inertial>
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
 			<geometry>
-				<box size="0.780000 0.300000 0.400000" />
+				<box size="1.100000 0.300000 0.500000" />
 			</geometry>
 			<material name="white_l"><color rgba="0.95 0.95 0.95 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.180000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
 			<geometry>
-				<box size="0.780000 0.300000 0.400000" />
+				<box size="1.100000 0.300000 0.500000" />
 			</geometry>
 		</collision>
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.30 -0.09 -0.16" />
 			<geometry>
-				<box size="0.44 0.08 0.30" />
+				<box size="0.70 0.10 0.44" />
 			</geometry>
 			<material name="sole_l"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.15 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.30 -0.09 -0.16" />
 			<geometry>
-				<box size="0.44 0.08 0.30" />
+				<box size="0.70 0.10 0.44" />
 			</geometry>
 		</collision>
 	</link>
