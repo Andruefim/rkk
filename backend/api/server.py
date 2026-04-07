@@ -688,6 +688,36 @@ def memory_load(path: str | None = Query(default=None)):
     return get_sim().memory_load(path)
 
 
+@app.get("/memory/status")
+def memory_status():
+    """Статус .rkk файла по умолчанию."""
+    from engine.persistence import default_memory_path
+
+    p = default_memory_path()
+    if not p.is_file():
+        return {"exists": False, "path": str(p.resolve())}
+    st = p.stat()
+    return {
+        "exists": True,
+        "path": str(p.resolve()),
+        "size_kb": round(float(st.st_size) / 1024.0, 2),
+        "mtime": float(st.st_mtime),
+    }
+
+
+@app.get("/graph/frozen-edges")
+def graph_frozen_edges():
+    """Диагностика замороженных кинематических рёбер."""
+    sim = get_sim()
+    frozen = sorted(list(getattr(sim.agent.graph, "_frozen_edge_set", set()) or set()))
+    return {
+        "count": len(frozen),
+        "edges": [{"from_": f, "to": t} for (f, t) in frozen],
+        "mask_active": bool(frozen and sim.agent.graph._core is not None),
+        "frozen_weight_target": float(getattr(sim.agent.graph, "FROZEN_EDGE_W", 0.0)),
+    }
+
+
 @app.get("/concepts/list")
 def concepts_list():
     """Список концептов: Phase 1 proto-concepts + Phase 2 ConceptStore snapshot."""

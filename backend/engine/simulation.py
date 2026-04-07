@@ -318,6 +318,17 @@ class Simulation:
         # L3 cadence без отдельного writer-потока (минимум гонок).
         self._l3_next_due_ts = 0.0
         self._l3_last_tick = 0
+        # Фаза 1: автозагрузка .rkk на старте (если есть файл).
+        self._memory_resume_enabled = os.environ.get(
+            "RKK_MEMORY_RESUME_ON_START", "1"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if self._memory_resume_enabled:
+            try:
+                meta = self.memory_load()
+                if meta.get("ok"):
+                    print(f"[Simulation] Memory resumed at tick={self.tick}")
+            except Exception as e:
+                print(f"[Simulation] Memory resume skipped: {type(e).__name__}: {e}")
 
     # ── Фаза 1: память и концепты ─────────────────────────────────────────────
     def _annotate_concepts_with_graph_nodes(self) -> None:
@@ -449,9 +460,17 @@ class Simulation:
                 }
 
         with self._sim_step_lock:
+            # Worker-safe load: останавливаем L4 воркер и чистим его очереди,
+            # чтобы не применить устаревшие концепты после миграции графа.
+            self._stop_l4_worker()
+            self._l4_last_snapshot = {"n_concepts": 0, "concepts": []}
+            self._l4_last_submit_tick = 0
+            self._l4_last_apply_tick = 0
+            self._l3_next_due_ts = 0.0
             out = load_simulation(self, p)
             if out.get("ok"):
                 self._annotate_concepts_with_graph_nodes()
+                self._ensure_phase2()
             return out
 
     def concepts_list_payload(self) -> dict:
@@ -661,6 +680,16 @@ class Simulation:
         self._l4_thread = None
         self._l4_stop.clear()
         self._l4_task_pending = False
+        self._drain_simple_queue(self._l4_in_q)
+        self._drain_simple_queue(self._l4_out_q)
+
+    @staticmethod
+    def _drain_simple_queue(q: queue.SimpleQueue) -> None:
+        while True:
+            try:
+                q.get_nowait()
+            except Exception:
+                break
 
     def _enqueue_l4_task(
         self,
