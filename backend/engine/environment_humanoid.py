@@ -1553,7 +1553,7 @@ class EnvironmentHumanoid:
     def __init__(
         self,
         device: torch.device | None = None,
-        steps_per_do: int = 12,
+        steps_per_do: int = 24,
         fixed_root: bool = False,
     ):
         self.device = device or torch.device("cpu")
@@ -1561,7 +1561,8 @@ class EnvironmentHumanoid:
             spd = int(os.environ.get("RKK_STEPS_PER_DO", str(steps_per_do)))
         except ValueError:
             spd = steps_per_do
-        self.steps_per_do = max(1, min(int(spd), 64))
+        # Больше шагов PyBullet на один do() — инерция успевает проявиться до снимка для GNN/VL.
+        self.steps_per_do = max(1, min(int(spd), 128))
         self.preset       = self.PRESET
         self.n_interventions = 0
         self._fixed_root  = fixed_root
@@ -1691,6 +1692,42 @@ class EnvironmentHumanoid:
         if variable in controllable:
             self._sim.set_joint(variable, value)
 
+        self._sim.step(self.steps_per_do)
+        return self.observe()
+
+    def intervene_burst(
+        self,
+        pairs: list[tuple[str, float]],
+        *,
+        count_intervention: bool = False,
+    ) -> dict[str, float]:
+        """
+        Несколько do() за один физический settle-step: важно для согласованных intent/joint.
+        Порядок: self_* и motor intent в _motor_state → один _apply_motor_intents → явные set_joint.
+        """
+        if not pairs:
+            return self.observe()
+        if count_intervention:
+            self.n_interventions += 1
+        if self._fixed_root:
+            controllable = ARM_VARS + SPINE_VARS + HEAD_VARS
+        else:
+            controllable = LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS
+        touched_intent = False
+        joints_after: list[tuple[str, float]] = []
+        for variable, value in pairs:
+            v = float(np.clip(value, 0.05, 0.95))
+            if variable in SELF_VARS:
+                self._self_state[variable] = v
+            elif variable in MOTOR_INTENT_VARS:
+                self._motor_state[variable] = v
+                touched_intent = True
+            elif variable in controllable:
+                joints_after.append((variable, v))
+        if touched_intent:
+            self._apply_motor_intents()
+        for variable, v in joints_after:
+            self._sim.set_joint(variable, v)
         self._sim.step(self.steps_per_do)
         return self.observe()
 

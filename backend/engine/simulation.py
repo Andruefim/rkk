@@ -269,12 +269,12 @@ def _default_bounds() -> HomeostaticBounds:
         phi_min=0.01,
         h_slow_max=14.0,
         env_entropy_max_delta=0.96,
-        warmup_ticks=1500,
-        blend_ticks=500,
-        phi_min_steady=0.04,
-        env_entropy_max_delta_steady=0.60,
-        h_slow_max_steady=11.0,
-        predict_band_edge_steady=0.02,
+        warmup_ticks=3000,
+        blend_ticks=800,
+        phi_min_steady=0.03,
+        env_entropy_max_delta_steady=0.85,
+        h_slow_max_steady=12.0,
+        predict_band_edge_steady=0.015,
     )
 
 
@@ -357,6 +357,7 @@ class Simulation:
 
         self._fall_count  = 0
         self._fixed_root_active = False
+        self._curriculum_auto_fr_released = False
         self._stand_ticks = 0
         self._last_fall_reset_tick: int = -999
         self._fall_recovery_active = False
@@ -598,6 +599,18 @@ class Simulation:
             if out.get("ok"):
                 self._annotate_concepts_with_graph_nodes()
                 self._ensure_phase2()
+                try:
+                    auto_fr = int(os.environ.get("RKK_AUTO_FIXED_ROOT_TICKS", "0"))
+                except ValueError:
+                    auto_fr = 0
+                if (
+                    auto_fr > 0
+                    and self.current_world == "humanoid"
+                    and self.tick >= auto_fr
+                ):
+                    self._curriculum_auto_fr_released = True
+                    if self._fixed_root_active:
+                        self.disable_fixed_root()
             return out
 
     def concepts_list_payload(self) -> dict:
@@ -977,6 +990,7 @@ class Simulation:
                     winfo["color"], "phase"
                 )
                 if new_world == "humanoid":
+                    self._curriculum_auto_fr_released = False
                     fr = os.environ.get("RKK_FREEZE_URDF", "1").strip().lower()
                     if fr not in ("0", "false", "no", "off") and "lhip" in self.agent.graph.nodes:
                         self.agent.graph.freeze_kinematic_priors()
@@ -1777,21 +1791,18 @@ class Simulation:
         obs_after_full = self.agent.graph.snapshot_vec_dict()
         self.agent.graph.record_observation(obs_before_full)
         self.agent.graph.record_observation(obs_after_full)
-        if not intents:
-            return
-        best_var = None
-        best_delta = -1.0
-        best_val = 0.5
-        for k, v in intents.items():
+        # Все значимые intent в burst (до 4 сильнейших по |v−0.5|).
+        sig: list[tuple[float, str, float]] = []
+        for k, v in (intents or {}).items():
             if k not in self.agent.graph.nodes:
                 continue
-            d = abs(float(v) - 0.5)
-            if d > best_delta:
-                best_delta = d
-                best_var = k
-                best_val = float(v)
-        if best_var is not None:
-            self.agent.graph.record_intervention(best_var, best_val, obs_before_full, obs_after_full)
+            fv = float(v)
+            d = abs(fv - 0.5)
+            if d > 0.08:
+                sig.append((d, k, fv))
+        sig.sort(key=lambda t: -t[0])
+        for _d, k, fv in sig[:4]:
+            self.agent.graph.record_intervention(k, fv, obs_before_full, obs_after_full)
 
     def _drain_l1_motor_commands(self) -> None:
         base = self._unwrap_base_env(self.agent.env)
@@ -1855,6 +1866,17 @@ class Simulation:
             p = float(os.environ.get("RKK_SKILL_LIBRARY_PROB", "0.1"))
         except ValueError:
             p = 0.1
+        if self.current_world == "humanoid" and not self._fixed_root_active:
+            obs = self.agent.env.observe()
+            posture = float(
+                obs.get(
+                    "posture_stability",
+                    obs.get("phys_posture_stability", 0.5),
+                )
+            )
+            # Чем нестабильнее — тем выше доля скиллов (меньше сырого EIG).
+            adaptive = 0.80 - posture * 0.30  # posture=0 → 0.80, posture=1 → 0.50
+            p = max(p, adaptive)
         return float(np.clip(p, 0.0, 1.0))
 
     def _ensure_skill_library(self):
@@ -1881,6 +1903,17 @@ class Simulation:
             return "stand"
         if posture < 0.68 or min(foot_l, foot_r) < 0.54:
             return "stand"
+        try:
+            walk_min = int(os.environ.get("RKK_CURRICULUM_WALK_MIN_TICK", "2000"))
+        except ValueError:
+            walk_min = 2000
+        if (
+            walk_min > 0
+            and self.current_world == "humanoid"
+            and not self._fixed_root_active
+            and self.tick < walk_min
+        ):
+            return "stand"
         g = os.environ.get("RKK_SKILL_GOAL", "walk").strip().lower()
         return g if g else "walk"
 
@@ -1900,61 +1933,142 @@ class Simulation:
         except TypeError:
             return fn(var, val)
 
+    @staticmethod
+    def _skill_step_to_pairs(step) -> list[tuple[str, float]]:
+        if isinstance(step, tuple) and len(step) == 2 and isinstance(step[0], str):
+            return [(str(step[0]), float(step[1]))]
+        if isinstance(step, list):
+            return [(str(a), float(b)) for a, b in step]
+        return []
+
     def _execute_skill_frame(self) -> dict:
+        from engine.graph_constants import is_read_only_macro_var
+
         pack = self._skill_exec
         if pack is None:
             return self.agent.step(engine_tick=self.tick)
         skill = pack["skill"]
         idx: int = pack["index"]
         obs_before_init: dict = pack["obs_before"]
-        var, val = skill.action_sequence[idx]
+        step = skill.action_sequence[idx]
+        pairs = [
+            (v, x)
+            for v, x in self._skill_step_to_pairs(step)
+            if not is_read_only_macro_var(v)
+        ]
+        var0, val0 = (pairs[0] if pairs else ("", 0.5))
+
         obs_before_env = dict(self.agent.env.observe())
         self.agent.graph.apply_env_observation(obs_before_env)
         obs_before_full = self.agent.graph.snapshot_vec_dict()
-        check = self.agent.value_layer.check_action(
-            variable=var,
-            value=float(val),
-            current_nodes=dict(self.agent.graph.nodes),
-            graph=self.agent.graph,
-            temporal=self.agent.temporal,
-            current_phi=self.agent.phi_approx(),
-            other_agents_phi=self.agent.other_agents_phi,
-            engine_tick=self.tick,
-            imagination_horizon=0,
-        )
-        if not check.allowed:
+
+        if not pairs:
+            idx += 1
+            done = idx >= len(skill.action_sequence)
+            if done:
+                obs = dict(self.agent.env.observe())
+                st = self._skill_state_dict(obs)
+                cz_a = float(st.get("com_z", st.get("phys_com_z", 0.5)))
+                cz_b = float(
+                    obs_before_init.get(
+                        "com_z", obs_before_init.get("phys_com_z", 0.5)
+                    )
+                )
+                self._ensure_skill_library().record_outcome(
+                    skill, st, cz_a - cz_b
+                )
+                self._skill_exec = None
+            else:
+                self._skill_exec = {
+                    "skill": skill,
+                    "index": idx,
+                    "obs_before": obs_before_init,
+                }
             return {
-                "blocked": True,
-                "blocked_count": 1,
-                "reason": check.reason.value,
-                "variable": var,
-                "value": float(val),
+                "blocked": False,
+                "skipped": True,
+                "hierarchy": "skill",
+                "skill": skill.name,
+                "skill_step": idx,
+                "skill_done": done,
+                "variable": "",
+                "value": 0.5,
                 "updated_edges": [],
                 "compression_delta": 0.0,
                 "prediction_error": 0.0,
                 "cf_predicted": {},
                 "cf_observed": {},
                 "goal_planned": False,
-                "hierarchy": "skill",
-                "skill": skill.name,
-                "skill_step": idx,
-                "skill_done": False,
             }
-        obs_after = self._sim_env_intervene(var, val, count_intervention=True)
+
+        burst = len(pairs) > 1
+
+        if not burst:
+            var, val = pairs[0]
+            check = self.agent.value_layer.check_action(
+                variable=var,
+                value=float(val),
+                current_nodes=dict(self.agent.graph.nodes),
+                graph=self.agent.graph,
+                temporal=self.agent.temporal,
+                current_phi=self.agent.phi_approx(),
+                other_agents_phi=self.agent.other_agents_phi,
+                engine_tick=self.tick,
+                imagination_horizon=0,
+            )
+            if not check.allowed:
+                return {
+                    "blocked": True,
+                    "blocked_count": 1,
+                    "reason": check.reason.value,
+                    "variable": var,
+                    "value": float(val),
+                    "updated_edges": [],
+                    "compression_delta": 0.0,
+                    "prediction_error": 0.0,
+                    "cf_predicted": {},
+                    "cf_observed": {},
+                    "goal_planned": False,
+                    "hierarchy": "skill",
+                    "skill": skill.name,
+                    "skill_step": idx,
+                    "skill_done": False,
+                }
+            obs_after = self._sim_env_intervene(var, val, count_intervention=True)
+        else:
+            burst_fn = getattr(self.agent.env, "intervene_burst", None)
+            if callable(burst_fn):
+                obs_after = dict(burst_fn(pairs, count_intervention=True))
+            else:
+                obs_after = {}
+                for var, val in pairs:
+                    obs_after = self._sim_env_intervene(
+                        var, val, count_intervention=False
+                    )
+                if not obs_after:
+                    obs_after = dict(self.agent.env.observe())
+
         if not obs_after:
-            obs_after = self.agent.env.observe()
+            obs_after = dict(self.agent.env.observe())
         st_after = self._skill_state_dict(obs_after)
         self._sync_motor_state(obs_after, source="skill", tick=self.tick)
+        intents_log = {
+            v: float(x) for v, x in pairs if str(v).startswith("intent_")
+        }
         self._log_motor_command(
             source="skill",
-            intents={var: float(val)} if isinstance(var, str) and var.startswith("intent_") else None,
+            intents=intents_log if intents_log else None,
             obs=self._motor_obs_payload(obs_after),
         )
         self.agent.graph.apply_env_observation(obs_after)
         obs_after_full = self.agent.graph.snapshot_vec_dict()
         self.agent.graph.record_observation(obs_before_full)
         self.agent.graph.record_observation(obs_after_full)
-        self.agent.graph.record_intervention(var, float(val), obs_before_full, obs_after_full)
+        for var, val in pairs:
+            if var in self.agent.graph.nodes:
+                self.agent.graph.record_intervention(
+                    var, float(val), obs_before_full, obs_after_full
+                )
         self.agent.temporal.step(obs_after)
 
         idx += 1
@@ -1983,8 +2097,8 @@ class Simulation:
             "skill": skill.name,
             "skill_step": idx,
             "skill_done": done,
-            "variable": var,
-            "value": float(val),
+            "variable": var0,
+            "value": float(val0),
             "updated_edges": [],
             "compression_delta": 0.0,
             "prediction_error": 0.0,
@@ -1995,6 +2109,28 @@ class Simulation:
 
     def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
         """L3 внутри agent.step; L2 skill — один шаг последовательности за тик."""
+        # Humanoid: при нестабильной позе не даём EIG выбирать сырые суставы — только скиллы / stand.
+        if self.current_world == "humanoid" and not self._fixed_root_active:
+            obs = self.agent.env.observe()
+            posture = float(
+                obs.get(
+                    "posture_stability", obs.get("phys_posture_stability", 0.5)
+                )
+            )
+            if posture < 0.65:
+                if self._skill_exec is not None:
+                    return self._execute_skill_frame()
+                if self._skill_library_enabled():
+                    lib = self._ensure_skill_library()
+                    obs_st = self._skill_state_dict(obs)
+                    sk = lib.select_skill(obs_st, "stand")
+                    if sk is not None:
+                        self._skill_exec = {
+                            "skill": sk,
+                            "index": 0,
+                            "obs_before": dict(obs_st),
+                        }
+                        return self._execute_skill_frame()
         if (
             self._skill_library_enabled()
             and self.current_world == "humanoid"
@@ -2104,6 +2240,32 @@ class Simulation:
         self.tick += 1
         self._apply_pending_llm_bundle()
         self._ensure_phase2()
+
+        # Humanoid curriculum: фаза 1 — fixed_root с тика 1; снятие после RKK_AUTO_FIXED_ROOT_TICKS.
+        try:
+            auto_fr_ticks = int(os.environ.get("RKK_AUTO_FIXED_ROOT_TICKS", "0"))
+        except ValueError:
+            auto_fr_ticks = 0
+        if auto_fr_ticks > 0 and self.current_world == "humanoid":
+            if self.tick == 1 and not self._fixed_root_active:
+                self.enable_fixed_root()
+                self._add_event(
+                    "📌 Curriculum: fixed_root ON (phase 1, arms→cubes)",
+                    "#66ccaa",
+                    "phase",
+                )
+            if (
+                self._fixed_root_active
+                and self.tick >= auto_fr_ticks
+                and not self._curriculum_auto_fr_released
+            ):
+                self._curriculum_auto_fr_released = True
+                self.disable_fixed_root()
+                self._add_event(
+                    f"📌 Auto fixed_root OFF at tick {self.tick}",
+                    "#66ccaa",
+                    "phase",
+                )
 
         # Fallen check + автосброс физики (иначе VL и block_rate залипают)
         fallen = False

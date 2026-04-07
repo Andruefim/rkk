@@ -79,6 +79,10 @@ MAX_FALLBACK_TRIES = 5  # больше кандидатов, чтобы прой
 # Вес slot_* в actual_ig для System 1; основной сигнал — не-визуальные узлы (RKK_VISUAL_IG_WEIGHT=0 → только физика).
 VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.1"))
 _SELF_VAR_SET = frozenset(SELF_VARS)
+# RKK_LOCOMOTION_CPG=1: CPG ведёт ноги; EIG не выбирает прямые do() по этим узлам.
+_LOCOMOTION_CPG_LEG_EIG_BLOCK = frozenset(
+    {"lhip", "lknee", "lankle", "rhip", "rknee", "rankle"}
+)
 
 
 def _is_motor_intent_var(name: str) -> bool:
@@ -473,6 +477,11 @@ class RKKAgent:
             return None
         return self._build_goal_planned_candidate(best_first[0], best_first[1])
 
+    def _is_locomotion_primary_active(self) -> bool:
+        """Если CPG управляет ногами, EIG не должен конкурировать за суставы — только intent_* и др."""
+        v = os.environ.get("RKK_LOCOMOTION_CPG", "0").strip().lower()
+        return v in ("1", "true", "yes", "on")
+
     # ── Epistemic scoring ─────────────────────────────────────────────────────
     def score_interventions(self) -> list[dict]:
         var_ids   = self.env.variable_ids
@@ -613,7 +622,21 @@ class RKKAgent:
                 "expected_ig": 0.0,
             })
 
-        if not features_batch:
+        if self._is_locomotion_primary_active():
+            candidates = [
+                c
+                for c in candidates
+                if c["variable"] not in _LOCOMOTION_CPG_LEG_EIG_BLOCK
+            ]
+            if posture_now < 0.65:
+                candidates = [
+                    c
+                    for c in candidates
+                    if str(c["variable"]).startswith("intent_")
+                    or str(c["variable"]).startswith("phys_intent_")
+                ]
+
+        if not candidates or not features_batch:
             return []
 
         use_eig = _hypothesis_eig_from_env() and W_m is not None and unc_m is not None

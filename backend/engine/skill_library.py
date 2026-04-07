@@ -11,6 +11,8 @@ from typing import Callable
 
 import numpy as np
 
+# Один кадр скилла: одна пара (var, val) или несколько пар за один физ. шаг.
+SkillStep = tuple[str, float] | list[tuple[str, float]]
 
 StateFn = Callable[[dict], bool]
 
@@ -19,7 +21,7 @@ StateFn = Callable[[dict], bool]
 class Skill:
     name: str
     precondition: StateFn
-    action_sequence: list[tuple[str, float]]
+    action_sequence: list[SkillStep]
     postcondition: StateFn
     goals: frozenset[str] = field(default_factory=lambda: frozenset({"walk"}))
     success_rate: float = 0.5
@@ -50,56 +52,67 @@ class SkillLibrary:
         Skill(
             name="stand_up",
             goals=frozenset({"stand"}),
-            precondition=lambda s: _cz(s) < 0.38,
+            precondition=lambda s: _cz(s) < 0.20,
             action_sequence=[
-                ("intent_stop_recover", 0.88),
-                ("intent_torso_forward", 0.68),
-                ("intent_support_left", 0.62),
-                ("intent_support_right", 0.62),
-                ("intent_stride", 0.42),
-                ("intent_arm_counterbalance", 0.55),
+                [("intent_stop_recover", 0.88), ("intent_torso_forward", 0.60)],
+                [("intent_support_left", 0.65), ("intent_support_right", 0.65)],
+                [("intent_stride", 0.48), ("intent_arm_counterbalance", 0.55)],
             ],
-            postcondition=lambda s: _cz(s) > 0.42,
+            postcondition=lambda s: _cz(s) > 0.24,
         ),
         Skill(
             name="stabilize_stance",
             goals=frozenset({"stand"}),
-            precondition=lambda s: _posture(s) < 0.66 or _contact_min(s) < 0.52,
+            precondition=lambda s: 0.20 < _cz(s)
+            and (_posture(s) < 0.62 or _contact_min(s) < 0.50),
             action_sequence=[
-                ("intent_stop_recover", 0.72),
-                ("intent_stride", 0.48),
-                ("intent_support_left", 0.56),
-                ("intent_support_right", 0.56),
-                ("intent_torso_forward", 0.52),
-                ("intent_arm_counterbalance", 0.50),
+                [("intent_stop_recover", 0.75), ("intent_stride", 0.50)],
+                [("intent_support_left", 0.58), ("intent_support_right", 0.58)],
+                [("intent_torso_forward", 0.54), ("intent_arm_counterbalance", 0.52)],
             ],
-            postcondition=lambda s: _posture(s) > 0.70 and _contact_min(s) > 0.55,
+            postcondition=lambda s: _posture(s) > 0.64,
+        ),
+        Skill(
+            name="hold_stance",
+            goals=frozenset({"stand", "walk"}),
+            precondition=lambda s: _cz(s) > 0.22 and _posture(s) > 0.60,
+            action_sequence=[
+                [("intent_support_left", 0.55), ("intent_support_right", 0.55)],
+                [("intent_stride", 0.50), ("intent_torso_forward", 0.51)],
+            ],
+            postcondition=lambda s: _posture(s) > 0.68 and _contact_min(s) > 0.54,
         ),
         Skill(
             name="step_forward_L",
             goals=frozenset({"walk"}),
-            precondition=lambda s: _cz(s) > 0.40 and _posture(s) > 0.68 and _contact_min(s) > 0.55,
+            precondition=lambda s: (
+                _cz(s) > 0.22
+                and _posture(s) > 0.70
+                and _contact_min(s) > 0.58
+            ),
             action_sequence=[
-                ("intent_stride", 0.62),
-                ("intent_support_right", 0.62),
-                ("intent_torso_forward", 0.55),
-                ("intent_arm_counterbalance", 0.58),
-                ("intent_support_left", 0.46),
+                [("intent_support_right", 0.68), ("intent_torso_forward", 0.56)],
+                [("intent_stride", 0.62), ("intent_arm_counterbalance", 0.58)],
+                [("intent_support_left", 0.44), ("intent_support_right", 0.62)],
+                [("intent_support_left", 0.56), ("intent_support_right", 0.56)],
             ],
-            postcondition=lambda s: True,
+            postcondition=lambda s: _posture(s) > 0.62,
         ),
         Skill(
             name="step_forward_R",
             goals=frozenset({"walk"}),
-            precondition=lambda s: _cz(s) > 0.40 and _posture(s) > 0.68 and _contact_min(s) > 0.55,
+            precondition=lambda s: (
+                _cz(s) > 0.22
+                and _posture(s) > 0.70
+                and _contact_min(s) > 0.58
+            ),
             action_sequence=[
-                ("intent_stride", 0.62),
-                ("intent_support_left", 0.62),
-                ("intent_torso_forward", 0.55),
-                ("intent_arm_counterbalance", 0.42),
-                ("intent_support_right", 0.46),
+                [("intent_support_left", 0.68), ("intent_torso_forward", 0.56)],
+                [("intent_stride", 0.62), ("intent_arm_counterbalance", 0.42)],
+                [("intent_support_right", 0.44), ("intent_support_left", 0.62)],
+                [("intent_support_left", 0.56), ("intent_support_right", 0.56)],
             ],
-            postcondition=lambda s: True,
+            postcondition=lambda s: _posture(s) > 0.62,
         ),
     ]
 
@@ -147,10 +160,12 @@ class SkillLibrary:
                 goals=frozenset({"walk"}),
                 precondition=lambda s: _cz(s) > 0.36,
                 action_sequence=[
-                    ("intent_stride", 0.84),
-                    ("intent_support_right", 0.78),
-                    ("intent_torso_forward", 0.64),
-                    ("intent_arm_counterbalance", 0.68),
+                    [
+                        ("intent_stride", 0.84),
+                        ("intent_support_right", 0.78),
+                        ("intent_torso_forward", 0.64),
+                        ("intent_arm_counterbalance", 0.68),
+                    ],
                     ("intent_support_left", 0.38),
                     ("intent_stop_recover", 0.34),
                 ],
@@ -163,10 +178,12 @@ class SkillLibrary:
                 goals=frozenset({"walk"}),
                 precondition=lambda s: _cz(s) > 0.36,
                 action_sequence=[
-                    ("intent_stride", 0.84),
-                    ("intent_support_left", 0.78),
-                    ("intent_torso_forward", 0.64),
-                    ("intent_arm_counterbalance", 0.32),
+                    [
+                        ("intent_stride", 0.84),
+                        ("intent_support_left", 0.78),
+                        ("intent_torso_forward", 0.64),
+                        ("intent_arm_counterbalance", 0.32),
+                    ],
                     ("intent_support_right", 0.38),
                     ("intent_stop_recover", 0.34),
                 ],
