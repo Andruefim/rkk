@@ -144,12 +144,12 @@ class LocomotionController:
 
         cpg_out = self.cpg.step(dt=dt, external_command=cmd)
 
-        hip_center = 0.45
-        knee_center = 0.40
+        hip_center = 0.50
+        knee_center = 0.50
         ankle_center = 0.50
-        hip_range = 0.18
-        knee_range = 0.15
-        ankle_range = 0.10
+        hip_range = 0.15
+        knee_range = 0.12
+        ankle_range = 0.08
 
         lhip_raw = float(cpg_out[0].item())
         rhip_raw = float(cpg_out[1].item())

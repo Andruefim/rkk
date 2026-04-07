@@ -1605,7 +1605,6 @@ class EnvironmentHumanoid:
         Переключить fixed_root mode без пересоздания среды.
         Simulation.enable/disable_fixed_root() вызывает это и затем
         rebind_variables() на агенте.
-        When disabling: set neutral pose and settle BEFORE removing constraint.
         """
         if enabled == self._fixed_root:
             return
@@ -1614,9 +1613,7 @@ class EnvironmentHumanoid:
             if enabled:
                 self._sim.enable_fixed_root()
             else:
-                self._settle_after_reset()
                 self._sim.disable_fixed_root()
-                self._settle_after_reset()
         else:
             self._sim.fixed_root = enabled
 
@@ -1672,7 +1669,13 @@ class EnvironmentHumanoid:
         support_bias = float(np.clip(0.5 + 0.45 * ((support_l - support_r) + 0.6 * com_x), 0.0, 1.0))
         motor_drive_l = float(np.clip(np.mean([abs(lhip - 0.5), abs(lknee - 0.5), abs(lankle - 0.5)]) * 1.8, 0.0, 1.0))
         motor_drive_r = float(np.clip(np.mean([abs(rhip - 0.5), abs(rknee - 0.5), abs(rankle - 0.5)]) * 1.8, 0.0, 1.0))
-        posture_stability = float(np.clip(1.0 - (abs(torso_roll) + abs(torso_pitch)) * 0.35 - abs(com_z - STAND_Z) * 0.45, 0.0, 1.0))
+        roll_from_upright = torso_roll - HUMANOID_URDF_STAND_EULER[0]
+        posture_stability = float(np.clip(
+            1.0
+            - (abs(roll_from_upright) + abs(torso_pitch)) * 0.6
+            - abs(com_z - STAND_Z) / max(STAND_Z, 0.01) * 0.4,
+            0.0, 1.0,
+        ))
         return {
             "gait_phase_l": gait_l,
             "gait_phase_r": gait_r,
@@ -1812,12 +1815,12 @@ class EnvironmentHumanoid:
             return
 
         if not self.cpg_owns_legs:
-            self._sim.set_joint("lhip", clip01(0.45 + 0.18 * stride - 0.10 * sup_r + 0.06 * torso - 0.08 * recover))
-            self._sim.set_joint("rhip", clip01(0.45 - 0.18 * stride - 0.10 * sup_l + 0.06 * torso - 0.08 * recover))
-            self._sim.set_joint("lknee", clip01(0.40 + 0.15 * sup_l + 0.14 * recover))
-            self._sim.set_joint("rknee", clip01(0.40 + 0.15 * sup_r + 0.14 * recover))
-            self._sim.set_joint("lankle", clip01(0.50 + 0.10 * sup_l - 0.04 * stride - 0.06 * recover))
-            self._sim.set_joint("rankle", clip01(0.50 + 0.10 * sup_r + 0.04 * stride - 0.06 * recover))
+            self._sim.set_joint("lhip", clip01(0.50 + 0.14 * stride - 0.08 * sup_r + 0.05 * torso - 0.06 * recover))
+            self._sim.set_joint("rhip", clip01(0.50 - 0.14 * stride - 0.08 * sup_l + 0.05 * torso - 0.06 * recover))
+            self._sim.set_joint("lknee", clip01(0.50 + 0.12 * sup_l + 0.10 * recover))
+            self._sim.set_joint("rknee", clip01(0.50 + 0.12 * sup_r + 0.10 * recover))
+            self._sim.set_joint("lankle", clip01(0.50 + 0.08 * sup_l - 0.03 * stride - 0.04 * recover))
+            self._sim.set_joint("rankle", clip01(0.50 + 0.08 * sup_r + 0.03 * stride - 0.04 * recover))
         self._apply_upper_body_from_intents()
 
     def apply_cpg_leg_targets(self, targets: dict[str, float]) -> None:
@@ -1968,35 +1971,6 @@ class EnvironmentHumanoid:
         return edges
 
     # ── Упал? ─────────────────────────────────────────────────────────────────
-    def _settle_after_reset(self) -> None:
-        """
-        Run physics for a brief settling period after reset so the humanoid
-        starts from a stable standing pose rather than mid-air/mid-fall.
-        Sets joints to a neutral standing configuration and lets physics settle.
-        """
-        def clip01(v: float) -> float:
-            return float(np.clip(v, 0.05, 0.95))
-
-        if not self._fixed_root:
-            self._sim.set_joint("lhip", clip01(0.45))
-            self._sim.set_joint("rhip", clip01(0.45))
-            self._sim.set_joint("lknee", clip01(0.40))
-            self._sim.set_joint("rknee", clip01(0.40))
-            self._sim.set_joint("lankle", clip01(0.50))
-            self._sim.set_joint("rankle", clip01(0.50))
-        self._sim.set_joint("spine_pitch", clip01(0.50))
-        self._sim.set_joint("spine_yaw", clip01(0.50))
-        self._sim.set_joint("lshoulder", clip01(0.50))
-        self._sim.set_joint("rshoulder", clip01(0.50))
-        self._sim.set_joint("lelbow", clip01(0.50))
-        self._sim.set_joint("relbow", clip01(0.50))
-        try:
-            settle_steps = int(os.environ.get("RKK_SETTLE_STEPS", "40"))
-        except ValueError:
-            settle_steps = 40
-        settle_steps = max(8, min(settle_steps, 120))
-        self._sim.step(settle_steps)
-
     def is_fallen(self) -> bool:
         # В fixed_root mode робот никогда не падает
         if self._fixed_root:
@@ -2010,7 +1984,6 @@ class EnvironmentHumanoid:
             self._self_state[k] = 0.5
         for k in MOTOR_INTENT_VARS:
             self._motor_state[k] = 0.5
-        self._settle_after_reset()
 
     # ── Camera / Skeleton ─────────────────────────────────────────────────────
     def get_frame_base64(self, view: str | None = None, **kwargs) -> str | None:
