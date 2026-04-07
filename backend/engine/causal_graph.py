@@ -114,9 +114,9 @@ class NOTEARSCore(nn.Module):
 # ─── CausalGraph ──────────────────────────────────────────────────────────────
 class CausalGraph:
     LAMBDA_DAG  = 0.3
-    LAMBDA_INT  = 4.0
-    LAMBDA_L1   = 0.005
-    EDGE_THRESH = 0.04
+    LAMBDA_INT  = 6.0
+    LAMBDA_L1   = 0.001
+    EDGE_THRESH = 0.03
     # Фаза 1: целевой вес замороженных рёбер в W (после каждого optim.step снова clamp).
     FROZEN_EDGE_W = 0.85
 
@@ -129,7 +129,7 @@ class CausalGraph:
         self._optim     = None
         self._obs_buffer: list[list[float]] = []
         self._int_buffer: list[dict]        = []
-        self.BUFFER_SIZE = 64
+        self.BUFFER_SIZE = 128
         self._edge_cache: list[Edge] | None = None
         self._mdl_cache:  float | None      = None
         self.train_losses: list[float]      = []

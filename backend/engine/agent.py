@@ -74,7 +74,7 @@ from engine.rsi_lite import (
 from engine.local_reflex import local_reflex_train_enabled, train_chains_parallel
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
-NOTEARS_EVERY = 16
+NOTEARS_EVERY = 8
 MAX_FALLBACK_TRIES = 5  # больше кандидатов, чтобы пройти Value Layer в начале обучения
 # Вес slot_* в actual_ig для System 1; основной сигнал — не-визуальные узлы (RKK_VISUAL_IG_WEIGHT=0 → только физика).
 VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.1"))
