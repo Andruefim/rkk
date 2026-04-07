@@ -252,7 +252,7 @@ export default function RKKHumanoid() {
     scene.fog = new THREE.FogExp2(0x030912,0.022);
 
     const camera = new THREE.PerspectiveCamera(55,mount.clientWidth/mount.clientHeight,0.1,100);
-    camera.position.set(0,0.6,5.5);
+    camera.position.set(0,0.8,4.0);
 
     scene.add(new THREE.AmbientLight(0x0a1020,3.0));
     const key = new THREE.DirectionalLight(0x8899ff,2.5);
@@ -267,70 +267,110 @@ export default function RKKHumanoid() {
     floor.rotation.x=-Math.PI/2; floor.receiveShadow=true; scene.add(floor);
     scene.add(new THREE.GridHelper(20,40,0x0d1a2e,0x071220));
 
-    // Рампа
-    const vS = 0.5;
+    const vS = 0.62;
 
     const ramp = new THREE.Mesh(
-      new THREE.BoxGeometry(3,0.1,2),
+      new THREE.BoxGeometry(3.75,0.12,2.5),
       new THREE.MeshStandardMaterial({color:0x1a1510,roughness:0.8})
     );
-    ramp.position.set(3,0.38,0); ramp.rotation.x=-0.26; scene.add(ramp);
+    ramp.position.set(3.5,0.48,0); ramp.rotation.x=-0.26; scene.add(ramp);
 
-    // Платформа (полка)
     const shelf = new THREE.Mesh(
-      new THREE.BoxGeometry(0.5,0.05,0.5),
+      new THREE.BoxGeometry(0.6,0.06,0.6),
       new THREE.MeshStandardMaterial({color:0x1a2030,roughness:0.6})
     );
-    shelf.position.set(0.95,0.18,0.0); scene.add(shelf);
+    shelf.position.set(1.2,0.22,0.0); scene.add(shelf);
 
-    // Гуманоид
+    // Гуманоид — Figure 03 aesthetic: smooth matte-white body with dark accents
     const JOINT_COUNT = 18;
+    const bodyMat = new THREE.MeshStandardMaterial({color:0xe8e0d8,roughness:0.65,metalness:0.05});
+    const accentMat = new THREE.MeshStandardMaterial({color:0x2a2a2e,roughness:0.5,metalness:0.2});
+    const jointMat = new THREE.MeshStandardMaterial({color:0x1a1a1e,roughness:0.4,metalness:0.3});
+    const headMat = new THREE.MeshStandardMaterial({color:0xd0c8c0,roughness:0.55,metalness:0.1,
+      emissive:0x111115,emissiveIntensity:0.15});
+
+    const JOINT_RADII = [
+      0.065, 0.055, 0.05,  // 0=head, 1=neck, 2=chest
+      0.06,                // 3=upper torso
+      0.04, 0.04,          // 4,5=shoulders
+      0.035, 0.035,        // 6,7=elbows
+      0.028, 0.028,        // 8,9=wrists/hands
+      0.045, 0.045,        // 10,11=hips
+      0.038, 0.038,        // 12,13=knees
+      0.042, 0.042,        // 14,15=ankles/feet
+    ];
     const jointMeshes = Array.from({length:JOINT_COUNT},(_,i)=>{
       if (i>=16){const o=new THREE.Object3D();o.visible=false;scene.add(o);return o;}
-      const isTorso=i<=2;
-      const m=new THREE.Mesh(
-        new THREE.SphereGeometry(isTorso?0.065*vS:0.05*vS,8,8),
-        new THREE.MeshStandardMaterial({color:isTorso?0xcc88ff:0x8844cc,
-          emissive:isTorso?0x6622aa:0x441188,emissiveIntensity:0.4,roughness:0.3})
-      );
-      m.castShadow=true; scene.add(m); return m;
+      const r = (JOINT_RADII[i] || 0.04) * vS;
+      const isHead = i===0;
+      const isHand = i===8||i===9;
+      const isFoot = i===14||i===15;
+      let geo, mat;
+      if (isHead) {
+        geo = new THREE.SphereGeometry(r, 16, 16);
+        mat = headMat;
+      } else if (isFoot) {
+        geo = new THREE.BoxGeometry(r*2.2, r*0.7, r*1.6);
+        mat = accentMat;
+      } else if (isHand) {
+        geo = new THREE.SphereGeometry(r, 10, 10);
+        mat = accentMat;
+      } else {
+        geo = new THREE.SphereGeometry(r, 10, 10);
+        mat = jointMat;
+      }
+      const m = new THREE.Mesh(geo, mat);
+      m.castShadow = true;
+      scene.add(m);
+      return m;
     });
 
-    const boneMeshes = SKELETON_BONES.map(()=>{
-      const m=new THREE.Mesh(
-        new THREE.CylinderGeometry(0.025*vS,0.025*vS,1,6),
-        new THREE.MeshStandardMaterial({color:0x6633aa,emissive:0x221144,emissiveIntensity:0.2,roughness:0.6})
+    const BONE_RADII = [
+      0.032, 0.028, 0.025,       // spine segments
+      0.030, 0.025, 0.022,       // L arm: shoulder→elbow, elbow→wrist
+      0.030, 0.025, 0.022,       // R arm
+      0.035, 0.030, 0.028,       // L leg: hip→knee, knee→ankle
+      0.035, 0.030, 0.028,       // R leg
+    ];
+    const boneMeshes = SKELETON_BONES.map((_,bi)=>{
+      const r = (BONE_RADII[bi] || 0.025) * vS;
+      const isLeg = bi >= 9;
+      const m = new THREE.Mesh(
+        new THREE.CylinderGeometry(r, r * 0.85, 1, 8),
+        isLeg ? bodyMat.clone() : bodyMat
       );
-      m.castShadow=true; scene.add(m); return m;
+      m.castShadow = true;
+      scene.add(m);
+      return m;
     });
 
     // Кубы
     // cube0: box оранжевый, cube1: СФЕРА синяя, cube2: box зелёный
     const cubeMeshes = [];
 
-    // cube0 — лёгкий box
+    // cube0 — box
     const cm0=new THREE.Mesh(
-      new THREE.BoxGeometry(0.20,0.20,0.20),
+      new THREE.BoxGeometry(0.25,0.25,0.25),
       new THREE.MeshStandardMaterial({color:0xff6622,emissive:0xff4400,emissiveIntensity:0.15,roughness:0.4})
     );
     cm0.castShadow=true; cm0.receiveShadow=true;
-    cm0.position.set(0.45,0.10,0.10); scene.add(cm0); cubeMeshes.push(cm0);
+    cm0.position.set(0.56,0.125,0.12); scene.add(cm0); cubeMeshes.push(cm0);
 
-    // cube1 — СФЕРА (ball) голубая
+    // cube1 — sphere
     const cm1=new THREE.Mesh(
-      new THREE.SphereGeometry(0.09,12,12),
+      new THREE.SphereGeometry(0.11,12,12),
       new THREE.MeshStandardMaterial({color:0x22aaff,emissive:0x0066ff,emissiveIntensity:0.2,roughness:0.2,metalness:0.1})
     );
     cm1.castShadow=true; cm1.receiveShadow=true;
-    cm1.position.set(-0.35,0.15,0.40); scene.add(cm1); cubeMeshes.push(cm1);
+    cm1.position.set(-0.44,0.19,0.50); scene.add(cm1); cubeMeshes.push(cm1);
 
-    // cube2 — тяжёлый box зелёный
+    // cube2 — heavy box
     const cm2=new THREE.Mesh(
-      new THREE.BoxGeometry(0.28,0.28,0.28),
+      new THREE.BoxGeometry(0.35,0.35,0.35),
       new THREE.MeshStandardMaterial({color:0x44ff88,emissive:0x22aa44,emissiveIntensity:0.15,roughness:0.5})
     );
     cm2.castShadow=true; cm2.receiveShadow=true;
-    cm2.position.set(0.20,0.20,-0.60); scene.add(cm2); cubeMeshes.push(cm2);
+    cm2.position.set(0.25,0.25,-0.75); scene.add(cm2); cubeMeshes.push(cm2);
 
     // Рычаг
     const leverBase = new THREE.Mesh(
@@ -382,7 +422,7 @@ export default function RKKHumanoid() {
 
     let frame=0;
     const camTarget=new THREE.Vector3(0,0.5,0);
-    let camAzim=0,camElev=0.2,camRadius=5.5;
+    let camAzim=0,camElev=0.25,camRadius=3.5;
     let camDrag=false,camPtrX=0,camPtrY=0;
 
     function updateBone(b,a,bp){
@@ -414,7 +454,7 @@ export default function RKKHumanoid() {
         }
         if(n>0){comX=sx/n;comZ=sz/n;}
       }
-      camTarget.lerp(new THREE.Vector3(comX,1.05,comZ),0.05);
+      camTarget.lerp(new THREE.Vector3(comX,0.7,comZ),0.05);
       const ch=Math.cos(camElev);
       camera.position.set(
         camTarget.x+camRadius*ch*Math.sin(camAzim),
@@ -435,9 +475,9 @@ export default function RKKHumanoid() {
             jointMeshes[i].position.copy(v);
             if(i<16) jointMeshes[i].visible=true;
             if(i===0){
-              jointMeshes[i].material.emissiveIntensity=0.3+(ag.phi??0.1)*0.4+Math.sin(frame*.08)*.1;
-              jointMeshes[i].material.emissive.setHex(fallen?0xff2200:isFR?0xaa8800:isVis?0x22ccaa:0x6622aa);
-              jointMeshes[i].material.color.setHex(isFR?0xffcc44:isVis?0x44ffcc:0xcc88ff);
+              jointMeshes[i].material.emissiveIntensity=0.1+(ag.phi??0.1)*0.2+Math.sin(frame*.08)*.05;
+              jointMeshes[i].material.emissive.setHex(fallen?0x660800:isFR?0x443300:isVis?0x114433:0x111115);
+              jointMeshes[i].material.color.setHex(fallen?0xff4422:isFR?0xe8d0a0:isVis?0xb0e8d8:0xd0c8c0);
             }
           }
         });
@@ -445,7 +485,7 @@ export default function RKKHumanoid() {
           jointPositions.push(jointMeshes[Math.max(0,i-1)]?.position?.clone()??new THREE.Vector3());
       } else {
         const t=frame*.025;
-        const comH=0.6+(fallen?-.4:0);
+        const comH=0.7+(fallen?-.5:0);
         const poses=[
           [0,comH+.26,0],[0,comH+.13,0],[0,comH+.02,0],[0,comH-.10,0],
           [-.26,comH+.11,0],[.26,comH+.11,0],
@@ -467,9 +507,9 @@ export default function RKKHumanoid() {
         if(a<jointPositions.length&&b<jointPositions.length&&k<boneMeshes.length){
           updateBone(boneMeshes[k],jointPositions[a],jointPositions[b]);
           boneMeshes[k].visible=true;
-          const boneCol=fallen?0x881100:isFR?0x886600:isVis?parseInt(SLOT_COLORS[k%8].replace("#",""),16):wCol;
+          const boneCol=fallen?0x993322:isFR?0xd0c0a0:isVis?parseInt(SLOT_COLORS[k%8].replace("#",""),16):0xe8e0d8;
           boneMeshes[k].material.color.setHex(boneCol);
-          boneMeshes[k].material.emissiveIntensity=0.15+Math.sin(frame*.05+k)*.05;
+          boneMeshes[k].material.emissiveIntensity=fallen?0.1:0.02;
         }
       });
 
