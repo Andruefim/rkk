@@ -17,6 +17,7 @@ value_layer.py — Value Layer (РКК v5, Проблема 10) + fixed_root mod
 """
 from __future__ import annotations
 
+import os
 import torch
 import numpy as np
 from dataclasses import dataclass, field
@@ -171,6 +172,22 @@ def _warmup_alpha(tick: int, warmup: int, blend: int) -> float:
     return (tick - warmup) / blend
 
 
+def _loco_warmup_relax(engine_tick: int) -> float:
+    """
+    1.0 early locomotion warmup, 0.0 after warmup.
+    Separate from the generic VL warmup so motor intents can stabilize longer.
+    """
+    try:
+        warm = int(os.environ.get("RKK_LOCO_VL_WARMUP_TICKS", "6000"))
+    except ValueError:
+        warm = 6000
+    try:
+        blend = int(os.environ.get("RKK_LOCO_VL_WARMUP_BLEND", "2000"))
+    except ValueError:
+        blend = 2000
+    return float(np.clip(1.0 - _warmup_alpha(engine_tick, warm, blend), 0.0, 1.0))
+
+
 def effective_vl_state(bounds: HomeostaticBounds, engine_tick: int) -> EffectiveVLState:
     a = _warmup_alpha(engine_tick, bounds.warmup_ticks, bounds.blend_ticks)
     lo = _vl_lerp(0.0, bounds.predict_band_edge_steady, a)
@@ -308,6 +325,11 @@ class ValueLayer:
             or variable.startswith("phys_self_")
         )
         is_intent_action = variable.startswith("intent_") or variable.startswith("phys_intent_")
+        loco_relax = 0.0
+        relaxed_phi_min = eff.phi_min
+        relaxed_h_slow_max = eff.h_slow_max
+        relaxed_entropy_phi_low = eff.entropy_spike_phi_low
+        repeat_threshold = 5 if fixed_root else 3
         if is_intent_action:
             def _n(k: str, default: float = 0.5) -> float:
                 if k in current_nodes:
@@ -325,8 +347,17 @@ class ValueLayer:
             gait_r = _n("gait_phase_r", 0.5)
             intent_key = variable[5:] if variable.startswith("phys_") else variable
             shift = abs(float(value) - 0.5)
+            loco_relax = _loco_warmup_relax(engine_tick)
+            if intent_key == "intent_stop_recover":
+                loco_relax = max(loco_relax, 0.65)
+            if posture < 0.52:
+                loco_relax = max(loco_relax, float(np.clip((0.52 - posture) / 0.22, 0.0, 1.0)))
+            relaxed_phi_min = eff.phi_min * (1.0 - 0.55 * loco_relax)
+            relaxed_h_slow_max = eff.h_slow_max * (1.0 + 0.85 * loco_relax)
+            relaxed_entropy_phi_low = min(0.95, eff.entropy_spike_phi_low + 0.20 * loco_relax)
+            repeat_threshold = max(repeat_threshold, 3 + int(round(3.0 * loco_relax)))
             # Overspeed intent: already high motor drive + aggressive new intent command.
-            if shift > 0.40 and max(drive_l, drive_r) > 0.82:
+            if shift > (0.40 + 0.10 * loco_relax) and max(drive_l, drive_r) > (0.82 + 0.06 * loco_relax):
                 return self._block(
                     BlockReason.PHI_TOO_LOW,
                     current_nodes,
@@ -339,8 +370,11 @@ class ValueLayer:
             if intent_key in ("intent_support_left", "intent_support_right"):
                 wants_left = intent_key.endswith("left") and value > 0.6
                 wants_right = intent_key.endswith("right") and value > 0.6
-                unstable = posture < 0.36
-                opposite_bias = (wants_left and support_bias > 0.62) or (wants_right and support_bias < 0.38)
+                unstable = posture < (0.36 - 0.06 * loco_relax)
+                opposite_bias = (
+                    (wants_left and support_bias > (0.62 + 0.08 * loco_relax))
+                    or (wants_right and support_bias < (0.38 - 0.08 * loco_relax))
+                )
                 if unstable and opposite_bias:
                     return self._block(
                         BlockReason.ENTROPY_SPIKE,
@@ -353,7 +387,7 @@ class ValueLayer:
             # Repeated unstable gait mode: aggressive stride while gait already desynchronized.
             if intent_key == "intent_stride":
                 gait_desync = abs(gait_l - gait_r)
-                if shift > 0.34 and posture < 0.42 and gait_desync > 0.38:
+                if shift > (0.34 + 0.08 * loco_relax) and posture < (0.42 - 0.06 * loco_relax) and gait_desync > (0.38 + 0.08 * loco_relax):
                     return self._block(
                         BlockReason.REPEATED_FAIL,
                         current_nodes,
@@ -408,20 +442,20 @@ class ValueLayer:
         # §5 h_slow temporal overload — пропускаем в fixed_root
         if not fixed_root:
             h_slow_norm = temporal.h_slow.norm().item() if temporal is not None else 0.0
-            if h_slow_norm > eff.h_slow_max:
+            if h_slow_norm > relaxed_h_slow_max:
                 return self._block(
                     BlockReason.PHI_TOO_LOW, predicted_state, current_phi,
-                    f"h_slow norm={h_slow_norm:.2f} > {eff.h_slow_max:.2f} (temporal overload)",
+                    f"h_slow norm={h_slow_norm:.2f} > {relaxed_h_slow_max:.2f} (temporal overload)",
                     variable, value, imagination_steps=imagination_evals,
                 )
 
         # §6 Φ near minimum + high entropy — пропускаем в fixed_root
         if not fixed_root:
-            if current_phi < eff.phi_min:
-                if abs(value - 0.5) > 0.35 and entropy_delta > eff.entropy_spike_phi_low:
+            if current_phi < relaxed_phi_min:
+                if abs(value - 0.5) > 0.35 and entropy_delta > relaxed_entropy_phi_low:
                     return self._block(
                         BlockReason.PHI_TOO_LOW, predicted_state, current_phi,
-                        f"Φ={current_phi:.3f} < {eff.phi_min:.3f} and high-entropy action",
+                        f"Φ={current_phi:.3f} < {relaxed_phi_min:.3f} and high-entropy action",
                         variable, value, imagination_steps=imagination_evals,
                     )
 
@@ -435,8 +469,7 @@ class ValueLayer:
                         variable, value, imagination_steps=imagination_evals,
                     )
 
-        # §8 Repeated fail — порог выше в fixed_root (5 вместо 3)
-        repeat_threshold = 5 if fixed_root else 3
+        # §8 Repeated fail — intent warmup gets additional slack.
         recent_fails = [
             (v, vl) for v, vl in self._blocked_history[-5:]
             if v == variable and abs(vl - value) < 0.05

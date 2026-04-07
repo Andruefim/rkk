@@ -30,6 +30,16 @@ def _cz(s: dict) -> float:
     return float(s.get("com_z", s.get("phys_com_z", 0.5)))
 
 
+def _posture(s: dict) -> float:
+    return float(s.get("posture_stability", s.get("phys_posture_stability", 0.5)))
+
+
+def _contact_min(s: dict) -> float:
+    l = float(s.get("foot_contact_l", s.get("phys_foot_contact_l", 0.5)))
+    r = float(s.get("foot_contact_r", s.get("phys_foot_contact_r", 0.5)))
+    return min(l, r)
+
+
 class SkillLibrary:
     """
     Переиспользуемые моторные последовательности.
@@ -52,28 +62,42 @@ class SkillLibrary:
             postcondition=lambda s: _cz(s) > 0.42,
         ),
         Skill(
+            name="stabilize_stance",
+            goals=frozenset({"stand"}),
+            precondition=lambda s: _posture(s) < 0.66 or _contact_min(s) < 0.52,
+            action_sequence=[
+                ("intent_stop_recover", 0.72),
+                ("intent_stride", 0.48),
+                ("intent_support_left", 0.56),
+                ("intent_support_right", 0.56),
+                ("intent_torso_forward", 0.52),
+                ("intent_arm_counterbalance", 0.50),
+            ],
+            postcondition=lambda s: _posture(s) > 0.70 and _contact_min(s) > 0.55,
+        ),
+        Skill(
             name="step_forward_L",
             goals=frozenset({"walk"}),
-            precondition=lambda s: _cz(s) > 0.34,
+            precondition=lambda s: _cz(s) > 0.40 and _posture(s) > 0.68 and _contact_min(s) > 0.55,
             action_sequence=[
-                ("intent_stride", 0.76),
-                ("intent_support_right", 0.70),
-                ("intent_torso_forward", 0.60),
-                ("intent_arm_counterbalance", 0.64),
-                ("intent_support_left", 0.42),
+                ("intent_stride", 0.62),
+                ("intent_support_right", 0.62),
+                ("intent_torso_forward", 0.55),
+                ("intent_arm_counterbalance", 0.58),
+                ("intent_support_left", 0.46),
             ],
             postcondition=lambda s: True,
         ),
         Skill(
             name="step_forward_R",
             goals=frozenset({"walk"}),
-            precondition=lambda s: _cz(s) > 0.34,
+            precondition=lambda s: _cz(s) > 0.40 and _posture(s) > 0.68 and _contact_min(s) > 0.55,
             action_sequence=[
-                ("intent_stride", 0.76),
-                ("intent_support_left", 0.70),
-                ("intent_torso_forward", 0.60),
-                ("intent_arm_counterbalance", 0.36),
-                ("intent_support_right", 0.42),
+                ("intent_stride", 0.62),
+                ("intent_support_left", 0.62),
+                ("intent_torso_forward", 0.55),
+                ("intent_arm_counterbalance", 0.42),
+                ("intent_support_right", 0.46),
             ],
             postcondition=lambda s: True,
         ),

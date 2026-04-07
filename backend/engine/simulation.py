@@ -1795,7 +1795,12 @@ class Simulation:
 
     def _skill_goal_hint(self, st: dict) -> str:
         cz = float(st.get("com_z", st.get("phys_com_z", 0.5)))
+        posture = float(st.get("posture_stability", st.get("phys_posture_stability", 0.5)))
+        foot_l = float(st.get("foot_contact_l", st.get("phys_foot_contact_l", 0.5)))
+        foot_r = float(st.get("foot_contact_r", st.get("phys_foot_contact_r", 0.5)))
         if cz < 0.36:
+            return "stand"
+        if posture < 0.68 or min(foot_l, foot_r) < 0.54:
             return "stand"
         g = os.environ.get("RKK_SKILL_GOAL", "walk").strip().lower()
         return g if g else "walk"

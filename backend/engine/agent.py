@@ -81,6 +81,10 @@ VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.1"))
 _SELF_VAR_SET = frozenset(SELF_VARS)
 
 
+def _is_motor_intent_var(name: str) -> bool:
+    return str(name).startswith("intent_") or str(name).startswith("phys_intent_")
+
+
 def _hypothesis_eig_from_env() -> bool:
     """Этап B: байесовский выбор эксперимента (EIG) вместо только System 1."""
     v = os.environ.get("RKK_HYPOTHESIS_EIG", "1").strip().lower()
@@ -563,17 +567,47 @@ class RKKAgent:
         features_batch = feats_arr.tolist()
 
         rng = np.random.default_rng()
-        rand_v = np.clip(rng.uniform(0.22, 0.78, size=n_pairs), 0.06, 0.94)
+        posture_now = float(
+            self.graph.nodes.get(
+                "posture_stability",
+                self.graph.nodes.get("phys_posture_stability", 0.5),
+            )
+        )
+        foot_l_now = float(
+            self.graph.nodes.get(
+                "foot_contact_l",
+                self.graph.nodes.get("phys_foot_contact_l", 0.5),
+            )
+        )
+        foot_r_now = float(
+            self.graph.nodes.get(
+                "foot_contact_r",
+                self.graph.nodes.get("phys_foot_contact_r", 0.5),
+            )
+        )
+        stable_stance = posture_now > 0.70 and min(foot_l_now, foot_r_now) > 0.56
         candidates: list[dict] = []
         for k in range(n_pairs):
             i, j = int(fi[k]), int(fj[k])
             vf, vt = var_ids[i], var_ids[j]
             unc_k = float(uncertainty[k])
             feat_k = features_batch[k]
+            if _is_motor_intent_var(vf):
+                if stable_stance:
+                    lo, hi = 0.42, 0.62
+                else:
+                    lo, hi = 0.47, 0.56
+                if str(vf).endswith("stride"):
+                    hi = min(hi, 0.54 if stable_stance else 0.51)
+                if str(vf).endswith("stop_recover"):
+                    lo, hi = (0.52, 0.68) if not stable_stance else (0.46, 0.58)
+                rand_value = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
+            else:
+                rand_value = float(np.clip(rng.uniform(0.22, 0.78), 0.06, 0.94))
             candidates.append({
                 "variable":    vf,
                 "target":      vt,
-                "value":       float(rand_v[k]),
+                "value":       rand_value,
                 "uncertainty": unc_k,
                 "features":    feat_k,
                 "expected_ig": 0.0,

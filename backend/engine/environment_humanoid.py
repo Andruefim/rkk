@@ -1709,25 +1709,25 @@ class EnvironmentHumanoid:
 
         if self._fixed_root:
             # Fixed root: bias upper body/arms only.
-            self._sim.set_joint("spine_pitch", clip01(0.5 + 0.28 * torso + 0.08 * recover))
-            self._sim.set_joint("spine_yaw", clip01(0.5 + 0.10 * (sup_l - sup_r)))
-            self._sim.set_joint("lshoulder", clip01(0.5 + 0.18 * arms + 0.05 * recover))
-            self._sim.set_joint("rshoulder", clip01(0.5 - 0.18 * arms + 0.05 * recover))
+            self._sim.set_joint("spine_pitch", clip01(0.5 + 0.18 * torso + 0.12 * recover))
+            self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
+            self._sim.set_joint("lshoulder", clip01(0.5 + 0.12 * arms + 0.08 * recover))
+            self._sim.set_joint("rshoulder", clip01(0.5 - 0.12 * arms + 0.08 * recover))
             self._sim.set_joint("lelbow", clip01(0.5 + 0.10 * arms))
             self._sim.set_joint("relbow", clip01(0.5 - 0.10 * arms))
             return
 
         # Full humanoid: turn intents into a modest gait/posture bias.
-        self._sim.set_joint("lhip", clip01(0.5 + 0.20 * stride - 0.08 * sup_r + 0.04 * torso))
-        self._sim.set_joint("rhip", clip01(0.5 - 0.20 * stride - 0.08 * sup_l + 0.04 * torso))
-        self._sim.set_joint("lknee", clip01(0.5 + 0.16 * sup_l + 0.06 * recover))
-        self._sim.set_joint("rknee", clip01(0.5 + 0.16 * sup_r + 0.06 * recover))
-        self._sim.set_joint("lankle", clip01(0.5 + 0.10 * sup_l - 0.04 * stride))
-        self._sim.set_joint("rankle", clip01(0.5 + 0.10 * sup_r + 0.04 * stride))
-        self._sim.set_joint("spine_pitch", clip01(0.5 + 0.24 * torso + 0.10 * recover))
-        self._sim.set_joint("spine_yaw", clip01(0.5 + 0.10 * (sup_l - sup_r)))
-        self._sim.set_joint("lshoulder", clip01(0.5 + 0.18 * arms + 0.06 * stride))
-        self._sim.set_joint("rshoulder", clip01(0.5 - 0.18 * arms - 0.06 * stride))
+        self._sim.set_joint("lhip", clip01(0.5 + 0.10 * stride - 0.06 * sup_r + 0.03 * torso - 0.04 * recover))
+        self._sim.set_joint("rhip", clip01(0.5 - 0.10 * stride - 0.06 * sup_l + 0.03 * torso - 0.04 * recover))
+        self._sim.set_joint("lknee", clip01(0.5 + 0.12 * sup_l + 0.10 * recover))
+        self._sim.set_joint("rknee", clip01(0.5 + 0.12 * sup_r + 0.10 * recover))
+        self._sim.set_joint("lankle", clip01(0.5 + 0.08 * sup_l - 0.02 * stride - 0.04 * recover))
+        self._sim.set_joint("rankle", clip01(0.5 + 0.08 * sup_r + 0.02 * stride - 0.04 * recover))
+        self._sim.set_joint("spine_pitch", clip01(0.5 + 0.14 * torso + 0.16 * recover))
+        self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
+        self._sim.set_joint("lshoulder", clip01(0.5 + 0.12 * arms + 0.03 * stride + 0.04 * recover))
+        self._sim.set_joint("rshoulder", clip01(0.5 - 0.12 * arms - 0.03 * stride + 0.04 * recover))
         self._sim.set_joint("lelbow", clip01(0.5 + 0.10 * arms))
         self._sim.set_joint("relbow", clip01(0.5 - 0.10 * arms))
 
