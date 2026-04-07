@@ -358,6 +358,7 @@ class Simulation:
         self._fall_count  = 0
         self._fixed_root_active = False
         self._curriculum_auto_fr_released = False
+        self._curriculum_stabilize_until: int = 0
         self._stand_ticks = 0
         self._last_fall_reset_tick: int = -999
         self._fall_recovery_active = False
@@ -2110,6 +2111,28 @@ class Simulation:
 
     def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
         """L3 внутри agent.step; L2 skill — один шаг последовательности за тик."""
+        if (
+            self.current_world == "humanoid"
+            and not self._fixed_root_active
+            and self._curriculum_stabilize_until > 0
+            and engine_tick <= self._curriculum_stabilize_until
+        ):
+            if self._skill_exec is not None:
+                return self._execute_skill_frame()
+            if self._skill_library_enabled():
+                lib = self._ensure_skill_library()
+                obs = self.agent.env.observe()
+                obs_st = self._skill_state_dict(obs)
+                sk = lib.select_skill(obs_st, "stand")
+                if sk is not None:
+                    self._skill_exec = {
+                        "skill": sk,
+                        "index": 0,
+                        "obs_before": dict(obs_st),
+                    }
+                    return self._execute_skill_frame()
+            return self.agent.step(engine_tick=engine_tick, enable_l3=False)
+
         # Humanoid: при нестабильной позе не даём EIG выбирать сырые суставы — только скиллы / stand.
         if self.current_world == "humanoid" and not self._fixed_root_active:
             obs = self.agent.env.observe()
@@ -2262,8 +2285,13 @@ class Simulation:
             ):
                 self._curriculum_auto_fr_released = True
                 self.disable_fixed_root()
+                try:
+                    stab = int(os.environ.get("RKK_POST_FR_STABILIZE_TICKS", "80"))
+                except ValueError:
+                    stab = 80
+                self._curriculum_stabilize_until = self.tick + max(0, stab)
                 self._add_event(
-                    f"📌 Auto fixed_root OFF at tick {self.tick}",
+                    f"📌 Auto fixed_root OFF at tick {self.tick}, stabilize until {self._curriculum_stabilize_until}",
                     "#66ccaa",
                     "phase",
                 )
