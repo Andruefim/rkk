@@ -1148,7 +1148,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if var_name == "spine_yaw":
                     self._spine_euler[2] = 0.50 * real_pos
                 else:
-                    self._spine_euler[0] = 0.40 * real_pos
+                    self._spine_euler[0] = 0.25 * real_pos
                 ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
@@ -1777,7 +1777,7 @@ class EnvironmentHumanoid:
         if self._fixed_root:
             self._sim.set_joint(
                 "spine_pitch",
-                clip01(0.5 + 0.18 * torso + 0.12 * recover + 0.06 * arms),
+                clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms),
             )
             self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
             self._sim.set_joint("lshoulder", clip01(0.5 + 0.16 * arms + 0.09 * recover))
@@ -1788,7 +1788,7 @@ class EnvironmentHumanoid:
 
         self._sim.set_joint(
             "spine_pitch",
-            clip01(0.54 + 0.14 * torso + 0.16 * recover + 0.07 * arms),
+            clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms),
         )
         self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
         self._sim.set_joint(
