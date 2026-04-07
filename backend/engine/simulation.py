@@ -2341,9 +2341,15 @@ class Simulation:
         else:
             self.agent.value_layer.set_teacher_vl_overlay(None)
 
-        # Low-level CPG в фоне (RKK_CPG_LOOP_HZ), до тяжёлого agent.step — не ждёт GNN/EIG.
+        # CPG runs BEFORE agent step so legs are stabilized before high-level exploration
         self._ensure_cpg_background_loop()
         self._drain_l1_motor_commands()
+        fallen_pre = False
+        is_fn_pre = getattr(self.agent.env, "is_fallen", None)
+        if callable(is_fn_pre) and not self._fixed_root_active:
+            fallen_pre = is_fn_pre()
+        self._maybe_apply_cpg_locomotion(fallen_pre)
+        self._publish_cpg_node_snapshot()
         self.agent.other_agents_phi = []
         self._maybe_step_hierarchical_l1()
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
@@ -2386,12 +2392,6 @@ class Simulation:
         if _l4_worker_enabled():
             self._drain_l4_results()
 
-        fallen_locomotion = fallen
-        is_fn2 = getattr(self.agent.env, "is_fallen", None)
-        if callable(is_fn2) and not self._fixed_root_active:
-            fallen_locomotion = is_fn2()
-        self._maybe_apply_cpg_locomotion(fallen_locomotion)
-        self._publish_cpg_node_snapshot()
         self._log_step(result, fallen)
         self._rolling_block_bits.append(1 if result.get("blocked") else 0)
 
