@@ -1145,10 +1145,11 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                        positionGain=0.70, velocityGain=0.20, maxVelocity=3.5,
-                        force=[180.0, 180.0, 180.0], physicsClientId=cid)
+                        positionGain=0.85, velocityGain=0.25, maxVelocity=3.5,
+                        force=[280.0, 280.0, 280.0], physicsClientId=cid)
                 return
 
+            is_leg = var_name in ("lhip", "rhip", "lknee", "rknee", "lankle", "rankle")
             if jt == pb.JOINT_SPHERICAL and callable(motor_m):
                 if var_name == "lshoulder":
                     q = pb.getQuaternionFromEuler((0.32 * real_pos, 0.42 * real_pos, 0.28 * real_pos))
@@ -1164,15 +1165,27 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     q = pb.getQuaternionFromEuler((-0.22 * real_pos, -0.1 * real_pos, 0.0))
                 else:
                     q = [0.0, 0.0, 0.0, 1.0]
-                motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                        positionGain=0.52, velocityGain=0.15, maxVelocity=5.5,
-                        force=[165.0, 165.0, 165.0], physicsClientId=cid)
+                if is_leg:
+                    motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
+                            positionGain=0.85, velocityGain=0.25, maxVelocity=4.0,
+                            force=[320.0, 320.0, 320.0], physicsClientId=cid)
+                else:
+                    motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
+                            positionGain=0.52, velocityGain=0.15, maxVelocity=5.5,
+                            force=[165.0, 165.0, 165.0], physicsClientId=cid)
             else:
-                pb.setJointMotorControl2(
-                    rid, jid, controlMode=pb.POSITION_CONTROL,
-                    targetPosition=real_pos,
-                    positionGain=0.5, velocityGain=0.1, force=80.0, physicsClientId=cid,
-                )
+                if is_leg:
+                    pb.setJointMotorControl2(
+                        rid, jid, controlMode=pb.POSITION_CONTROL,
+                        targetPosition=real_pos,
+                        positionGain=0.80, velocityGain=0.20, force=200.0, physicsClientId=cid,
+                    )
+                else:
+                    pb.setJointMotorControl2(
+                        rid, jid, controlMode=pb.POSITION_CONTROL,
+                        targetPosition=real_pos,
+                        positionGain=0.5, velocityGain=0.1, force=80.0, physicsClientId=cid,
+                    )
 
     def get_com(self) -> tuple[np.ndarray, np.ndarray]:
         pos, orn = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
