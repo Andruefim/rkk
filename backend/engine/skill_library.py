@@ -54,9 +54,17 @@ class SkillLibrary:
             goals=frozenset({"stand"}),
             precondition=lambda s: _cz(s) < 0.20,
             action_sequence=[
-                [("intent_stop_recover", 0.88), ("intent_torso_forward", 0.60)],
-                [("intent_support_left", 0.65), ("intent_support_right", 0.65)],
-                [("intent_stride", 0.48), ("intent_arm_counterbalance", 0.55)],
+                [
+                    ("intent_stop_recover", 0.88),
+                    ("intent_torso_forward", 0.58),
+                    ("intent_arm_counterbalance", 0.66),
+                ],
+                [
+                    ("intent_support_left", 0.65),
+                    ("intent_support_right", 0.65),
+                    ("intent_arm_counterbalance", 0.58),
+                ],
+                [("intent_stride", 0.48), ("intent_arm_counterbalance", 0.60)],
             ],
             postcondition=lambda s: _cz(s) > 0.24,
         ),
@@ -66,9 +74,17 @@ class SkillLibrary:
             precondition=lambda s: 0.20 < _cz(s)
             and (_posture(s) < 0.62 or _contact_min(s) < 0.50),
             action_sequence=[
-                [("intent_stop_recover", 0.75), ("intent_stride", 0.50)],
-                [("intent_support_left", 0.58), ("intent_support_right", 0.58)],
-                [("intent_torso_forward", 0.54), ("intent_arm_counterbalance", 0.52)],
+                [
+                    ("intent_stop_recover", 0.75),
+                    ("intent_stride", 0.50),
+                    ("intent_arm_counterbalance", 0.56),
+                ],
+                [
+                    ("intent_support_left", 0.58),
+                    ("intent_support_right", 0.58),
+                    ("intent_arm_counterbalance", 0.52),
+                ],
+                [("intent_torso_forward", 0.54), ("intent_arm_counterbalance", 0.54)],
             ],
             postcondition=lambda s: _posture(s) > 0.64,
         ),
@@ -77,8 +93,16 @@ class SkillLibrary:
             goals=frozenset({"stand", "walk"}),
             precondition=lambda s: _cz(s) > 0.22 and _posture(s) > 0.60,
             action_sequence=[
-                [("intent_support_left", 0.55), ("intent_support_right", 0.55)],
-                [("intent_stride", 0.50), ("intent_torso_forward", 0.51)],
+                [
+                    ("intent_support_left", 0.55),
+                    ("intent_support_right", 0.55),
+                    ("intent_arm_counterbalance", 0.52),
+                ],
+                [
+                    ("intent_stride", 0.50),
+                    ("intent_torso_forward", 0.51),
+                    ("intent_arm_counterbalance", 0.50),
+                ],
             ],
             postcondition=lambda s: _posture(s) > 0.68 and _contact_min(s) > 0.54,
         ),
@@ -91,7 +115,11 @@ class SkillLibrary:
                 and _contact_min(s) > 0.58
             ),
             action_sequence=[
-                [("intent_support_right", 0.68), ("intent_torso_forward", 0.56)],
+                [
+                    ("intent_support_right", 0.68),
+                    ("intent_torso_forward", 0.56),
+                    ("intent_arm_counterbalance", 0.56),
+                ],
                 [("intent_stride", 0.62), ("intent_arm_counterbalance", 0.58)],
                 [("intent_support_left", 0.44), ("intent_support_right", 0.62)],
                 [("intent_support_left", 0.56), ("intent_support_right", 0.56)],
@@ -107,7 +135,11 @@ class SkillLibrary:
                 and _contact_min(s) > 0.58
             ),
             action_sequence=[
-                [("intent_support_left", 0.68), ("intent_torso_forward", 0.56)],
+                [
+                    ("intent_support_left", 0.68),
+                    ("intent_torso_forward", 0.56),
+                    ("intent_arm_counterbalance", 0.56),
+                ],
                 [("intent_stride", 0.62), ("intent_arm_counterbalance", 0.42)],
                 [("intent_support_right", 0.44), ("intent_support_left", 0.62)],
                 [("intent_support_left", 0.56), ("intent_support_right", 0.56)],

@@ -1731,8 +1731,11 @@ class EnvironmentHumanoid:
         self._sim.step(self.steps_per_do)
         return self.observe()
 
-    def _apply_motor_intents(self) -> None:
-        """Map high-level motor intents to a stable low-level postural bias."""
+    def _apply_upper_body_from_intents(self) -> None:
+        """
+        Позвоночник + руки из тех же intent_*, что и весь моторный слой (граф / скиллы).
+        Вызывается и при полном intervene, и перед CPG на ногах — руки не «застывают» между тиками.
+        """
         intents = self._motor_state
         stride = float(intents.get("intent_stride", 0.5) - 0.5)
         sup_l = float(intents.get("intent_support_left", 0.5) - 0.5)
@@ -1745,28 +1748,56 @@ class EnvironmentHumanoid:
             return float(np.clip(v, 0.05, 0.95))
 
         if self._fixed_root:
-            # Fixed root: bias upper body/arms only.
-            self._sim.set_joint("spine_pitch", clip01(0.5 + 0.18 * torso + 0.12 * recover))
+            self._sim.set_joint(
+                "spine_pitch",
+                clip01(0.5 + 0.18 * torso + 0.12 * recover + 0.06 * arms),
+            )
             self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
-            self._sim.set_joint("lshoulder", clip01(0.5 + 0.12 * arms + 0.08 * recover))
-            self._sim.set_joint("rshoulder", clip01(0.5 - 0.12 * arms + 0.08 * recover))
-            self._sim.set_joint("lelbow", clip01(0.5 + 0.10 * arms))
-            self._sim.set_joint("relbow", clip01(0.5 - 0.10 * arms))
+            self._sim.set_joint("lshoulder", clip01(0.5 + 0.16 * arms + 0.09 * recover))
+            self._sim.set_joint("rshoulder", clip01(0.5 - 0.16 * arms + 0.09 * recover))
+            self._sim.set_joint("lelbow", clip01(0.5 + 0.14 * arms))
+            self._sim.set_joint("relbow", clip01(0.5 - 0.14 * arms))
             return
 
-        # Full humanoid: turn intents into a modest gait/posture bias.
+        self._sim.set_joint(
+            "spine_pitch",
+            clip01(0.5 + 0.14 * torso + 0.16 * recover + 0.07 * arms),
+        )
+        self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
+        self._sim.set_joint(
+            "lshoulder",
+            clip01(0.5 + 0.17 * arms + 0.03 * stride + 0.05 * recover),
+        )
+        self._sim.set_joint(
+            "rshoulder",
+            clip01(0.5 - 0.17 * arms - 0.03 * stride + 0.05 * recover),
+        )
+        self._sim.set_joint("lelbow", clip01(0.5 + 0.14 * arms))
+        self._sim.set_joint("relbow", clip01(0.5 - 0.14 * arms))
+
+    def _apply_motor_intents(self) -> None:
+        """Ноги из интентов + верх из _apply_upper_body_from_intents (каузально от intent_*)."""
+        intents = self._motor_state
+        stride = float(intents.get("intent_stride", 0.5) - 0.5)
+        sup_l = float(intents.get("intent_support_left", 0.5) - 0.5)
+        sup_r = float(intents.get("intent_support_right", 0.5) - 0.5)
+        torso = float(intents.get("intent_torso_forward", 0.5) - 0.5)
+        recover = float(intents.get("intent_stop_recover", 0.5) - 0.5)
+
+        def clip01(v: float) -> float:
+            return float(np.clip(v, 0.05, 0.95))
+
+        if self._fixed_root:
+            self._apply_upper_body_from_intents()
+            return
+
         self._sim.set_joint("lhip", clip01(0.5 + 0.10 * stride - 0.06 * sup_r + 0.03 * torso - 0.04 * recover))
         self._sim.set_joint("rhip", clip01(0.5 - 0.10 * stride - 0.06 * sup_l + 0.03 * torso - 0.04 * recover))
         self._sim.set_joint("lknee", clip01(0.5 + 0.12 * sup_l + 0.10 * recover))
         self._sim.set_joint("rknee", clip01(0.5 + 0.12 * sup_r + 0.10 * recover))
         self._sim.set_joint("lankle", clip01(0.5 + 0.08 * sup_l - 0.02 * stride - 0.04 * recover))
         self._sim.set_joint("rankle", clip01(0.5 + 0.08 * sup_r + 0.02 * stride - 0.04 * recover))
-        self._sim.set_joint("spine_pitch", clip01(0.5 + 0.14 * torso + 0.16 * recover))
-        self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
-        self._sim.set_joint("lshoulder", clip01(0.5 + 0.12 * arms + 0.03 * stride + 0.04 * recover))
-        self._sim.set_joint("rshoulder", clip01(0.5 - 0.12 * arms - 0.03 * stride + 0.04 * recover))
-        self._sim.set_joint("lelbow", clip01(0.5 + 0.10 * arms))
-        self._sim.set_joint("relbow", clip01(0.5 - 0.10 * arms))
+        self._apply_upper_body_from_intents()
 
     def apply_cpg_leg_targets(self, targets: dict[str, float]) -> None:
         """
@@ -1781,6 +1812,7 @@ class EnvironmentHumanoid:
         if n_sub <= 0:
             n_sub = max(1, self.steps_per_do // 2)
         n_sub = min(max(n_sub, 1), 32)
+        self._apply_upper_body_from_intents()
         for name, val in targets.items():
             if name in LEG_VARS:
                 self._sim.set_joint(name, float(np.clip(val, 0.05, 0.95)))
