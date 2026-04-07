@@ -45,8 +45,8 @@ class CPGNetwork(nn.Module):
         Один шаг CPG → (n,) в [0, 1].
         external_command: (>=n,) на том же device, что модуль.
         """
-        freq = torch.sigmoid(self.frequency) * 3.0 + 0.5
-        amp = torch.sigmoid(self.amplitude) * 0.8 + 0.1
+        freq = torch.sigmoid(self.frequency) * 2.0 + 0.3
+        amp = torch.sigmoid(self.amplitude) * 0.6
 
         if external_command is not None:
             ec = external_command[: self.n]
@@ -76,21 +76,30 @@ class LocomotionController:
     """
     CPG/MotorPolicy → цели суставов и моторный латент для humanoid.
     Управляется motor intents из causal graph и структурным reward.
-    """
 
-    CPG_TO_JOINTS: dict[int, list[str]] = {
-        0: ["lhip", "lknee"],
-        1: ["rhip", "rknee"],
-        2: ["lankle"],
-        3: ["rankle"],
-    }
+    Каждый осциллятор управляет ОДНИМ суставом (6 осцилляторов = lhip, rhip, lknee, rknee, lankle, rankle).
+    Бёдра и колени работают в анти-фазе: при разгибании бедра колено выпрямляется (опорная фаза),
+    при сгибании бедра колено сгибается (фаза переноса).
+    """
 
     def __init__(self, device: torch.device):
         self.device = device
-        self.cpg = CPGNetwork(n_oscillators=4, device=device)
-        self.optim = torch.optim.Adam(self.cpg.parameters(), lr=1e-3)
+        self.cpg = CPGNetwork(n_oscillators=6, device=device)
+
+        with torch.no_grad():
+            self.cpg.phase_bias[0, 1] = math.pi
+            self.cpg.phase_bias[1, 0] = -math.pi
+            self.cpg.phase_bias[2, 3] = math.pi
+            self.cpg.phase_bias[3, 2] = -math.pi
+            self.cpg.phase_bias[0, 2] = math.pi * 0.25
+            self.cpg.phase_bias[1, 3] = math.pi * 0.25
+            self.cpg.frequency.data[:] = 0.3
+            self.cpg.amplitude.data[:] = -1.5
+
+        self.optim = torch.optim.Adam(self.cpg.parameters(), lr=3e-4)
         self._step_count = 0
         self._last_com_x: float = 0.5
+        self._last_com_z: float = 0.5
         self._reward_history: list[float] = []
         self._last_command: dict[str, float] = {}
         self._last_motor_state: dict[str, float] = {}
@@ -103,7 +112,10 @@ class LocomotionController:
         return float(v if v is not None else 0.5)
 
     def get_joint_targets(self, agent_nodes: dict[str, float], *, dt: float = 0.05) -> dict[str, float]:
-        """agent_nodes: нормализованные узлы графа; intent_* и self_* модулируют ноги."""
+        """
+        6 осцилляторов → 6 суставов: lhip, rhip, lknee, rknee, lankle, rankle.
+        intent_* модулируют амплитуду через external_command.
+        """
         intents = {
             "intent_stride": self._node(agent_nodes, "intent_stride"),
             "intent_support_left": self._node(agent_nodes, "intent_support_left"),
@@ -113,42 +125,48 @@ class LocomotionController:
             "intent_stop_recover": self._node(agent_nodes, "intent_stop_recover"),
         }
         self._last_motor_state = dict(intents)
-        lh = self._node(agent_nodes, "lhip") - 0.5
-        rh = self._node(agent_nodes, "rhip") - 0.5
-        la = self._node(agent_nodes, "lankle") - 0.5
-        ra = self._node(agent_nodes, "rankle") - 0.5
-        larm = self._node(agent_nodes, "self_intention_larm") - 0.5
-        rarm = self._node(agent_nodes, "self_intention_rarm") - 0.5
+
         eng = float(np.clip(self._node(agent_nodes, "self_energy"), 0.0, 1.0))
 
         stride = float(intents["intent_stride"] - 0.5)
         sup_l = float(intents["intent_support_left"] - 0.5)
         sup_r = float(intents["intent_support_right"] - 0.5)
-        torso = float(intents["intent_torso_forward"] - 0.5)
-        arms = float(intents["intent_arm_counterbalance"] - 0.5)
         recover = float(intents["intent_stop_recover"] - 0.5)
 
-        cmd = torch.tensor([lh, rh, la, ra], dtype=torch.float32, device=self.device)
-        cmd[0] = cmd[0] + 0.12 * float(larm) + 0.10 * stride - 0.05 * sup_r + 0.03 * torso
-        cmd[1] = cmd[1] + 0.12 * float(rarm) - 0.10 * stride - 0.05 * sup_l + 0.03 * torso
-        cmd[2] = cmd[2] + 0.08 * sup_l - 0.04 * stride + 0.03 * recover
-        cmd[3] = cmd[3] + 0.08 * sup_r + 0.04 * stride + 0.03 * recover
-        cmd = cmd * float(0.68 + 0.58 * eng)
+        cmd = torch.zeros(6, dtype=torch.float32, device=self.device)
+        cmd[0] = 0.15 * stride - 0.06 * sup_r - 0.05 * recover
+        cmd[1] = -0.15 * stride - 0.06 * sup_l - 0.05 * recover
+        cmd[2] = 0.10 * sup_l + 0.08 * recover
+        cmd[3] = 0.10 * sup_r + 0.08 * recover
+        cmd[4] = 0.06 * sup_l - 0.03 * stride + 0.04 * recover
+        cmd[5] = 0.06 * sup_r + 0.03 * stride + 0.04 * recover
+        cmd = cmd * float(0.6 + 0.6 * eng)
 
         cpg_out = self.cpg.step(dt=dt, external_command=cmd)
-        targets: dict[str, float] = {}
-        for osc_idx, joints in self.CPG_TO_JOINTS.items():
-            v = float(cpg_out[osc_idx].item())
-            if osc_idx == 0:
-                v = float(np.clip(v + 0.12 * stride - 0.05 * sup_r, 0.0, 1.0))
-            elif osc_idx == 1:
-                v = float(np.clip(v - 0.12 * stride - 0.05 * sup_l, 0.0, 1.0))
-            elif osc_idx == 2:
-                v = float(np.clip(v + 0.06 * recover + 0.04 * sup_l, 0.0, 1.0))
-            else:
-                v = float(np.clip(v + 0.06 * recover + 0.04 * sup_r, 0.0, 1.0))
-            for joint in joints:
-                targets[joint] = v
+
+        hip_center = 0.45
+        knee_center = 0.40
+        ankle_center = 0.50
+        hip_range = 0.18
+        knee_range = 0.15
+        ankle_range = 0.10
+
+        lhip_raw = float(cpg_out[0].item())
+        rhip_raw = float(cpg_out[1].item())
+        lknee_raw = float(cpg_out[2].item())
+        rknee_raw = float(cpg_out[3].item())
+        lankle_raw = float(cpg_out[4].item())
+        rankle_raw = float(cpg_out[5].item())
+
+        targets: dict[str, float] = {
+            "lhip": float(np.clip(hip_center + hip_range * (lhip_raw * 2.0 - 1.0), 0.05, 0.95)),
+            "rhip": float(np.clip(hip_center + hip_range * (rhip_raw * 2.0 - 1.0), 0.05, 0.95)),
+            "lknee": float(np.clip(knee_center + knee_range * (lknee_raw * 2.0 - 1.0), 0.05, 0.95)),
+            "rknee": float(np.clip(knee_center + knee_range * (rknee_raw * 2.0 - 1.0), 0.05, 0.95)),
+            "lankle": float(np.clip(ankle_center + ankle_range * (lankle_raw * 2.0 - 1.0), 0.05, 0.95)),
+            "rankle": float(np.clip(ankle_center + ankle_range * (rankle_raw * 2.0 - 1.0), 0.05, 0.95)),
+        }
+
         self._last_command = dict(targets)
         self._step_count += 1
         return targets
@@ -162,9 +180,12 @@ class LocomotionController:
         motor_obs: dict[str, float] | None = None,
     ) -> None:
         """
-        Структурный reward: устойчивость корпуса + опора + симметрия + forward progress.
+        Phased reward: standing first, then forward progress.
+        Phase 1 (com_z < 0.35): max reward for increasing com_z (get upright).
+        Phase 2 (upright): stability + symmetry + gentle forward.
         """
         dx = float(com_x) - self._last_com_x
+        dz = float(com_z) - self._last_com_z
         rz = float(np.clip(com_z, 0.0, 1.0))
         motor_obs = motor_obs or {}
         posture = float(np.clip(motor_obs.get("posture_stability", 0.5), 0.0, 1.0))
@@ -174,21 +195,36 @@ class LocomotionController:
         gait_l = float(np.clip(motor_obs.get("gait_phase_l", 0.5), 0.0, 1.0))
         gait_r = float(np.clip(motor_obs.get("gait_phase_r", 0.5), 0.0, 1.0))
         symmetry = 1.0 - min(1.0, abs(gait_l - gait_r) + abs(contact_l - contact_r) + abs(bias - 0.5) * 1.4)
-        reward = (
-            rz * 1.6
-            + dx * 2.8
-            + posture * 2.2
-            + symmetry * 1.4
-            + min(contact_l, contact_r) * 0.8
-            - (3.0 if fallen else 0.0)
-        )
+
+        upright = rz > 0.35
+
+        if not upright:
+            reward = (
+                rz * 4.0
+                + dz * 8.0
+                + posture * 1.5
+                + min(contact_l, contact_r) * 1.0
+                - (5.0 if fallen else 0.0)
+            )
+        else:
+            reward = (
+                rz * 3.0
+                + posture * 3.0
+                + symmetry * 2.0
+                + min(contact_l, contact_r) * 1.5
+                + dx * 1.5
+                - abs(bias - 0.5) * 1.0
+                - (5.0 if fallen else 0.0)
+            )
+
         self._last_com_x = float(com_x)
+        self._last_com_z = float(com_z)
         self._reward_history.append(reward)
 
         try:
-            win = int(os.environ.get("RKK_CPG_REWARD_WINDOW", "16"))
+            win = int(os.environ.get("RKK_CPG_REWARD_WINDOW", "24"))
         except ValueError:
-            win = 16
+            win = 24
         win = max(4, min(win, 256))
 
         if len(self._reward_history) < win:
@@ -198,14 +234,13 @@ class LocomotionController:
         self.optim.zero_grad()
         dev = next(self.cpg.parameters()).device
         scale = torch.tensor(r_mean, device=dev, dtype=torch.float32)
-        # Положительный r_mean → усилить устойчивый моторный ритм, а не только forward progress.
         loss = -scale * (
-            0.45 * self.cpg.amplitude.mean()
-            + 0.20 * self.cpg.frequency.mean()
-            - 0.10 * torch.abs(self.cpg.phase_bias).mean()
+            0.35 * self.cpg.amplitude.mean()
+            + 0.15 * self.cpg.frequency.mean()
+            - 0.15 * torch.abs(self.cpg.phase_bias).mean()
         )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.cpg.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(self.cpg.parameters(), 0.3)
         self.optim.step()
 
     def snapshot(self) -> dict:

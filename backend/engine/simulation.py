@@ -1238,15 +1238,16 @@ class Simulation:
             from engine.value_layer import HomeostaticBounds
             self.agent.value_layer.bounds = HomeostaticBounds(
                 var_min=0.05, var_max=0.95,
-                phi_min=0.01,
-                h_slow_max=14.0,
-                env_entropy_max_delta=0.96,
-                warmup_ticks=1500,
-                blend_ticks=500,
-                phi_min_steady=0.04,
-                env_entropy_max_delta_steady=0.60,
-                h_slow_max_steady=11.0,
-                predict_band_edge_steady=0.02,
+                phi_min=0.005,
+                h_slow_max=18.0,
+                env_entropy_max_delta=1.2,
+                s1_penalty=-0.2,
+                warmup_ticks=800,
+                blend_ticks=400,
+                phi_min_steady=0.03,
+                env_entropy_max_delta_steady=0.65,
+                h_slow_max_steady=14.0,
+                predict_band_edge_steady=0.015,
                 fixed_root_mode=False,
             )
 
@@ -1319,13 +1320,13 @@ class Simulation:
         """
         score = self._fall_recovery_score(obs)
         try:
-            max_ticks = int(os.environ.get("RKK_FALL_RECOVERY_TICKS", "90"))
+            max_ticks = int(os.environ.get("RKK_FALL_RECOVERY_TICKS", "40"))
         except ValueError:
-            max_ticks = 90
+            max_ticks = 40
         try:
-            stall_ticks = int(os.environ.get("RKK_FALL_RECOVERY_STALL_TICKS", "28"))
+            stall_ticks = int(os.environ.get("RKK_FALL_RECOVERY_STALL_TICKS", "12"))
         except ValueError:
-            stall_ticks = 28
+            stall_ticks = 12
         try:
             min_gain = float(os.environ.get("RKK_FALL_RECOVERY_MIN_GAIN", "0.02"))
         except ValueError:

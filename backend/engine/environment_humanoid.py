@@ -1553,7 +1553,7 @@ class EnvironmentHumanoid:
     def __init__(
         self,
         device: torch.device | None = None,
-        steps_per_do: int = 24,
+        steps_per_do: int = 10,
         fixed_root: bool = False,
     ):
         self.device = device or torch.device("cpu")
@@ -1561,7 +1561,6 @@ class EnvironmentHumanoid:
             spd = int(os.environ.get("RKK_STEPS_PER_DO", str(steps_per_do)))
         except ValueError:
             spd = steps_per_do
-        # Больше шагов PyBullet на один do() — инерция успевает проявиться до снимка для GNN/VL.
         self.steps_per_do = max(1, min(int(spd), 128))
         self.preset       = self.PRESET
         self.n_interventions = 0
@@ -1577,6 +1576,8 @@ class EnvironmentHumanoid:
         mode_label = "fixed_root" if fixed_root else "full"
         var_count  = len(FIXED_BASE_VARS if fixed_root else VAR_NAMES)
         print(f"[HumanoidEnv] backend={self._backend}, mode={mode_label}, vars={var_count}")
+        # When True, CPG owns leg joints; _apply_motor_intents only sets upper body.
+        self.cpg_owns_legs: bool = False
         # Самомодель: значения держим в среде, observe() мержит с физикой; intervene(self_*) не трогает суставы.
         self._self_state: dict[str, float] = {k: 0.5 for k in SELF_VARS}
         self._motor_state: dict[str, float] = {k: 0.5 for k in MOTOR_INTENT_VARS}
@@ -1776,7 +1777,10 @@ class EnvironmentHumanoid:
         self._sim.set_joint("relbow", clip01(0.5 - 0.14 * arms))
 
     def _apply_motor_intents(self) -> None:
-        """Ноги из интентов + верх из _apply_upper_body_from_intents (каузально от intent_*)."""
+        """
+        Legs from intents + upper body from _apply_upper_body_from_intents.
+        When cpg_owns_legs is True, skip leg joints (CPG controls them directly).
+        """
         intents = self._motor_state
         stride = float(intents.get("intent_stride", 0.5) - 0.5)
         sup_l = float(intents.get("intent_support_left", 0.5) - 0.5)
@@ -1791,20 +1795,23 @@ class EnvironmentHumanoid:
             self._apply_upper_body_from_intents()
             return
 
-        self._sim.set_joint("lhip", clip01(0.5 + 0.10 * stride - 0.06 * sup_r + 0.03 * torso - 0.04 * recover))
-        self._sim.set_joint("rhip", clip01(0.5 - 0.10 * stride - 0.06 * sup_l + 0.03 * torso - 0.04 * recover))
-        self._sim.set_joint("lknee", clip01(0.5 + 0.12 * sup_l + 0.10 * recover))
-        self._sim.set_joint("rknee", clip01(0.5 + 0.12 * sup_r + 0.10 * recover))
-        self._sim.set_joint("lankle", clip01(0.5 + 0.08 * sup_l - 0.02 * stride - 0.04 * recover))
-        self._sim.set_joint("rankle", clip01(0.5 + 0.08 * sup_r + 0.02 * stride - 0.04 * recover))
+        if not self.cpg_owns_legs:
+            self._sim.set_joint("lhip", clip01(0.45 + 0.18 * stride - 0.10 * sup_r + 0.06 * torso - 0.08 * recover))
+            self._sim.set_joint("rhip", clip01(0.45 - 0.18 * stride - 0.10 * sup_l + 0.06 * torso - 0.08 * recover))
+            self._sim.set_joint("lknee", clip01(0.40 + 0.15 * sup_l + 0.14 * recover))
+            self._sim.set_joint("rknee", clip01(0.40 + 0.15 * sup_r + 0.14 * recover))
+            self._sim.set_joint("lankle", clip01(0.50 + 0.10 * sup_l - 0.04 * stride - 0.06 * recover))
+            self._sim.set_joint("rankle", clip01(0.50 + 0.10 * sup_r + 0.04 * stride - 0.06 * recover))
         self._apply_upper_body_from_intents()
 
     def apply_cpg_leg_targets(self, targets: dict[str, float]) -> None:
         """
         Phase A locomotion: низкоуровневые цели на ноги без увеличения n_interventions.
+        Also marks cpg_owns_legs=True so _apply_motor_intents doesn't fight CPG.
         """
         if self._fixed_root:
             return
+        self.cpg_owns_legs = True
         try:
             n_sub = int(os.environ.get("RKK_CPG_PHYS_SUBSTEPS", "0"))
         except ValueError:
@@ -1945,6 +1952,35 @@ class EnvironmentHumanoid:
         return edges
 
     # ── Упал? ─────────────────────────────────────────────────────────────────
+    def _settle_after_reset(self) -> None:
+        """
+        Run physics for a brief settling period after reset so the humanoid
+        starts from a stable standing pose rather than mid-air/mid-fall.
+        Sets joints to a neutral standing configuration and lets physics settle.
+        """
+        def clip01(v: float) -> float:
+            return float(np.clip(v, 0.05, 0.95))
+
+        if not self._fixed_root:
+            self._sim.set_joint("lhip", clip01(0.45))
+            self._sim.set_joint("rhip", clip01(0.45))
+            self._sim.set_joint("lknee", clip01(0.40))
+            self._sim.set_joint("rknee", clip01(0.40))
+            self._sim.set_joint("lankle", clip01(0.50))
+            self._sim.set_joint("rankle", clip01(0.50))
+        self._sim.set_joint("spine_pitch", clip01(0.50))
+        self._sim.set_joint("spine_yaw", clip01(0.50))
+        self._sim.set_joint("lshoulder", clip01(0.50))
+        self._sim.set_joint("rshoulder", clip01(0.50))
+        self._sim.set_joint("lelbow", clip01(0.50))
+        self._sim.set_joint("relbow", clip01(0.50))
+        try:
+            settle_steps = int(os.environ.get("RKK_SETTLE_STEPS", "40"))
+        except ValueError:
+            settle_steps = 40
+        settle_steps = max(8, min(settle_steps, 120))
+        self._sim.step(settle_steps)
+
     def is_fallen(self) -> bool:
         # В fixed_root mode робот никогда не падает
         if self._fixed_root:
@@ -1958,6 +1994,7 @@ class EnvironmentHumanoid:
             self._self_state[k] = 0.5
         for k in MOTOR_INTENT_VARS:
             self._motor_state[k] = 0.5
+        self._settle_after_reset()
 
     # ── Camera / Skeleton ─────────────────────────────────────────────────────
     def get_frame_base64(self, view: str | None = None, **kwargs) -> str | None:

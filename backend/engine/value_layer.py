@@ -55,17 +55,17 @@ class CheckResult:
 class HomeostaticBounds:
     var_min:         float = 0.05
     var_max:         float = 0.95
-    phi_min:         float = 0.01
-    h_slow_max:      float = 12.0
-    env_entropy_max_delta: float = 0.95
-    s1_penalty:      float = -0.3
+    phi_min:         float = 0.005
+    h_slow_max:      float = 18.0
+    env_entropy_max_delta: float = 1.2
+    s1_penalty:      float = -0.2
 
-    warmup_ticks:    int   = 2000
-    blend_ticks:     int   = 600
-    phi_min_steady:  float = 0.05
-    env_entropy_max_delta_steady: float = 0.55
-    h_slow_max_steady: float = 10.0
-    predict_band_edge_steady: float = 0.02
+    warmup_ticks:    int   = 800
+    blend_ticks:     int   = 400
+    phi_min_steady:  float = 0.03
+    env_entropy_max_delta_steady: float = 0.65
+    h_slow_max_steady: float = 14.0
+    predict_band_edge_steady: float = 0.015
 
     # ── fixed_root mode ──────────────────────────────────────────────────────
     # Когда True: пропускаем entropy_spike и phi checks связанные с балансом.
@@ -175,16 +175,16 @@ def _warmup_alpha(tick: int, warmup: int, blend: int) -> float:
 def _loco_warmup_relax(engine_tick: int) -> float:
     """
     1.0 early locomotion warmup, 0.0 after warmup.
-    Separate from the generic VL warmup so motor intents can stabilize longer.
+    Shorter warmup so the agent can explore motor intents earlier.
     """
     try:
-        warm = int(os.environ.get("RKK_LOCO_VL_WARMUP_TICKS", "6000"))
+        warm = int(os.environ.get("RKK_LOCO_VL_WARMUP_TICKS", "1500"))
     except ValueError:
-        warm = 6000
+        warm = 1500
     try:
-        blend = int(os.environ.get("RKK_LOCO_VL_WARMUP_BLEND", "2000"))
+        blend = int(os.environ.get("RKK_LOCO_VL_WARMUP_BLEND", "800"))
     except ValueError:
-        blend = 2000
+        blend = 800
     return float(np.clip(1.0 - _warmup_alpha(engine_tick, warm, blend), 0.0, 1.0))
 
 

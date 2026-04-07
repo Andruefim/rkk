@@ -603,16 +603,16 @@ class RKKAgent:
             feat_k = features_batch[k]
             if _is_motor_intent_var(vf):
                 if stable_stance:
-                    lo, hi = 0.42, 0.62
+                    lo, hi = 0.30, 0.72
                 else:
-                    lo, hi = 0.47, 0.56
+                    lo, hi = 0.35, 0.68
                 if str(vf).endswith("stride"):
-                    hi = min(hi, 0.54 if stable_stance else 0.51)
+                    hi = min(hi, 0.62 if stable_stance else 0.56)
                 if str(vf).endswith("stop_recover"):
-                    lo, hi = (0.52, 0.68) if not stable_stance else (0.46, 0.58)
+                    lo, hi = (0.55, 0.80) if not stable_stance else (0.40, 0.65)
                 rand_value = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
             else:
-                rand_value = float(np.clip(rng.uniform(0.22, 0.78), 0.06, 0.94))
+                rand_value = float(np.clip(rng.uniform(0.15, 0.85), 0.06, 0.94))
             candidates.append({
                 "variable":    vf,
                 "target":      vt,
