@@ -129,7 +129,7 @@ FIXED_BASE_VARS: list[str] = (
 # Нормализация диапазонов
 _RANGES = {}
 for v in TORSO_VARS[:2]:  _RANGES[v] = (-1.5, 1.5)
-_RANGES["com_z"]          = (0.0,  1.5)
+_RANGES["com_z"]          = (0.0,  1.8)
 _RANGES["torso_roll"]     = (-1.2, 1.2)
 _RANGES["torso_pitch"]    = (-1.2, 1.2)
 for v in SPINE_VARS:       _RANGES[v] = (-1.2, 1.2)
@@ -158,10 +158,10 @@ HUMANOID_URDF_LEGACY_SCALE = 0.45
 HUMANOID_URDF_GLOBAL_SCALING = 0.225
 _HSZ = HUMANOID_URDF_GLOBAL_SCALING / HUMANOID_URDF_LEGACY_SCALE
 
-FALLEN_Z     = 0.25 * _HSZ
-STAND_Z      = 0.85 * _HSZ
+FALLEN_Z     = 0.30
+STAND_Z      = 0.80
 HUMANOID_URDF_STAND_EULER = (np.pi / 2, 0.0, 0.0)
-HUMANOID_URDF_SPAWN_Z = 1.15 * _HSZ
+HUMANOID_URDF_SPAWN_Z = 1.10
 
 
 def _np_quat_from_axis_angle(axis: np.ndarray, angle: float) -> list[float]:
@@ -980,7 +980,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, pb.POSITION_CONTROL,
                     targetPosition=quat_id,
                     positionGain=1.2, velocityGain=0.40,
-                    maxVelocity=6.0, force=[3000.0, 3000.0, 3000.0],
+                    maxVelocity=6.0, force=[12000.0, 12000.0, 12000.0],
                     physicsClientId=cid,
                 )
             else:
@@ -988,7 +988,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, controlMode=pb.POSITION_CONTROL,
                     targetPosition=0.0,
                     positionGain=0.90, velocityGain=0.25,
-                    force=2000.0, physicsClientId=cid,
+                    force=8000.0, physicsClientId=cid,
                 )
 
     def _snap_base_spine_vertical(self) -> None:
@@ -1132,7 +1132,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                         positionGain=0.62, velocityGain=0.18, maxVelocity=4.0,
-                        force=[110.0, 110.0, 110.0], physicsClientId=cid)
+                        force=[4000.0, 4000.0, 4000.0], physicsClientId=cid)
                 return
 
             if var_name in ("spine_yaw", "spine_pitch"):
@@ -1146,7 +1146,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                         positionGain=0.85, velocityGain=0.25, maxVelocity=3.5,
-                        force=[2200.0, 2200.0, 2200.0], physicsClientId=cid)
+                        force=[10000.0, 10000.0, 10000.0], physicsClientId=cid)
                 return
 
             is_leg = var_name in ("lhip", "rhip", "lknee", "rknee", "lankle", "rankle")
@@ -1168,23 +1168,23 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if is_leg:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                             positionGain=0.85, velocityGain=0.25, maxVelocity=4.0,
-                            force=[2500.0, 2500.0, 2500.0], physicsClientId=cid)
+                            force=[12000.0, 12000.0, 12000.0], physicsClientId=cid)
                 else:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                             positionGain=0.52, velocityGain=0.15, maxVelocity=5.5,
-                            force=[165.0, 165.0, 165.0], physicsClientId=cid)
+                            force=[3000.0, 3000.0, 3000.0], physicsClientId=cid)
             else:
                 if is_leg:
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
-                        positionGain=0.80, velocityGain=0.20, force=1600.0, physicsClientId=cid,
+                        positionGain=0.80, velocityGain=0.20, force=8000.0, physicsClientId=cid,
                     )
                 else:
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
-                        positionGain=0.5, velocityGain=0.1, force=80.0, physicsClientId=cid,
+                        positionGain=0.5, velocityGain=0.1, force=2000.0, physicsClientId=cid,
                     )
 
     def get_com(self) -> tuple[np.ndarray, np.ndarray]:
