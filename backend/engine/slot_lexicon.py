@@ -172,7 +172,7 @@ async def _ollama_chat_multimodal(
     model: str,
     prompt: str,
     images_b64: list[str],
-    timeout: float = 300.0,
+    timeout: float = 500.0,
 ) -> str:
     images_clean = [normalize_ollama_image_b64(x) for x in images_b64]
     images_clean = [x for x in images_clean if x]

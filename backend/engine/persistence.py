@@ -149,6 +149,14 @@ def save_simulation(sim, path: Path | str | None = None) -> dict[str, Any]:
         ),
         "concepts_cache": list(getattr(sim, "_concepts_cache", [])),
     }
+    motor_state = getattr(sim, "_motor_state", None)
+    if motor_state is not None and hasattr(motor_state, "snapshot"):
+        lock = getattr(sim, "_motor_state_lock", None)
+        if lock is not None:
+            with lock:
+                payload["motor_state"] = motor_state.snapshot()
+        else:
+            payload["motor_state"] = motor_state.snapshot()
     torch.save(payload, path)
     return {"ok": True, "path": str(path.resolve())}
 
@@ -177,6 +185,24 @@ def load_simulation(sim, path: Path | str | None = None) -> dict[str, Any]:
     if hasattr(sim, "_concepts_cache"):
         cc = payload.get("concepts_cache")
         sim._concepts_cache = list(cc) if isinstance(cc, list) else []
+    ms = payload.get("motor_state")
+    if isinstance(ms, dict) and hasattr(sim, "_motor_state"):
+        st = sim._motor_state
+        st.tick = int(ms.get("tick", st.tick))
+        st.source = str(ms.get("source", st.source))
+        if isinstance(ms.get("intents"), dict):
+            st.intents.update({k: float(v) for k, v in ms["intents"].items()})
+        if isinstance(ms.get("joint_targets"), dict):
+            st.joint_targets = {k: float(v) for k, v in ms["joint_targets"].items()}
+        st.gait_phase_l = float(ms.get("gait_phase_l", st.gait_phase_l))
+        st.gait_phase_r = float(ms.get("gait_phase_r", st.gait_phase_r))
+        st.foot_contact_l = float(ms.get("foot_contact_l", st.foot_contact_l))
+        st.foot_contact_r = float(ms.get("foot_contact_r", st.foot_contact_r))
+        st.support_bias = float(ms.get("support_bias", st.support_bias))
+        st.motor_drive_l = float(ms.get("motor_drive_l", st.motor_drive_l))
+        st.motor_drive_r = float(ms.get("motor_drive_r", st.motor_drive_r))
+        st.posture_stability = float(ms.get("posture_stability", st.posture_stability))
+        st.support_leg = str(ms.get("support_leg", st.support_leg))
     return {
         "ok": True,
         "path": str(path.resolve()),

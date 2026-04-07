@@ -121,7 +121,7 @@ def consult_counterfactual_sync(
     llm_model: str,
     ctx: dict[str, Any],
     valid_vars: set[str],
-    timeout: float = 120.0,
+    timeout: float = 500.0,
 ) -> dict[str, Any]:
     """Synchronous Ollama /api/generate call (for background thread)."""
     prompt = build_counterfactual_prompt(ctx)
@@ -179,7 +179,7 @@ def structure_revision_sync(
     llm_url: str,
     llm_model: str,
     var_names: list[str],
-    timeout: float = 150.0,
+    timeout: float = 500.0,
 ) -> dict[str, Any]:
     """Уровень 3: редкая полная перезапись списка гипотез (как bootstrap, sync)."""
     url = _normalize_generate_url(llm_url)

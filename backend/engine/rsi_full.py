@@ -19,6 +19,7 @@ import torch.nn as nn
 
 from engine.causal_gnn import CausalGNNCore
 from engine.causal_graph import USE_GNN
+from engine.environment_humanoid import MOTOR_INTENT_VARS
 
 if TYPE_CHECKING:
     from engine.agent import RKKAgent
@@ -256,6 +257,18 @@ class RSIController:
             f = cpg.frequency
             cpg.phase_bias.copy_(p.detach() + torch.randn_like(p) * pb)
             cpg.frequency.copy_(f.detach() + torch.randn_like(f) * fq)
+        env = getattr(self.agent, "env", None)
+        while env is not None and hasattr(env, "base_env"):
+            env = getattr(env, "base_env")
+        motor_state = getattr(env, "_motor_state", None) if env is not None else None
+        if motor_state is not None and hasattr(motor_state, "intents"):
+            noise = float(_env_float("RKK_RSI_FULL_MOTOR_INTENT_NOISE", 0.08))
+            for key in MOTOR_INTENT_VARS:
+                cur = float(motor_state.intents.get(key, 0.5))
+                delta = float(np.random.normal(0.0, noise))
+                motor_state.intents[key] = float(np.clip(cur + delta, 0.05, 0.95))
+                if key in self.agent.graph.nodes:
+                    self.agent.graph.nodes[key] = motor_state.intents[key]
 
     def tick(
         self,
@@ -363,7 +376,7 @@ class RSIController:
             and abs(loco_gain) < loco_eps
         ):
             self._perturb_cpg(active_loco)
-            event = {"type": "cpg_perturb", "tick": tick}
+            event = {"type": "motor_policy_perturb", "tick": tick}
             self._rsi_events.append(event)
             self._last_structural_tick = tick
             return event

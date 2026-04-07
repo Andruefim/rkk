@@ -33,12 +33,10 @@ def resolve_humanoid_base(env: Any) -> Any | None:
 
 
 def motor_allow_set(humanoid_env: Any) -> set[str]:
-    """Имена суставов в пространстве humanoid (без префикса phys_)."""
-    from engine.environment_humanoid import ARM_VARS, SPINE_VARS, HEAD_VARS, LEG_VARS
+    """Intent-only action space for embodied planning."""
+    from engine.environment_humanoid import MOTOR_INTENT_VARS
 
-    if getattr(humanoid_env, "_fixed_root", False):
-        return set(ARM_VARS + SPINE_VARS + HEAD_VARS)
-    return set(ARM_VARS + SPINE_VARS + HEAD_VARS + LEG_VARS)
+    return set(MOTOR_INTENT_VARS)
 
 
 def planning_graph_motor_vars(env: Any, graph_node_ids: list[str]) -> list[str]:
@@ -55,6 +53,12 @@ def planning_graph_motor_vars(env: Any, graph_node_ids: list[str]) -> list[str]:
         if nid.startswith("self_") or nid.startswith("slot_") or nid.startswith("concept_"):
             continue
         if nid == "target_dist":
+            continue
+        if nid.startswith("intent_"):
+            out.append(nid)
+            continue
+        if nid.startswith("phys_intent_"):
+            out.append(nid)
             continue
         key = nid[5:] if nid.startswith("phys_") else nid
         if key in allow:

@@ -32,6 +32,7 @@ import torch
 import base64
 from typing import Callable
 
+from engine.environment_humanoid import MOTOR_INTENT_VARS, MOTOR_OBSERVABLE_VARS
 from engine.causal_vision import CausalVisualCortex, make_visual_cortex
 from engine.slot_lexicon import frame_content_hash
 
@@ -56,6 +57,8 @@ _HYBRID_PHYS_KEYS = (
     "lshoulder", "rshoulder",
     "lever_pin", "target_dist",
     "floor_friction", "stack_height", "stability_score",
+    *MOTOR_INTENT_VARS,
+    *MOTOR_OBSERVABLE_VARS,
 )
 
 # do(phys_*) в hybrid: только реально управляемые моторные ключи;
@@ -64,6 +67,7 @@ _HYBRID_CONTROLLABLE_KEYS = {
     "com_z", "torso_roll", "lknee", "rknee",
     "spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch",
     "lshoulder", "rshoulder",
+    *MOTOR_INTENT_VARS,
 }
 
 

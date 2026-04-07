@@ -53,6 +53,27 @@ SANDBOX_VARS = [
     "stack_height",
     "stability_score",
 ]
+# Motor-intent layer: high-level causal controls that can be planned/intervened on
+# without directly addressing raw joints.
+MOTOR_INTENT_VARS: tuple[str, ...] = (
+    "intent_stride",
+    "intent_support_left",
+    "intent_support_right",
+    "intent_torso_forward",
+    "intent_arm_counterbalance",
+    "intent_stop_recover",
+)
+# Derived motor observables that should be visible to the graph and hybrid view.
+MOTOR_OBSERVABLE_VARS: tuple[str, ...] = (
+    "gait_phase_l",
+    "gait_phase_r",
+    "foot_contact_l",
+    "foot_contact_r",
+    "support_bias",
+    "motor_drive_l",
+    "motor_drive_r",
+    "posture_stability",
+)
 # Этап Г — самомодель; Этап E — self_goal_* + imagination-планирование к target_dist (см. goal_planning.py).
 SELF_VARS: tuple[str, ...] = (
     "self_intention_larm",
@@ -65,7 +86,7 @@ SELF_VARS: tuple[str, ...] = (
 )
 VAR_NAMES   = (
     TORSO_VARS + SPINE_VARS + HEAD_VARS + LEG_VARS + ARM_VARS + FOOT_VARS
-    + CUBE_VARS + SANDBOX_VARS + list(SELF_VARS)
+    + CUBE_VARS + SANDBOX_VARS + list(MOTOR_INTENT_VARS) + list(MOTOR_OBSERVABLE_VARS) + list(SELF_VARS)
 )
 
 # Фаза 1: URDF-топология → frozen_edges (meta: alpha_trust для отчёта; в W — clamp + mask L1/grad).
@@ -94,7 +115,16 @@ KINEMATIC_CHAINS: tuple[tuple[str, ...], ...] = (
 
 # Fixed-base mode: таз зафиксирован в воздухе, баланс исключён.
 # Агент учит arms/spine/neck → кубы + сигналы песочницы (мяч, рычаг, цель) + self_*.
-FIXED_BASE_VARS: list[str] = ARM_VARS + SPINE_VARS + HEAD_VARS + CUBE_VARS + SANDBOX_VARS + list(SELF_VARS)
+FIXED_BASE_VARS: list[str] = (
+    ARM_VARS
+    + SPINE_VARS
+    + HEAD_VARS
+    + CUBE_VARS
+    + SANDBOX_VARS
+    + list(MOTOR_INTENT_VARS)
+    + list(MOTOR_OBSERVABLE_VARS)
+    + list(SELF_VARS)
+)
 
 # Нормализация диапазонов
 _RANGES = {}
@@ -118,6 +148,8 @@ _RANGES["target_dist"]  = (0.0, 4.0)
 _RANGES["floor_friction"] = (0.1, 1.0)
 _RANGES["stack_height"] = (0.0, 0.8)
 _RANGES["stability_score"] = (0.0, 1.0)
+for _mv in MOTOR_INTENT_VARS + MOTOR_OBSERVABLE_VARS:
+    _RANGES[_mv] = (0.0, 1.0)
 for _sv in SELF_VARS:
     _RANGES[_sv] = (0.0, 1.0)
 
@@ -1546,6 +1578,7 @@ class EnvironmentHumanoid:
         print(f"[HumanoidEnv] backend={self._backend}, mode={mode_label}, vars={var_count}")
         # Самомодель: значения держим в среде, observe() мержит с физикой; intervene(self_*) не трогает суставы.
         self._self_state: dict[str, float] = {k: 0.5 for k in SELF_VARS}
+        self._motor_state: dict[str, float] = {k: 0.5 for k in MOTOR_INTENT_VARS}
 
     # ── Fixed root switch ─────────────────────────────────────────────────────
     @property
@@ -1583,6 +1616,10 @@ class EnvironmentHumanoid:
         raw = self._sim.get_state()
         active = set(FIXED_BASE_VARS if self._fixed_root else VAR_NAMES)
         out = {k: self._norm(k, v) for k, v in raw.items() if k in active}
+        for mk in MOTOR_INTENT_VARS:
+            if mk in active:
+                out[mk] = float(np.clip(self._motor_state.get(mk, 0.5), 0.05, 0.95))
+        out.update(self._derived_motor_observables(raw))
         for sk in SELF_VARS:
             if sk in active:
                 out[sk] = float(np.clip(self._self_state.get(sk, 0.5), 0.05, 0.95))
@@ -1596,6 +1633,39 @@ class EnvironmentHumanoid:
     def variable_ids(self) -> list[str]:
         return list(FIXED_BASE_VARS if self._fixed_root else VAR_NAMES)
 
+    def _derived_motor_observables(self, raw: dict[str, float]) -> dict[str, float]:
+        """Compute causal motor variables from current humanoid pose."""
+        com_x = float(raw.get("com_x", 0.0))
+        com_z = float(raw.get("com_z", STAND_Z))
+        torso_roll = float(raw.get("torso_roll", 0.0))
+        torso_pitch = float(raw.get("torso_pitch", 0.0))
+        lhip = float(raw.get("lhip", 0.5))
+        rhip = float(raw.get("rhip", 0.5))
+        lknee = float(raw.get("lknee", 0.5))
+        rknee = float(raw.get("rknee", 0.5))
+        lankle = float(raw.get("lankle", 0.5))
+        rankle = float(raw.get("rankle", 0.5))
+        lf = float(raw.get("lfoot_z", 0.05))
+        rf = float(raw.get("rfoot_z", 0.05))
+        support_l = float(np.clip(1.0 - lf / max(STAND_Z * 0.18, 1e-6), 0.0, 1.0))
+        support_r = float(np.clip(1.0 - rf / max(STAND_Z * 0.18, 1e-6), 0.0, 1.0))
+        gait_l = float(np.clip(0.5 + 0.5 * np.sin(3.2 * (lhip - 0.5) - 1.7 * (lknee - 0.5)), 0.0, 1.0))
+        gait_r = float(np.clip(0.5 + 0.5 * np.sin(3.2 * (rhip - 0.5) - 1.7 * (rknee - 0.5)), 0.0, 1.0))
+        support_bias = float(np.clip(0.5 + 0.45 * ((support_l - support_r) + 0.6 * com_x), 0.0, 1.0))
+        motor_drive_l = float(np.clip(np.mean([abs(lhip - 0.5), abs(lknee - 0.5), abs(lankle - 0.5)]) * 1.8, 0.0, 1.0))
+        motor_drive_r = float(np.clip(np.mean([abs(rhip - 0.5), abs(rknee - 0.5), abs(rankle - 0.5)]) * 1.8, 0.0, 1.0))
+        posture_stability = float(np.clip(1.0 - (abs(torso_roll) + abs(torso_pitch)) * 0.35 - abs(com_z - STAND_Z) * 0.45, 0.0, 1.0))
+        return {
+            "gait_phase_l": gait_l,
+            "gait_phase_r": gait_r,
+            "foot_contact_l": support_l,
+            "foot_contact_r": support_r,
+            "support_bias": support_bias,
+            "motor_drive_l": motor_drive_l,
+            "motor_drive_r": motor_drive_r,
+            "posture_stability": posture_stability,
+        }
+
     # ── do() ─────────────────────────────────────────────────────────────────
     def intervene(self, variable: str, value: float, *, count_intervention: bool = True) -> dict[str, float]:
         if count_intervention:
@@ -1603,6 +1673,12 @@ class EnvironmentHumanoid:
 
         if variable in SELF_VARS:
             self._self_state[variable] = float(np.clip(value, 0.05, 0.95))
+            self._sim.step(self.steps_per_do)
+            return self.observe()
+
+        if variable in MOTOR_INTENT_VARS:
+            self._motor_state[variable] = float(np.clip(value, 0.05, 0.95))
+            self._apply_motor_intents()
             self._sim.step(self.steps_per_do)
             return self.observe()
 
@@ -1617,6 +1693,43 @@ class EnvironmentHumanoid:
 
         self._sim.step(self.steps_per_do)
         return self.observe()
+
+    def _apply_motor_intents(self) -> None:
+        """Map high-level motor intents to a stable low-level postural bias."""
+        intents = self._motor_state
+        stride = float(intents.get("intent_stride", 0.5) - 0.5)
+        sup_l = float(intents.get("intent_support_left", 0.5) - 0.5)
+        sup_r = float(intents.get("intent_support_right", 0.5) - 0.5)
+        torso = float(intents.get("intent_torso_forward", 0.5) - 0.5)
+        arms = float(intents.get("intent_arm_counterbalance", 0.5) - 0.5)
+        recover = float(intents.get("intent_stop_recover", 0.5) - 0.5)
+
+        def clip01(v: float) -> float:
+            return float(np.clip(v, 0.05, 0.95))
+
+        if self._fixed_root:
+            # Fixed root: bias upper body/arms only.
+            self._sim.set_joint("spine_pitch", clip01(0.5 + 0.28 * torso + 0.08 * recover))
+            self._sim.set_joint("spine_yaw", clip01(0.5 + 0.10 * (sup_l - sup_r)))
+            self._sim.set_joint("lshoulder", clip01(0.5 + 0.18 * arms + 0.05 * recover))
+            self._sim.set_joint("rshoulder", clip01(0.5 - 0.18 * arms + 0.05 * recover))
+            self._sim.set_joint("lelbow", clip01(0.5 + 0.10 * arms))
+            self._sim.set_joint("relbow", clip01(0.5 - 0.10 * arms))
+            return
+
+        # Full humanoid: turn intents into a modest gait/posture bias.
+        self._sim.set_joint("lhip", clip01(0.5 + 0.20 * stride - 0.08 * sup_r + 0.04 * torso))
+        self._sim.set_joint("rhip", clip01(0.5 - 0.20 * stride - 0.08 * sup_l + 0.04 * torso))
+        self._sim.set_joint("lknee", clip01(0.5 + 0.16 * sup_l + 0.06 * recover))
+        self._sim.set_joint("rknee", clip01(0.5 + 0.16 * sup_r + 0.06 * recover))
+        self._sim.set_joint("lankle", clip01(0.5 + 0.10 * sup_l - 0.04 * stride))
+        self._sim.set_joint("rankle", clip01(0.5 + 0.10 * sup_r + 0.04 * stride))
+        self._sim.set_joint("spine_pitch", clip01(0.5 + 0.24 * torso + 0.10 * recover))
+        self._sim.set_joint("spine_yaw", clip01(0.5 + 0.10 * (sup_l - sup_r)))
+        self._sim.set_joint("lshoulder", clip01(0.5 + 0.18 * arms + 0.06 * stride))
+        self._sim.set_joint("rshoulder", clip01(0.5 - 0.18 * arms - 0.06 * stride))
+        self._sim.set_joint("lelbow", clip01(0.5 + 0.10 * arms))
+        self._sim.set_joint("relbow", clip01(0.5 - 0.10 * arms))
 
     def apply_cpg_leg_targets(self, targets: dict[str, float]) -> None:
         """
@@ -1718,6 +1831,11 @@ class EnvironmentHumanoid:
                 {"from_": "lshoulder", "to": "cube0_y", "weight": 0.4},
                 {"from_": "rshoulder", "to": "cube1_x", "weight": 0.6},
                 {"from_": "rshoulder", "to": "cube1_y", "weight": 0.4},
+                {"from_": "intent_stride", "to": "lhip", "weight": 0.55},
+                {"from_": "intent_stride", "to": "rhip", "weight": 0.55},
+                {"from_": "intent_arm_counterbalance", "to": "lshoulder", "weight": 0.45},
+                {"from_": "intent_arm_counterbalance", "to": "rshoulder", "weight": 0.45},
+                {"from_": "intent_torso_forward", "to": "spine_pitch", "weight": 0.45},
                 {"from_": "lelbow",    "to": "cube0_z", "weight": 0.3},
                 {"from_": "relbow",    "to": "cube1_z", "weight": 0.3},
                 {"from_": "lshoulder", "to": "lelbow",  "weight": 0.5},
@@ -1736,6 +1854,21 @@ class EnvironmentHumanoid:
         edges.append({"from_": "rshoulder",   "to": "cube1_x",  "weight": 0.6})
         edges.append({"from_": "com_z",       "to": "torso_roll","weight": -0.4})
         edges.extend([
+            {"from_": "intent_stride", "to": "lhip", "weight": 0.7},
+            {"from_": "intent_stride", "to": "rhip", "weight": 0.7},
+            {"from_": "intent_support_left", "to": "lknee", "weight": 0.45},
+            {"from_": "intent_support_right", "to": "rknee", "weight": 0.45},
+            {"from_": "intent_torso_forward", "to": "spine_pitch", "weight": 0.5},
+            {"from_": "intent_stop_recover", "to": "com_z", "weight": 0.35},
+            {"from_": "intent_arm_counterbalance", "to": "lshoulder", "weight": 0.4},
+            {"from_": "intent_arm_counterbalance", "to": "rshoulder", "weight": 0.4},
+            {"from_": "lhip", "to": "gait_phase_l", "weight": 0.35},
+            {"from_": "rhip", "to": "gait_phase_r", "weight": 0.35},
+            {"from_": "lknee", "to": "foot_contact_l", "weight": 0.45},
+            {"from_": "rknee", "to": "foot_contact_r", "weight": 0.45},
+            {"from_": "foot_contact_l", "to": "support_bias", "weight": 0.25},
+            {"from_": "foot_contact_r", "to": "support_bias", "weight": 0.25},
+            {"from_": "support_bias", "to": "torso_roll", "weight": -0.2},
             {"from_": "self_intention_larm", "to": "lshoulder", "weight": 0.5},
             {"from_": "self_intention_rarm", "to": "rshoulder", "weight": 0.5},
             {"from_": "self_attention", "to": "neck_yaw", "weight": 0.3},
@@ -1754,6 +1887,8 @@ class EnvironmentHumanoid:
         self._sim.reset_stance()
         for k in SELF_VARS:
             self._self_state[k] = 0.5
+        for k in MOTOR_INTENT_VARS:
+            self._motor_state[k] = 0.5
 
     # ── Camera / Skeleton ─────────────────────────────────────────────────────
     def get_frame_base64(self, view: str | None = None, **kwargs) -> str | None:

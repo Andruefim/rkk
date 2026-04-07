@@ -298,8 +298,70 @@ class ValueLayer:
                 value,
             )
 
-        # slot_* и self_* — «внутренние» оси; не жмём узкий predict_band как у физики.
-        slot_action = variable.startswith("slot_") or variable.startswith("self_")
+        # slot_*, self_* и intent_* — «внутренние» оси; не жмём узкий predict_band как у физики.
+        slot_action = (
+            variable.startswith("slot_")
+            or variable.startswith("self_")
+            or variable.startswith("intent_")
+            or variable.startswith("motor_")
+            or variable.startswith("phys_intent_")
+            or variable.startswith("phys_self_")
+        )
+        is_intent_action = variable.startswith("intent_") or variable.startswith("phys_intent_")
+        if is_intent_action:
+            def _n(k: str, default: float = 0.5) -> float:
+                if k in current_nodes:
+                    return float(current_nodes[k])
+                pk = f"phys_{k}"
+                if pk in current_nodes:
+                    return float(current_nodes[pk])
+                return float(default)
+
+            posture = _n("posture_stability", 0.5)
+            support_bias = _n("support_bias", 0.5)
+            drive_l = _n("motor_drive_l", 0.5)
+            drive_r = _n("motor_drive_r", 0.5)
+            gait_l = _n("gait_phase_l", 0.5)
+            gait_r = _n("gait_phase_r", 0.5)
+            intent_key = variable[5:] if variable.startswith("phys_") else variable
+            shift = abs(float(value) - 0.5)
+            # Overspeed intent: already high motor drive + aggressive new intent command.
+            if shift > 0.40 and max(drive_l, drive_r) > 0.82:
+                return self._block(
+                    BlockReason.PHI_TOO_LOW,
+                    current_nodes,
+                    current_phi,
+                    f"motor overspeed: drive={max(drive_l, drive_r):.2f}, shift={shift:.2f}",
+                    variable,
+                    value,
+                )
+            # Destabilizing support switch while posture is low.
+            if intent_key in ("intent_support_left", "intent_support_right"):
+                wants_left = intent_key.endswith("left") and value > 0.6
+                wants_right = intent_key.endswith("right") and value > 0.6
+                unstable = posture < 0.36
+                opposite_bias = (wants_left and support_bias > 0.62) or (wants_right and support_bias < 0.38)
+                if unstable and opposite_bias:
+                    return self._block(
+                        BlockReason.ENTROPY_SPIKE,
+                        current_nodes,
+                        current_phi,
+                        f"destabilizing support shift: posture={posture:.2f}, bias={support_bias:.2f}",
+                        variable,
+                        value,
+                    )
+            # Repeated unstable gait mode: aggressive stride while gait already desynchronized.
+            if intent_key == "intent_stride":
+                gait_desync = abs(gait_l - gait_r)
+                if shift > 0.34 and posture < 0.42 and gait_desync > 0.38:
+                    return self._block(
+                        BlockReason.REPEATED_FAIL,
+                        current_nodes,
+                        current_phi,
+                        f"unstable gait mode: posture={posture:.2f}, desync={gait_desync:.2f}",
+                        variable,
+                        value,
+                    )
 
         # §2–4 Виртуальный do() + imagination rollout
         S = dict(current_nodes)

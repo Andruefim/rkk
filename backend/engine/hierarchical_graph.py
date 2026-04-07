@@ -16,7 +16,11 @@ import numpy as np
 import torch
 
 from engine.causal_graph import CausalGraph
-from engine.environment_humanoid import KINEMATIC_CHAINS as _HUMANOID_KINEMATIC_CHAINS
+from engine.environment_humanoid import (
+    KINEMATIC_CHAINS as _HUMANOID_KINEMATIC_CHAINS,
+    MOTOR_INTENT_VARS,
+    MOTOR_OBSERVABLE_VARS,
+)
 
 # Имена цепей → те же суставы, что в URDF LocalReflex
 KINEMATIC_CHAINS: dict[str, list[str]] = {
@@ -90,6 +94,16 @@ class HierarchicalGraph:
                 joint_ids=list(joints),
                 graph=g,
             )
+
+        motor_keys = list(MOTOR_OBSERVABLE_VARS + MOTOR_INTENT_VARS)
+        g = CausalGraph(device)
+        for k in motor_keys:
+            g.set_node(k, 0.5)
+        self.L1_chains["motor"] = LocalReflexState(
+            chain_name="motor",
+            joint_ids=motor_keys,
+            graph=g,
+        )
 
         self._l1_virtual_nodes: dict[str, float] = {}
         self._active_goal: dict[str, Any] | None = None

@@ -74,7 +74,8 @@ class CPGNetwork(nn.Module):
 
 class LocomotionController:
     """
-    CPG → цели суставов ног humanoid; reward обучает amplitude (и остальные параметры с нулевым градиентом от суррогата).
+    CPG/MotorPolicy → цели суставов и моторный латент для humanoid.
+    Управляется motor intents из causal graph и структурным reward.
     """
 
     CPG_TO_JOINTS: dict[int, list[str]] = {
@@ -91,6 +92,8 @@ class LocomotionController:
         self._step_count = 0
         self._last_com_x: float = 0.5
         self._reward_history: list[float] = []
+        self._last_command: dict[str, float] = {}
+        self._last_motor_state: dict[str, float] = {}
 
     @staticmethod
     def _node(agent_nodes: dict[str, float], key: str) -> float:
@@ -99,8 +102,17 @@ class LocomotionController:
             v = agent_nodes.get(f"phys_{key}")
         return float(v if v is not None else 0.5)
 
-    def get_joint_targets(self, agent_nodes: dict[str, float]) -> dict[str, float]:
-        """agent_nodes: нормализованные узлы графа; self_* модулируют ноги (Phase A+)."""
+    def get_joint_targets(self, agent_nodes: dict[str, float], *, dt: float = 0.05) -> dict[str, float]:
+        """agent_nodes: нормализованные узлы графа; intent_* и self_* модулируют ноги."""
+        intents = {
+            "intent_stride": self._node(agent_nodes, "intent_stride"),
+            "intent_support_left": self._node(agent_nodes, "intent_support_left"),
+            "intent_support_right": self._node(agent_nodes, "intent_support_right"),
+            "intent_torso_forward": self._node(agent_nodes, "intent_torso_forward"),
+            "intent_arm_counterbalance": self._node(agent_nodes, "intent_arm_counterbalance"),
+            "intent_stop_recover": self._node(agent_nodes, "intent_stop_recover"),
+        }
+        self._last_motor_state = dict(intents)
         lh = self._node(agent_nodes, "lhip") - 0.5
         rh = self._node(agent_nodes, "rhip") - 0.5
         la = self._node(agent_nodes, "lankle") - 0.5
@@ -109,28 +121,67 @@ class LocomotionController:
         rarm = self._node(agent_nodes, "self_intention_rarm") - 0.5
         eng = float(np.clip(self._node(agent_nodes, "self_energy"), 0.0, 1.0))
 
-        cmd = torch.tensor([lh, rh, la, ra], dtype=torch.float32, device=self.device)
-        cmd[0] = cmd[0] + 0.12 * float(larm)
-        cmd[1] = cmd[1] + 0.12 * float(rarm)
-        cmd = cmd * float(0.72 + 0.56 * eng)
+        stride = float(intents["intent_stride"] - 0.5)
+        sup_l = float(intents["intent_support_left"] - 0.5)
+        sup_r = float(intents["intent_support_right"] - 0.5)
+        torso = float(intents["intent_torso_forward"] - 0.5)
+        arms = float(intents["intent_arm_counterbalance"] - 0.5)
+        recover = float(intents["intent_stop_recover"] - 0.5)
 
-        cpg_out = self.cpg.step(dt=0.05, external_command=cmd)
+        cmd = torch.tensor([lh, rh, la, ra], dtype=torch.float32, device=self.device)
+        cmd[0] = cmd[0] + 0.12 * float(larm) + 0.10 * stride - 0.05 * sup_r + 0.03 * torso
+        cmd[1] = cmd[1] + 0.12 * float(rarm) - 0.10 * stride - 0.05 * sup_l + 0.03 * torso
+        cmd[2] = cmd[2] + 0.08 * sup_l - 0.04 * stride + 0.03 * recover
+        cmd[3] = cmd[3] + 0.08 * sup_r + 0.04 * stride + 0.03 * recover
+        cmd = cmd * float(0.68 + 0.58 * eng)
+
+        cpg_out = self.cpg.step(dt=dt, external_command=cmd)
         targets: dict[str, float] = {}
         for osc_idx, joints in self.CPG_TO_JOINTS.items():
             v = float(cpg_out[osc_idx].item())
+            if osc_idx == 0:
+                v = float(np.clip(v + 0.12 * stride - 0.05 * sup_r, 0.0, 1.0))
+            elif osc_idx == 1:
+                v = float(np.clip(v - 0.12 * stride - 0.05 * sup_l, 0.0, 1.0))
+            elif osc_idx == 2:
+                v = float(np.clip(v + 0.06 * recover + 0.04 * sup_l, 0.0, 1.0))
+            else:
+                v = float(np.clip(v + 0.06 * recover + 0.04 * sup_r, 0.0, 1.0))
             for joint in joints:
                 targets[joint] = v
+        self._last_command = dict(targets)
         self._step_count += 1
         return targets
 
-    def learn_from_reward(self, com_z: float, com_x: float, fallen: bool) -> None:
+    def learn_from_reward(
+        self,
+        com_z: float,
+        com_x: float,
+        fallen: bool,
+        *,
+        motor_obs: dict[str, float] | None = None,
+    ) -> None:
         """
-        Суррогатный reward в нормализованных координатах наблюдения.
-        Градиент: усилить амплитуду при положительном среднем reward (упрощённо).
+        Структурный reward: устойчивость корпуса + опора + симметрия + forward progress.
         """
         dx = float(com_x) - self._last_com_x
         rz = float(np.clip(com_z, 0.0, 1.0))
-        reward = rz * 2.0 + dx * 5.0 - (3.0 if fallen else 0.0)
+        motor_obs = motor_obs or {}
+        posture = float(np.clip(motor_obs.get("posture_stability", 0.5), 0.0, 1.0))
+        contact_l = float(np.clip(motor_obs.get("foot_contact_l", 0.5), 0.0, 1.0))
+        contact_r = float(np.clip(motor_obs.get("foot_contact_r", 0.5), 0.0, 1.0))
+        bias = float(np.clip(motor_obs.get("support_bias", 0.5), 0.0, 1.0))
+        gait_l = float(np.clip(motor_obs.get("gait_phase_l", 0.5), 0.0, 1.0))
+        gait_r = float(np.clip(motor_obs.get("gait_phase_r", 0.5), 0.0, 1.0))
+        symmetry = 1.0 - min(1.0, abs(gait_l - gait_r) + abs(contact_l - contact_r) + abs(bias - 0.5) * 1.4)
+        reward = (
+            rz * 1.6
+            + dx * 2.8
+            + posture * 2.2
+            + symmetry * 1.4
+            + min(contact_l, contact_r) * 0.8
+            - (3.0 if fallen else 0.0)
+        )
         self._last_com_x = float(com_x)
         self._reward_history.append(reward)
 
@@ -147,8 +198,12 @@ class LocomotionController:
         self.optim.zero_grad()
         dev = next(self.cpg.parameters()).device
         scale = torch.tensor(r_mean, device=dev, dtype=torch.float32)
-        # Положительный r_mean → увеличить сигнал через amplitude (через sigmoid в forward при желании; здесь прямой суррогат)
-        loss = -scale * self.cpg.amplitude.mean()
+        # Положительный r_mean → усилить устойчивый моторный ритм, а не только forward progress.
+        loss = -scale * (
+            0.45 * self.cpg.amplitude.mean()
+            + 0.20 * self.cpg.frequency.mean()
+            - 0.10 * torch.abs(self.cpg.phase_bias).mean()
+        )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.cpg.parameters(), 0.5)
         self.optim.step()
@@ -163,4 +218,6 @@ class LocomotionController:
             "amplitude_mean": round(amp_m, 4),
             "frequency_mean_hz": round(fr_m, 3),
             "reward_recent_mean": round(float(np.mean(rh)), 4) if rh else 0.0,
+            "last_command_size": len(self._last_command),
+            "last_intent_stride": round(float(self._last_motor_state.get("intent_stride", 0.5)), 4) if self._last_motor_state else 0.5,
         }

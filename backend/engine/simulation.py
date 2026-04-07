@@ -41,6 +41,7 @@ import os
 import queue
 import threading
 import time
+from dataclasses import dataclass, field
 import torch
 import numpy as np
 from collections import deque
@@ -98,6 +99,117 @@ def _l3_loop_hz_from_env() -> float:
 def _l4_worker_enabled() -> bool:
     v = os.environ.get("RKK_L4_WORKER", "1").strip().lower()
     return v in ("1", "true", "yes", "on")
+
+
+@dataclass
+class MotorCommandLog:
+    tick: int
+    source: str
+    intents: dict[str, float] = field(default_factory=dict)
+    joint_targets: dict[str, float] = field(default_factory=dict)
+    support_bias: float = 0.5
+    gait_phase_l: float = 0.5
+    gait_phase_r: float = 0.5
+    foot_contact_l: float = 0.5
+    foot_contact_r: float = 0.5
+    posture_stability: float = 0.5
+
+
+@dataclass
+class MotorState:
+    tick: int = 0
+    source: str = "init"
+    intents: dict[str, float] = field(default_factory=lambda: {
+        "intent_stride": 0.5,
+        "intent_support_left": 0.5,
+        "intent_support_right": 0.5,
+        "intent_torso_forward": 0.5,
+        "intent_arm_counterbalance": 0.5,
+        "intent_stop_recover": 0.5,
+    })
+    joint_targets: dict[str, float] = field(default_factory=dict)
+    gait_phase_l: float = 0.5
+    gait_phase_r: float = 0.5
+    foot_contact_l: float = 0.5
+    foot_contact_r: float = 0.5
+    support_bias: float = 0.5
+    motor_drive_l: float = 0.5
+    motor_drive_r: float = 0.5
+    posture_stability: float = 0.5
+    support_leg: str = "balanced"
+    history: list[MotorCommandLog] = field(default_factory=list)
+
+    def snapshot(self) -> dict:
+        return {
+            "tick": self.tick,
+            "source": self.source,
+            "intents": dict(self.intents),
+            "joint_targets": dict(self.joint_targets),
+            "gait_phase_l": float(self.gait_phase_l),
+            "gait_phase_r": float(self.gait_phase_r),
+            "foot_contact_l": float(self.foot_contact_l),
+            "foot_contact_r": float(self.foot_contact_r),
+            "support_bias": float(self.support_bias),
+            "motor_drive_l": float(self.motor_drive_l),
+            "motor_drive_r": float(self.motor_drive_r),
+            "posture_stability": float(self.posture_stability),
+            "support_leg": self.support_leg,
+            "history_len": len(self.history),
+        }
+
+    def update_from_observation(self, obs: dict[str, float], *, tick: int | None = None, source: str | None = None) -> None:
+        if tick is not None:
+            self.tick = int(tick)
+        if source is not None:
+            self.source = str(source)
+        self.gait_phase_l = float(obs.get("gait_phase_l", self.gait_phase_l))
+        self.gait_phase_r = float(obs.get("gait_phase_r", self.gait_phase_r))
+        self.foot_contact_l = float(obs.get("foot_contact_l", self.foot_contact_l))
+        self.foot_contact_r = float(obs.get("foot_contact_r", self.foot_contact_r))
+        self.support_bias = float(obs.get("support_bias", self.support_bias))
+        self.motor_drive_l = float(obs.get("motor_drive_l", self.motor_drive_l))
+        self.motor_drive_r = float(obs.get("motor_drive_r", self.motor_drive_r))
+        self.posture_stability = float(obs.get("posture_stability", self.posture_stability))
+        if self.foot_contact_l > self.foot_contact_r + 0.08:
+            self.support_leg = "left"
+        elif self.foot_contact_r > self.foot_contact_l + 0.08:
+            self.support_leg = "right"
+        else:
+            self.support_leg = "balanced"
+
+    def update_from_command(
+        self,
+        *,
+        tick: int,
+        source: str,
+        intents: dict[str, float] | None = None,
+        joint_targets: dict[str, float] | None = None,
+        obs: dict[str, float] | None = None,
+    ) -> MotorCommandLog:
+        if intents:
+            self.intents.update({k: float(v) for k, v in intents.items()})
+        if joint_targets is not None:
+            self.joint_targets = {k: float(v) for k, v in joint_targets.items()}
+        self.tick = int(tick)
+        self.source = str(source)
+        if obs:
+            self.update_from_observation(obs, tick=tick, source=source)
+        log = MotorCommandLog(
+            tick=int(tick),
+            source=str(source),
+            intents=dict(self.intents),
+            joint_targets=dict(self.joint_targets),
+            support_bias=float(self.support_bias),
+            gait_phase_l=float(self.gait_phase_l),
+            gait_phase_r=float(self.gait_phase_r),
+            foot_contact_l=float(self.foot_contact_l),
+            foot_contact_r=float(self.foot_contact_r),
+            posture_stability=float(self.posture_stability),
+        )
+        self.history.append(log)
+        if len(self.history) > 160:
+            self.history = self.history[-160:]
+        return log
 
 
 def resolve_torch_device(requested: str | None = None) -> torch.device:
@@ -271,10 +383,15 @@ class Simulation:
         self._pe_history: deque[float] = deque(maxlen=200)
         # Phase A: CPG locomotion (humanoid, не fixed_root)
         self._locomotion_controller = None
+        self._motor_state = MotorState()
+        self._motor_state_lock = threading.Lock()
         self._cpg_loop_thread: threading.Thread | None = None
         self._cpg_stop = threading.Event()
         self._cpg_snapshot_lock = threading.Lock()
         self._cpg_node_snapshot: dict[str, float] = {}
+        self._l1_motor_q: queue.SimpleQueue = queue.SimpleQueue()
+        self._l1_last_cmd_tick = 0
+        self._l1_last_apply_tick = 0
         # High-level agent tick (GNN/EIG/do) vs HTTP/WS: одна критическая секция на симуляцию.
         self._sim_step_lock = threading.RLock()
         self._agent_loop_thread: threading.Thread | None = None
@@ -467,6 +584,10 @@ class Simulation:
             self._l4_last_submit_tick = 0
             self._l4_last_apply_tick = 0
             self._l3_next_due_ts = 0.0
+            self._motor_state = MotorState()
+            self._drain_simple_queue(self._l1_motor_q)
+            self._l1_last_cmd_tick = 0
+            self._l1_last_apply_tick = 0
             out = load_simulation(self, p)
             if out.get("ok"):
                 self._annotate_concepts_with_graph_nodes()
@@ -871,6 +992,10 @@ class Simulation:
                 self._l4_last_snapshot = {"n_concepts": 0, "concepts": []}
                 self._l3_next_due_ts = 0.0
                 self._l3_last_tick = 0
+                self._motor_state = MotorState()
+                self._drain_simple_queue(self._l1_motor_q)
+                self._l1_last_cmd_tick = 0
+                self._l1_last_apply_tick = 0
 
         # Восстанавливаем visual mode если был (вне lock: enable_visual сам берёт lock)
         if was_visual and result.get("switched"):
@@ -1379,6 +1504,7 @@ class Simulation:
             th.join(timeout=1.5)
         self._cpg_loop_thread = None
         self._cpg_stop.clear()
+        self._drain_simple_queue(self._l1_motor_q)
 
     def _ensure_cpg_background_loop(self) -> None:
         if not self._cpg_decoupled_enabled():
@@ -1433,16 +1559,13 @@ class Simulation:
                     nodes = dict(self._cpg_node_snapshot)
                 if not nodes:
                     nodes = dict(self.agent.graph.nodes)
-                targets = self._locomotion_controller.get_joint_targets(nodes)
-                fn(targets)
-                obs = self.agent.env.observe()
-                com_z = float(obs.get("com_z", 0.5))
-                com_x = float(obs.get("com_x", 0.5))
-                fallen = False
-                is_fn = getattr(self.agent.env, "is_fallen", None)
-                if callable(is_fn) and not self._fixed_root_active:
-                    fallen = bool(is_fn())
-                self._locomotion_controller.learn_from_reward(com_z, com_x, fallen)
+                targets = self._locomotion_controller.get_joint_targets(nodes, dt=dt)
+                self._enqueue_l1_motor_command(
+                    source="cpg",
+                    joint_targets=targets,
+                    intents=getattr(self._locomotion_controller, "_last_motor_state", None),
+                    dt=dt,
+                )
             except Exception as ex:
                 print(f"[Simulation] CPG loop: {ex}")
             elapsed = time.perf_counter() - t0
@@ -1455,6 +1578,7 @@ class Simulation:
         Phase A: CPG шаг ног + learn_from_reward в том же тике, что и agent.step.
         Если включён RKK_CPG_LOOP_HZ>0, этот путь отключён — работает _cpg_loop_worker.
         """
+        dt = 0.05
         if self._cpg_decoupled_enabled():
             return
         if not self._locomotion_cpg_enabled():
@@ -1471,12 +1595,30 @@ class Simulation:
             self._locomotion_controller = LocomotionController(self.device)
         try:
             nodes = dict(self.agent.graph.nodes)
-            targets = self._locomotion_controller.get_joint_targets(nodes)
+            targets = self._locomotion_controller.get_joint_targets(nodes, dt=dt)
+            obs_before = dict(self.agent.env.observe())
             fn(targets)
             obs = self.agent.env.observe()
+            self._sync_motor_state(obs, source="cpg", tick=self.tick)
+            self._log_motor_command(
+                source="cpg",
+                joint_targets=targets,
+                intents=getattr(self._locomotion_controller, "_last_motor_state", None),
+                obs=self._motor_obs_payload(obs),
+            )
+            self._record_motor_burst_causal(
+                obs_before_env=obs_before,
+                obs_after_env=dict(obs),
+                intents=dict(getattr(self._locomotion_controller, "_last_motor_state", {}) or {}),
+            )
             com_z = float(obs.get("com_z", 0.5))
             com_x = float(obs.get("com_x", 0.5))
-            self._locomotion_controller.learn_from_reward(com_z, com_x, fallen)
+            self._locomotion_controller.learn_from_reward(
+                com_z,
+                com_x,
+                fallen,
+                motor_obs=self._motor_obs_payload(obs),
+            )
         except Exception as ex:
             print(f"[Simulation] CPG locomotion: {ex}")
 
@@ -1490,6 +1632,140 @@ class Simulation:
             return 0.0
         w = min(32, len(lc._reward_history))
         return float(np.mean(lc._reward_history[-w:]))
+
+    def _motor_obs_payload(self, obs: dict) -> dict[str, float]:
+        keys = (
+            "gait_phase_l",
+            "gait_phase_r",
+            "foot_contact_l",
+            "foot_contact_r",
+            "support_bias",
+            "motor_drive_l",
+            "motor_drive_r",
+            "posture_stability",
+        )
+        return {k: float(obs.get(k, 0.5)) for k in keys}
+
+    def _sync_motor_state(self, obs: dict, *, source: str, tick: int | None = None) -> None:
+        with self._motor_state_lock:
+            self._motor_state.update_from_observation(obs, tick=tick if tick is not None else self.tick, source=source)
+
+    def _log_motor_command(
+        self,
+        *,
+        source: str,
+        joint_targets: dict[str, float] | None = None,
+        obs: dict | None = None,
+        intents: dict[str, float] | None = None,
+    ) -> None:
+        with self._motor_state_lock:
+            self._motor_state.update_from_command(
+                tick=self.tick,
+                source=source,
+                intents=intents,
+                joint_targets=joint_targets,
+                obs=obs,
+            )
+
+    def _motor_state_snapshot(self) -> dict:
+        with self._motor_state_lock:
+            return self._motor_state.snapshot()
+
+    def _enqueue_l1_motor_command(
+        self,
+        *,
+        source: str,
+        joint_targets: dict[str, float],
+        intents: dict[str, float] | None = None,
+        dt: float,
+    ) -> None:
+        self._l1_motor_q.put(
+            {
+                "tick": int(self.tick),
+                "source": str(source),
+                "joint_targets": {k: float(v) for k, v in joint_targets.items()},
+                "intents": {k: float(v) for k, v in (intents or {}).items()},
+                "dt": float(dt),
+            }
+        )
+        self._l1_last_cmd_tick = self.tick
+
+    def _record_motor_burst_causal(
+        self,
+        *,
+        obs_before_env: dict[str, float],
+        obs_after_env: dict[str, float],
+        intents: dict[str, float],
+    ) -> None:
+        """
+        Low-level motor burst as record_intervention-like event in main writer.
+        """
+        self.agent.graph.apply_env_observation(obs_before_env)
+        obs_before_full = self.agent.graph.snapshot_vec_dict()
+        self.agent.graph.apply_env_observation(obs_after_env)
+        obs_after_full = self.agent.graph.snapshot_vec_dict()
+        self.agent.graph.record_observation(obs_before_full)
+        self.agent.graph.record_observation(obs_after_full)
+        if not intents:
+            return
+        best_var = None
+        best_delta = -1.0
+        best_val = 0.5
+        for k, v in intents.items():
+            if k not in self.agent.graph.nodes:
+                continue
+            d = abs(float(v) - 0.5)
+            if d > best_delta:
+                best_delta = d
+                best_var = k
+                best_val = float(v)
+        if best_var is not None:
+            self.agent.graph.record_intervention(best_var, best_val, obs_before_full, obs_after_full)
+
+    def _drain_l1_motor_commands(self) -> None:
+        base = self._unwrap_base_env(self.agent.env)
+        fn = getattr(base, "apply_cpg_leg_targets", None)
+        if not callable(fn):
+            return
+        latest = None
+        while True:
+            try:
+                latest = self._l1_motor_q.get_nowait()
+            except Exception:
+                break
+        if latest is None:
+            return
+        obs_before = dict(self.agent.env.observe())
+        targets = dict(latest.get("joint_targets") or {})
+        intents = dict(latest.get("intents") or {})
+        fn(targets)
+        obs_after = dict(self.agent.env.observe())
+        self._sync_motor_state(obs_after, source=str(latest.get("source", "cpg")), tick=self.tick)
+        self._log_motor_command(
+            source=str(latest.get("source", "cpg")),
+            joint_targets=targets,
+            intents=intents or None,
+            obs=self._motor_obs_payload(obs_after),
+        )
+        self._record_motor_burst_causal(
+            obs_before_env=obs_before,
+            obs_after_env=obs_after,
+            intents=intents,
+        )
+        lc = self._locomotion_controller
+        if lc is not None:
+            fallen = False
+            is_fn = getattr(self.agent.env, "is_fallen", None)
+            if callable(is_fn) and not self._fixed_root_active:
+                fallen = bool(is_fn())
+            lc.learn_from_reward(
+                float(obs_after.get("com_z", 0.5)),
+                float(obs_after.get("com_x", 0.5)),
+                fallen,
+                motor_obs=self._motor_obs_payload(obs_after),
+            )
+        self.agent.temporal.step(obs_after)
+        self._l1_last_apply_tick = self.tick
 
     def _skill_library_enabled(self) -> bool:
         v = os.environ.get("RKK_SKILL_LIBRARY", "0").strip().lower()
@@ -1548,16 +1824,53 @@ class Simulation:
         idx: int = pack["index"]
         obs_before_init: dict = pack["obs_before"]
         var, val = skill.action_sequence[idx]
-        self.agent.graph.apply_env_observation(dict(self.agent.env.observe()))
+        obs_before_env = dict(self.agent.env.observe())
+        self.agent.graph.apply_env_observation(obs_before_env)
         obs_before_full = self.agent.graph.snapshot_vec_dict()
-        obs_after = self._sim_env_intervene(var, val, count_intervention=False)
+        check = self.agent.value_layer.check_action(
+            variable=var,
+            value=float(val),
+            current_nodes=dict(self.agent.graph.nodes),
+            graph=self.agent.graph,
+            temporal=self.agent.temporal,
+            current_phi=self.agent.phi_approx(),
+            other_agents_phi=self.agent.other_agents_phi,
+            engine_tick=self.tick,
+            imagination_horizon=0,
+        )
+        if not check.allowed:
+            return {
+                "blocked": True,
+                "blocked_count": 1,
+                "reason": check.reason.value,
+                "variable": var,
+                "value": float(val),
+                "updated_edges": [],
+                "compression_delta": 0.0,
+                "prediction_error": 0.0,
+                "cf_predicted": {},
+                "cf_observed": {},
+                "goal_planned": False,
+                "hierarchy": "skill",
+                "skill": skill.name,
+                "skill_step": idx,
+                "skill_done": False,
+            }
+        obs_after = self._sim_env_intervene(var, val, count_intervention=True)
         if not obs_after:
             obs_after = self.agent.env.observe()
         st_after = self._skill_state_dict(obs_after)
+        self._sync_motor_state(obs_after, source="skill", tick=self.tick)
+        self._log_motor_command(
+            source="skill",
+            intents={var: float(val)} if isinstance(var, str) and var.startswith("intent_") else None,
+            obs=self._motor_obs_payload(obs_after),
+        )
         self.agent.graph.apply_env_observation(obs_after)
         obs_after_full = self.agent.graph.snapshot_vec_dict()
         self.agent.graph.record_observation(obs_before_full)
         self.agent.graph.record_observation(obs_after_full)
+        self.agent.graph.record_intervention(var, float(val), obs_before_full, obs_after_full)
         self.agent.temporal.step(obs_after)
 
         idx += 1
@@ -1717,6 +2030,7 @@ class Simulation:
                 self._fall_count += 1
                 if self._try_reset_pose_after_fall():
                     obs = self.agent.env.observe()
+                    self._sync_motor_state(obs, source="reset", tick=self.tick)
                     for nid in self.agent.graph._node_ids:
                         if nid in obs:
                             self.agent.graph.nodes[nid] = obs[nid]
@@ -1751,6 +2065,7 @@ class Simulation:
 
         # Low-level CPG в фоне (RKK_CPG_LOOP_HZ), до тяжёлого agent.step — не ждёт GNN/EIG.
         self._ensure_cpg_background_loop()
+        self._drain_l1_motor_commands()
         self.agent.other_agents_phi = []
         self._maybe_step_hierarchical_l1()
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
@@ -2227,6 +2542,8 @@ class Simulation:
                 "l4_pending": bool(self._l4_task_pending),
                 "l4_last_submit_tick": int(self._l4_last_submit_tick),
                 "l4_last_apply_tick": int(self._l4_last_apply_tick),
+                "l1_last_cmd_tick": int(self._l1_last_cmd_tick),
+                "l1_last_apply_tick": int(self._l1_last_apply_tick),
             },
             "locomotion":    (
                 {
@@ -2238,6 +2555,7 @@ class Simulation:
                 if self._locomotion_controller is not None
                 else None
             ),
+            "motor_state":   self._motor_state_snapshot(),
             "skills":        self._skill_snapshot(),
             "rsi_full":      self._rsi_full.snapshot()
             if self._rsi_full_enabled() and self._rsi_full is not None
