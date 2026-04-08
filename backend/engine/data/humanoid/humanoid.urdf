@@ -122,34 +122,34 @@
 	</joint>
 	<link name="right_ankle" >
 		<inertial>
-				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.000000 -0.090000 0.000000" />
 			 <mass value = "74.6" />
 			<inertia ixx = "7.46" ixy = "0" ixz = "0" iyy = "7.46" iyz = "0" izz = "7.46" />
 		</inertial>
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.000000 -0.090000 0.000000" />
 			<geometry>
-				<box size="1.100000 0.300000 0.500000" />
+				<box size="1.000000 0.260000 0.500000" />
 			</geometry>
 			<material name="white"><color rgba="0.95 0.95 0.95 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.000000 -0.090000 0.000000" />
 			<geometry>
-				<box size="1.100000 0.300000 0.500000" />
+				<box size="1.000000 0.260000 0.500000" />
 			</geometry>
 		</collision>
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.30 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.00 -0.09 -0.14" />
 			<geometry>
-				<box size="0.70 0.10 0.44" />
+				<box size="0.80 0.08 0.44" />
 			</geometry>
 			<material name="sole_r"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.30 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.00 -0.09 -0.14" />
 			<geometry>
-				<box size="0.70 0.10 0.44" />
+				<box size="0.80 0.08 0.44" />
 			</geometry>
 		</collision>
 	</link>
@@ -257,34 +257,34 @@
 	</joint>
 	<link name="left_ankle" >
 		<inertial>
-				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.000000 -0.090000 0.000000" />
 			 <mass value = "74.6" />
 			<inertia ixx = "7.46" ixy = "0" ixz = "0" iyy = "7.46" iyz = "0" izz = "7.46" />
 		</inertial>
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.000000 -0.090000 0.000000" />
 			<geometry>
-				<box size="1.100000 0.300000 0.500000" />
+				<box size="1.000000 0.260000 0.500000" />
 			</geometry>
 			<material name="white_l"><color rgba="0.95 0.95 0.95 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.220000 -0.090000 0.000000" />
+				<origin rpy = "0 0 0" xyz = "0.000000 -0.090000 0.000000" />
 			<geometry>
-				<box size="1.100000 0.300000 0.500000" />
+				<box size="1.000000 0.260000 0.500000" />
 			</geometry>
 		</collision>
 		<visual>
-				<origin rpy = "0 0 0" xyz = "0.30 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.00 -0.09 -0.14" />
 			<geometry>
-				<box size="0.70 0.10 0.44" />
+				<box size="0.80 0.08 0.44" />
 			</geometry>
 			<material name="sole_l"><color rgba="0.2 0.2 0.22 1"/></material>
 		</visual>
 		<collision>
-				<origin rpy = "0 0 0" xyz = "0.30 -0.09 -0.16" />
+				<origin rpy = "0 0 0" xyz = "0.00 -0.09 -0.14" />
 			<geometry>
-				<box size="0.70 0.10 0.44" />
+				<box size="0.80 0.08 0.44" />
 			</geometry>
 		</collision>
 	</link>
