@@ -982,17 +982,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             jt = self._joint_types[i]
             if jt == pb.JOINT_FIXED:
                 continue
-            var_name = self.joint_map.get(i, "")
-            if var_name in ("lshoulder", "rshoulder") and jt == pb.JOINT_SPHERICAL and callable(motor_m):
-                lo, hi = _RANGES.get(var_name, (-1.0, 1.0))
-                rp = float(0.10 * (hi - lo) + lo)
-                sign = 1.0 if var_name == "lshoulder" else -1.0
-                q = pb.getQuaternionFromEuler((0.32 * rp, sign * 0.42 * rp, sign * 0.28 * rp))
-                motor_m(rid, i, pb.POSITION_CONTROL, targetPosition=list(q),
-                        positionGain=1.2, velocityGain=0.40,
-                        maxVelocity=6.0, force=[12000.0, 12000.0, 12000.0],
-                        physicsClientId=cid)
-            elif jt == pb.JOINT_SPHERICAL and callable(motor_m):
+            if jt == pb.JOINT_SPHERICAL and callable(motor_m):
                 motor_m(
                     rid, i, pb.POSITION_CONTROL,
                     targetPosition=quat_id,
@@ -1693,8 +1683,8 @@ class EnvironmentHumanoid:
         motor_drive_l = float(np.clip(np.mean([abs(lhip - 0.5), abs(lknee - 0.5), abs(lankle - 0.5)]) * 1.8, 0.0, 1.0))
         motor_drive_r = float(np.clip(np.mean([abs(rhip - 0.5), abs(rknee - 0.5), abs(rankle - 0.5)]) * 1.8, 0.0, 1.0))
         roll_from_upright = torso_roll - HUMANOID_URDF_STAND_EULER[0]
-        lsh_neutral = -0.80
-        rsh_neutral = 0.80
+        lsh_neutral = 0.0
+        rsh_neutral = 0.0
         joint_deviations = [
             abs(lsh - lsh_neutral) * 0.6, abs(rsh - rsh_neutral) * 0.6,
             abs(lel) * 0.8, abs(rel) * 0.8,
@@ -1721,7 +1711,7 @@ class EnvironmentHumanoid:
 
     # ── do() ─────────────────────────────────────────────────────────────────
     _JOINT_NEUTRAL: dict[str, float] = {
-        "lshoulder": 0.10, "rshoulder": 0.10,
+        "lshoulder": 0.50, "rshoulder": 0.50,
         "lelbow": 0.50, "relbow": 0.50,
         "spine_pitch": 0.50, "spine_yaw": 0.50,
         "neck_pitch": 0.50, "neck_yaw": 0.50,
@@ -1832,8 +1822,8 @@ class EnvironmentHumanoid:
                 clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms),
             )
             self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
-            self._sim.set_joint("lshoulder", clip01(0.10 + 0.06 * arms + 0.03 * recover))
-            self._sim.set_joint("rshoulder", clip01(0.10 - 0.06 * arms + 0.03 * recover))
+            self._sim.set_joint("lshoulder", clip01(0.50 + 0.05 * arms + 0.02 * recover))
+            self._sim.set_joint("rshoulder", clip01(0.50 - 0.05 * arms + 0.02 * recover))
             self._sim.set_joint("lelbow", clip01(0.50 + 0.06 * arms))
             self._sim.set_joint("relbow", clip01(0.50 - 0.06 * arms))
             return
@@ -1845,11 +1835,11 @@ class EnvironmentHumanoid:
         self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
         self._sim.set_joint(
             "lshoulder",
-            clip01(0.10 + 0.05 * arms + 0.02 * stride + 0.02 * recover),
+            clip01(0.50 + 0.04 * arms + 0.01 * stride + 0.02 * recover),
         )
         self._sim.set_joint(
             "rshoulder",
-            clip01(0.10 - 0.05 * arms - 0.02 * stride + 0.02 * recover),
+            clip01(0.50 - 0.04 * arms - 0.01 * stride + 0.02 * recover),
         )
         self._sim.set_joint("lelbow", clip01(0.50 + 0.05 * arms))
         self._sim.set_joint("relbow", clip01(0.50 - 0.05 * arms))
