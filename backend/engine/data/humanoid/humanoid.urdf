@@ -56,11 +56,10 @@
 			</geometry>
 		</collision>
 	</link>
-	<joint name="chest" type="spherical" >
+	<joint name="chest" type="fixed" >
 		<parent link="spine" />
 		<child link="chest" />
 				<origin rpy = "0 0 0" xyz = "0.000000 0.472302 0.000000" />
-		<axis xyz="0 0 1" />
 	</joint>
 	<link name="neck" >
 		<inertial>
