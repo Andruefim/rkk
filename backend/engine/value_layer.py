@@ -258,7 +258,7 @@ class ValueLayer:
             if pv < eff.predict_lo or pv > eff.predict_hi:
                 n_out += 1
         out_frac = n_out / max(len(predicted_state), 1)
-        if out_frac > 0.15:
+        if out_frac > 0.35:
             return (
                 BlockReason.VAR_OUT_OF_RANGE,
                 f"predicted {n_out}/{len(predicted_state)} vars ({out_frac:.0%}) outside predict band",
