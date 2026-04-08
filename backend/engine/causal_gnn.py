@@ -161,19 +161,36 @@ class CausalGNNCore(nn.Module):
 
     def dag_constraint(self) -> torch.Tensor:
         """
-        h(W) = tr(exp(W∘W)) - d  (NOTEARS DAG constraint).
-        Та же формула — совместима с Epistemic Annealing.
+        Оптимизированный DAG constraint через Taylor expansion (до 4-го порядка).
+        Снижает вычислительную нагрузку по сравнению с полным matrix_exp.
         """
-        W2  = self.W_masked() ** 2
-        exp = torch.linalg.matrix_exp(W2)
-        return exp.trace() - self.d
+        M = self.W_masked() ** 2
+        
+        # Вычисляем степени матрицы для следа
+        M2 = torch.matmul(M, M)
+        M3 = torch.matmul(M2, M)
+        M4 = torch.matmul(M3, M)
+        
+        # h(W) ≈ tr(M^2)/2! + tr(M^3)/3! + tr(M^4)/4!
+        # tr(I) и tr(M) опущены, так как они сокращаются с -d и равны 0 соответственно.
+        trace_sum = (M2.trace() / 2.0) + (M3.trace() / 6.0) + (M4.trace() / 24.0)
+        return trace_sum
 
     def dag_constraint_masked(self, free_mask: torch.Tensor) -> torch.Tensor:
-        """Фаза 1: DAG-штраф без замороженных позиций W (free_mask=0 на frozen i→j)."""
+        """
+        Фаза 1: Оптимизированный DAG-штраф с учетом маски свободных параметров.
+        Использует разложение Тейлора для ускорения расчета.
+        """
+        # Применяем маску к весам перед возведением в квадрат
         Wm = self.W_masked() * free_mask
-        W2 = Wm ** 2
-        exp = torch.linalg.matrix_exp(W2)
-        return exp.trace() - self.d
+        M = Wm ** 2
+        
+        M2 = torch.matmul(M, M)
+        M3 = torch.matmul(M2, M)
+        M4 = torch.matmul(M3, M)
+        
+        trace_sum = (M2.trace() / 2.0) + (M3.trace() / 6.0) + (M4.trace() / 24.0)
+        return trace_sum
 
     def intervention_loss(
         self,

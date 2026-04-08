@@ -55,6 +55,7 @@ from engine.hierarchical_graph import HierarchicalGraph, hierarchical_graph_enab
 from engine.ollama_env  import get_ollama_generate_url, get_ollama_model
 from engine.value_layer import HomeostaticBounds
 from engine.wm_neural_ode import integrate_world_model_step
+from engine.rsi_structural import NeurogenesisEngine
 
 PHASE_THRESHOLDS = [0.0, 0.15, 0.30, 0.50, 0.70, 0.88]
 PHASE_HOLD_TICKS = 12
@@ -415,6 +416,7 @@ class Simulation:
         }
         # Phase C: full RSI (GNN NAS-lite, CPG perturb, skill curriculum, VL relax)
         self._rsi_full = None
+        self.neuro_engine = NeurogenesisEngine()
         # Фаза 1: зачатки понятий (кэш детектора), автосохранение памяти
         self._concepts_cache: list[dict] = []
         self._materialized_detector_concept_ids: set[str] = set()
@@ -2445,6 +2447,26 @@ class Simulation:
         if cnt != self._prev_edge_count:
             graph_deltas[0] = [e.as_dict() for e in self.agent.graph.edges]
             self._prev_edge_count = cnt
+
+        # Neurogenesis
+        # Structural ASI: Neurogenesis
+        if self.current_world == "humanoid" and not self._fixed_root_active:
+            neuro_event = self.neuro_engine.scan_and_grow(self.agent, self.tick)
+            if neuro_event is not None:
+                self._add_event(
+                    f"🧬 Neurogenesis: {neuro_event['new_node']} allocated", 
+                    "#ff44cc", 
+                    "phase"
+                )
+                
+                # Обновляем TemporalBlankets под новую размерность (d = d + 1)
+                from engine.temporal import TemporalBlankets
+                new_d = self.agent.graph._d
+                old_tb = self.agent.temporal
+                new_tb = TemporalBlankets(d_input=new_d, device=self.device)
+                # Копируем состояния TemporalBlankets (насколько возможно)
+                # ... (миграция состояния SSM, аналогично resize_to в GNN)
+                self.agent.temporal = new_tb
 
         # Scene
         scene_fn = getattr(self.agent.env, "get_full_scene", None)

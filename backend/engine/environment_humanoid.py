@@ -1679,7 +1679,10 @@ class EnvironmentHumanoid:
         support_r = float(np.clip(1.0 - rf / max(STAND_Z * 0.18, 1e-6), 0.0, 1.0))
         gait_l = float(np.clip(0.5 + 0.5 * np.sin(3.2 * (lhip - 0.5) - 1.7 * (lknee - 0.5)), 0.0, 1.0))
         gait_r = float(np.clip(0.5 + 0.5 * np.sin(3.2 * (rhip - 0.5) - 1.7 * (rknee - 0.5)), 0.0, 1.0))
-        support_bias = float(np.clip(0.5 + 0.45 * ((support_l - support_r) + 0.6 * com_x), 0.0, 1.0))
+        # Lateral + forward CoM; extra term when a foot is loaded nudges the bias channel toward forefoot ZMP.
+        load = max(support_l, support_r)
+        fwd_zmp = 0.07 * load * float(np.clip((com_x - 0.40) / 0.38, 0.0, 1.0))
+        support_bias = float(np.clip(0.5 + 0.45 * ((support_l - support_r) + 0.65 * com_x) + fwd_zmp, 0.0, 1.0))
         motor_drive_l = float(np.clip(np.mean([abs(lhip - 0.5), abs(lknee - 0.5), abs(lankle - 0.5)]) * 1.8, 0.0, 1.0))
         motor_drive_r = float(np.clip(np.mean([abs(rhip - 0.5), abs(rknee - 0.5), abs(rankle - 0.5)]) * 1.8, 0.0, 1.0))
         roll_from_upright = torso_roll - HUMANOID_URDF_STAND_EULER[0]
@@ -1819,7 +1822,7 @@ class EnvironmentHumanoid:
         if self._fixed_root:
             self._sim.set_joint(
                 "spine_pitch",
-                clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms),
+                clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms - 0.08 * max(0.0, stride)),
             )
             self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
             self._sim.set_joint("lshoulder", clip01(0.50 + 0.05 * arms + 0.02 * recover))
@@ -1830,7 +1833,7 @@ class EnvironmentHumanoid:
 
         self._sim.set_joint(
             "spine_pitch",
-            clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms),
+            clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms - 0.08 * max(0.0, stride)),
         )
         self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
         self._sim.set_joint(
@@ -1977,9 +1980,11 @@ class EnvironmentHumanoid:
                 {"from_": "rshoulder", "to": "cube1_y", "weight": 0.4},
                 {"from_": "intent_stride", "to": "lhip", "weight": 0.55},
                 {"from_": "intent_stride", "to": "rhip", "weight": 0.55},
+                {"from_": "intent_stride", "to": "intent_torso_forward", "weight": 0.42},
+                {"from_": "intent_stride", "to": "spine_pitch", "weight": 0.38},
                 {"from_": "intent_arm_counterbalance", "to": "lshoulder", "weight": 0.45},
                 {"from_": "intent_arm_counterbalance", "to": "rshoulder", "weight": 0.45},
-                {"from_": "intent_torso_forward", "to": "spine_pitch", "weight": 0.45},
+                {"from_": "intent_torso_forward", "to": "spine_pitch", "weight": 0.52},
                 {"from_": "lelbow",    "to": "cube0_z", "weight": 0.3},
                 {"from_": "relbow",    "to": "cube1_z", "weight": 0.3},
                 {"from_": "lshoulder", "to": "lelbow",  "weight": 0.5},
@@ -2000,9 +2005,13 @@ class EnvironmentHumanoid:
         edges.extend([
             {"from_": "intent_stride", "to": "lhip", "weight": 0.7},
             {"from_": "intent_stride", "to": "rhip", "weight": 0.7},
+            {"from_": "intent_stride", "to": "intent_torso_forward", "weight": 0.45},
+            {"from_": "intent_stride", "to": "spine_pitch", "weight": 0.38},
+            {"from_": "intent_stride", "to": "com_x", "weight": 0.28},
             {"from_": "intent_support_left", "to": "lknee", "weight": 0.45},
             {"from_": "intent_support_right", "to": "rknee", "weight": 0.45},
-            {"from_": "intent_torso_forward", "to": "spine_pitch", "weight": 0.5},
+            {"from_": "intent_torso_forward", "to": "spine_pitch", "weight": 0.58},
+            {"from_": "intent_torso_forward", "to": "com_x", "weight": 0.32},
             {"from_": "intent_stop_recover", "to": "com_z", "weight": 0.35},
             {"from_": "intent_arm_counterbalance", "to": "lshoulder", "weight": 0.4},
             {"from_": "intent_arm_counterbalance", "to": "rshoulder", "weight": 0.4},
@@ -2067,6 +2076,10 @@ class EnvironmentHumanoid:
 def humanoid_hardcoded_seeds() -> list[dict]:
     """Биомеханические text priors для полного режима (суставы → COM, стопы)."""
     return [
+        {"from_": "intent_stride", "to": "intent_torso_forward", "weight": 0.24, "alpha": 0.05},
+        {"from_": "intent_stride", "to": "spine_pitch", "weight": 0.20, "alpha": 0.05},
+        {"from_": "intent_stride", "to": "com_x", "weight": 0.18, "alpha": 0.05},
+        {"from_": "intent_torso_forward", "to": "com_x", "weight": 0.16, "alpha": 0.05},
         {"from_": "lhip",       "to": "com_x",    "weight": 0.22, "alpha": 0.05},
         {"from_": "rhip",       "to": "com_x",    "weight": 0.22, "alpha": 0.05},
         {"from_": "lknee",      "to": "lfoot_z",  "weight": 0.25, "alpha": 0.05},

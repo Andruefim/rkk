@@ -207,13 +207,23 @@ class LocomotionController:
                 - (5.0 if fallen else 0.0)
             )
         else:
+            # Walking: do not punish asymmetric support_bias as harshly; encourage CoM_x forward (ZMP/CoM ahead).
+            stride_n = abs(float(self._last_motor_state.get("intent_stride", 0.5)) - 0.5) * 2.0
+            torso_n = abs(float(self._last_motor_state.get("intent_torso_forward", 0.5)) - 0.5) * 2.0
+            walk_drive = float(np.clip(0.5 * stride_n + 0.5 * torso_n, 0.0, 1.0))
+            bias_pen = abs(bias - 0.5) * (1.0 - 0.55 * walk_drive)
+            cx = float(com_x)
+            forward_bonus = 2.0 * max(0.0, cx - 0.46)
+            back_penalty = 1.6 * max(0.0, 0.41 - cx)
             reward = (
                 rz * 3.0
                 + posture * 3.0
                 + symmetry * 2.0
                 + min(contact_l, contact_r) * 1.5
-                + dx * 1.5
-                - abs(bias - 0.5) * 1.0
+                + dx * 1.85
+                + forward_bonus
+                - back_penalty
+                - bias_pen * 1.0
                 - (5.0 if fallen else 0.0)
             )
 

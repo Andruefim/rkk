@@ -75,19 +75,37 @@ class NOTEARSCore(nn.Module):
         return X @ self.W_masked()
 
     def dag_constraint(self) -> torch.Tensor:
-        W2  = self.W_masked() ** 2
-        exp = torch.linalg.matrix_exp(W2)
-        return exp.trace() - self.d
+        """
+        Оптимизированный DAG constraint через Taylor expansion (до 4-го порядка).
+        Снижает вычислительную нагрузку по сравнению с полным matrix_exp.
+        """
+        M = self.W_masked() ** 2
+        
+        # Вычисляем степени матрицы для следа
+        M2 = torch.matmul(M, M)
+        M3 = torch.matmul(M2, M)
+        M4 = torch.matmul(M3, M)
+        
+        # h(W) ≈ tr(M^2)/2! + tr(M^3)/3! + tr(M^4)/4!
+        # tr(I) и tr(M) опущены, так как они сокращаются с -d и равны 0 соответственно.
+        trace_sum = (M2.trace() / 2.0) + (M3.trace() / 6.0) + (M4.trace() / 24.0)
+        return trace_sum
 
     def dag_constraint_masked(self, free_mask: torch.Tensor) -> torch.Tensor:
         """
-        DAG-штраф только по «обучаемым» рёбрам: (W∘mask_diag)∘free_mask.
-        Замороженные URDF-позиции (free_mask=0) не входят в tr(exp(·)).
+        Фаза 1: Оптимизированный DAG-штраф с учетом маски свободных параметров.
+        Использует разложение Тейлора для ускорения расчета.
         """
+        # Применяем маску к весам перед возведением в квадрат
         Wm = self.W_masked() * free_mask
-        W2 = Wm ** 2
-        exp = torch.linalg.matrix_exp(W2)
-        return exp.trace() - self.d
+        M = Wm ** 2
+        
+        M2 = torch.matmul(M, M)
+        M3 = torch.matmul(M2, M)
+        M4 = torch.matmul(M3, M)
+        
+        trace_sum = (M2.trace() / 2.0) + (M3.trace() / 6.0) + (M4.trace() / 24.0)
+        return trace_sum
 
     def intervention_loss(self, X_obs, X_int, int_var_idx, int_val):
         a = torch.zeros_like(X_obs)
