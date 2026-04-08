@@ -841,7 +841,7 @@ export default function RKKHumanoid() {
       </div>
 
       {/* Event log */}
-      <div style={{position:"absolute",bottom:14,left:14,right:14,background:"rgba(2,5,14,0.92)",border:"1px solid #0a1a2e",padding:"8px 14px",borderRadius:3,maxHeight:220,overflowY:"auto",overflowX:"hidden"}}>
+      <div style={{position:"absolute",bottom:14,left:14,right:14,background:"rgba(2,5,14,0.92)",border:"1px solid #0a1a2e",padding:"8px 14px",borderRadius:3,maxHeight:220, maxWidth: "500px", margin: "0 auto",overflowY:"auto",overflowX:"hidden"}}>
         <div style={{color:"#0a1a2e",fontSize:9,letterSpacing:"0.1em",marginBottom:4}}>
           CAUSAL STREAM {connected?"● ONLINE":"○ OFFLINE"}
           {isFR&&<span style={{color:frColor}}> · 📌 FIXED BASE</span>}
