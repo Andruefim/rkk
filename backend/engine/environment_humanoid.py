@@ -129,7 +129,7 @@ FIXED_BASE_VARS: list[str] = (
 # Нормализация диапазонов
 _RANGES = {}
 for v in TORSO_VARS[:2]:  _RANGES[v] = (-1.5, 1.5)
-_RANGES["com_z"]          = (0.0,  1.5)
+_RANGES["com_z"]          = (0.0,  1.8)
 _RANGES["torso_roll"]     = (-1.2, 1.2)
 _RANGES["torso_pitch"]    = (-1.2, 1.2)
 for v in SPINE_VARS:       _RANGES[v] = (-1.2, 1.2)
@@ -154,14 +154,14 @@ for _sv in SELF_VARS:
     _RANGES[_sv] = (0.0, 1.0)
 
 # Масштаб URDF относительно прежнего «эталона» 0.36 (0.18 = ровно в 2× меньше по линейным размерам).
-HUMANOID_URDF_LEGACY_SCALE = 0.36
-HUMANOID_URDF_GLOBAL_SCALING = 0.18
+HUMANOID_URDF_LEGACY_SCALE = 0.45
+HUMANOID_URDF_GLOBAL_SCALING = 0.225
 _HSZ = HUMANOID_URDF_GLOBAL_SCALING / HUMANOID_URDF_LEGACY_SCALE
 
-FALLEN_Z     = 0.25 * _HSZ
-STAND_Z      = 0.85 * _HSZ
+FALLEN_Z     = 0.30
+STAND_Z      = 0.80
 HUMANOID_URDF_STAND_EULER = (np.pi / 2, 0.0, 0.0)
-HUMANOID_URDF_SPAWN_Z = 1.15 * _HSZ
+HUMANOID_URDF_SPAWN_Z = 1.10
 
 
 def _np_quat_from_axis_angle(axis: np.ndarray, angle: float) -> list[float]:
@@ -591,16 +591,16 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         pb.setGravity(0, 0, -9.81, physicsClientId=self.client)
         pb.setAdditionalSearchPath(pbd.getDataPath(), physicsClientId=self.client)
         pb.setTimeStep(1/240., physicsClientId=self.client)
-        pb.setPhysicsEngineParameter(numSolverIterations=50, physicsClientId=self.client)
+        pb.setPhysicsEngineParameter(numSolverIterations=80, physicsClientId=self.client)
 
         self.floor_id = pb.loadURDF("plane.urdf", physicsClientId=self.client)
         self._build_ramp()
 
         self.cube_ids = []
         cube_configs = [
-            {"pos": [1.0,  0.3, 0.15], "size": 0.12, "mass": 2.0,  "color": [1.0, 0.4, 0.1, 1]},
-            {"pos": [-0.6, 0.8, 0.12], "size": 0.10, "mass": 0.5,  "color": [0.2, 0.7, 1.0, 1]},
-            {"pos": [0.3, -0.9, 0.20], "size": 0.16, "mass": 6.0,  "color": [0.25, 0.85, 0.35, 1]},
+            {"pos": [1.25,  0.375, 0.1875], "size": 0.15, "mass": 2.0,  "color": [1.0, 0.4, 0.1, 1]},
+            {"pos": [-0.75, 1.0, 0.15], "size": 0.125, "mass": 0.5,  "color": [0.2, 0.7, 1.0, 1]},
+            {"pos": [0.375, -1.125, 0.25], "size": 0.20, "mass": 6.0,  "color": [0.25, 0.85, 0.35, 1]},
         ]
         for cfg in cube_configs:
             hs = cfg["size"] / 2
@@ -621,8 +621,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self.lever_center = np.array([-1.05, 0.55, 0.10], dtype=np.float64)
         self.target_pad = np.array([1.85, -0.72, 0.02], dtype=np.float64)
         self.lever_trigger_r = 0.26
-        self._ball_start = [0.55, -0.45, 0.11]
-        br = 0.09
+        self._ball_start = [0.6875, -0.5625, 0.1375]
+        br = 0.1125
         col_ball = pb.createCollisionShape(pb.GEOM_SPHERE, radius=br, physicsClientId=self.client)
         vis_ball = pb.createVisualShape(
             pb.GEOM_SPHERE, radius=br,
@@ -675,6 +675,13 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             elif jname == "spine":
                 self.joint_by_var["spine_yaw"] = i
                 self.joint_by_var["spine_pitch"] = i
+
+        for i in range(self.n_joints):
+            jt = self._joint_types[i]
+            if jt != pb.JOINT_FIXED:
+                pb.changeDynamics(self.robot_id, i,
+                    jointDamping=0.5, linearDamping=0.04, angularDamping=0.04,
+                    physicsClientId=self.client)
 
         # ── Fixed root constraint (None = not applied) ───────────────────────
         self._root_constraint: int | None = None
@@ -980,7 +987,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, pb.POSITION_CONTROL,
                     targetPosition=quat_id,
                     positionGain=1.2, velocityGain=0.40,
-                    maxVelocity=6.0, force=[400.0, 400.0, 400.0],
+                    maxVelocity=6.0, force=[12000.0, 12000.0, 12000.0],
                     physicsClientId=cid,
                 )
             else:
@@ -988,7 +995,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, controlMode=pb.POSITION_CONTROL,
                     targetPosition=0.0,
                     positionGain=0.90, velocityGain=0.25,
-                    force=250.0, physicsClientId=cid,
+                    force=8000.0, physicsClientId=cid,
                 )
 
     def _snap_base_spine_vertical(self) -> None:
@@ -1132,7 +1139,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                         positionGain=0.62, velocityGain=0.18, maxVelocity=4.0,
-                        force=[110.0, 110.0, 110.0], physicsClientId=cid)
+                        force=[4000.0, 4000.0, 4000.0], physicsClientId=cid)
                 return
 
             if var_name in ("spine_yaw", "spine_pitch"):
@@ -1141,12 +1148,12 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if var_name == "spine_yaw":
                     self._spine_euler[2] = 0.50 * real_pos
                 else:
-                    self._spine_euler[0] = 0.40 * real_pos
+                    self._spine_euler[0] = 0.25 * real_pos
                 ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                         positionGain=0.85, velocityGain=0.25, maxVelocity=3.5,
-                        force=[280.0, 280.0, 280.0], physicsClientId=cid)
+                        force=[10000.0, 10000.0, 10000.0], physicsClientId=cid)
                 return
 
             is_leg = var_name in ("lhip", "rhip", "lknee", "rknee", "lankle", "rankle")
@@ -1168,23 +1175,23 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if is_leg:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                             positionGain=0.85, velocityGain=0.25, maxVelocity=4.0,
-                            force=[320.0, 320.0, 320.0], physicsClientId=cid)
+                            force=[12000.0, 12000.0, 12000.0], physicsClientId=cid)
                 else:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                             positionGain=0.52, velocityGain=0.15, maxVelocity=5.5,
-                            force=[165.0, 165.0, 165.0], physicsClientId=cid)
+                            force=[3000.0, 3000.0, 3000.0], physicsClientId=cid)
             else:
                 if is_leg:
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
-                        positionGain=0.80, velocityGain=0.20, force=200.0, physicsClientId=cid,
+                        positionGain=0.80, velocityGain=0.20, force=8000.0, physicsClientId=cid,
                     )
                 else:
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
-                        positionGain=0.5, velocityGain=0.1, force=80.0, physicsClientId=cid,
+                        positionGain=0.5, velocityGain=0.1, force=2000.0, physicsClientId=cid,
                     )
 
     def get_com(self) -> tuple[np.ndarray, np.ndarray]:
@@ -1660,6 +1667,12 @@ class EnvironmentHumanoid:
         rknee = float(raw.get("rknee", 0.5))
         lankle = float(raw.get("lankle", 0.5))
         rankle = float(raw.get("rankle", 0.5))
+        lsh = float(raw.get("lshoulder", 0.0))
+        rsh = float(raw.get("rshoulder", 0.0))
+        lel = float(raw.get("lelbow", 0.0))
+        rel = float(raw.get("relbow", 0.0))
+        sp_pitch = float(raw.get("spine_pitch", 0.0))
+        sp_yaw = float(raw.get("spine_yaw", 0.0))
         lf = float(raw.get("lfoot_z", 0.05))
         rf = float(raw.get("rfoot_z", 0.05))
         support_l = float(np.clip(1.0 - lf / max(STAND_Z * 0.18, 1e-6), 0.0, 1.0))
@@ -1670,10 +1683,19 @@ class EnvironmentHumanoid:
         motor_drive_l = float(np.clip(np.mean([abs(lhip - 0.5), abs(lknee - 0.5), abs(lankle - 0.5)]) * 1.8, 0.0, 1.0))
         motor_drive_r = float(np.clip(np.mean([abs(rhip - 0.5), abs(rknee - 0.5), abs(rankle - 0.5)]) * 1.8, 0.0, 1.0))
         roll_from_upright = torso_roll - HUMANOID_URDF_STAND_EULER[0]
+        lsh_neutral = 0.0
+        rsh_neutral = 0.0
+        joint_deviations = [
+            abs(lsh - lsh_neutral) * 0.6, abs(rsh - rsh_neutral) * 0.6,
+            abs(lel) * 0.8, abs(rel) * 0.8,
+            abs(sp_pitch) * 2.0, abs(sp_yaw) * 2.0,
+        ]
+        joint_penalty = float(np.clip(np.mean(joint_deviations), 0.0, 1.0))
         posture_stability = float(np.clip(
             1.0
             - (abs(roll_from_upright) + abs(torso_pitch)) * 0.6
-            - abs(com_z - STAND_Z) / max(STAND_Z, 0.01) * 0.4,
+            - abs(com_z - STAND_Z) / max(STAND_Z, 0.01) * 0.4
+            - joint_penalty * 0.3,
             0.0, 1.0,
         ))
         return {
@@ -1688,6 +1710,31 @@ class EnvironmentHumanoid:
         }
 
     # ── do() ─────────────────────────────────────────────────────────────────
+    _JOINT_NEUTRAL: dict[str, float] = {
+        "lshoulder": 0.50, "rshoulder": 0.50,
+        "lelbow": 0.50, "relbow": 0.50,
+        "spine_pitch": 0.50, "spine_yaw": 0.50,
+        "neck_pitch": 0.50, "neck_yaw": 0.50,
+        "lhip": 0.50, "rhip": 0.50,
+        "lknee": 0.50, "rknee": 0.50,
+        "lankle": 0.50, "rankle": 0.50,
+    }
+    _JOINT_COMFORT_RANGE: dict[str, float] = {
+        "lshoulder": 0.10, "rshoulder": 0.10,
+        "lelbow": 0.08, "relbow": 0.08,
+        "spine_pitch": 0.05, "spine_yaw": 0.05,
+        "neck_pitch": 0.06, "neck_yaw": 0.06,
+        "lhip": 0.12, "rhip": 0.12,
+        "lknee": 0.12, "rknee": 0.12,
+        "lankle": 0.10, "rankle": 0.10,
+    }
+
+    @classmethod
+    def _comfort_zone(cls, var: str) -> tuple[float, float]:
+        n = cls._JOINT_NEUTRAL.get(var, 0.5)
+        r = cls._JOINT_COMFORT_RANGE.get(var, 0.45)
+        return (max(0.05, n - r), min(0.95, n + r))
+
     def intervene(self, variable: str, value: float, *, count_intervention: bool = True) -> dict[str, float]:
         if count_intervention:
             self.n_interventions += 1
@@ -1703,14 +1750,15 @@ class EnvironmentHumanoid:
             self._sim.step(self.steps_per_do)
             return self.observe()
 
-        # В fixed_root mode управляем только руками и головой (ноги зафиксированы)
         if self._fixed_root:
             controllable = ARM_VARS + SPINE_VARS + HEAD_VARS
         else:
             controllable = LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS
 
         if variable in controllable:
-            self._sim.set_joint(variable, value)
+            lo, hi = self._comfort_zone(variable)
+            clamped = float(np.clip(value, lo, hi))
+            self._sim.set_joint(variable, clamped)
 
         self._sim.step(self.steps_per_do)
         return self.observe()
@@ -1743,7 +1791,8 @@ class EnvironmentHumanoid:
                 self._motor_state[variable] = v
                 touched_intent = True
             elif variable in controllable:
-                joints_after.append((variable, v))
+                lo, hi = self._comfort_zone(variable)
+                joints_after.append((variable, float(np.clip(v, lo, hi))))
         if touched_intent:
             self._apply_motor_intents()
         for variable, v in joints_after:
@@ -1770,30 +1819,30 @@ class EnvironmentHumanoid:
         if self._fixed_root:
             self._sim.set_joint(
                 "spine_pitch",
-                clip01(0.5 + 0.18 * torso + 0.12 * recover + 0.06 * arms),
+                clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms),
             )
             self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
-            self._sim.set_joint("lshoulder", clip01(0.5 + 0.16 * arms + 0.09 * recover))
-            self._sim.set_joint("rshoulder", clip01(0.5 - 0.16 * arms + 0.09 * recover))
-            self._sim.set_joint("lelbow", clip01(0.5 + 0.14 * arms))
-            self._sim.set_joint("relbow", clip01(0.5 - 0.14 * arms))
+            self._sim.set_joint("lshoulder", clip01(0.50 + 0.05 * arms + 0.02 * recover))
+            self._sim.set_joint("rshoulder", clip01(0.50 - 0.05 * arms + 0.02 * recover))
+            self._sim.set_joint("lelbow", clip01(0.50 + 0.06 * arms))
+            self._sim.set_joint("relbow", clip01(0.50 - 0.06 * arms))
             return
 
         self._sim.set_joint(
             "spine_pitch",
-            clip01(0.54 + 0.14 * torso + 0.16 * recover + 0.07 * arms),
+            clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms),
         )
         self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
         self._sim.set_joint(
             "lshoulder",
-            clip01(0.5 + 0.17 * arms + 0.03 * stride + 0.05 * recover),
+            clip01(0.50 + 0.04 * arms + 0.01 * stride + 0.02 * recover),
         )
         self._sim.set_joint(
             "rshoulder",
-            clip01(0.5 - 0.17 * arms - 0.03 * stride + 0.05 * recover),
+            clip01(0.50 - 0.04 * arms - 0.01 * stride + 0.02 * recover),
         )
-        self._sim.set_joint("lelbow", clip01(0.5 + 0.14 * arms))
-        self._sim.set_joint("relbow", clip01(0.5 - 0.14 * arms))
+        self._sim.set_joint("lelbow", clip01(0.50 + 0.05 * arms))
+        self._sim.set_joint("relbow", clip01(0.50 - 0.05 * arms))
 
     def _apply_motor_intents(self) -> None:
         """
