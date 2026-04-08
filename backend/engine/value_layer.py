@@ -250,19 +250,10 @@ class ValueLayer:
     ) -> tuple[BlockReason, str] | None:
         if slot_action:
             return None
-        n_out = 0
         for var_name, pred_val in predicted_state.items():
             pv = self._clip_state_val(pred_val)
             if not np.isfinite(pv):
                 return BlockReason.VAR_OUT_OF_RANGE, f"predicted {var_name} non-finite"
-            if pv < eff.predict_lo or pv > eff.predict_hi:
-                n_out += 1
-        out_frac = n_out / max(len(predicted_state), 1)
-        if out_frac > 0.35:
-            return (
-                BlockReason.VAR_OUT_OF_RANGE,
-                f"predicted {n_out}/{len(predicted_state)} vars ({out_frac:.0%}) outside predict band",
-            )
         # entropy spike check — пропускаем в fixed_root
         if skip_entropy:
             return None
