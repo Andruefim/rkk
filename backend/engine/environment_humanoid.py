@@ -1825,6 +1825,7 @@ class EnvironmentHumanoid:
         sup_l = float(intents.get("intent_support_left", 0.5) - 0.5)
         sup_r = float(intents.get("intent_support_right", 0.5) - 0.5)
         torso = float(intents.get("intent_torso_forward", 0.5) - 0.5)
+        torso = torso * 1.45
         arms = float(intents.get("intent_arm_counterbalance", 0.5) - 0.5)
         recover = float(intents.get("intent_stop_recover", 0.5) - 0.5)
 

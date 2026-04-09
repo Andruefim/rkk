@@ -126,100 +126,43 @@ class LocomotionController:
 
     def get_joint_targets(self, agent_nodes: dict[str, float], *, dt: float = 0.05) -> dict[str, float]:
         """
-        6 осцилляторов → 6 суставов: lhip, rhip, lknee, rknee, lankle, rankle.
-        intent_* модулируют амплитуду через external_command.
+        Исправленная версия: сильный forward lean при stride > 0.5
         """
-        _gc = agent_nodes.get("intent_gait_coupling")
-        if _gc is None:
-            _gc = agent_nodes.get("phys_intent_gait_coupling")
-        intent_gait_coupling = float(_gc if _gc is not None else 0.88)
-        gscale = float(np.clip(intent_gait_coupling, 0.0, 1.0))
+        stride = float(self._node(agent_nodes, "intent_stride") - 0.5)
+        sup_l = float(self._node(agent_nodes, "intent_support_left") - 0.5)
+        sup_r = float(self._node(agent_nodes, "intent_support_right") - 0.5)
+        recover = float(self._node(agent_nodes, "intent_stop_recover") - 0.5)
+        energy = float(np.clip(self._node(agent_nodes, "self_energy"), 0.0, 1.0))
 
-        intents = {
-            "intent_stride": self._node(agent_nodes, "intent_stride"),
-            "intent_support_left": self._node(agent_nodes, "intent_support_left"),
-            "intent_support_right": self._node(agent_nodes, "intent_support_right"),
-            "intent_torso_forward": self._node(agent_nodes, "intent_torso_forward"),
-            "intent_gait_coupling": intent_gait_coupling,
-            "intent_arm_counterbalance": self._node(agent_nodes, "intent_arm_counterbalance"),
-            "intent_stop_recover": self._node(agent_nodes, "intent_stop_recover"),
-        }
-        self._last_motor_state = dict(intents)
+        # === КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ===
+        # Сильный наклон торса вперёд при ходьбе
+        torso_forward = 0.5 + 0.52 * stride + 0.15 * energy
+        torso_forward = np.clip(torso_forward, 0.38, 0.96)
 
-        eng = float(np.clip(self._node(agent_nodes, "self_energy"), 0.0, 1.0))
+        # Сохраняем для upper_body
+        self._last_motor_state["intent_torso_forward"] = float(torso_forward)
 
-        stride = float(intents["intent_stride"] - 0.5)
-        sup_l = float(intents["intent_support_left"] - 0.5)
-        sup_r = float(intents["intent_support_right"] - 0.5)
-        recover = float(intents["intent_stop_recover"] - 0.5)
-
+        # CPG-команды для ног
         cmd = torch.zeros(6, dtype=torch.float32, device=self.device)
-        cmd[0] = 0.15 * stride - 0.06 * sup_r - 0.05 * recover
-        cmd[1] = -0.15 * stride - 0.06 * sup_l - 0.05 * recover
-        cmd[2] = 0.10 * sup_l + 0.08 * recover
-        cmd[3] = 0.10 * sup_r + 0.08 * recover
-        cmd[4] = 0.06 * sup_l - 0.03 * stride + 0.04 * recover
-        cmd[5] = 0.06 * sup_r + 0.03 * stride + 0.04 * recover
-        cmd = cmd * float(0.6 + 0.6 * eng)
+        cmd[0] =  0.19 * stride - 0.08 * sup_r - 0.05 * recover   # lhip
+        cmd[1] = -0.19 * stride - 0.08 * sup_l - 0.05 * recover   # rhip
+        cmd[2] =  0.14 * sup_l + 0.10 * recover                    # lknee
+        cmd[3] =  0.14 * sup_r + 0.10 * recover                    # rknee
+        cmd[4] =  0.08 * sup_l - 0.04 * stride + 0.05 * recover    # lankle
+        cmd[5] =  0.08 * sup_r + 0.04 * stride + 0.05 * recover    # rankle
 
-        cpg_out = self.cpg.step(dt=dt, external_command=cmd)
+        cpg_out = self.cpg.step(dt=dt, external_command=cmd * (0.7 + 0.3 * energy))
 
-        # --- Whole-body: gait clock + CoM velocity lag; gscale — из узла intent_gait_coupling (каузальный граф). ---
-        sync: dict[str, float] = {}
-        with torch.no_grad():
-            pl = float(self.cpg._phase[0].item())
-            pr = float(self.cpg._phase[1].item())
-        gait_mid = 0.5 * (pl + pr)
-        s = math.sin(pl)
-        c_g = math.cos(gait_mid)
-        stride_n = max(0.0, float(stride))
-        com_x = self._node(agent_nodes, "com_x")
-        if self._com_x_prev_step is None:
-            self._com_x_prev_step = com_x
-        dcx = float(com_x - self._com_x_prev_step)
-        self._com_x_prev_step = com_x
-        exp_scale = max(1e-6, float(_COM_VEL_EXPECT))
-        expected_dx = exp_scale * stride_n * (0.6 + 0.4 * float(eng))
-        com_lag = (
-            float(np.clip((expected_dx - dcx) * float(_COM_LAG_GAIN), 0.0, 1.0))
-            if stride_n > 0.04
-            else 0.0
-        )
-        sync = {
-            "sin": s,
-            "cos_mid": c_g,
-            "stride_n": stride_n,
-            "com_lag": com_lag,
-            "dcx": dcx,
-            "gscale": gscale,
-        }
-        self._last_cpg_sync = sync
-
-        hip_center = 0.50
-        knee_center = 0.50
-        ankle_center = 0.50
-        hip_range = 0.15
-        knee_range = 0.12
-        ankle_range = 0.08
-
-        lhip_raw = float(cpg_out[0].item())
-        rhip_raw = float(cpg_out[1].item())
-        lknee_raw = float(cpg_out[2].item())
-        rknee_raw = float(cpg_out[3].item())
-        lankle_raw = float(cpg_out[4].item())
-        rankle_raw = float(cpg_out[5].item())
-
+        # Формируем цели суставов
         targets: dict[str, float] = {
-            "lhip": float(np.clip(hip_center + hip_range * (lhip_raw * 2.0 - 1.0), 0.05, 0.95)),
-            "rhip": float(np.clip(hip_center + hip_range * (rhip_raw * 2.0 - 1.0), 0.05, 0.95)),
-            "lknee": float(np.clip(knee_center + knee_range * (lknee_raw * 2.0 - 1.0), 0.05, 0.95)),
-            "rknee": float(np.clip(knee_center + knee_range * (rknee_raw * 2.0 - 1.0), 0.05, 0.95)),
-            "lankle": float(np.clip(ankle_center + ankle_range * (lankle_raw * 2.0 - 1.0), 0.05, 0.95)),
-            "rankle": float(np.clip(ankle_center + ankle_range * (rankle_raw * 2.0 - 1.0), 0.05, 0.95)),
+            "lhip":   float(np.clip(0.50 + 0.17 * (float(cpg_out[0].item())*2 - 1), 0.05, 0.95)),
+            "rhip":   float(np.clip(0.50 + 0.17 * (float(cpg_out[1].item())*2 - 1), 0.05, 0.95)),
+            "lknee":  float(np.clip(0.50 + 0.14 * (float(cpg_out[2].item())*2 - 1), 0.05, 0.95)),
+            "rknee":  float(np.clip(0.50 + 0.14 * (float(cpg_out[3].item())*2 - 1), 0.05, 0.95)),
+            "lankle": float(np.clip(0.50 + 0.09 * (float(cpg_out[4].item())*2 - 1), 0.05, 0.95)),
+            "rankle": float(np.clip(0.50 + 0.09 * (float(cpg_out[5].item())*2 - 1), 0.05, 0.95)),
         }
 
-        self._last_command = dict(targets)
-        self._step_count += 1
         return targets
 
     def learn_from_reward(
