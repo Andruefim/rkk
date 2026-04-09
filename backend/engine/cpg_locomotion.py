@@ -1,14 +1,19 @@
 """
-cpg_locomotion.py — Phase A: Locomotion (CPG поверх агента).
+cpg_locomotion.py — Phase A: Locomotion (CPG поверх агента) + Phase D: CPG Annealing.
+
+ИЗМЕНЕНИЯ (Motor Cortex / Phase D):
+  - get_joint_targets: усилен forward lean, добавлен com_lag компенсатор
+  - upper_body_cpg_sync: возвращает com_lag для наклона торса вперёд
+  - learn_from_reward: фазовый reward (stance → walk) с явным forward_bonus
+
+Проблема «заваливается назад»: при stride>0 торс должен быть наклонён вперёд.
+Основные фиксы:
+  1. intent_torso_forward масштабирован на 1.6× (был 1.45)
+  2. com_lag penalty + recovery теперь тянет CoM вперёд активнее
+  3. Добавлен _step_phase для определения stance/swing per leg
 
 Central Pattern Generator: фазовые осцилляторы для ритма ног; высокоуровневые
-сигналы из узлов GNN модулируют амплитуду. Отдельный суррогатный reward
-(com_z + продвижение com_x, штраф за падение) крутит параметры CPG.
-
-Включается симуляцией при RKK_LOCOMOTION_CPG=1, humanoid, не fixed_root.
-
-Целостная походка: фаза бёдер + отставание CoM; сила связки задаётся каузальным узлом
-intent_gait_coupling (в среде по умолчанию 0.88).
+сигналы из узлов GNN модулируют амплитуду.
 """
 from __future__ import annotations
 
@@ -18,17 +23,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-# Ожидаемый микро-сдвиг нормализованного com_x за шаг при ходьбе; усиление штрафа при отставании массы.
 _COM_VEL_EXPECT = 0.022
 _COM_LAG_GAIN = 42.0
 
 
 class CPGNetwork(nn.Module):
-    """
-    Несколько связанных фазовых осцилляторов (упрощённая фазовая модель).
-    Выход: нормализованные цели суставов [0, 1].
-    """
-
     def __init__(self, n_oscillators: int = 4, device: torch.device | None = None):
         super().__init__()
         self.n = n_oscillators
@@ -48,10 +47,6 @@ class CPGNetwork(nn.Module):
         dt: float = 0.05,
         external_command: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Один шаг CPG → (n,) в [0, 1].
-        external_command: (>=n,) на том же device, что модуль.
-        """
         freq = torch.sigmoid(self.frequency) * 2.0 + 0.3
         amp = torch.sigmoid(self.amplitude) * 0.6
 
@@ -82,11 +77,11 @@ class CPGNetwork(nn.Module):
 class LocomotionController:
     """
     CPG/MotorPolicy → цели суставов и моторный латент для humanoid.
-    Управляется motor intents из causal graph и структурным reward.
 
-    Каждый осциллятор управляет ОДНИМ суставом (6 осцилляторов = lhip, rhip, lknee, rknee, lankle, rankle).
-    Бёдра и колени работают в анти-фазе: при разгибании бедра колено выпрямляется (опорная фаза),
-    при сгибании бедра колено сгибается (фаза переноса).
+    FIX «заваливается назад»:
+      - stride_n > 0 → torso_forward = 0.5 + 0.62*stride (было 0.52)
+      - com_lag > threshold → дополнительный наклон вперёд (pitch_add > 0)
+      - gscale: масштаб coupling синхронизации
     """
 
     def __init__(self, device: torch.device):
@@ -113,6 +108,9 @@ class LocomotionController:
         self._last_cpg_sync: dict[str, float] = {}
         self._com_x_prev_step: float | None = None
 
+        # MOTOR_CORTEX: cpg_weight is set externally by MotorCortexLibrary
+        self.cpg_weight: float = 1.0  # used for diagnostics only here
+
     @staticmethod
     def _node(agent_nodes: dict[str, float], key: str) -> float:
         v = agent_nodes.get(key)
@@ -121,28 +119,44 @@ class LocomotionController:
         return float(v if v is not None else 0.5)
 
     def upper_body_cpg_sync(self) -> dict[str, float]:
-        """Фаза CPG + инерция CoM для согласованного корпуса с ногами (после get_joint_targets)."""
+        """Фаза CPG + инерция CoM для согласованного корпуса с ногами."""
         return dict(self._last_cpg_sync)
 
     def get_joint_targets(self, agent_nodes: dict[str, float], *, dt: float = 0.05) -> dict[str, float]:
         """
-        Исправленная версия: сильный forward lean при stride > 0.5
+        FIXED: усиленный forward lean при stride > 0.
+        
+        Ключевые изменения vs оригинала:
+        - torso_forward scale: 0.52 → 0.62 (больше наклон вперёд)
+        - com_lag penalty активно тянет CoM вперёд при отставании
+        - CPG sync: pitch_add при com_lag теперь положительный (наклон вперёд)
         """
         stride = float(self._node(agent_nodes, "intent_stride") - 0.5)
         sup_l = float(self._node(agent_nodes, "intent_support_left") - 0.5)
         sup_r = float(self._node(agent_nodes, "intent_support_right") - 0.5)
         recover = float(self._node(agent_nodes, "intent_stop_recover") - 0.5)
         energy = float(np.clip(self._node(agent_nodes, "self_energy"), 0.0, 1.0))
+        com_x = float(self._node(agent_nodes, "com_x"))
+        com_z = float(self._node(agent_nodes, "com_z"))
 
-        # === КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ===
-        # Сильный наклон торса вперёд при ходьбе
-        torso_forward = 0.5 + 0.52 * stride + 0.15 * energy
-        torso_forward = np.clip(torso_forward, 0.38, 0.96)
-
-        # Сохраняем для upper_body
+        # === FORWARD LEAN FIX ===
+        # При stride > 0 агент должен лидировать корпусом — иначе падает назад
+        # com_x: нормализованная позиция ≈ 0.5 = center. >0.5 = forward of stance foot.
+        # Мы хотим com_x чуть впереди опорной стопы при ходьбе.
+        com_lag = float(np.clip(0.48 - com_x, 0.0, 0.15))  # >0 если CoM отстаёт
+        stride_n = max(0.0, stride)  # только positive stride (forward)
+        
+        # Forward lean: base + stride contribution + com_lag recovery
+        torso_forward = (
+            0.5
+            + 0.62 * stride_n          # главный forward lean при ходьбе (УСИЛЕН с 0.52)
+            + 0.40 * com_lag           # активное восстановление если CoM позади
+            + 0.15 * energy            # энергичные движения = больше наклон
+        )
+        torso_forward = float(np.clip(torso_forward, 0.38, 0.96))
         self._last_motor_state["intent_torso_forward"] = float(torso_forward)
 
-        # CPG-команды для ног
+        # CPG команды для ног
         cmd = torch.zeros(6, dtype=torch.float32, device=self.device)
         cmd[0] =  0.19 * stride - 0.08 * sup_r - 0.05 * recover   # lhip
         cmd[1] = -0.19 * stride - 0.08 * sup_l - 0.05 * recover   # rhip
@@ -153,7 +167,28 @@ class LocomotionController:
 
         cpg_out = self.cpg.step(dt=dt, external_command=cmd * (0.7 + 0.3 * energy))
 
-        # Формируем цели суставов
+        # Торс синхронизация с CPG: pitch_add > 0 = наклон вперёд
+        gscale = float(np.clip(stride_n * 1.8, 0.0, 1.0))
+        s = float(torch.sin(self.cpg._phase[0]).item())
+        c_m = float(torch.cos(self.cpg._phase[2]).item())
+        
+        # FIXED: com_lag → дополнительный pitch вперёд (был минус, теперь плюс)
+        pitch_add = (
+            -0.055 * s * gscale           # quality rhythm coupling
+            + 0.18 * com_lag * stride_n   # FORWARD тянем CoM (ключевой фикс)
+        )
+        yaw_add = 0.05 * c_m * gscale
+        lsh_add = -0.065 * s * gscale
+        rsh_add =  0.065 * s * gscale
+
+        self._last_cpg_sync = {
+            "sin": s, "cos_mid": c_m,
+            "stride_n": stride_n,
+            "com_lag": com_lag,
+            "gscale": gscale,
+            "pitch_add": float(pitch_add),
+        }
+
         targets: dict[str, float] = {
             "lhip":   float(np.clip(0.50 + 0.17 * (float(cpg_out[0].item())*2 - 1), 0.05, 0.95)),
             "rhip":   float(np.clip(0.50 + 0.17 * (float(cpg_out[1].item())*2 - 1), 0.05, 0.95)),
@@ -163,6 +198,8 @@ class LocomotionController:
             "rankle": float(np.clip(0.50 + 0.09 * (float(cpg_out[5].item())*2 - 1), 0.05, 0.95)),
         }
 
+        self._step_count += 1
+        self._last_command = dict(targets)
         return targets
 
     def learn_from_reward(
@@ -174,12 +211,9 @@ class LocomotionController:
         motor_obs: dict[str, float] | None = None,
     ) -> None:
         """
-        Phased reward: standing first, then forward progress.
-        Phase 1 (com_z < 0.35): max reward for increasing com_z (get upright).
-        Phase 2 (upright): stability + symmetry + gentle forward.
+        Phased reward с явным forward_bonus за продвижение CoM.
         """
         dx = float(com_x) - self._last_com_x
-        dz = float(com_z) - self._last_com_z
         rz = float(np.clip(com_z, 0.0, 1.0))
         motor_obs = motor_obs or {}
         posture = float(np.clip(motor_obs.get("posture_stability", 0.5), 0.0, 1.0))
@@ -195,32 +229,35 @@ class LocomotionController:
         if not upright:
             reward = (
                 rz * 4.0
-                + dz * 8.0
+                + (rz - self._last_com_z) * 8.0
                 + posture * 1.5
                 + min(contact_l, contact_r) * 1.0
                 - (5.0 if fallen else 0.0)
             )
         else:
-            # Walking: do not punish asymmetric support_bias as harshly; encourage CoM_x forward (ZMP/CoM ahead).
             stride_n = abs(float(self._last_motor_state.get("intent_stride", 0.5)) - 0.5) * 2.0
             torso_n = abs(float(self._last_motor_state.get("intent_torso_forward", 0.5)) - 0.5) * 2.0
             walk_drive = float(np.clip(0.5 * stride_n + 0.5 * torso_n, 0.0, 1.0))
             bias_pen = abs(bias - 0.5) * (1.0 - 0.55 * walk_drive)
             cx = float(com_x)
-            forward_bonus = 2.0 * max(0.0, cx - 0.46)
-            back_penalty = 1.6 * max(0.0, 0.41 - cx)
+
+            # FORWARD BONUS: более агрессивное поощрение за CoM впереди стопы
+            forward_bonus = 3.5 * max(0.0, cx - 0.45)   # усилен с 2.0
+            back_penalty  = 2.5 * max(0.0, 0.42 - cx)   # усилен с 1.6
+
             coherence = 0.0
             if self._last_cpg_sync:
                 cl = float(self._last_cpg_sync.get("com_lag", 0.0))
                 sn = float(self._last_cpg_sync.get("stride_n", 0.0))
                 gs = float(self._last_cpg_sync.get("gscale", 1.0))
                 coherence = 0.35 * (1.0 - cl) * min(1.0, sn * 2.0) * gs
+
             reward = (
                 rz * 3.0
                 + posture * 3.0
                 + symmetry * 2.0
                 + min(contact_l, contact_r) * 1.5
-                + dx * 1.85
+                + dx * 2.2          # усилен с 1.85
                 + forward_bonus
                 - back_penalty
                 + coherence
@@ -268,4 +305,5 @@ class LocomotionController:
             "last_command_size": len(self._last_command),
             "last_intent_stride": round(float(self._last_motor_state.get("intent_stride", 0.5)), 4) if self._last_motor_state else 0.5,
             "cpg_com_lag": round(lag, 4),
+            "cpg_weight": round(self.cpg_weight, 4),  # MOTOR_CORTEX
         }

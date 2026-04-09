@@ -57,6 +57,14 @@ from engine.value_layer import HomeostaticBounds
 from engine.wm_neural_ode import integrate_world_model_step
 from engine.rsi_structural import NeurogenesisEngine
 
+# Motor Cortex import (lazy — инициализируется при первом вызове)
+try:
+    from engine.motor_cortex import MotorCortexLibrary as _MotorCortexLibrary
+    _MOTOR_CORTEX_AVAILABLE = True
+except ImportError:
+    _MOTOR_CORTEX_AVAILABLE = False
+    print("[Simulation] motor_cortex.py not found — motor cortex disabled")
+
 PHASE_THRESHOLDS = [0.0, 0.15, 0.30, 0.50, 0.70, 0.88]
 PHASE_HOLD_TICKS = 12
 PHASE_NAMES      = ["", "Causal Crib", "Robotic Explorer",
@@ -418,6 +426,11 @@ class Simulation:
         # Phase C: full RSI (GNN NAS-lite, CPG perturb, skill curriculum, VL relax)
         self._rsi_full = None
         self.neuro_engine = NeurogenesisEngine()
+        # Phase D: Motor Cortex (learned motor programs + CPG annealing)
+        self._motor_cortex: "_MotorCortexLibrary | None" = None
+        self._mc_posture_window: deque = deque(maxlen=200)
+        self._mc_fallen_count_window: deque = deque(maxlen=200)
+        self._mc_abstract_nodes_injected: bool = False
         # Фаза 1: зачатки понятий (кэш детектора), автосохранение памяти
         self._concepts_cache: list[dict] = []
         self._materialized_detector_concept_ids: set[str] = set()
@@ -1017,6 +1030,11 @@ class Simulation:
                 self._l3_next_due_ts = 0.0
                 self._l3_last_tick = 0
                 self._motor_state = MotorState()
+                # Motor Cortex reset on world switch
+                self._motor_cortex = None
+                self._mc_abstract_nodes_injected = False
+                self._mc_posture_window.clear()
+                self._mc_fallen_count_window.clear()
                 self._clear_fall_recovery()
                 self._drain_simple_queue(self._l1_motor_q)
                 self._l1_last_cmd_tick = 0
@@ -1674,10 +1692,7 @@ class Simulation:
                 self._cpg_stop.wait(timeout=wait)
 
     def _maybe_apply_cpg_locomotion(self, fallen: bool) -> None:
-        """
-        Phase A: CPG шаг ног + learn_from_reward в том же тике, что и agent.step.
-        Если включён RKK_CPG_LOOP_HZ>0, этот путь отключён — работает _cpg_loop_worker.
-        """
+        """Phase A+D: CPG + Motor Cortex blended locomotion."""
         dt = 0.05
         if self._cpg_decoupled_enabled():
             return
@@ -1691,41 +1706,115 @@ class Simulation:
             return
         if self._locomotion_controller is None:
             from engine.cpg_locomotion import LocomotionController
-
             self._locomotion_controller = LocomotionController(self.device)
+
         try:
             nodes = dict(self.agent.graph.nodes)
-            targets = self._locomotion_controller.get_joint_targets(nodes, dt=dt)
+
+            # CPG generates base targets
+            cpg_targets = self._locomotion_controller.get_joint_targets(nodes, dt=dt)
             cpg_sync = self._locomotion_controller.upper_body_cpg_sync()
-            obs_before = dict(self.agent.env.observe())
-            fn(targets, cpg_sync=cpg_sync)
-            obs = self.agent.env.observe()
-            self._sync_motor_state(obs, source="cpg", tick=self.tick)
+
+            # Phase D: Motor Cortex blending
+            mc = self._ensure_motor_cortex()
+            final_targets = dict(cpg_targets)
+            if mc is not None and len(mc.programs) > 0:
+                obs_now = dict(self.agent.env.observe())
+                posture_now = float(obs_now.get(
+                    "posture_stability", obs_now.get("phys_posture_stability", 0.5)
+                ))
+                com_z_now = float(obs_now.get("com_z", obs_now.get("phys_com_z", 0.5)))
+
+                # Select active programs by situation
+                if com_z_now < 0.35 or fallen:
+                    active_progs = ["recovery"]
+                elif posture_now < 0.58:
+                    active_progs = ["balance", "recovery"]
+                else:
+                    active_progs = ["walk", "balance"]
+                active_progs = [p for p in active_progs if p in mc.programs]
+
+                if active_progs:
+                    cortex_targets = mc.infer(nodes, active_progs)
+                    final_targets = mc.blend_targets(cpg_targets, cortex_targets)
+                    # Expose CPG weight to locomotion controller for diagnostics
+                    self._locomotion_controller.cpg_weight = mc.cpg_weight
+
+            obs_before_env = dict(self.agent.env.observe())
+            fn(final_targets, cpg_sync=cpg_sync)
+            obs = dict(self.agent.env.observe())
+
+            self._sync_motor_state(obs, source="cpg+mc", tick=self.tick)
             self._log_motor_command(
-                source="cpg",
-                joint_targets=targets,
+                source="cpg+mc",
+                joint_targets=final_targets,
                 intents=getattr(self._locomotion_controller, "_last_motor_state", None),
                 obs=self._motor_obs_payload(obs),
             )
             self._record_motor_burst_causal(
-                obs_before_env=obs_before,
+                obs_before_env=obs_before_env,
                 obs_after_env=dict(obs),
                 intents=dict(getattr(self._locomotion_controller, "_last_motor_state", {}) or {}),
             )
-            com_z = float(obs.get("com_z", 0.5))
-            com_x = float(obs.get("com_x", 0.5))
+
+            # Extract metrics
+            posture = float(obs.get("posture_stability", obs.get("phys_posture_stability", 0.5)))
+            foot_l = float(obs.get("foot_contact_l", obs.get("phys_foot_contact_l", 0.5)))
+            foot_r = float(obs.get("foot_contact_r", obs.get("phys_foot_contact_r", 0.5)))
+            com_z = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
+            com_x = float(obs.get("com_x", obs.get("phys_com_x", 0.5)))
+
+            self._mc_posture_window.append(posture)
+            self._mc_fallen_count_window.append(1 if fallen else 0)
+
+            # Phase D: train motor cortex programs + anneal CPG
+            if mc is not None:
+                reward = (
+                    posture * 2.0
+                    + min(foot_l, foot_r) * 1.5
+                    + com_z * 1.0
+                    + max(0.0, com_x - 0.46) * 1.5   # forward bonus
+                    - (3.0 if fallen else 0.0)
+                )
+                mc.push_and_train(nodes, cpg_targets, reward, posture, foot_l, foot_r)
+                mc.anneal_step(posture, foot_l, foot_r, fallen, self.tick)
+
+                # Inject abstract nodes once when first program spawned
+                if not self._mc_abstract_nodes_injected and len(mc.programs) > 0:
+                    added = mc.inject_abstract_nodes_into_graph(self.agent.graph)
+                    if added > 0:
+                        self._mc_abstract_nodes_injected = True
+                        self._add_event(
+                            f"🧠 MotorCortex: +{added} abstract nodes (mc_walk_drive, mc_balance_signal, …)",
+                            "#ff88ff", "phase"
+                        )
+                mc.sync_abstract_nodes_to_graph(self.agent.graph)
+
             self._locomotion_controller.learn_from_reward(
-                com_z,
-                com_x,
-                fallen,
-                motor_obs=self._motor_obs_payload(obs),
+                com_z, com_x, fallen, motor_obs=self._motor_obs_payload(obs)
             )
         except Exception as ex:
-            print(f"[Simulation] CPG locomotion: {ex}")
+            import traceback
+            print(f"[Simulation] CPG+MC locomotion error: {ex}")
+            if os.environ.get("RKK_DEBUG_CPG"):
+                traceback.print_exc()
 
     def _rsi_full_enabled(self) -> bool:
         v = os.environ.get("RKK_RSI_FULL", "0").strip().lower()
         return v in ("1", "true", "yes", "on")
+
+    def _ensure_motor_cortex(self):
+        """Phase D: ленивая инициализация MotorCortexLibrary."""
+        if not _MOTOR_CORTEX_AVAILABLE:
+            return None
+        env_flag = os.environ.get("RKK_MOTOR_CORTEX", "1").strip().lower()
+        if env_flag in ("0", "false", "no", "off"):
+            return None
+        if self.current_world != "humanoid" or self._fixed_root_active:
+            return None
+        if self._motor_cortex is None:
+            self._motor_cortex = _MotorCortexLibrary(self.device)
+        return self._motor_cortex
 
     def _locomotion_reward_ema(self) -> float:
         lc = self._locomotion_controller
@@ -2433,6 +2522,7 @@ class Simulation:
                     self.agent,
                     self._locomotion_controller,
                     skill_library_supplier=sup,
+                    motor_cortex_supplier=self._ensure_motor_cortex,
                 )
             rsi_ev = self._rsi_full.tick(
                 snap,
@@ -2443,6 +2533,29 @@ class Simulation:
             if rsi_ev is not None:
                 t = rsi_ev.get("type", "?")
                 self._add_event(f"🔧 RSI [{t}]", "#66ccaa", "phase")
+
+        # Phase D: Motor Cortex RSI check (every 50 ticks)
+        if self.tick % 50 == 0:
+            mc = self._ensure_motor_cortex()
+            if mc is not None:
+                posture_mean = (
+                    float(np.mean(self._mc_posture_window))
+                    if self._mc_posture_window else 0.0
+                )
+                fallen_rate = (
+                    float(np.mean(self._mc_fallen_count_window))
+                    if self._mc_fallen_count_window else 0.0
+                )
+                loco_r = self._locomotion_reward_ema()
+                new_progs = mc.rsi_check_and_spawn(
+                    self.tick, posture_mean, loco_r, fallen_rate
+                )
+                for prog_name in new_progs:
+                    self._add_event(
+                        f"🧠 MC-RSI: spawned '{prog_name}' "
+                        f"(posture={posture_mean:.2f}, cpg_w={mc.cpg_weight:.2f})",
+                        "#ff88ff", "phase"
+                    )
 
         dr = float(snap.get("discovery_rate", 0.0))
         self._tick_discovery_plateau(dr)
@@ -2884,6 +2997,11 @@ class Simulation:
             "rsi_full":      self._rsi_full.snapshot()
             if self._rsi_full_enabled() and self._rsi_full is not None
             else None,
+            "motor_cortex": (
+                self._motor_cortex.snapshot()
+                if self._motor_cortex is not None
+                else None
+            ),
             "concepts":      [
                 {
                     "id": c["id"],

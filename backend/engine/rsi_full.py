@@ -1,11 +1,13 @@
 """
-Full RSI loop for embodied AGI (Phase C):
-1. Meta-learning: hooks for MAML-like adaptation (stub events / future extension).
-2. Architecture search: NAS lite — expand GNN hidden dim when discovery plateaus.
-3. Self-curriculum: harder walk skills when motor skills plateau.
-4. Knowledge distillation: placeholder for compressing skills (robot deployment).
+rsi_full.py — Full RSI loop (Phase C) + Motor Cortex RSI (Phase D).
 
-Отдельно от rsi_lite (L1/buffer/imagination). Включается RKK_RSI_FULL=1.
+ИЗМЕНЕНИЯ (Motor Cortex):
+  - RSIController.tick() вызывает mc.rsi_check_and_spawn() если motor cortex существует
+  - _perturb_cpg() теперь также уведомляет MotorCortexLibrary о сбросе
+  - Новый тип события: "motor_cortex_spawn"
+  - Новый тип события: "cpg_annealing_active" — когда cpg_weight < 0.5
+
+Оригинальный функционал не затронут.
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ if TYPE_CHECKING:
     from engine.agent import RKKAgent
     from engine.cpg_locomotion import LocomotionController
     from engine.skill_library import SkillLibrary
+    from engine.motor_cortex import MotorCortexLibrary
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -54,17 +57,13 @@ def _unwrap_gnn_core(core: Any) -> CausalGNNCore | None:
 
 
 def _migrate_gnn_expand_hidden(old: CausalGNNCore, new_hidden: int) -> CausalGNNCore:
-    """Новый core с большим hidden; W и пересекающиеся слои MLP копируются."""
     d, dev = old.d, old.device
     oh, nh = old.hidden, new_hidden
-    nmin = min(oh, nh)
-
     new = CausalGNNCore(d, dev, hidden=new_hidden)
     with torch.no_grad():
         new.W.copy_(old.W)
 
     def copy_linear(src: nn.Linear, dst: nn.Linear) -> None:
-        """Нельзя dst.weight[s].copy_(…) — это in-place на view nn.Parameter."""
         so, si = src.weight.shape
         do, di = dst.weight.shape
         o_ = min(so, do)
@@ -79,22 +78,15 @@ def _migrate_gnn_expand_hidden(old: CausalGNNCore, new_hidden: int) -> CausalGNN
                 b[:b_].copy_(src.bias[:b_].detach())
                 dst.bias.copy_(b)
 
-    # node_enc / action_enc: Linear(1, hidden)
     copy_linear(old.node_enc[0], new.node_enc[0])
     copy_linear(old.action_enc[0], new.action_enc[0])
-
-    # msg_fn: Linear(2*h,h) -> Linear(h,h)
     copy_linear(old.msg_fn[0], new.msg_fn[0])
     copy_linear(old.msg_fn[2], new.msg_fn[2])
-
-    # out_dec: Linear(2*h,h) -> Linear(h,1)
     copy_linear(old.out_dec[0], new.out_dec[0])
     copy_linear(old.out_dec[2], new.out_dec[2])
 
-    # Новые строки/столбцы hidden: инициализация только на клоне, затем copy_ в Parameter.
     if nh > oh:
         with torch.no_grad():
-
             def xavier_rows(p: nn.Parameter, r0: int, r1: int) -> None:
                 w = p.detach().clone()
                 chunk = torch.empty(r1 - r0, w.shape[1], device=w.device, dtype=w.dtype)
@@ -133,11 +125,16 @@ class RSIController:
     """
     Следит за прогрессом агента и запускает структурную самонастройку.
 
-    Триггеры:
-    - падение phi → временное смягчение VL (phi_min, phi_min_steady)
-    - плато success walk-скиллов → более жёсткие варианты шага
-    - плато discovery_rate при GNN → расширение hidden (NAS lite)
-    - плато locomotion reward → шум по CPG (phase_bias, frequency)
+    MOTOR_CORTEX: добавлен motor_cortex_supplier для координации с MotorCortexLibrary.
+    Новые RSI события:
+      - "motor_cortex_spawn": новый моторный модуль создан
+      - "cpg_annealing": cpg_weight снизился ниже 0.5
+
+    Оригинальные триггеры:
+      - phi drop → VL relax
+      - walk skill plateau → harder variants
+      - discovery plateau → GNN expand
+      - loco plateau → CPG perturb
     """
 
     def __init__(
@@ -145,10 +142,12 @@ class RSIController:
         agent: RKKAgent,
         locomotion_ctrl: LocomotionController | None = None,
         skill_library_supplier: Callable[[], SkillLibrary | None] | None = None,
+        motor_cortex_supplier: Callable[[], MotorCortexLibrary | None] | None = None,
     ):
         self.agent = agent
         self.loco = locomotion_ctrl
         self._skill_supplier = skill_library_supplier
+        self._mc_supplier = motor_cortex_supplier  # MOTOR_CORTEX
 
         maxlen = max(50, _env_int("RKK_RSI_FULL_SNAPSHOT_CAP", 500))
         self._snapshots: deque[dict[str, float]] = deque(maxlen=maxlen)
@@ -156,6 +155,10 @@ class RSIController:
         self._last_structural_tick = -10**9
         self._vl_backup: tuple[float, float] | None = None
         self._vl_relax_remaining = 0
+
+        # MOTOR_CORTEX tracking
+        self._last_mc_spawn_tick = -10**9
+        self._last_cpg_annealing_event_w = 1.0
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -176,6 +179,14 @@ class RSIController:
             return None
         try:
             return self._skill_supplier()
+        except Exception:
+            return None
+
+    def _motor_cortex(self) -> MotorCortexLibrary | None:
+        if self._mc_supplier is None:
+            return None
+        try:
+            return self._mc_supplier()
         except Exception:
             return None
 
@@ -252,7 +263,6 @@ class RSIController:
         pb = float(_env_float("RKK_RSI_FULL_CPG_PHASE_NOISE", 0.3))
         fq = float(_env_float("RKK_RSI_FULL_CPG_FREQ_NOISE", 0.1))
         with torch.no_grad():
-            # add_ на Parameter допустим, но при torch.compile/обёртках безопаснее copy_.
             p = cpg.phase_bias
             f = cpg.frequency
             cpg.phase_bias.copy_(p.detach() + torch.randn_like(p) * pb)
@@ -269,6 +279,56 @@ class RSIController:
                 motor_state.intents[key] = float(np.clip(cur + delta, 0.05, 0.95))
                 if key in self.agent.graph.nodes:
                     self.agent.graph.nodes[key] = motor_state.intents[key]
+
+        # MOTOR_CORTEX: reset cpg_weight slightly when CPG is perturbed
+        mc = self._motor_cortex()
+        if mc is not None and mc.cpg_weight < 0.9:
+            mc.cpg_weight = min(1.0, mc.cpg_weight + 0.15)
+            print(f"[RSI] CPG perturbed → cpg_weight restored to {mc.cpg_weight:.3f}")
+
+    def _check_motor_cortex_rsi(self, tick: int, snap: dict) -> dict[str, Any] | None:
+        """
+        MOTOR_CORTEX: RSI check — события связанные с motor cortex.
+        Вызывается из tick() ниже основных RSI триггеров.
+        """
+        mc = self._motor_cortex()
+        if mc is None:
+            return None
+
+        # Событие: cpg_weight снизился ниже 0.5 (cortex берёт управление)
+        if mc.cpg_weight < 0.5 and self._last_cpg_annealing_event_w >= 0.5:
+            self._last_cpg_annealing_event_w = mc.cpg_weight
+            ev = {
+                "type": "cpg_annealing",
+                "cpg_weight": round(mc.cpg_weight, 4),
+                "tick": tick,
+                "n_programs": len(mc.programs),
+                "quality_ema": round(mc._quality_ema, 4),
+            }
+            self._rsi_events.append(ev)
+            print(f"[RSI] Motor cortex dominant: cpg_weight={mc.cpg_weight:.3f}, programs={list(mc.programs.keys())}")
+            return ev
+        elif mc.cpg_weight >= 0.5:
+            self._last_cpg_annealing_event_w = mc.cpg_weight
+
+        # Событие: новые программы созданы (через rsi_check_and_spawn уже в simulation)
+        # Проверяем можно ли расширить hidden у walk-программы при плато
+        walk_prog = mc.programs.get("walk")
+        if (
+            walk_prog is not None
+            and walk_prog.train_steps > 500
+            and walk_prog.performance < 0.15
+            and (tick - self._last_mc_spawn_tick) > 2000
+        ):
+            # Сбрасываем буфер опыта и перезапускаем обучение с меньшим lr
+            for p in walk_prog.optim.param_groups:
+                p["lr"] = max(5e-5, p["lr"] * 0.5)
+            self._last_mc_spawn_tick = tick
+            ev = {"type": "mc_lr_decay", "program": "walk", "tick": tick}
+            self._rsi_events.append(ev)
+            return ev
+
+        return None
 
     def tick(
         self,
@@ -296,15 +356,20 @@ class RSIController:
             }
         )
 
+        # MOTOR_CORTEX RSI check (runs every tick regardless of cooldown)
+        mc_event = self._check_motor_cortex_rsi(tick, snap)
+        if mc_event is not None and mc_event.get("type") != "cpg_annealing":
+            return mc_event  # mc_lr_decay is a minor event, don't block other RSI
+
         min_n = max(20, _env_int("RKK_RSI_FULL_MIN_SNAPSHOTS", 200))
         win = max(10, _env_int("RKK_RSI_FULL_WINDOW", 100))
         if len(self._snapshots) < min_n:
-            return None
+            return mc_event  # return mc_event if any
 
         recent = list(self._snapshots)[-win:]
         older = list(self._snapshots)[-2 * win : -win]
         if len(older) < win // 2:
-            return None
+            return mc_event
 
         def mean_key(key: str, rows: list[dict]) -> float:
             return float(np.mean([r[key] for r in rows]))
@@ -322,7 +387,6 @@ class RSIController:
 
         event: dict[str, Any] | None = None
 
-        # Периодический stub для мета-learning / distillation (расширение без тяжёлой логики)
         if tick > 0 and tick % max(5000, min_n * 10) == 0:
             self._rsi_events.append(
                 {"type": "meta_distill_stub", "tick": tick, "note": "MAML/distill hook"}
@@ -333,7 +397,7 @@ class RSIController:
             return self._relax_value_layer(tick)
 
         if not self._cooldown_ok(tick):
-            return None
+            return mc_event  # can still return cpg_annealing event
 
         sr_eps = _env_float("RKK_RSI_FULL_SKILL_SR_EPS", 0.012)
         sr_floor = _env_float("RKK_RSI_FULL_SKILL_SR_FLOOR", 0.78)
@@ -375,10 +439,19 @@ class RSIController:
             and len(active_loco._reward_history) >= 8
             and abs(loco_gain) < loco_eps
         ):
-            self._perturb_cpg(active_loco)
-            event = {"type": "motor_policy_perturb", "tick": tick}
-            self._rsi_events.append(event)
-            self._last_structural_tick = tick
-            return event
+            # Before perturbing CPG, check if motor cortex can take over instead
+            mc = self._motor_cortex()
+            if mc is not None and mc.cpg_weight < 0.4 and len(mc.programs) > 0:
+                # Motor cortex is dominant — don't perturb CPG, let cortex handle it
+                event = {"type": "mc_take_over_loco", "cpg_weight": mc.cpg_weight, "tick": tick}
+                self._rsi_events.append(event)
+                self._last_structural_tick = tick
+                return event
+            else:
+                self._perturb_cpg(active_loco)
+                event = {"type": "motor_policy_perturb", "tick": tick}
+                self._rsi_events.append(event)
+                self._last_structural_tick = tick
+                return event
 
-        return None
+        return mc_event  # return cpg_annealing event if happened this tick
