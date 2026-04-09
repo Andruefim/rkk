@@ -125,6 +125,7 @@ class MotorState:
         "intent_support_left": 0.5,
         "intent_support_right": 0.5,
         "intent_torso_forward": 0.5,
+        "intent_gait_coupling": 0.88,
         "intent_arm_counterbalance": 0.5,
         "intent_stop_recover": 0.5,
     })
@@ -1648,12 +1649,22 @@ class Simulation:
                     nodes = dict(self._cpg_node_snapshot)
                 if not nodes:
                     nodes = dict(self.agent.graph.nodes)
+                # Актуальный CoM из физики — иначе отставание массы (com_lag) в trunk_sync ломается в фоне.
+                try:
+                    obs_live = self.agent.env.observe()
+                    for _k in ("com_x", "com_y", "com_z"):
+                        if _k in obs_live:
+                            nodes[_k] = float(obs_live[_k])
+                except Exception:
+                    pass
                 targets = self._locomotion_controller.get_joint_targets(nodes, dt=dt)
+                cpg_sync = self._locomotion_controller.upper_body_cpg_sync()
                 self._enqueue_l1_motor_command(
                     source="cpg",
                     joint_targets=targets,
                     intents=getattr(self._locomotion_controller, "_last_motor_state", None),
                     dt=dt,
+                    cpg_sync=cpg_sync,
                 )
             except Exception as ex:
                 print(f"[Simulation] CPG loop: {ex}")
@@ -1685,8 +1696,9 @@ class Simulation:
         try:
             nodes = dict(self.agent.graph.nodes)
             targets = self._locomotion_controller.get_joint_targets(nodes, dt=dt)
+            cpg_sync = self._locomotion_controller.upper_body_cpg_sync()
             obs_before = dict(self.agent.env.observe())
-            fn(targets)
+            fn(targets, cpg_sync=cpg_sync)
             obs = self.agent.env.observe()
             self._sync_motor_state(obs, source="cpg", tick=self.tick)
             self._log_motor_command(
@@ -1767,16 +1779,18 @@ class Simulation:
         joint_targets: dict[str, float],
         intents: dict[str, float] | None = None,
         dt: float,
+        cpg_sync: dict[str, float] | None = None,
     ) -> None:
-        self._l1_motor_q.put(
-            {
-                "tick": int(self.tick),
-                "source": str(source),
-                "joint_targets": {k: float(v) for k, v in joint_targets.items()},
-                "intents": {k: float(v) for k, v in (intents or {}).items()},
-                "dt": float(dt),
-            }
-        )
+        payload: dict = {
+            "tick": int(self.tick),
+            "source": str(source),
+            "joint_targets": {k: float(v) for k, v in joint_targets.items()},
+            "intents": {k: float(v) for k, v in (intents or {}).items()},
+            "dt": float(dt),
+        }
+        if cpg_sync:
+            payload["cpg_sync"] = {k: float(v) for k, v in cpg_sync.items()}
+        self._l1_motor_q.put(payload)
         self._l1_last_cmd_tick = self.tick
 
     def _record_motor_burst_causal(
@@ -1823,6 +1837,7 @@ class Simulation:
             return
         targets = dict(latest.get("joint_targets") or {})
         intents = dict(latest.get("intents") or {})
+        cpg_sync = latest.get("cpg_sync")
         try:
             credit_every = int(os.environ.get("RKK_MOTOR_CREDIT_EVERY", "4"))
         except ValueError:
@@ -1831,7 +1846,10 @@ class Simulation:
         strong_intent = any(abs(float(v) - 0.5) > 0.12 for v in intents.values())
         should_credit = strong_intent and ((self.tick - self._l1_last_credit_tick) >= credit_every)
         obs_before = dict(self.agent.env.observe()) if should_credit else None
-        fn(targets)
+        if cpg_sync:
+            fn(targets, cpg_sync=dict(cpg_sync))
+        else:
+            fn(targets)
         obs_after = dict(self.agent.env.observe())
         self._sync_motor_state(obs_after, source=str(latest.get("source", "cpg")), tick=self.tick)
         self._log_motor_command(

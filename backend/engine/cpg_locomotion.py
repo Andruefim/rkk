@@ -6,6 +6,9 @@ Central Pattern Generator: фазовые осцилляторы для ритм
 (com_z + продвижение com_x, штраф за падение) крутит параметры CPG.
 
 Включается симуляцией при RKK_LOCOMOTION_CPG=1, humanoid, не fixed_root.
+
+Целостная походка: фаза бёдер + отставание CoM; сила связки задаётся каузальным узлом
+intent_gait_coupling (в среде по умолчанию 0.88).
 """
 from __future__ import annotations
 
@@ -14,6 +17,10 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
+
+# Ожидаемый микро-сдвиг нормализованного com_x за шаг при ходьбе; усиление штрафа при отставании массы.
+_COM_VEL_EXPECT = 0.022
+_COM_LAG_GAIN = 42.0
 
 
 class CPGNetwork(nn.Module):
@@ -103,6 +110,8 @@ class LocomotionController:
         self._reward_history: list[float] = []
         self._last_command: dict[str, float] = {}
         self._last_motor_state: dict[str, float] = {}
+        self._last_cpg_sync: dict[str, float] = {}
+        self._com_x_prev_step: float | None = None
 
     @staticmethod
     def _node(agent_nodes: dict[str, float], key: str) -> float:
@@ -111,16 +120,27 @@ class LocomotionController:
             v = agent_nodes.get(f"phys_{key}")
         return float(v if v is not None else 0.5)
 
+    def upper_body_cpg_sync(self) -> dict[str, float]:
+        """Фаза CPG + инерция CoM для согласованного корпуса с ногами (после get_joint_targets)."""
+        return dict(self._last_cpg_sync)
+
     def get_joint_targets(self, agent_nodes: dict[str, float], *, dt: float = 0.05) -> dict[str, float]:
         """
         6 осцилляторов → 6 суставов: lhip, rhip, lknee, rknee, lankle, rankle.
         intent_* модулируют амплитуду через external_command.
         """
+        _gc = agent_nodes.get("intent_gait_coupling")
+        if _gc is None:
+            _gc = agent_nodes.get("phys_intent_gait_coupling")
+        intent_gait_coupling = float(_gc if _gc is not None else 0.88)
+        gscale = float(np.clip(intent_gait_coupling, 0.0, 1.0))
+
         intents = {
             "intent_stride": self._node(agent_nodes, "intent_stride"),
             "intent_support_left": self._node(agent_nodes, "intent_support_left"),
             "intent_support_right": self._node(agent_nodes, "intent_support_right"),
             "intent_torso_forward": self._node(agent_nodes, "intent_torso_forward"),
+            "intent_gait_coupling": intent_gait_coupling,
             "intent_arm_counterbalance": self._node(agent_nodes, "intent_arm_counterbalance"),
             "intent_stop_recover": self._node(agent_nodes, "intent_stop_recover"),
         }
@@ -143,6 +163,37 @@ class LocomotionController:
         cmd = cmd * float(0.6 + 0.6 * eng)
 
         cpg_out = self.cpg.step(dt=dt, external_command=cmd)
+
+        # --- Whole-body: gait clock + CoM velocity lag; gscale — из узла intent_gait_coupling (каузальный граф). ---
+        sync: dict[str, float] = {}
+        with torch.no_grad():
+            pl = float(self.cpg._phase[0].item())
+            pr = float(self.cpg._phase[1].item())
+        gait_mid = 0.5 * (pl + pr)
+        s = math.sin(pl)
+        c_g = math.cos(gait_mid)
+        stride_n = max(0.0, float(stride))
+        com_x = self._node(agent_nodes, "com_x")
+        if self._com_x_prev_step is None:
+            self._com_x_prev_step = com_x
+        dcx = float(com_x - self._com_x_prev_step)
+        self._com_x_prev_step = com_x
+        exp_scale = max(1e-6, float(_COM_VEL_EXPECT))
+        expected_dx = exp_scale * stride_n * (0.6 + 0.4 * float(eng))
+        com_lag = (
+            float(np.clip((expected_dx - dcx) * float(_COM_LAG_GAIN), 0.0, 1.0))
+            if stride_n > 0.04
+            else 0.0
+        )
+        sync = {
+            "sin": s,
+            "cos_mid": c_g,
+            "stride_n": stride_n,
+            "com_lag": com_lag,
+            "dcx": dcx,
+            "gscale": gscale,
+        }
+        self._last_cpg_sync = sync
 
         hip_center = 0.50
         knee_center = 0.50
@@ -215,6 +266,12 @@ class LocomotionController:
             cx = float(com_x)
             forward_bonus = 2.0 * max(0.0, cx - 0.46)
             back_penalty = 1.6 * max(0.0, 0.41 - cx)
+            coherence = 0.0
+            if self._last_cpg_sync:
+                cl = float(self._last_cpg_sync.get("com_lag", 0.0))
+                sn = float(self._last_cpg_sync.get("stride_n", 0.0))
+                gs = float(self._last_cpg_sync.get("gscale", 1.0))
+                coherence = 0.35 * (1.0 - cl) * min(1.0, sn * 2.0) * gs
             reward = (
                 rz * 3.0
                 + posture * 3.0
@@ -223,6 +280,7 @@ class LocomotionController:
                 + dx * 1.85
                 + forward_bonus
                 - back_penalty
+                + coherence
                 - bias_pen * 1.0
                 - (5.0 if fallen else 0.0)
             )
@@ -258,6 +316,7 @@ class LocomotionController:
             amp_m = float(torch.sigmoid(self.cpg.amplitude).mean().item())
             fr_m = float((torch.sigmoid(self.cpg.frequency) * 3.0 + 0.5).mean().item())
         rh = self._reward_history[-32:] if self._reward_history else []
+        lag = float(self._last_cpg_sync.get("com_lag", 0.0)) if self._last_cpg_sync else 0.0
         return {
             "cpg_steps": self._step_count,
             "amplitude_mean": round(amp_m, 4),
@@ -265,4 +324,5 @@ class LocomotionController:
             "reward_recent_mean": round(float(np.mean(rh)), 4) if rh else 0.0,
             "last_command_size": len(self._last_command),
             "last_intent_stride": round(float(self._last_motor_state.get("intent_stride", 0.5)), 4) if self._last_motor_state else 0.5,
+            "cpg_com_lag": round(lag, 4),
         }

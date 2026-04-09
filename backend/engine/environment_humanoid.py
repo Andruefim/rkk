@@ -60,9 +60,14 @@ MOTOR_INTENT_VARS: tuple[str, ...] = (
     "intent_support_left",
     "intent_support_right",
     "intent_torso_forward",
+    "intent_gait_coupling",
     "intent_arm_counterbalance",
     "intent_stop_recover",
 )
+# Дефолты узлов intent_* (остальные 0.5).
+MOTOR_INTENT_DEFAULTS: dict[str, float] = {
+    "intent_gait_coupling": 0.88,
+}
 # Derived motor observables that should be visible to the graph and hybrid view.
 MOTOR_OBSERVABLE_VARS: tuple[str, ...] = (
     "gait_phase_l",
@@ -1600,7 +1605,9 @@ class EnvironmentHumanoid:
         self.cpg_owns_legs: bool = False
         # Самомодель: значения держим в среде, observe() мержит с физикой; intervene(self_*) не трогает суставы.
         self._self_state: dict[str, float] = {k: 0.5 for k in SELF_VARS}
-        self._motor_state: dict[str, float] = {k: 0.5 for k in MOTOR_INTENT_VARS}
+        self._motor_state: dict[str, float] = {
+            k: float(MOTOR_INTENT_DEFAULTS.get(k, 0.5)) for k in MOTOR_INTENT_VARS
+        }
 
     # ── Fixed root switch ─────────────────────────────────────────────────────
     @property
@@ -1803,10 +1810,13 @@ class EnvironmentHumanoid:
         self._sim.step(self.steps_per_do)
         return self.observe()
 
-    def _apply_upper_body_from_intents(self) -> None:
+    def _apply_upper_body_from_intents(self, *, cpg_sync: dict[str, float] | None = None) -> None:
         """
         Позвоночник + руки из тех же intent_*, что и весь моторный слой (граф / скиллы).
         Вызывается и при полном intervene, и перед CPG на ногах — руки не «застывают» между тиками.
+
+        cpg_sync (опц.): фаза осцилляторов CPG + оценка отставания CoM — качает торс и плечи в фазе с ногами,
+        чтобы масса тела не оставалась «мертвой» пока шагают только ноги.
         """
         intents = self._motor_state
         stride = float(intents.get("intent_stride", 0.5) - 0.5)
@@ -1816,33 +1826,54 @@ class EnvironmentHumanoid:
         arms = float(intents.get("intent_arm_counterbalance", 0.5) - 0.5)
         recover = float(intents.get("intent_stop_recover", 0.5) - 0.5)
 
+        pitch_add = 0.0
+        yaw_add = 0.0
+        lsh_add = 0.0
+        rsh_add = 0.0
+        if cpg_sync:
+            s = float(cpg_sync.get("sin", 0.0))
+            c_m = float(cpg_sync.get("cos_mid", 0.0))
+            sn = float(np.clip(cpg_sync.get("stride_n", 0.0), 0.0, 1.0))
+            lag = float(np.clip(cpg_sync.get("com_lag", 0.0), 0.0, 1.0))
+            # Сагиттальное качание + опережение при отставании проекции массы (инерция).
+            pitch_add = (-0.055 * s * sn) + (-0.06 * lag * sn)
+            yaw_add = 0.05 * c_m * sn
+            # Руки в противофазу ногам (естественный размах при ходьбе).
+            lsh_add = -0.065 * s * sn
+            rsh_add = 0.065 * s * sn
+            gs = float(np.clip(cpg_sync.get("gscale", 1.0), 0.0, 1.0))
+            pitch_add *= gs
+            yaw_add *= gs
+            lsh_add *= gs
+            rsh_add *= gs
+
         def clip01(v: float) -> float:
             return float(np.clip(v, 0.05, 0.95))
 
         if self._fixed_root:
             self._sim.set_joint(
                 "spine_pitch",
-                clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms - 0.08 * max(0.0, stride)),
+                clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms - 0.2 * max(0.0, stride) + pitch_add),
             )
-            self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
-            self._sim.set_joint("lshoulder", clip01(0.50 + 0.05 * arms + 0.02 * recover))
-            self._sim.set_joint("rshoulder", clip01(0.50 - 0.05 * arms + 0.02 * recover))
+            self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r) + yaw_add))
+            self._sim.set_joint("lshoulder", clip01(0.50 + 0.05 * arms + 0.02 * recover + lsh_add))
+            self._sim.set_joint("rshoulder", clip01(0.50 - 0.05 * arms + 0.02 * recover + rsh_add))
             self._sim.set_joint("lelbow", clip01(0.50 + 0.06 * arms))
             self._sim.set_joint("relbow", clip01(0.50 - 0.06 * arms))
             return
 
         self._sim.set_joint(
             "spine_pitch",
-            clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms - 0.08 * max(0.0, stride)),
+            clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms - 0.08 * max(0.0, stride) + pitch_add),
         )
-        self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r)))
+        self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r) + yaw_add))
         self._sim.set_joint(
             "lshoulder",
-            clip01(0.50 + 0.04 * arms + 0.01 * stride + 0.02 * recover),
+            clip01(0.50 + 0.04 * arms + 0.01 * stride + 0.02 * recover + lsh_add),
         )
         self._sim.set_joint(
             "rshoulder",
-            clip01(0.50 - 0.04 * arms - 0.01 * stride + 0.02 * recover),
+            clip01(0.50 - 0.04 * arms - 0.01 * stride + 0.02 * recover + rsh_add),
         )
         self._sim.set_joint("lelbow", clip01(0.50 + 0.05 * arms))
         self._sim.set_joint("relbow", clip01(0.50 - 0.05 * arms))
@@ -1875,10 +1906,16 @@ class EnvironmentHumanoid:
             self._sim.set_joint("rankle", clip01(0.50 + 0.08 * sup_r + 0.03 * stride - 0.04 * recover))
         self._apply_upper_body_from_intents()
 
-    def apply_cpg_leg_targets(self, targets: dict[str, float]) -> None:
+    def apply_cpg_leg_targets(
+        self,
+        targets: dict[str, float],
+        *,
+        cpg_sync: dict[str, float] | None = None,
+    ) -> None:
         """
         Phase A locomotion: низкоуровневые цели на ноги без увеличения n_interventions.
         Also marks cpg_owns_legs=True so _apply_motor_intents doesn't fight CPG.
+        cpg_sync: фаза CPG + отставание CoM — согласует корпус с ритмом ног.
         """
         if self._fixed_root:
             return
@@ -1890,7 +1927,7 @@ class EnvironmentHumanoid:
         if n_sub <= 0:
             n_sub = max(1, self.steps_per_do // 2)
         n_sub = min(max(n_sub, 1), 32)
-        self._apply_upper_body_from_intents()
+        self._apply_upper_body_from_intents(cpg_sync=cpg_sync)
         for name, val in targets.items():
             if name in LEG_VARS:
                 self._sim.set_joint(name, float(np.clip(val, 0.05, 0.95)))
@@ -1985,6 +2022,8 @@ class EnvironmentHumanoid:
                 {"from_": "intent_arm_counterbalance", "to": "lshoulder", "weight": 0.45},
                 {"from_": "intent_arm_counterbalance", "to": "rshoulder", "weight": 0.45},
                 {"from_": "intent_torso_forward", "to": "spine_pitch", "weight": 0.52},
+                {"from_": "intent_stride", "to": "intent_gait_coupling", "weight": 0.40},
+                {"from_": "self_energy", "to": "intent_gait_coupling", "weight": 0.26},
                 {"from_": "lelbow",    "to": "cube0_z", "weight": 0.3},
                 {"from_": "relbow",    "to": "cube1_z", "weight": 0.3},
                 {"from_": "lshoulder", "to": "lelbow",  "weight": 0.5},
@@ -2012,6 +2051,10 @@ class EnvironmentHumanoid:
             {"from_": "intent_support_right", "to": "rknee", "weight": 0.45},
             {"from_": "intent_torso_forward", "to": "spine_pitch", "weight": 0.58},
             {"from_": "intent_torso_forward", "to": "com_x", "weight": 0.32},
+            {"from_": "intent_stride", "to": "intent_gait_coupling", "weight": 0.42},
+            {"from_": "self_energy", "to": "intent_gait_coupling", "weight": 0.28},
+            {"from_": "intent_stop_recover", "to": "intent_gait_coupling", "weight": -0.35},
+            {"from_": "posture_stability", "to": "intent_gait_coupling", "weight": 0.22},
             {"from_": "intent_stop_recover", "to": "com_z", "weight": 0.35},
             {"from_": "intent_arm_counterbalance", "to": "lshoulder", "weight": 0.4},
             {"from_": "intent_arm_counterbalance", "to": "rshoulder", "weight": 0.4},
@@ -2041,7 +2084,7 @@ class EnvironmentHumanoid:
         for k in SELF_VARS:
             self._self_state[k] = 0.5
         for k in MOTOR_INTENT_VARS:
-            self._motor_state[k] = 0.5
+            self._motor_state[k] = float(MOTOR_INTENT_DEFAULTS.get(k, 0.5))
 
     # ── Camera / Skeleton ─────────────────────────────────────────────────────
     def get_frame_base64(self, view: str | None = None, **kwargs) -> str | None:
@@ -2076,6 +2119,9 @@ class EnvironmentHumanoid:
 def humanoid_hardcoded_seeds() -> list[dict]:
     """Биомеханические text priors для полного режима (суставы → COM, стопы)."""
     return [
+        {"from_": "intent_stride", "to": "intent_gait_coupling", "weight": 0.24, "alpha": 0.05},
+        {"from_": "posture_stability", "to": "intent_gait_coupling", "weight": 0.20, "alpha": 0.05},
+        {"from_": "intent_stop_recover", "to": "intent_gait_coupling", "weight": -0.20, "alpha": 0.05},
         {"from_": "intent_stride", "to": "intent_torso_forward", "weight": 0.24, "alpha": 0.05},
         {"from_": "intent_stride", "to": "spine_pitch", "weight": 0.20, "alpha": 0.05},
         {"from_": "intent_stride", "to": "com_x", "weight": 0.18, "alpha": 0.05},
