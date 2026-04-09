@@ -1139,7 +1139,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if var_name == "neck_yaw":
                     self._neck_euler[2] = 0.55 * real_pos
                 else:
-                    self._neck_euler[0] = 0.45 * real_pos
+                    # БЫЛО: self._neck_euler[0] = 0.45 * real_pos
+                    self._neck_euler[1] = 0.45 * real_pos  # ИСПРАВЛЕНО: Индекс 1 (Ось Y - Pitch)
                 ex, ey, ez = float(self._neck_euler[0]), float(self._neck_euler[1]), float(self._neck_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
@@ -1153,7 +1154,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if var_name == "spine_yaw":
                     self._spine_euler[2] = 0.50 * real_pos
                 else:
-                    self._spine_euler[0] = 0.25 * real_pos
+                    # БЫЛО: self._spine_euler[0] = 0.25 * real_pos
+                    self._spine_euler[1] = 0.25 * real_pos  # ИСПРАВЛЕНО: Индекс 1 (Ось Y - Pitch)
                 ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
@@ -1835,10 +1837,12 @@ class EnvironmentHumanoid:
             c_m = float(cpg_sync.get("cos_mid", 0.0))
             sn = float(np.clip(cpg_sync.get("stride_n", 0.0), 0.0, 1.0))
             lag = float(np.clip(cpg_sync.get("com_lag", 0.0), 0.0, 1.0))
-            # Сагиттальное качание + опережение при отставании проекции массы (инерция).
-            pitch_add = (-0.055 * s * sn) + (-0.06 * lag * sn)
+            
+            # ИСПРАВЛЕНО: Меняем знак у lag на плюс и немного увеличиваем вес.
+            # Теперь при отставании массы робот будет наклоняться ВПЕРЕД (+0.15), чтобы поймать баланс.
+            pitch_add = (-0.055 * s * sn) + (0.15 * lag * sn)
+            
             yaw_add = 0.05 * c_m * sn
-            # Руки в противофазу ногам (естественный размах при ходьбе).
             lsh_add = -0.065 * s * sn
             rsh_add = 0.065 * s * sn
             gs = float(np.clip(cpg_sync.get("gscale", 1.0), 0.0, 1.0))
@@ -1853,7 +1857,8 @@ class EnvironmentHumanoid:
         if self._fixed_root:
             self._sim.set_joint(
                 "spine_pitch",
-                clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms - 0.2 * max(0.0, stride) + pitch_add),
+                # ИСПРАВЛЕНО: Меняем минус на плюс перед stride
+                clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms + 0.15 * max(0.0, stride) + pitch_add),
             )
             self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r) + yaw_add))
             self._sim.set_joint("lshoulder", clip01(0.50 + 0.05 * arms + 0.02 * recover + lsh_add))
@@ -1864,7 +1869,8 @@ class EnvironmentHumanoid:
 
         self._sim.set_joint(
             "spine_pitch",
-            clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms - 0.08 * max(0.0, stride) + pitch_add),
+            # ИСПРАВЛЕНО: Меняем минус на плюс перед stride (с 0.08 на 0.12 для лучшего наката массы)
+            clip01(0.50 + 0.10 * torso + 0.10 * recover + 0.05 * arms + 0.12 * max(0.0, stride) + pitch_add),
         )
         self._sim.set_joint("spine_yaw", clip01(0.5 + 0.06 * (sup_l - sup_r) + yaw_add))
         self._sim.set_joint(
