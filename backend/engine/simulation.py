@@ -57,6 +57,29 @@ from engine.value_layer import HomeostaticBounds
 from engine.wm_neural_ode import integrate_world_model_step
 from engine.rsi_structural import NeurogenesisEngine
 
+# Level 1-A: Embodied LLM Reward
+try:
+    from engine.embodied_llm_reward import (
+        EmbodiedRewardController,
+        PoseSnapshot,
+        embodied_reward_enabled,
+    )
+    _EMBODIED_REWARD_AVAILABLE = True
+except ImportError:
+    _EMBODIED_REWARD_AVAILABLE = False
+    print("[Simulation] embodied_llm_reward.py not found")
+
+# Level 1-B: Visual Grounding
+try:
+    from engine.visual_grounding import (
+        VisualGroundingController,
+        get_pybullet_state_from_humanoid_env,
+    )
+    _VISUAL_GROUNDING_AVAILABLE = True
+except ImportError:
+    _VISUAL_GROUNDING_AVAILABLE = False
+    print("[Simulation] visual_grounding.py not found")
+
 # Motor Cortex import (lazy — инициализируется при первом вызове)
 try:
     from engine.motor_cortex import MotorCortexLibrary as _MotorCortexLibrary
@@ -426,6 +449,14 @@ class Simulation:
         # Phase C: full RSI (GNN NAS-lite, CPG perturb, skill curriculum, VL relax)
         self._rsi_full = None
         self.neuro_engine = NeurogenesisEngine()
+        # Level 1-A: Embodied LLM Reward
+        self._embodied_reward_ctrl = (
+            EmbodiedRewardController() if _EMBODIED_REWARD_AVAILABLE else None
+        )
+        # Level 1-B: Visual Grounding
+        self._visual_grounding_ctrl = (
+            VisualGroundingController() if _VISUAL_GROUNDING_AVAILABLE else None
+        )
         # Phase D: Motor Cortex (learned motor programs + CPG annealing)
         self._motor_cortex: "_MotorCortexLibrary | None" = None
         self._mc_posture_window: deque = deque(maxlen=200)
@@ -1030,11 +1061,18 @@ class Simulation:
                 self._l3_next_due_ts = 0.0
                 self._l3_last_tick = 0
                 self._motor_state = MotorState()
+                # Reset Level 1 controllers on world switch
+                if _EMBODIED_REWARD_AVAILABLE and self._embodied_reward_ctrl is not None:
+                    self._embodied_reward_ctrl = EmbodiedRewardController()
+                if _VISUAL_GROUNDING_AVAILABLE and self._visual_grounding_ctrl is not None:
+                    self._visual_grounding_ctrl = VisualGroundingController()
+                if hasattr(self, "_mc_posture_window"):
+                    self._mc_posture_window.clear()
+                if hasattr(self, "_mc_fallen_count_window"):
+                    self._mc_fallen_count_window.clear()
                 # Motor Cortex reset on world switch
                 self._motor_cortex = None
                 self._mc_abstract_nodes_injected = False
-                self._mc_posture_window.clear()
-                self._mc_fallen_count_window.clear()
                 self._clear_fall_recovery()
                 self._drain_simple_queue(self._l1_motor_q)
                 self._l1_last_cmd_tick = 0
@@ -1764,9 +1802,6 @@ class Simulation:
             com_z = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
             com_x = float(obs.get("com_x", obs.get("phys_com_x", 0.5)))
 
-            self._mc_posture_window.append(posture)
-            self._mc_fallen_count_window.append(1 if fallen else 0)
-
             # Phase D: train motor cortex programs + anneal CPG
             if mc is not None:
                 reward = (
@@ -1793,6 +1828,9 @@ class Simulation:
             self._locomotion_controller.learn_from_reward(
                 com_z, com_x, fallen, motor_obs=self._motor_obs_payload(obs)
             )
+            # Track for embodied reward and motor cortex
+            self._mc_posture_window.append(posture)
+            self._mc_fallen_count_window.append(1 if fallen else 0)
         except Exception as ex:
             import traceback
             print(f"[Simulation] CPG+MC locomotion error: {ex}")
@@ -2308,6 +2346,111 @@ class Simulation:
             }
         return out
 
+    def _pose_snapshot(self) -> "PoseSnapshot | None":
+        """Level 1-A: Construct PoseSnapshot from current environment state."""
+        if not _EMBODIED_REWARD_AVAILABLE:
+            return None
+        try:
+            env = self.agent.env
+            obs = dict(env.observe())
+            nodes = dict(self.agent.graph.nodes)
+            posture_window = (
+                list(self._mc_posture_window)
+                if hasattr(self, "_mc_posture_window")
+                else []
+            )
+            fallen_window = (
+                list(self._mc_fallen_count_window)
+                if hasattr(self, "_mc_fallen_count_window")
+                else []
+            )
+            recent_fall_rate = float(np.mean(fallen_window)) if fallen_window else 0.0
+            mean_posture = float(np.mean(posture_window)) if posture_window else 0.5
+            mc = self._ensure_motor_cortex() if hasattr(self, "_ensure_motor_cortex") else None
+            cpg_w = mc.cpg_weight if mc is not None else 1.0
+            mc_q = mc._quality_ema if mc is not None else 0.0
+            return PoseSnapshot.from_obs_and_graph(
+                obs=obs,
+                graph_nodes=nodes,
+                tick=self.tick,
+                fallen=self._fall_count > 0,
+                fall_count=self._fall_count,
+                cpg_weight=cpg_w,
+                mc_quality_ema=mc_q,
+                recent_fall_rate=recent_fall_rate,
+                mean_posture_recent=mean_posture,
+            )
+        except Exception as e:
+            print(f"[Simulation] _pose_snapshot error: {e}")
+            return None
+
+    async def _run_embodied_reward_async(self) -> None:
+        """Level 1-A: Run embodied LLM reward shaping (async, called as task)."""
+        if not _EMBODIED_REWARD_AVAILABLE or self._embodied_reward_ctrl is None:
+            return
+        pose = self._pose_snapshot()
+        if pose is None:
+            return
+        try:
+            mc = self._ensure_motor_cortex() if hasattr(self, "_ensure_motor_cortex") else None
+            result = await self._embodied_reward_ctrl.run(
+                pose=pose,
+                agent=self.agent,
+                locomotion_ctrl=self._locomotion_controller,
+                motor_cortex=mc,
+                llm_url=get_ollama_generate_url(),
+                llm_model=get_ollama_model(),
+            )
+            if result.ok and (result.verbal or result.priority_issue):
+                issue_str = f" [{result.priority_issue}]" if result.priority_issue else ""
+                self._add_event(
+                    f"🧠 EmbodiedLLM: r={result.combined_reward:+.2f}"
+                    f" pos={result.posture_score:.2f} gait={result.gait_quality:.2f}"
+                    f"{issue_str} +{len(result.seeds)}seeds",
+                    "#ff99ff",
+                    "phase",
+                )
+        except Exception as e:
+            print(f"[Simulation] embodied reward error: {e}")
+
+    def _maybe_run_visual_grounding(self) -> None:
+        """Level 1-B: Update visual-body grounding (slot → joint mapping)."""
+        if not _VISUAL_GROUNDING_AVAILABLE or self._visual_grounding_ctrl is None:
+            return
+        if not self._visual_mode or self._visual_env is None:
+            return
+        if not self._visual_grounding_ctrl.should_run(self.tick):
+            return
+
+        # Get PyBullet state
+        base_env = self._base_env_ref
+        physics_client, robot_id, link_names = None, None, []
+        if base_env is not None:
+            physics_client, robot_id, link_names = get_pybullet_state_from_humanoid_env(
+                base_env
+            )
+
+        result = self._visual_grounding_ctrl.update(
+            tick=self.tick,
+            visual_env=self._visual_env,
+            agent_graph=self.agent.graph,
+            physics_client=physics_client,
+            robot_id=robot_id,
+            link_names=link_names,
+        )
+
+        if result.get("ok") and result.get("edges_injected", 0) > 0:
+            slot_map = result.get("slot_to_joint", {})
+            if slot_map:
+                mapping_str = ", ".join(
+                    f"{k}→{v}" for k, v in list(slot_map.items())[:4]
+                )
+                self._add_event(
+                    f"👁 Grounding: +{result['edges_injected']} edges [{mapping_str}]",
+                    "#44ffcc",
+                    "phase",
+                )
+
     # ── Tick ──────────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
         hz = _agent_loop_hz_from_env()
@@ -2562,6 +2705,58 @@ class Simulation:
         if dr > self._best_discovery_rate + 1e-5:
             self._best_discovery_rate = dr
             self._last_dr_gain_tick = self.tick
+
+        # Level 1-A: Embodied LLM Reward Shaping (async task)
+        if (
+            _EMBODIED_REWARD_AVAILABLE
+            and self._embodied_reward_ctrl is not None
+            and self.current_world == "humanoid"
+            and not self._fixed_root_active
+            and embodied_reward_enabled()
+            and self._embodied_reward_ctrl.should_run(self.tick)
+        ):
+            import asyncio
+
+            def _run_embodied_in_thread() -> None:
+                asyncio.run(self._run_embodied_reward_async())
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            try:
+                if loop is not None:
+                    try:
+                        loop.create_task(self._run_embodied_reward_async())
+                    except RuntimeError:
+                        self._llm_loop_executor.submit(_run_embodied_in_thread)
+                else:
+                    # rkk-agent-loop и др.: в потоке нет loop — не блокируем тик
+                    self._llm_loop_executor.submit(_run_embodied_in_thread)
+            except Exception as e:
+                print(f"[Simulation] embodied reward schedule error: {e}")
+
+        # Level 1-B: Visual Body Grounding
+        self._maybe_run_visual_grounding()
+
+        # Level 1-C: Standalone reconstruction training (warm up decoder early)
+        if (
+            self._visual_mode
+            and self._visual_env is not None
+            and self.tick % 5 == 0
+            and hasattr(self._visual_env, "cortex")
+        ):
+            cortex = self._visual_env.cortex
+            if (
+                hasattr(cortex, "train_reconstruction_only")
+                and hasattr(self._visual_env, "_last_frame")
+                and self._visual_env._last_frame is not None
+                and cortex.n_train == 0  # only during warmup phase
+            ):
+                try:
+                    cortex.train_reconstruction_only(self._visual_env._last_frame)
+                except Exception:
+                    pass
 
         # Demon
         if self.demon._last_action is not None:
@@ -3013,6 +3208,16 @@ class Simulation:
                 for c in self._concepts_cache
             ],
             "memory":        self._memory_snapshot_meta(),
+            "embodied_reward": (
+                self._embodied_reward_ctrl.snapshot()
+                if self._embodied_reward_ctrl is not None
+                else None
+            ),
+            "visual_grounding": (
+                self._visual_grounding_ctrl.snapshot()
+                if self._visual_grounding_ctrl is not None
+                else None
+            ),
             "phase1":        self._phase1_snapshot_meta(),
             "phase2":        self._phase2_snapshot_meta(),
         }
