@@ -360,19 +360,51 @@ class CausalGraph:
         if not hasattr(torch, "compile"):
             return
         try:
-            self._core = torch.compile(self._core, mode="reduce-overhead")
+            # dynamic=True: d меняется (neurogenesis, visual rebind) — без этого inductor
+            # может зафиксировать старую размерность и падать «expected sequence length …».
+            try:
+                self._core = torch.compile(
+                    self._core, mode="reduce-overhead", dynamic=True
+                )
+            except TypeError:
+                self._core = torch.compile(self._core, mode="reduce-overhead")
             print(f"[CausalGraph] GNN torch.compile (d={self._d}, device={self.device.type})")
         except Exception as e:
             print(f"[CausalGraph] torch.compile skipped: {e}")
+
+    def _unwrap_gnn_core(self):
+        """Снять обёртку torch.compile — resize_to только у «сырого» CausalGNNCore."""
+        c = self._core
+        if c is None:
+            return None
+        om = getattr(c, "_orig_mod", None)
+        if om is not None:
+            return om
+        return c
+
+    def _coerce_row_to_d(self, row: list[float] | list) -> list[float]:
+        """Строки буферов после роста d могут быть короче/длиннее текущего _node_ids."""
+        d = self._d
+        r = [float(x) for x in row]
+        if len(r) == d:
+            return r
+        if len(r) < d:
+            tail = [
+                float(self.nodes.get(self._node_ids[i], 0.5))
+                for i in range(len(r), d)
+            ]
+            return r + tail
+        return r[:d]
 
     def _rebuild_core(self):
         if USE_GNN:
             from engine.causal_gnn import CausalGNNCore
             old_W = None
             if self._core is not None:
-                # GNN resize: мигрируем через resize_to если можем
-                if hasattr(self._core, 'resize_to'):
-                    new_core  = self._core.resize_to(self._d)
+                # GNN resize: мигрируем через resize_to если можем (не через torch.compile обёртку)
+                raw = self._unwrap_gnn_core()
+                if isinstance(raw, CausalGNNCore) and hasattr(raw, "resize_to"):
+                    new_core = raw.resize_to(self._d)
                     self._core = new_core
                     self._maybe_compile_gnn_core()
                     self._optim = torch.optim.Adam(self._core.parameters(), lr=5e-3)
@@ -458,17 +490,19 @@ class CausalGraph:
         rows_a: list[list[float]] = []
 
         for item in int_b[-n_i:] if n_i > 0 else []:
-            rows_X.append(item["obs_before"])
-            rows_Y.append(item["obs_after"])
+            rows_X.append(self._coerce_row_to_d(item["obs_before"]))
+            rows_Y.append(self._coerce_row_to_d(item["obs_after"]))
             arow = [0.0] * self._d
-            arow[item["idx"]] = item["val"]
+            idx = int(item["idx"])
+            if 0 <= idx < self._d:
+                arow[idx] = float(item["val"])
             rows_a.append(arow)
 
         if n_p > 0:
             start_t = L - n_p - 1
             for k in range(n_p):
-                rows_X.append(obs_b[start_t + k])
-                rows_Y.append(obs_b[start_t + k + 1])
+                rows_X.append(self._coerce_row_to_d(obs_b[start_t + k]))
+                rows_Y.append(self._coerce_row_to_d(obs_b[start_t + k + 1]))
                 rows_a.append([0.0] * self._d)
 
         X_t = torch.tensor(rows_X, dtype=torch.float32, device=self.device)
