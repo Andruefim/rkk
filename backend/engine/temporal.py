@@ -164,7 +164,11 @@ class TemporalBlankets:
                 vals.append(0.0)
             u = torch.tensor(vals, dtype=torch.float32, device=self.device)
         else:
-            u = observation.to(self.device)
+            u = observation.to(self.device).reshape(-1)
+            if u.numel() > self.d_input:
+                u = u[: self.d_input]
+            elif u.numel() < self.d_input:
+                u = torch.nn.functional.pad(u, (0, self.d_input - u.numel()))
 
         # ── Fast step ──
         # Контекст от slow SSM добавляется как граничное условие
@@ -246,7 +250,14 @@ class TemporalBlankets:
 
         self.optim.zero_grad()
         y_pred, _ = self.fast.step(u_prev, self.h_fast.detach())
-        loss = nn.functional.mse_loss(y_pred, target_obs.to(self.device))
+        target = target_obs.to(self.device).reshape(-1)
+        d = self.d_input
+        if target.numel() != d:
+            if target.numel() > d:
+                target = target[:d]
+            else:
+                target = torch.nn.functional.pad(target, (0, d - target.numel()))
+        loss = nn.functional.mse_loss(y_pred, target)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.fast.parameters(), 1.0)
         self.optim.step()

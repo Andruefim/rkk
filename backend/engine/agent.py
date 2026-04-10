@@ -925,10 +925,11 @@ class RKKAgent:
             actual_ig=actual_ig,
         )
 
-        # SSM train
+        # SSM train — размерность = temporal.d_input (= |graph._node_ids|), не только env.variable_ids
         u_next = torch.tensor(
-            [observed_env.get(n, 0.0) for n in self.env.variable_ids],
-            dtype=torch.float32, device=self.device
+            [float(self.graph.nodes.get(n, 0.5)) for n in self.graph._node_ids],
+            dtype=torch.float32,
+            device=self.device,
         )
         self.temporal.train_step(u_next)
 

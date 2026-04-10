@@ -112,7 +112,16 @@ def unpack_graph(agent, data: dict[str, Any]) -> None:
 def unpack_temporal(agent, data: dict[str, Any], device: torch.device) -> None:
     from engine.temporal import TemporalBlankets
 
-    d_in = int(data["d_input"])
+    # Граф — источник истины: после neurogenesis / смены мира в сейве могли разъехаться
+    # pack_graph (node_ids) и pack_temporal (d_input).
+    d_graph = len(agent.graph._node_ids)
+    d_saved = int(data["d_input"]) if data.get("d_input") is not None else d_graph
+    if d_saved != d_graph:
+        print(
+            f"[RKK] temporal/graph dimension sync: saved d_input={d_saved}, "
+            f"graph nodes={d_graph} — TemporalBlankets resized to graph"
+        )
+    d_in = d_graph
     if agent.temporal.d_input != d_in:
         agent.temporal = TemporalBlankets(d_input=d_in, device=device)
     tb = agent.temporal
