@@ -80,6 +80,35 @@ except ImportError:
     _VISUAL_GROUNDING_AVAILABLE = False
     print("[Simulation] visual_grounding.py not found")
 
+# Level 2-D: Episodic Fall Memory
+try:
+    from engine.episodic_memory import EpisodicMemory, episode_memory_enabled
+    _EPISODIC_MEMORY_AVAILABLE = True
+except ImportError:
+    _EPISODIC_MEMORY_AVAILABLE = False
+    print("[Simulation] episodic_memory.py not found")
+
+# Level 2-E: LLM Curriculum Generator
+try:
+    from engine.llm_curriculum import CurriculumScheduler, curriculum_enabled
+    _CURRICULUM_AVAILABLE = True
+except ImportError:
+    _CURRICULUM_AVAILABLE = False
+    print("[Simulation] llm_curriculum.py not found")
+
+# Level 2-F: RSSM Temporal World Model
+try:
+    from engine.temporal_world_model import (
+        maybe_upgrade_graph_to_rssm,
+        RSSMTrainer,
+        RSSMImagination,
+        rssm_enabled,
+    )
+    _RSSM_AVAILABLE = True
+except ImportError:
+    _RSSM_AVAILABLE = False
+    print("[Simulation] temporal_world_model.py not found")
+
 # Motor Cortex import (lazy — инициализируется при первом вызове)
 try:
     from engine.motor_cortex import MotorCortexLibrary as _MotorCortexLibrary
@@ -457,6 +486,25 @@ class Simulation:
         self._visual_grounding_ctrl = (
             VisualGroundingController() if _VISUAL_GROUNDING_AVAILABLE else None
         )
+        # Level 2-D: Episodic Fall Memory
+        self._episodic_memory = (
+            EpisodicMemory() if _EPISODIC_MEMORY_AVAILABLE else None
+        )
+        self._last_action_for_memory: tuple[str, float] | None = None
+        self._last_fall_memory_tick: int = -999_999
+
+        # Level 2-E: LLM Curriculum
+        self._curriculum = (
+            CurriculumScheduler() if _CURRICULUM_AVAILABLE else None
+        )
+        self._curriculum_apply_every: int = 50
+
+        # Level 2-F: RSSM
+        self._rssm_trainer: "RSSMTrainer | None" = None
+        self._rssm_imagination: "RSSMImagination | None" = None
+        self._rssm_upgraded: bool = False
+        self._rssm_upgrade_tick: int = -1
+
         # Phase D: Motor Cortex (learned motor programs + CPG annealing)
         self._motor_cortex: "_MotorCortexLibrary | None" = None
         self._mc_posture_window: deque = deque(maxlen=200)
@@ -1070,6 +1118,20 @@ class Simulation:
                     self._mc_posture_window.clear()
                 if hasattr(self, "_mc_fallen_count_window"):
                     self._mc_fallen_count_window.clear()
+                # Reset Level 2 controllers
+                if _EPISODIC_MEMORY_AVAILABLE and self._episodic_memory is not None:
+                    from engine.episodic_memory import EpisodicMemory
+
+                    self._episodic_memory = EpisodicMemory()
+                if _CURRICULUM_AVAILABLE and self._curriculum is not None:
+                    from engine.llm_curriculum import CurriculumScheduler
+
+                    self._curriculum = CurriculumScheduler()
+                self._last_action_for_memory = None
+                self._last_fall_memory_tick = -999_999
+                self._rssm_upgraded = False
+                self._rssm_trainer = None
+                self._rssm_imagination = None
                 # Motor Cortex reset on world switch
                 self._motor_cortex = None
                 self._mc_abstract_nodes_injected = False
@@ -1596,6 +1658,16 @@ class Simulation:
             "cf_predicted": result.get("cf_predicted") or {},
             "cf_observed": result.get("cf_observed") or {},
             "slot_lexicon": _slot_lexicon_summary(self._visual_env),
+            "fall_history": (
+                self._episodic_memory.get_llm_context_block(max_falls=5)
+                if self._episodic_memory is not None
+                else ""
+            ),
+            "curriculum_stage": (
+                self._curriculum.current_stage.name
+                if self._curriculum is not None
+                else ""
+            ),
             "run_level3": self._should_run_level3(triggers),
             "llm_url": get_ollama_generate_url(),
             "llm_model": get_ollama_model(),
@@ -2451,6 +2523,211 @@ class Simulation:
                     "phase",
                 )
 
+    def _record_last_action(self, result: dict) -> None:
+        """Level 2-D: Track last action for episodic memory."""
+        if not result.get("blocked") and not result.get("skipped"):
+            var = result.get("variable")
+            val = result.get("value")
+            if var is not None and val is not None:
+                self._last_action_for_memory = (str(var), float(val))
+
+    def _update_episodic_memory(
+        self, tick: int, obs: dict, fallen: bool, posture: float
+    ) -> None:
+        """Level 2-D: Update episodic memory with current state."""
+        if not _EPISODIC_MEMORY_AVAILABLE or self._episodic_memory is None:
+            return
+        if not episode_memory_enabled():
+            return
+        if self.current_world != "humanoid" or self._fixed_root_active:
+            return
+
+        self._episodic_memory.tick_update(
+            tick=tick,
+            obs=obs,
+            last_action=self._last_action_for_memory,
+            fallen=fallen,
+            posture=posture,
+        )
+
+        if fallen and (tick - self._last_fall_memory_tick) > 5:
+            env = self.agent.env
+            intents = {}
+            try:
+                obs_now = dict(env.observe())
+                intents = {
+                    k: float(
+                        obs_now.get(k, obs_now.get(f"phys_{k}", 0.5))
+                    )
+                    for k in [
+                        "intent_stride",
+                        "intent_torso_forward",
+                        "intent_support_left",
+                        "intent_support_right",
+                        "intent_stop_recover",
+                        "intent_gait_coupling",
+                    ]
+                }
+            except Exception:
+                pass
+            ep = self._episodic_memory.on_fall(tick, obs, intents)
+            if ep is not None:
+                self._last_fall_memory_tick = tick
+                seeds = self._episodic_memory.get_seeds_from_patterns(
+                    set(self.agent.graph.nodes.keys())
+                )
+                if seeds:
+                    self.agent.inject_text_priors(seeds)
+
+    def _tick_curriculum(self, tick: int, obs: dict, fallen: bool) -> None:
+        """Level 2-E: Update curriculum scheduler."""
+        if not _CURRICULUM_AVAILABLE or self._curriculum is None:
+            return
+        if not curriculum_enabled():
+            return
+        if self.current_world != "humanoid" or self._fixed_root_active:
+            return
+
+        fall_rate = (
+            float(np.mean(self._mc_fallen_count_window))
+            if hasattr(self, "_mc_fallen_count_window")
+            and self._mc_fallen_count_window
+            else 0.0
+        )
+
+        stage, advanced = self._curriculum.tick(tick, obs, fallen, fall_rate)
+
+        if advanced:
+            injected = self._curriculum.inject_stage_seeds(self.agent)
+            self._add_event(
+                f"📚 Curriculum → '{stage.name}': {stage.description[:60]} "
+                f"(+{injected} seeds)",
+                "#aaffaa",
+                "phase",
+            )
+
+        if tick % self._curriculum_apply_every == 0:
+            self._curriculum.apply_stage_intents(self.agent.env)
+
+        if (
+            tick % 300 == 0
+            and self._curriculum._current_idx >= len(self._curriculum._stages) - 2
+        ):
+            fall_summary = ""
+            if self._episodic_memory is not None:
+                fall_summary = self._episodic_memory.get_llm_context_block(
+                    max_falls=3
+                )
+            skill_stats = self._skill_snapshot() or {}
+            pose_metrics: dict = {}
+            try:
+                cur_obs = dict(self.agent.env.observe())
+                pose_metrics = self._curriculum.compute_metrics(cur_obs)
+            except Exception:
+                pass
+            valid_intent = [k for k in self.agent.graph.nodes if k.startswith("intent_")]
+            valid_graph = list(self.agent.graph.nodes.keys())
+
+            def _run_curriculum_llm() -> None:
+                import asyncio
+
+                asyncio.run(
+                    self._curriculum.maybe_generate_next_stage_llm(
+                        tick=tick,
+                        skill_stats=skill_stats,
+                        fall_summary=fall_summary,
+                        pose_metrics=pose_metrics,
+                        valid_intent_vars=valid_intent,
+                        valid_graph_vars=valid_graph,
+                        llm_url=get_ollama_generate_url(),
+                        llm_model=get_ollama_model(),
+                    )
+                )
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            try:
+                if loop is not None:
+                    try:
+                        loop.create_task(
+                            self._curriculum.maybe_generate_next_stage_llm(
+                                tick=tick,
+                                skill_stats=skill_stats,
+                                fall_summary=fall_summary,
+                                pose_metrics=pose_metrics,
+                                valid_intent_vars=valid_intent,
+                                valid_graph_vars=valid_graph,
+                                llm_url=get_ollama_generate_url(),
+                                llm_model=get_ollama_model(),
+                            )
+                        )
+                    except RuntimeError:
+                        self._llm_loop_executor.submit(_run_curriculum_llm)
+                else:
+                    self._llm_loop_executor.submit(_run_curriculum_llm)
+            except Exception as e:
+                print(f"[Simulation] curriculum LLM error: {e}")
+
+    def _maybe_upgrade_rssm(self, tick: int) -> None:
+        """Level 2-F: Upgrade GNN to RSSM after sufficient GNN training."""
+        if not _RSSM_AVAILABLE or self._rssm_upgraded:
+            return
+        if not rssm_enabled():
+            return
+        if self.current_world != "humanoid":
+            return
+        try:
+            min_tick = max(500, int(os.environ.get("RKK_WM_RSSM_UPGRADE_TICK", "500")))
+        except ValueError:
+            min_tick = 500
+        if tick < min_tick:
+            return
+        upgraded, trainer = maybe_upgrade_graph_to_rssm(self.agent.graph, self.device)
+        if upgraded and trainer is None:
+            self._rssm_upgraded = True
+            return
+        if upgraded and trainer is not None:
+            self._rssm_trainer = trainer
+            self._rssm_imagination = RSSMImagination(
+                self.agent.graph._core, self.device
+            )
+            self._rssm_upgraded = True
+            self._rssm_upgrade_tick = tick
+            try:
+                h = int(os.environ.get("RKK_WM_RSSM_IMAGINATION", "12"))
+            except ValueError:
+                h = 12
+            self.agent._imagination_horizon = h
+            self._add_event(
+                f"🔮 RSSM-lite activated at tick={tick} "
+                f"(horizon={self.agent._imagination_horizon})",
+                "#88aaff",
+                "phase",
+            )
+
+    def _rssm_train_step(
+        self,
+        obs_before: dict[str, float],
+        action_var: str,
+        action_val: float,
+        obs_after: dict[str, float],
+    ) -> None:
+        """Level 2-F: Push transition to RSSM trainer."""
+        if self._rssm_trainer is None or not self._rssm_upgraded:
+            return
+        try:
+            node_ids = list(self.agent.graph._node_ids)
+            X_t = [float(obs_before.get(n, 0.0)) for n in node_ids]
+            a_t = [float(action_val) if n == action_var else 0.0 for n in node_ids]
+            X_tp1 = [float(obs_after.get(n, 0.0)) for n in node_ids]
+            self._rssm_trainer.push(X_t, a_t, X_tp1)
+            if self.tick % 8 == 0:
+                self._rssm_trainer.maybe_train()
+        except Exception:
+            pass
+
     # ── Tick ──────────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
         hz = _agent_loop_hz_from_env()
@@ -2604,7 +2881,37 @@ class Simulation:
         self._publish_cpg_node_snapshot()
         self.agent.other_agents_phi = []
         self._maybe_step_hierarchical_l1()
+        obs_pre_rssm = dict(self.agent.graph.snapshot_vec_dict())
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
+
+        # Track action for episodic memory
+        self._record_last_action(result)
+
+        _obs_for_d_e: dict = {}
+        try:
+            _obs_for_d_e = dict(self.agent.env.observe())
+        except Exception:
+            pass
+        _posture_now = float(
+            _obs_for_d_e.get(
+                "posture_stability",
+                _obs_for_d_e.get("phys_posture_stability", 0.5),
+            )
+        )
+
+        # Level 2-D: Episodic Memory
+        self._update_episodic_memory(self.tick, _obs_for_d_e, fallen, _posture_now)
+
+        # Level 2-E: Curriculum
+        self._tick_curriculum(self.tick, _obs_for_d_e, fallen)
+
+        # Level 2-F: RSSM upgrade + training
+        self._maybe_upgrade_rssm(self.tick)
+        if not result.get("blocked") and not result.get("skipped"):
+            _var = str(result.get("variable", ""))
+            _val = float(result.get("value", 0.5))
+            obs_post = dict(self.agent.graph.snapshot_vec_dict())
+            self._rssm_train_step(obs_pre_rssm, _var, _val, obs_post)
 
         # Фаза 2 ч.3: L4 concept mining (sync fallback или async worker + single-writer apply)
         if self._visual_env is not None and self.tick % self._concept_inject_every == 0:
@@ -2910,8 +3217,16 @@ class Simulation:
             color = WORLDS.get(self.current_world, {}).get("color", "#cc44ff")
             if self._visual_mode:
                 color = "#44ffcc"
+            try:
+                val_f = float(val)
+            except (TypeError, ValueError):
+                val_f = 0.0
+            try:
+                cg_f = float(cg)
+            except (TypeError, ValueError):
+                cg_f = 0.0
             self._add_event(
-                f"Nova: do({var}={val:.2f}) CG{'+' if cg>=0 else ''}{cg:.3f}",
+                f"Nova: do({var}={val_f:.2f}) CG{'+' if cg_f >= 0 else ''}{cg_f:.3f}",
                 color, "discovery"
             )
 
@@ -3217,6 +3532,21 @@ class Simulation:
                 self._visual_grounding_ctrl.snapshot()
                 if self._visual_grounding_ctrl is not None
                 else None
+            ),
+            "episodic_memory": (
+                self._episodic_memory.snapshot()
+                if self._episodic_memory is not None
+                else None
+            ),
+            "curriculum": (
+                self._curriculum.snapshot()
+                if self._curriculum is not None
+                else None
+            ),
+            "rssm": (
+                self._rssm_trainer.snapshot()
+                if self._rssm_trainer is not None
+                else {"enabled": rssm_enabled() if _RSSM_AVAILABLE else False}
             ),
             "phase1":        self._phase1_snapshot_meta(),
             "phase2":        self._phase2_snapshot_meta(),

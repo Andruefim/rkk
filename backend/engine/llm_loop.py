@@ -41,6 +41,8 @@ def build_counterfactual_prompt(ctx: dict[str, Any]) -> str:
     pred = json.dumps(ctx.get("cf_predicted") or {}, ensure_ascii=False)[:2800]
     obs = json.dumps(ctx.get("cf_observed") or {}, ensure_ascii=False)[:2800]
     slot_line = (ctx.get("slot_lexicon") or "")[:500]
+    fall_history = (ctx.get("fall_history") or "")[:4000]
+    curriculum_stage = (ctx.get("curriculum_stage") or "")[:200]
     return f"""You advise a robot that learns a causal world model (GNN) by experimenting.
 
 The agent does NOT want a raw graph dump. It needs counterfactual reasoning.
@@ -59,6 +61,11 @@ Actually observed (same keys):
 {obs}
 
 Visual slot lexicon summary (if any): {slot_line or "none"}
+
+Fall history and patterns:
+{fall_history or "none"}
+
+Current curriculum stage: {curriculum_stage or "none"}
 
 Question (answer with structured JSON only, no markdown):
 "We observe these values after the intervention; the forward model expected something else.
