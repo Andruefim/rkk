@@ -934,7 +934,11 @@ class RKKAgent:
         self.temporal.train_step(u_next)
 
         self._total_interventions += 1
-        self._last_do = f"do({var}={value:.2f})"
+        try:
+            _v_do = float(value)
+        except (TypeError, ValueError):
+            _v_do = 0.5
+        self._last_do = f"do({var}={_v_do:.2f})"
         self._last_blocked_reason = ""
 
         cur_dr = self.discovery_rate

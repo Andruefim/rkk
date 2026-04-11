@@ -2575,9 +2575,15 @@ class Simulation:
             )
             if result.ok and (result.verbal or result.priority_issue):
                 issue_str = f" [{result.priority_issue}]" if result.priority_issue else ""
+                try:
+                    _r = float(result.combined_reward)
+                    _ps = float(result.posture_score)
+                    _gq = float(result.gait_quality)
+                except (TypeError, ValueError):
+                    _r, _ps, _gq = 0.0, 0.0, 0.0
                 self._add_event(
-                    f"🧠 EmbodiedLLM: r={result.combined_reward:+.2f}"
-                    f" pos={result.posture_score:.2f} gait={result.gait_quality:.2f}"
+                    f"🧠 EmbodiedLLM: r={_r:+.2f}"
+                    f" pos={_ps:.2f} gait={_gq:.2f}"
                     f"{issue_str} +{len(result.seeds)}seeds",
                     "#ff99ff",
                     "phase",
@@ -3430,8 +3436,12 @@ class Simulation:
             var = result.get("variable", "?")
             val = result.get("value", 0)
             done = result.get("skill_done", False)
+            try:
+                val_sf = float(val)
+            except (TypeError, ValueError):
+                val_sf = 0.0
             self._add_event(
-                f"🦿 Skill [{sk}] do({var}={float(val):.2f})"
+                f"🦿 Skill [{sk}] do({var}={val_sf:.2f})"
                 f"{' ✓' if done else ' …'}",
                 "#66ccff",
                 "skill",
