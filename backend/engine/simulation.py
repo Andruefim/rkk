@@ -2002,17 +2002,27 @@ class Simulation:
         return self._motor_cortex
 
     def _ensure_reward_coord(self) -> None:
-        """Lazy-init RewardCoordinator after graph is ready."""
+        """Lazy-init RewardCoordinator; rebuild CuriosityICM when graph dimension changes."""
         if not _REWARD_COORD_AVAILABLE:
-            return
-        if self._reward_coord is not None:
             return
         if not hasattr(self, "agent") or self.agent is None:
             return
         graph = getattr(self.agent, "graph", None)
         if graph is None:
             return
-        d = getattr(graph, "_d", 30)
+        nids = list(getattr(graph, "_node_ids", []) or [])
+        d = len(nids) if nids else int(getattr(graph, "_d", 30) or 30)
+
+        if self._reward_coord is not None:
+            cur = getattr(self._reward_coord.curiosity, "d", -1)
+            if cur != d:
+                self._reward_coord = None
+                self._reward_X_prev = []
+                self._reward_a_prev = []
+
+        if self._reward_coord is not None:
+            return
+
         self._reward_coord = RewardCoordinator(d=d, device=self.device)
         print(f"[Simulation] RewardCoordinator init d={d}")
 
