@@ -43,6 +43,13 @@ def build_counterfactual_prompt(ctx: dict[str, Any]) -> str:
     slot_line = (ctx.get("slot_lexicon") or "")[:500]
     fall_history = (ctx.get("fall_history") or "")[:4000]
     curriculum_stage = (ctx.get("curriculum_stage") or "")[:200]
+    temporal_context = (ctx.get("temporal_context") or "")[:4000]
+    reward_breakdown = json.dumps(ctx.get("reward_breakdown") or {}, ensure_ascii=False)[
+        :2800
+    ]
+    proprio_abstracts = json.dumps(ctx.get("proprio_abstracts") or {}, ensure_ascii=False)[
+        :2000
+    ]
     return f"""You advise a robot that learns a causal world model (GNN) by experimenting.
 
 The agent does NOT want a raw graph dump. It needs counterfactual reasoning.
@@ -66,6 +73,15 @@ Fall history and patterns:
 {fall_history or "none"}
 
 Current curriculum stage: {curriculum_stage or "none"}
+
+Temporal hierarchy context (multi-scale state):
+{temporal_context or "none"}
+
+Reward breakdown (last tick):
+{reward_breakdown or "none"}
+
+Proprioception abstracts:
+{proprio_abstracts or "none"}
 
 Question (answer with structured JSON only, no markdown):
 "We observe these values after the intervention; the forward model expected something else.

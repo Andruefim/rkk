@@ -109,6 +109,39 @@ except ImportError:
     _RSSM_AVAILABLE = False
     print("[Simulation] temporal_world_model.py not found")
 
+# Level 3-G: Proprioception Stream
+try:
+    from engine.proprioception import ProprioceptionStream
+
+    _PROPRIO_AVAILABLE = True
+except ImportError:
+    _PROPRIO_AVAILABLE = False
+    print("[Simulation] proprioception.py not found")
+
+# Level 3-H: Unified Reward Coordinator
+try:
+    from engine.reward_coordinator import RewardCoordinator
+
+    _REWARD_COORD_AVAILABLE = True
+except ImportError:
+    _REWARD_COORD_AVAILABLE = False
+    print("[Simulation] reward_coordinator.py not found")
+
+# Level 3-I: Multi-scale Time
+try:
+    from engine.multiscale_time import (
+        LEVEL_COGNIT,
+        LEVEL_MOTOR,
+        LEVEL_REFLEX,
+        MultiscaleTimeController,
+        timescale_enabled,
+    )
+
+    _TIMESCALE_AVAILABLE = True
+except ImportError:
+    _TIMESCALE_AVAILABLE = False
+    print("[Simulation] multiscale_time.py not found")
+
 # Motor Cortex import (lazy — инициализируется при первом вызове)
 try:
     from engine.motor_cortex import MotorCortexLibrary as _MotorCortexLibrary
@@ -504,6 +537,24 @@ class Simulation:
         self._rssm_imagination: "RSSMImagination | None" = None
         self._rssm_upgraded: bool = False
         self._rssm_upgrade_tick: int = -1
+
+        # Level 3-G: Proprioception Stream
+        self._proprio: "ProprioceptionStream | None" = None
+        if _PROPRIO_AVAILABLE:
+            self._proprio = ProprioceptionStream(device=self.device)
+
+        # Level 3-H: Unified Reward Coordinator (lazy-init after graph d known)
+        self._reward_coord: "RewardCoordinator | None" = None
+        self._reward_X_prev: list[float] = []
+        self._reward_a_prev: list[float] = []
+        self._reward_action_var: str = ""
+        self._reward_action_val: float = 0.5
+        self._was_blocked: bool = False
+
+        # Level 3-I: Multi-scale Time
+        self._timescale: "MultiscaleTimeController | None" = None
+        if _TIMESCALE_AVAILABLE:
+            self._timescale = MultiscaleTimeController()
 
         # Phase D: Motor Cortex (learned motor programs + CPG annealing)
         self._motor_cortex: "_MotorCortexLibrary | None" = None
@@ -1132,6 +1183,15 @@ class Simulation:
                 self._rssm_upgraded = False
                 self._rssm_trainer = None
                 self._rssm_imagination = None
+                # Reset Level 3 controllers
+                if _PROPRIO_AVAILABLE:
+                    self._proprio = ProprioceptionStream(device=self.device)
+                if _TIMESCALE_AVAILABLE:
+                    self._timescale = MultiscaleTimeController()
+                self._reward_coord = None
+                self._reward_X_prev = []
+                self._reward_a_prev = []
+                self._was_blocked = False
                 # Motor Cortex reset on world switch
                 self._motor_cortex = None
                 self._mc_abstract_nodes_injected = False
@@ -1668,6 +1728,21 @@ class Simulation:
                 if self._curriculum is not None
                 else ""
             ),
+            "temporal_context": (
+                self._timescale.build_llm_temporal_context()
+                if self._timescale is not None
+                else ""
+            ),
+            "reward_breakdown": (
+                self._reward_coord.snapshot().get("last_signal", {})
+                if self._reward_coord is not None
+                else {}
+            ),
+            "proprio_abstracts": (
+                self._proprio.snapshot().get("abstracts", {})
+                if self._proprio is not None
+                else {}
+            ),
             "run_level3": self._should_run_level3(triggers),
             "llm_url": get_ollama_generate_url(),
             "llm_model": get_ollama_model(),
@@ -1925,6 +2000,21 @@ class Simulation:
         if self._motor_cortex is None:
             self._motor_cortex = _MotorCortexLibrary(self.device)
         return self._motor_cortex
+
+    def _ensure_reward_coord(self) -> None:
+        """Lazy-init RewardCoordinator after graph is ready."""
+        if not _REWARD_COORD_AVAILABLE:
+            return
+        if self._reward_coord is not None:
+            return
+        if not hasattr(self, "agent") or self.agent is None:
+            return
+        graph = getattr(self.agent, "graph", None)
+        if graph is None:
+            return
+        d = getattr(graph, "_d", 30)
+        self._reward_coord = RewardCoordinator(d=d, device=self.device)
+        print(f"[Simulation] RewardCoordinator init d={d}")
 
     def _locomotion_reward_ema(self) -> float:
         lc = self._locomotion_controller
@@ -2899,6 +2989,132 @@ class Simulation:
             )
         )
 
+        # Level 3-I: Multi-scale time tick (first consumer of post-step obs)
+        if _TIMESCALE_AVAILABLE and self._timescale is not None:
+            self._timescale.tick(self.tick, _obs_for_d_e)
+            motor_intents = self._timescale.get_intents(LEVEL_MOTOR)
+            for var, val in motor_intents.items():
+                if var.startswith("intent_"):
+                    try:
+                        self.agent.env.intervene(var, float(val), count_intervention=False)
+                    except Exception:
+                        pass
+
+        # Level 3-G: Proprioception update (after CPG + agent step; fresh obs)
+        _proprio_anomaly = 0.0
+        _proprio_emp_reward = 0.0
+        if _PROPRIO_AVAILABLE and self._proprio is not None and self.current_world == "humanoid":
+            self._proprio.update(
+                tick=self.tick,
+                obs=_obs_for_d_e,
+                graph=self.agent.graph if hasattr(self.agent, "graph") else None,
+                agent=self.agent,
+            )
+            _proprio_anomaly = self._proprio.anomaly_score
+            _proprio_emp_reward = self._proprio.get_empowerment_reward()
+
+            if _TIMESCALE_AVAILABLE and self._timescale is not None:
+                if self._timescale.should_run(LEVEL_REFLEX, self.tick):
+                    self._timescale.mark_ran(LEVEL_REFLEX, self.tick)
+
+        # Level 3-H: Unified reward signal (humanoid)
+        _reward_signal = None
+        if _REWARD_COORD_AVAILABLE and self.current_world == "humanoid":
+            self._ensure_reward_coord()
+            if self._reward_coord is not None:
+                node_ids = (
+                    list(self.agent.graph._node_ids)
+                    if hasattr(self.agent.graph, "_node_ids")
+                    else []
+                )
+                X_now = [float(_obs_for_d_e.get(n, 0.0)) for n in node_ids]
+                a_vec = [
+                    float(self._reward_action_val) if n == self._reward_action_var else 0.0
+                    for n in node_ids
+                ]
+
+                _task_r = 0.0
+                _task_src = "heuristic"
+                if _EMBODIED_REWARD_AVAILABLE and self._embodied_reward_ctrl is not None:
+                    emb_sn = self._embodied_reward_ctrl.snapshot()
+                    lr = emb_sn.get("last_result")
+                    if isinstance(lr, dict):
+                        _task_r = float(lr.get("combined_reward", 0.0))
+                        err = str(lr.get("error") or "").strip()
+                        _task_src = "llm" if lr.get("ok") and not err else "heuristic"
+
+                if self._reward_action_var:
+                    self._reward_coord.record_action(
+                        self._reward_action_var, self._reward_action_val
+                    )
+
+                _h_W = 0.0
+                try:
+                    _h_W = float(self.agent.graph._core.dag_constraint().item())
+                except Exception:
+                    pass
+
+                _reward_signal = self._reward_coord.compute(
+                    tick=self.tick,
+                    obs=_obs_for_d_e,
+                    X_t=self._reward_X_prev if self._reward_X_prev else X_now,
+                    a_t=self._reward_a_prev if self._reward_a_prev else a_vec,
+                    X_tp1=X_now,
+                    fallen=fallen,
+                    anomaly=_proprio_anomaly,
+                    empowerment_reward=_proprio_emp_reward,
+                    task_reward=_task_r,
+                    task_source=_task_src,
+                    h_W=_h_W,
+                    llm_url=get_ollama_generate_url(),
+                    llm_model=get_ollama_model(),
+                )
+
+                self._reward_X_prev = X_now
+                self._reward_a_prev = a_vec
+
+                self._reward_coord.apply_to_learners(
+                    signal=_reward_signal,
+                    locomotion_ctrl=self._locomotion_controller,
+                    motor_cortex=getattr(self, "_motor_cortex", None),
+                    agent=self.agent,
+                )
+
+                if _reward_signal.constitution < 0.5 and _reward_signal.constitution_warning:
+                    self._add_event(
+                        f"⚠️ Constitution: {_reward_signal.constitution_warning[:60]}",
+                        "#ffaa44",
+                        "constitution",
+                    )
+
+                if _reward_signal.blocked and not self._was_blocked:
+                    self._add_event(
+                        f"🛑 Survival veto: {_reward_signal.survival_reason}",
+                        "#ff4444",
+                        "veto",
+                    )
+                self._was_blocked = bool(_reward_signal.blocked)
+
+                if _TIMESCALE_AVAILABLE and self._timescale is not None:
+                    if _reward_signal.curiosity > 0.6:
+                        self._timescale.set_intent(LEVEL_COGNIT, "causal_eig", 0.8)
+
+        if not result.get("blocked") and not result.get("skipped"):
+            _var_now = result.get("variable", "")
+            _val_now = result.get("value", 0.5)
+            if _var_now:
+                self._reward_action_var = str(_var_now)
+                try:
+                    self._reward_action_val = float(_val_now)
+                except (TypeError, ValueError):
+                    self._reward_action_val = 0.5
+
+        if _TIMESCALE_AVAILABLE and self._timescale is not None:
+            if self._timescale.should_run(LEVEL_MOTOR, self.tick):
+                self._timescale.mark_ran(LEVEL_MOTOR, self.tick)
+            if self._timescale.should_run(LEVEL_COGNIT, self.tick):
+                self._timescale.mark_ran(LEVEL_COGNIT, self.tick)
+
         # Level 2-D: Episodic Memory
         self._update_episodic_memory(self.tick, _obs_for_d_e, fallen, _posture_now)
 
@@ -3547,6 +3763,25 @@ class Simulation:
                 self._rssm_trainer.snapshot()
                 if self._rssm_trainer is not None
                 else {"enabled": rssm_enabled() if _RSSM_AVAILABLE else False}
+            ),
+            "proprioception": (
+                self._proprio.snapshot()
+                if self._proprio is not None
+                else None
+            ),
+            "reward_coordinator": (
+                self._reward_coord.snapshot()
+                if self._reward_coord is not None
+                else {"enabled": _REWARD_COORD_AVAILABLE}
+            ),
+            "timescale": (
+                self._timescale.snapshot()
+                if self._timescale is not None
+                else (
+                    {"enabled": timescale_enabled()}
+                    if _TIMESCALE_AVAILABLE
+                    else {"enabled": False}
+                )
             ),
             "phase1":        self._phase1_snapshot_meta(),
             "phase2":        self._phase2_snapshot_meta(),
