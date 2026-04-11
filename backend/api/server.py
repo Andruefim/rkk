@@ -225,6 +225,9 @@ async def _startup_phase3_teacher() -> None:
                 f"[RKK] Phase3 teacher: rules={out.get('n_rules', 0)}, "
                 f"vl_overlay={out.get('vl_overlay')}, ttl_tick={out.get('expires_at_tick')}"
             )
+            ins = (out.get("insight") or "").strip()
+            if ins:
+                print(f"[RKK] Phase3 teacher insight:\n{ins}\n")
             if out.get("warning"):
                 print(f"[RKK] Phase3 teacher note: {out.get('warning')}")
         else:

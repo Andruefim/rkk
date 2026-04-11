@@ -3616,7 +3616,7 @@ class Simulation:
             slot_lexicon=_slot_lexicon_summary(self._visual_env),
         )
 
-        rules, ov, err = await fetch_phase3_teacher_bundle(
+        rules, ov, err, teacher_insight = await fetch_phase3_teacher_bundle(
             llm_url=llm_url,
             llm_model=model,
             digest=digest,
@@ -3625,7 +3625,7 @@ class Simulation:
         )
 
         if err and not rules and ov is None:
-            return {"ok": False, "error": err}
+            return {"ok": False, "error": err, "insight": teacher_insight or ""}
 
         try:
             tmax = int(os.environ.get("RKK_TEACHER_T_MAX", "140"))
@@ -3644,13 +3644,42 @@ class Simulation:
             msg = f"📚 Phase3 teacher: {len(rules)} rules"
             if ov is not None:
                 msg += f", VL overlay ttl={ov.expires_at_tick - self.tick}t"
+            if teacher_insight:
+                msg += f" — {teacher_insight[:220]}{'…' if len(teacher_insight) > 220 else ''}"
             self._add_event(msg, "#ddaa44", "phase")
+
+        print("[Phase3 Teacher] ────────────────────────────────────────────────")
+        if teacher_insight:
+            print(f"[Phase3 Teacher] Insight:\n{teacher_insight}\n")
+        else:
+            print("[Phase3 Teacher] (no insight string in LLM JSON — check model output)\n")
+        for i, r in enumerate(rules):
+            if r.when_var:
+                cond = f"when {r.when_var}∈[{r.when_min},{r.when_max}]"
+            else:
+                cond = "always"
+            print(
+                f"[Phase3 Teacher] IG rule {i + 1}: target={r.target_var} "
+                f"{cond} bonus={r.bonus:.3f}"
+            )
+        if ov is not None:
+            print(
+                "[Phase3 Teacher] VL overlay deltas: "
+                f"φ_minΔ={ov.phi_min_delta:+.4f} "
+                f"entropy_maxΔ={ov.env_entropy_max_delta:+.4f} "
+                f"h_slowΔ={ov.h_slow_max_delta:+.4f} "
+                f"pred_loΔ={ov.predict_lo_delta:+.4f} pred_hiΔ={ov.predict_hi_delta:+.4f}"
+            )
+        if err:
+            print(f"[Phase3 Teacher] warning: {err}")
+        print("[Phase3 Teacher] ────────────────────────────────────────────────")
 
         return {
             "ok": True,
             "n_rules": len(rules),
             "vl_overlay": ov is not None,
             "warning": err,
+            "insight": teacher_insight or "",
             "expires_at_tick": ov.expires_at_tick if ov is not None else None,
         }
 

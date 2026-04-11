@@ -93,6 +93,7 @@ You are a cautious robotics curriculum advisor for a causal discovery humanoid a
 
 Return valid JSON only (one object). Shape:
 {{
+  "insight": "<2-5 sentences: plain-language rationale for the current graph state and why these rules help>",
   "ig_rules": [
     {{
       "target_var": "<id — variable the agent intervenes on (do target)>",
@@ -115,12 +116,13 @@ Return valid JSON only (one object). Shape:
 }}
 
 Rules:
+- Always include a non-empty "insight" string (reasoning the human operator can read).
 - 2–6 ig_rules. Prefer exploring leg/torso joints when com_z is healthy; caution when com_z is very low (fallen risk).
 - target_var must be a variable the agent can do(); use exact ids from the list.
 - when_var null means rule always applies to target_var (use sparingly, low bonus).
 - vl_overlay: mild adjustments only; ttl_ticks reasonable for early training help."""
 
-_PHASE3_ROOT_KEYS = frozenset({"ig_rules", "vl_overlay"})
+_PHASE3_ROOT_KEYS = frozenset({"ig_rules", "vl_overlay", "insight"})
 
 
 def _phase3_http_timeout() -> float:
@@ -147,12 +149,18 @@ def parse_phase3_response(
     raw_text: str,
     valid_vars: set[str],
     current_tick: int,
-) -> tuple[list[TeacherIGRule], TeacherVLOverlay | None]:
+) -> tuple[list[TeacherIGRule], TeacherVLOverlay | None, str]:
     obj = parse_json_object_loose(raw_text)
     if not _phase3_parsed_root_usable(obj):
         obj = scan_json_objects_having_any_key(raw_text, set(_PHASE3_ROOT_KEYS))
     if not obj:
-        return [], None
+        return [], None, ""
+
+    insight = ""
+    if isinstance(obj, dict):
+        ins = obj.get("insight") if "insight" in obj else obj.get("teacher_insight")
+        if ins is not None:
+            insight = str(ins).strip()
 
     rules_out: list[TeacherIGRule] = []
     for r in obj.get("ig_rules") or []:
@@ -216,7 +224,7 @@ def parse_phase3_response(
             entropy_spike_autonomy_delta=max(-0.12, min(0.15, gf("entropy_spike_autonomy_delta"))),
         )
 
-    return rules_out, overlay
+    return rules_out, overlay, insight
 
 
 async def fetch_phase3_teacher_bundle(
@@ -227,9 +235,9 @@ async def fetch_phase3_teacher_bundle(
     valid_vars: set[str],
     current_tick: int,
     timeout: float | None = None,
-) -> tuple[list[TeacherIGRule], TeacherVLOverlay | None, str | None]:
+) -> tuple[list[TeacherIGRule], TeacherVLOverlay | None, str | None, str]:
     """
-    Возвращает (rules, vl_overlay, error).
+    Возвращает (rules, vl_overlay, error, insight_text).
     """
     if timeout is None:
         timeout = _phase3_http_timeout()
@@ -258,11 +266,11 @@ async def fetch_phase3_teacher_bundle(
             for attempt in range(2):
                 resp = await client.post(url, json=payload)
                 if resp.status_code != 200:
-                    return [], None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    return [], None, f"HTTP {resp.status_code}: {resp.text[:200]}", ""
                 try:
                     data = resp.json()
                 except json.JSONDecodeError as e:
-                    return [], None, f"Ollama JSON body: {e}; text={resp.text[:300]!r}"
+                    return [], None, f"Ollama JSON body: {e}; text={resp.text[:300]!r}", ""
                 raw = (data.get("response") or "").strip()
                 if raw:
                     break
@@ -282,13 +290,13 @@ async def fetch_phase3_teacher_bundle(
                     f"body_preview={resp.text[:500]!r}"
                 )
     except Exception as e:
-        return [], None, str(e)
+        return [], None, str(e), ""
 
-    rules, ov = parse_phase3_response(raw, valid_vars, current_tick)
+    rules, ov, insight = parse_phase3_response(raw, valid_vars, current_tick)
     if not rules and ov is None:
         tail = (raw[-400:] if raw else "").replace("\n", " ")
-        return [], None, f"no parseable ig_rules/vl_overlay; response_tail={tail!r}"
-    return rules, ov, None
+        return [], None, f"no parseable ig_rules/vl_overlay; response_tail={tail!r}", insight
+    return rules, ov, None, insight
 
 
 def top_uncertain_vars_from_agent(agent, k: int = 5) -> list[tuple[str, float]]:
