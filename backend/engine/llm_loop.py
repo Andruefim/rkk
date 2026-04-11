@@ -23,6 +23,13 @@ from engine.rag_seeder import (
 )
 
 
+def _prompt_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x) if x is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_generate_url(llm_url: str) -> str:
     url = llm_url.strip().rstrip("/")
     if url.endswith("/generate"):
@@ -50,15 +57,17 @@ def build_counterfactual_prompt(ctx: dict[str, Any]) -> str:
     proprio_abstracts = json.dumps(ctx.get("proprio_abstracts") or {}, ensure_ascii=False)[
         :2000
     ]
+    inner_voice_concepts = (ctx.get("inner_voice_concepts") or "")[:1200]
+    inner_voice_verbal = (ctx.get("inner_voice_verbal") or "")[:800]
     return f"""You advise a robot that learns a causal world model (GNN) by experimenting.
 
 The agent does NOT want a raw graph dump. It needs counterfactual reasoning.
 
 Situation digest:
-- Last action: do({ctx.get("variable", "?")}={ctx.get("value", 0):.4f})
-- Prediction error (mean |pred-obs| over nodes): {ctx.get("prediction_error", 0):.5f}
-- Discovery rate (fraction of GT-like edges found): {ctx.get("discovery_rate", 0):.4f}
-- Value-layer block rate (cumulative): {ctx.get("block_rate", 0):.4f}
+- Last action: do({ctx.get("variable", "?")}={_prompt_float(ctx.get("value", 0)):.4f})
+- Prediction error (mean |pred-obs| over nodes): {_prompt_float(ctx.get("prediction_error", 0)):.5f}
+- Discovery rate (fraction of GT-like edges found): {_prompt_float(ctx.get("discovery_rate", 0)):.4f}
+- Value-layer block rate (cumulative): {_prompt_float(ctx.get("block_rate", 0)):.4f}
 - Triggers that fired: {triggers or "none"}
 
 After the action, model predicted (subset of node ids):
@@ -82,6 +91,12 @@ Reward breakdown (last tick):
 
 Proprioception abstracts:
 {proprio_abstracts or "none"}
+
+Robot inner voice (fast recurrent head, not the LLM):
+{inner_voice_concepts or "none"}
+
+Last τ3 teacher verbal (if any):
+{inner_voice_verbal or "none"}
 
 Question (answer with structured JSON only, no markdown):
 "We observe these values after the intervention; the forward model expected something else.

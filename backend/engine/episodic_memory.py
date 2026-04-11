@@ -42,6 +42,16 @@ from typing import Any
 import numpy as np
 
 
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    """Obs / intent values may be str; defaults like '?' must never reach :.3f format."""
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
 def episode_memory_enabled() -> bool:
     return os.environ.get("RKK_EPISODE_MEMORY", "1").strip().lower() not in (
         "0", "false", "no", "off"
@@ -68,19 +78,30 @@ class FallEpisode:
     recovered: bool = False
 
     def to_llm_lines(self, idx: int) -> list[str]:
+        cz_b = _safe_float(self.obs_before.get("com_z", self.obs_before.get("phys_com_z")))
+        cz_a = _safe_float(self.obs_at_fall.get("com_z", self.obs_at_fall.get("phys_com_z")))
+        tp_a = _safe_float(
+            self.obs_at_fall.get("torso_pitch", self.obs_at_fall.get("phys_torso_pitch"))
+        )
+        ps_a = _safe_float(
+            self.obs_at_fall.get(
+                "posture_stability", self.obs_at_fall.get("phys_posture_stability")
+            )
+        )
         lines = [
             f"Fall #{idx} at tick={self.tick}:",
             f"  cause: {self.cause}",
-            f"  com_z_before={self.obs_before.get('com_z', self.obs_before.get('phys_com_z', '?')):.3f} → com_z_at={self.obs_at_fall.get('com_z', self.obs_at_fall.get('phys_com_z', '?')):.3f}",
-            f"  torso_pitch_at={self.obs_at_fall.get('torso_pitch', self.obs_at_fall.get('phys_torso_pitch', '?')):.3f}",
-            f"  posture_at={self.obs_at_fall.get('posture_stability', self.obs_at_fall.get('phys_posture_stability', '?')):.3f}",
+            f"  com_z_before={cz_b:.3f} → com_z_at={cz_a:.3f}",
+            f"  torso_pitch_at={tp_a:.3f}",
+            f"  posture_at={ps_a:.3f}",
         ]
         if self.trigger_action:
-            lines.append(f"  last_action: do({self.trigger_action[0]}={self.trigger_action[1]:.3f})")
+            ta_v = _safe_float(self.trigger_action[1])
+            lines.append(f"  last_action: do({self.trigger_action[0]}={ta_v:.3f})")
         intent_str = ", ".join(
-            f"{k.replace('intent_','')}={v:.2f}"
+            f"{k.replace('intent_','')}={_safe_float(v):.2f}"
             for k, v in self.intents_at_fall.items()
-            if abs(v - 0.5) > 0.05
+            if abs(_safe_float(v) - 0.5) > 0.05
         )
         if intent_str:
             lines.append(f"  intents: {intent_str}")
@@ -100,9 +121,9 @@ class SuccessEpisode:
 
     def to_llm_lines(self, idx: int) -> list[str]:
         intent_str = ", ".join(
-            f"{k.replace('intent_','')}={v:.2f}"
+            f"{k.replace('intent_','')}={_safe_float(v):.2f}"
             for k, v in self.intents.items()
-            if abs(v - 0.5) > 0.05
+            if abs(_safe_float(v) - 0.5) > 0.05
         )
         return [
             f"Success #{idx} at tick={self.tick}: {self.duration_ticks} ticks stable walk",

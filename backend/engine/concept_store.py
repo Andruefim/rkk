@@ -1,261 +1,299 @@
 """
-Фаза 2, часть 3: формирование концептов из устойчивых паттернов SlotAttention.
+concept_store.py — SemanticConceptStore: семантический словарь внутренних концептов (inner voice).
 
-Расширяет идеи slot_lexicon: стабильный слот + корреляция с физ. переменными → узел concept_* в GNN.
+512 dense embeddings (d=64) — «словарь ситуаций» агента.
+Инициализируется вручную из биомеханических понятий,
+затем дообучается через LLM distillation.
+
+Концепты разделены по доменам:
+  BALANCE   — состояние баланса тела
+  GAIT      — качество походки
+  STABILITY — устойчивость позы
+  FALL      — риск и процесс падения
+  RECOVERY  — восстановление после падения
+  INTENT    — намерения и цели движения
+  SKILL     — активные навыки
+  ANOMALY   — аномальные состояния суставов
+
+Поиск: cosine similarity → top-K активных концептов → узлы GNN
+Обучение: contrastive loss (CLIP-style) vs LLM text embeddings
 """
 from __future__ import annotations
 
-import math
-import uuid
+import os
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from engine.causal_graph import CausalGraph
-
-# Пороги срабатывания формирования концепта
-CONCEPT_STABILITY_THRESHOLD = 0.82  # cosine similarity между соседними кадрами
-CONCEPT_MIN_FRAMES = 24  # сколько кадров подряд должен быть стабильным
-CONCEPT_MIN_VARIABILITY = 0.03  # слот должен иметь динамику
-CONCEPT_PHYS_CORR_THRESHOLD = 0.40  # |corr| > threshold
 
 
-@dataclass
-class Concept:
-    """Один устойчивый концепт — объект или отношение, открытый агентом."""
-
-    cid: str
-    label: str | None
-    mean_slot_vec: np.ndarray
-    slot_idx: int
-    phys_vars: list[str]
-    corr_scores: dict[str, float]
-    uses: int = 0
-    stable_frames: int = 0
-    created_tick: int = 0
+def _env_int(key: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(key, str(default))))
+    except ValueError:
+        return default
 
 
-class ConceptStore:
+CONCEPT_DIM = 64    # embedding dimension
+VOCAB_SIZE  = 512   # number of concepts
+
+
+# ── Concept definitions ────────────────────────────────────────────────────────
+# (name, domain, description, key_vars_hint)
+CONCEPT_DEFS: list[tuple[str, str, str]] = [
+    # BALANCE
+    ("STABLE_BALANCE",        "BALANCE", "body is well balanced, CoM centered over feet"),
+    ("FORWARD_LEAN",          "BALANCE", "torso leaning forward, CoM ahead of feet"),
+    ("BACKWARD_LEAN",         "BALANCE", "torso leaning backward, fall risk"),
+    ("LATERAL_TILT_LEFT",     "BALANCE", "body tilting left, uneven weight"),
+    ("LATERAL_TILT_RIGHT",    "BALANCE", "body tilting right, uneven weight"),
+    ("LOSING_BALANCE",        "BALANCE", "balance deteriorating rapidly"),
+    ("REGAINING_BALANCE",     "BALANCE", "actively correcting balance"),
+
+    # GAIT
+    ("GOOD_STRIDE",           "GAIT", "stride length and symmetry are appropriate"),
+    ("OVERSTRIDE",            "GAIT", "stride too wide for current posture, fall risk"),
+    ("UNDERSTRIDE",           "GAIT", "stride too small, shuffling gait"),
+    ("ASYMMETRIC_GAIT",       "GAIT", "left-right gait asymmetry detected"),
+    ("SYMMETRIC_GAIT",        "GAIT", "left-right gait is symmetric"),
+    ("GAIT_TRANSITION",       "GAIT", "transitioning between gait phases"),
+    ("STANCE_PHASE_LEFT",     "GAIT", "left foot in stance (supporting weight)"),
+    ("STANCE_PHASE_RIGHT",    "GAIT", "right foot in stance (supporting weight)"),
+    ("SWING_PHASE_LEFT",      "GAIT", "left foot in swing (airborne)"),
+    ("SWING_PHASE_RIGHT",     "GAIT", "right foot in swing (airborne)"),
+    ("DOUBLE_SUPPORT",        "GAIT", "both feet on ground simultaneously"),
+    ("SINGLE_SUPPORT_LEFT",   "GAIT", "only left foot on ground"),
+    ("SINGLE_SUPPORT_RIGHT",  "GAIT", "only right foot on ground"),
+
+    # STABILITY
+    ("HIGH_STABILITY",        "STABILITY", "posture_stability > 0.75"),
+    ("MEDIUM_STABILITY",      "STABILITY", "posture_stability 0.5-0.75"),
+    ("LOW_STABILITY",         "STABILITY", "posture_stability < 0.5"),
+    ("CRITICAL_STABILITY",    "STABILITY", "posture_stability < 0.3, near fall"),
+    ("STATIC_STANCE",         "STABILITY", "standing still, minimal movement"),
+    ("COM_HIGH",              "STABILITY", "center of mass at good height"),
+    ("COM_LOW",               "STABILITY", "center of mass low, crouched or fallen"),
+
+    # FALL
+    ("NO_FALL_RISK",          "FALL", "all metrics nominal, no fall imminent"),
+    ("LOW_FALL_RISK",         "FALL", "minor instability, monitoring"),
+    ("HIGH_FALL_RISK",        "FALL", "multiple risk factors, fall likely"),
+    ("FALLING_NOW",           "FALL", "falling in progress, com_z dropping"),
+    ("FALLEN",                "FALL", "body on ground, com_z very low"),
+    ("FALL_BACKWARD",         "FALL", "falling backward, torso_pitch negative"),
+    ("FALL_FORWARD",          "FALL", "falling forward, torso_pitch strongly positive"),
+    ("FALL_LATERAL",          "FALL", "falling sideways"),
+
+    # RECOVERY
+    ("NOT_IN_RECOVERY",       "RECOVERY", "normal operation, no recovery needed"),
+    ("INITIATING_RECOVERY",   "RECOVERY", "starting to get up from fallen state"),
+    ("RECOVERY_IN_PROGRESS",  "RECOVERY", "actively recovering, partial posture regained"),
+    ("RECOVERY_COMPLETE",     "RECOVERY", "successfully stood up"),
+    ("RECOVERY_FAILED",       "RECOVERY", "recovery attempt unsuccessful"),
+    ("SLOW_RECOVERY",         "RECOVERY", "recovery taking longer than expected"),
+
+    # WEIGHT TRANSFER
+    ("WEIGHT_LEFT",           "WEIGHT", "weight shifted to left leg"),
+    ("WEIGHT_RIGHT",          "WEIGHT", "weight shifted to right leg"),
+    ("WEIGHT_CENTERED",       "WEIGHT", "weight evenly distributed"),
+    ("WEIGHT_TRANSFER_ACTIVE","WEIGHT", "actively shifting weight between legs"),
+
+    # INTENT / GOAL
+    ("INTENT_STAND",          "INTENT", "current goal: stand still"),
+    ("INTENT_WALK",           "INTENT", "current goal: walk forward"),
+    ("INTENT_RECOVER",        "INTENT", "current goal: recover from fall"),
+    ("INTENT_SLOW_DOWN",      "INTENT", "reducing stride to improve stability"),
+    ("INTENT_SPEED_UP",       "INTENT", "increasing stride for faster movement"),
+    ("INTENT_EXPLORE",        "INTENT", "exploring new movement patterns"),
+
+    # SKILL EXECUTION
+    ("SKILL_STAND_ACTIVE",    "SKILL", "stand skill is currently running"),
+    ("SKILL_WALK_ACTIVE",     "SKILL", "walk skill is currently running"),
+    ("SKILL_NONE",            "SKILL", "no skill currently active"),
+    ("SKILL_TRANSITION",      "SKILL", "switching between skills"),
+
+    # CURIOSITY / LEARNING
+    ("HIGH_CURIOSITY",        "LEARNING", "prediction error high, unexplored state"),
+    ("LOW_CURIOSITY",         "LEARNING", "familiar state, low prediction error"),
+    ("LEARNING_OPPORTUNITY",  "LEARNING", "novel situation worth exploring"),
+    ("EXPLOITING_KNOWN",      "LEARNING", "using learned behavior"),
+
+    # EMPOWERMENT
+    ("HIGH_EMPOWERMENT",      "EMPOWER", "many future states reachable from here"),
+    ("LOW_EMPOWERMENT",       "EMPOWER", "few future options, constrained state"),
+
+    # ANOMALY
+    ("JOINT_NOMINAL",         "ANOMALY", "all joints operating normally"),
+    ("JOINT_STRESS",          "ANOMALY", "one or more joints under stress"),
+    ("JOINT_CRITICAL",        "ANOMALY", "joint anomaly critical, survival veto risk"),
+    ("ARM_ACTIVE",            "ANOMALY", "arms actively counterbalancing"),
+    ("ARM_PASSIVE",           "ANOMALY", "arms not contributing to balance"),
+
+    # TEMPORAL
+    ("IMPROVING",             "TEMPORAL", "performance metrics trending upward"),
+    ("DEGRADING",             "TEMPORAL", "performance metrics trending downward"),
+    ("PLATEAU",               "TEMPORAL", "performance stable but not improving"),
+    ("BREAKTHROUGH",          "TEMPORAL", "sudden improvement in key metric"),
+]
+
+# Pad to VOCAB_SIZE with generic concepts
+_N_DEFINED = len(CONCEPT_DEFS)
+for _i in range(VOCAB_SIZE - _N_DEFINED):
+    CONCEPT_DEFS.append((f"LATENT_{_i:04d}", "LATENT", f"latent concept slot {_i}"))
+
+assert len(CONCEPT_DEFS) == VOCAB_SIZE
+
+
+# ── Concept embeddings ────────────────────────────────────────────────────────
+class SemanticConceptStore(nn.Module):
     """
-    Формирует концепты из устойчивых паттернов SlotAttention.
+    Learnable concept embedding store.
 
-    Вызывается периодически из simulation.py при visual mode.
-    Добавляет concept_* узлы в GNN через CausalGraph.set_node / set_edge.
+    Usage:
+      store = SemanticConceptStore(device)
+      # Get top-3 active concepts for current thought embedding
+      top_k = store.query(thought_embedding, k=3)
+      # → [("FALLING_BACKWARD", 0.87), ("HIGH_FALL_RISK", 0.81), ("LOW_STABILITY", 0.78)]
+
+    Training:
+      store.contrastive_step(thought_emb, llm_text_emb)
+      → aligns concept embeddings with LLM text embeddings
     """
 
-    def __init__(self, n_slots: int, variable_ids: list[str]):
-        self.n_slots = n_slots
-        self.variable_ids = [
-            v for v in variable_ids
-            if not str(v).startswith("slot_") and not str(v).startswith("concept_")
-        ]
-        self.concepts: dict[str, Concept] = {}
+    def __init__(self, device: torch.device, concept_dim: int = CONCEPT_DIM):
+        super().__init__()
+        self.device = device
+        self.concept_dim = concept_dim
+        self.vocab_size = VOCAB_SIZE
 
-        self._slot_vec_history: list[np.ndarray] = []
-        self._phys_val_history: list[dict[str, float]] = []
-        self._stable_streak: list[int] = [0] * n_slots
+        # Learnable embeddings
+        self.embeddings = nn.Embedding(VOCAB_SIZE, concept_dim)
 
-        self._max_history = 128
+        # Initialize with domain-structured noise (concepts in same domain start close)
+        self._init_domain_structured()
 
-    def _sync_variable_ids(self, graph_node_ids: list[str] | None) -> None:
-        if graph_node_ids is None:
-            return
-        self.variable_ids = [
-            v for v in graph_node_ids
-            if not str(v).startswith("slot_") and not str(v).startswith("concept_")
-        ]
+        # LLM text projection: maps LLM embedding (d_llm) → concept_dim
+        # d_llm is unknown until first LLM call; lazy init
+        self._text_proj: nn.Linear | None = None
 
-    def update(
-        self,
-        slot_vecs: torch.Tensor,
-        slot_values: list[float],
-        variability: list[float],
-        phys_obs: dict[str, float],
-        tick: int,
-        *,
-        graph_node_ids: list[str] | None = None,
-    ) -> list[Concept]:
-        """
-        Обновляем историю и проверяем условия формирования концепта.
-        Возвращает список новых концептов (обычно пустой).
-        """
-        self._sync_variable_ids(graph_node_ids)
+        # Activation threshold
+        self.activation_threshold = 0.55
 
-        sv_np = slot_vecs.detach().cpu().float().numpy()
-        self._slot_vec_history.append(sv_np)
-        self._phys_val_history.append(dict(phys_obs))
+        self.to(device)
+        self.optim = torch.optim.Adam(self.parameters(), lr=1e-3)
 
-        if len(self._slot_vec_history) > self._max_history:
-            self._slot_vec_history.pop(0)
-            self._phys_val_history.pop(0)
+        # Index: name → idx
+        self.name_to_idx = {name: i for i, (name, _, _) in enumerate(CONCEPT_DEFS)}
+        self.idx_to_name = {i: name for i, (name, _, _) in enumerate(CONCEPT_DEFS)}
+        self.idx_to_domain = {i: domain for i, (_, domain, _) in enumerate(CONCEPT_DEFS)}
+        self.idx_to_desc = {i: desc for i, (_, _, desc) in enumerate(CONCEPT_DEFS)}
 
-        new_concepts: list[Concept] = []
-        if len(self._slot_vec_history) < CONCEPT_MIN_FRAMES:
-            return new_concepts
-
-        prev = self._slot_vec_history[-2]
-        curr = sv_np
-
-        for k in range(self.n_slots):
-            var_k = float(variability[k]) if k < len(variability) else 0.0
-
-            if var_k < CONCEPT_MIN_VARIABILITY:
-                self._stable_streak[k] = 0
-                continue
-
-            sim = float(
-                F.cosine_similarity(
-                    torch.from_numpy(prev[k]).unsqueeze(0),
-                    torch.from_numpy(curr[k]).unsqueeze(0),
-                    dim=1,
-                ).item()
-            )
-            if not math.isfinite(sim):
-                self._stable_streak[k] = 0
-                continue
-
-            if sim >= CONCEPT_STABILITY_THRESHOLD:
-                self._stable_streak[k] += 1
-            else:
-                self._stable_streak[k] = 0
-
-            if self._stable_streak[k] < CONCEPT_MIN_FRAMES:
-                continue
-
-            if self._concept_exists_for_slot(k, curr[k]):
-                self._update_existing(k, curr[k])
-                continue
-
-            phys_corrs = self._compute_phys_correlations(k)
-            corr_vars = {
-                v: c for v, c in phys_corrs.items()
-                if abs(c) >= CONCEPT_PHYS_CORR_THRESHOLD
+    def _init_domain_structured(self) -> None:
+        """Initialize embeddings with domain-cluster structure."""
+        with torch.no_grad():
+            domains = list({d for _, d, _ in CONCEPT_DEFS})
+            domain_centers = {
+                d: torch.randn(self.concept_dim) * 0.5
+                for d in domains
             }
+            data = torch.zeros(VOCAB_SIZE, self.concept_dim)
+            for i, (_, domain, _) in enumerate(CONCEPT_DEFS):
+                center = domain_centers[domain]
+                data[i] = center + torch.randn(self.concept_dim) * 0.15
+            # Normalize
+            data = F.normalize(data, dim=-1)
+            self.embeddings.weight.copy_(data)
 
-            if not corr_vars:
-                continue
+    @torch.no_grad()
+    def query(
+        self,
+        thought_emb: torch.Tensor,
+        k: int = 5,
+        threshold: float | None = None,
+    ) -> list[tuple[str, float]]:
+        """
+        Find top-k concepts matching thought embedding.
+        thought_emb: (concept_dim,) or (1, concept_dim)
+        Returns: [(name, similarity), ...]
+        """
+        t = threshold or self.activation_threshold
+        emb = F.normalize(thought_emb.view(1, -1), dim=-1)
+        all_emb = F.normalize(self.embeddings.weight, dim=-1)  # (V, D)
+        sims = (emb @ all_emb.T).squeeze(0)  # (V,)
 
-            cid = str(uuid.uuid4()).replace("-", "")[:8]
-            concept = Concept(
-                cid=cid,
-                label=None,
-                mean_slot_vec=curr[k].copy(),
-                slot_idx=k,
-                phys_vars=list(corr_vars.keys()),
-                corr_scores=dict(corr_vars),
-                stable_frames=self._stable_streak[k],
-                created_tick=tick,
-            )
-            self.concepts[cid] = concept
-            new_concepts.append(concept)
-            print(
-                f"[ConceptStore] New concept {cid}: slot_{k}, "
-                f"phys={list(corr_vars.keys())[:3]}, "
-                f"stable={self._stable_streak[k]}"
-            )
+        top_vals, top_idx = sims.topk(k)
+        results = []
+        for val, idx in zip(top_vals.tolist(), top_idx.tolist()):
+            if val >= t:
+                results.append((self.idx_to_name[idx], float(val)))
+        return results
 
-        return new_concepts
+    def get_embedding(self, name: str) -> torch.Tensor | None:
+        idx = self.name_to_idx.get(name)
+        if idx is None:
+            return None
+        return self.embeddings.weight[idx].detach()
 
-    def _concept_exists_for_slot(self, slot_idx: int, vec: np.ndarray) -> bool:
-        for c in self.concepts.values():
-            if c.slot_idx != slot_idx:
-                continue
-            sim = float(
-                F.cosine_similarity(
-                    torch.from_numpy(c.mean_slot_vec).unsqueeze(0),
-                    torch.from_numpy(vec).unsqueeze(0),
-                    dim=1,
-                ).item()
-            )
-            if math.isfinite(sim) and sim > 0.90:
-                return True
-        return False
+    def ensure_text_proj(self, llm_dim: int) -> None:
+        if self._text_proj is None or self._text_proj.in_features != llm_dim:
+            self._text_proj = nn.Linear(llm_dim, self.concept_dim, bias=False).to(self.device)
+            nn.init.orthogonal_(self._text_proj.weight)
+            # Add to optimizer
+            self.optim.add_param_group({"params": self._text_proj.parameters()})
 
-    def _update_existing(self, slot_idx: int, vec: np.ndarray) -> None:
-        for c in self.concepts.values():
-            if c.slot_idx == slot_idx:
-                c.mean_slot_vec = 0.95 * c.mean_slot_vec + 0.05 * vec
-                c.uses += 1
-                break
+    def contrastive_step(
+        self,
+        thought_emb: torch.Tensor,      # (B, concept_dim)
+        target_concept_names: list[str], # B concept names (from LLM annotation)
+        temperature: float = 0.07,
+    ) -> float:
+        """
+        CLIP-style contrastive loss:
+          thought_emb[i] should be close to concept_embeddings[target_i]
+          and far from all others.
+        """
+        if not target_concept_names:
+            return 0.0
 
-    def _compute_phys_correlations(self, slot_idx: int) -> dict[str, float]:
-        """Корреляция Пирсона: норма вектора слота vs каждая физ. переменная."""
-        tlen = len(self._slot_vec_history)
-        if tlen < 16:
-            return {}
+        # Get target indices
+        target_indices = []
+        for name in target_concept_names:
+            idx = self.name_to_idx.get(name)
+            if idx is not None:
+                target_indices.append(idx)
 
-        slot_series = np.array([
-            float(np.linalg.norm(h[slot_idx]))
-            for h in self._slot_vec_history
-        ])
+        if not target_indices:
+            return 0.0
 
-        corrs: dict[str, float] = {}
-        for var in self.variable_ids:
-            phys_series = np.array([
-                float(h.get(var, 0.5))
-                for h in self._phys_val_history
-            ])
-            if len(phys_series) != len(slot_series):
-                continue
-            if np.std(phys_series) < 1e-6 or np.std(slot_series) < 1e-6:
-                continue
-            corr = float(np.corrcoef(slot_series, phys_series)[0, 1])
-            if not np.isnan(corr):
-                corrs[var] = corr
+        B = len(target_indices)
+        thought = F.normalize(thought_emb[:B].to(self.device), dim=-1)  # (B, D)
+        target_idx_t = torch.tensor(target_indices, device=self.device)
+        concept_embs = F.normalize(self.embeddings(target_idx_t), dim=-1)  # (B, D)
 
-        return corrs
+        # All concept embeddings for contrastive negatives
+        all_embs = F.normalize(self.embeddings.weight, dim=-1)  # (V, D)
 
-    def inject_into_graph(self, graph: CausalGraph) -> int:
-        """Добавляем новые концепты как узлы в GNN. Возвращает число новых узлов."""
-        added = 0
-        for cid, concept in self.concepts.items():
-            node_name = f"concept_{cid[:4]}"
-            if node_name in graph.nodes:
-                continue
-            val = float(concept.uses / (concept.uses + 10))
-            graph.set_node(node_name, val)
+        # Similarity: thought vs all concepts
+        logits = (thought @ all_embs.T) / temperature  # (B, V)
 
-            slot_key = f"slot_{concept.slot_idx}"
-            if slot_key in graph.nodes:
-                graph.set_edge(slot_key, node_name, 0.15, 0.05)
+        # Labels: correct concept index
+        loss = F.cross_entropy(logits, target_idx_t)
 
-            for phys_var, corr in concept.corr_scores.items():
-                if phys_var not in graph.nodes:
-                    continue
-                w = float(np.clip(abs(corr) * 0.5, 0.06, 0.4))
-                sign = 1.0 if corr > 0 else -1.0
-                graph.set_edge(node_name, phys_var, sign * w, 0.06)
+        self.optim.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.parameters(), 0.5)
+        self.optim.step()
 
-            added += 1
-        return added
+        return float(loss.item())
 
-    def get_active_concepts(
-        self, slot_values: list[float], threshold: float = 0.55
-    ) -> list[Concept]:
-        """Концепты, чьи слоты сейчас активны."""
-        active: list[Concept] = []
-        for c in self.concepts.values():
-            k = c.slot_idx
-            if k < len(slot_values) and slot_values[k] >= threshold:
-                active.append(c)
-        return active
-
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, Any]:
         return {
-            "n_concepts": len(self.concepts),
-            "concepts": [
-                {
-                    "cid": c.cid,
-                    "label": c.label,
-                    "slot_idx": c.slot_idx,
-                    "phys_vars": c.phys_vars[:4],
-                    "uses": c.uses,
-                    "stable_frames": c.stable_frames,
-                    "created_tick": c.created_tick,
-                }
-                for c in self.concepts.values()
-            ],
+            "vocab_size": self.vocab_size,
+            "concept_dim": self.concept_dim,
+            "n_domains": len({d for _, d, _ in CONCEPT_DEFS}),
+            "defined_concepts": _N_DEFINED,
+            "latent_slots": VOCAB_SIZE - _N_DEFINED,
         }

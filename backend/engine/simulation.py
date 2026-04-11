@@ -50,7 +50,7 @@ from concurrent.futures import ThreadPoolExecutor
 from engine.agent       import RKKAgent
 from engine.demon       import AdversarialDemon
 from engine.environment import Environment
-from engine.concept_store import ConceptStore
+from engine.visual_concept_store import VisualConceptStore
 from engine.hierarchical_graph import HierarchicalGraph, hierarchical_graph_enabled
 from engine.ollama_env  import get_ollama_generate_url, get_ollama_model
 from engine.value_layer import HomeostaticBounds
@@ -132,6 +132,7 @@ try:
     from engine.multiscale_time import (
         LEVEL_COGNIT,
         LEVEL_MOTOR,
+        LEVEL_REFLECT,
         LEVEL_REFLEX,
         MultiscaleTimeController,
         timescale_enabled,
@@ -141,6 +142,17 @@ try:
 except ImportError:
     _TIMESCALE_AVAILABLE = False
     print("[Simulation] multiscale_time.py not found")
+
+# Phase J: Inner Voice (GRU) + LLM teacher (τ3 only)
+try:
+    from engine.inner_voice_net import InnerVoiceController
+    from engine.llm_voice_teacher import LLMVoiceTeacher, TeacherAnnotation
+
+    _INNER_VOICE_AVAILABLE = True
+except ImportError:
+    _INNER_VOICE_AVAILABLE = False
+    TeacherAnnotation = None  # type: ignore
+    print("[Simulation] inner_voice / llm_voice_teacher not found")
 
 # Motor Cortex import (lazy — инициализируется при первом вызове)
 try:
@@ -556,6 +568,14 @@ class Simulation:
         if _TIMESCALE_AVAILABLE:
             self._timescale = MultiscaleTimeController()
 
+        # Phase J: Inner Voice + LLM teacher (offline τ3)
+        self._inner_voice: "InnerVoiceController | None" = None
+        self._llm_teacher: "LLMVoiceTeacher | None" = None
+        if _INNER_VOICE_AVAILABLE:
+            self._inner_voice = InnerVoiceController(device=self.device)
+            self._llm_teacher = LLMVoiceTeacher()
+            self._llm_teacher.add_callback(self._on_teacher_annotation)
+
         # Phase D: Motor Cortex (learned motor programs + CPG annealing)
         self._motor_cortex: "_MotorCortexLibrary | None" = None
         self._mc_posture_window: deque = deque(maxlen=200)
@@ -569,7 +589,7 @@ class Simulation:
         # Фаза 2 (часть 1): L1 агрегаты → виртуальные узлы в основном GNN
         self._hierarchical_graph: HierarchicalGraph | None = None
         # Фаза 2 (часть 3): концепты из SlotAttention → узлы concept_* в GNN (visual humanoid)
-        self._concept_store: ConceptStore | None = None
+        self._concept_store: VisualConceptStore | None = None
         try:
             self._concept_inject_every = max(
                 1, int(os.environ.get("RKK_CONCEPT_INJECT_EVERY", "30"))
@@ -908,7 +928,7 @@ class Simulation:
                 v for v in self.agent.graph._node_ids
                 if not str(v).startswith("slot_") and not str(v).startswith("concept_")
             ]
-            self._concept_store = ConceptStore(
+            self._concept_store = VisualConceptStore(
                 n_slots=int(self._visual_env.n_slots),
                 variable_ids=vids,
             )
@@ -1015,7 +1035,7 @@ class Simulation:
         }
 
     def _l4_worker_loop(self) -> None:
-        store: ConceptStore | None = None
+        store: VisualConceptStore | None = None
         while not self._l4_stop.is_set():
             try:
                 task = self._l4_in_q.get(timeout=0.05)
@@ -1029,7 +1049,7 @@ class Simulation:
                         v for v in graph_node_ids
                         if not str(v).startswith("slot_") and not str(v).startswith("concept_")
                     ]
-                    store = ConceptStore(n_slots=n_slots, variable_ids=vids)
+                    store = VisualConceptStore(n_slots=n_slots, variable_ids=vids)
                 slot_vecs_np = task.get("slot_vecs")
                 slot_vecs = torch.from_numpy(slot_vecs_np).float()
                 new_concepts = store.update(
@@ -1192,6 +1212,13 @@ class Simulation:
                 self._reward_X_prev = []
                 self._reward_a_prev = []
                 self._was_blocked = False
+                if _INNER_VOICE_AVAILABLE:
+                    from engine.inner_voice_net import InnerVoiceController
+                    from engine.llm_voice_teacher import LLMVoiceTeacher
+
+                    self._inner_voice = InnerVoiceController(device=self.device)
+                    self._llm_teacher = LLMVoiceTeacher()
+                    self._llm_teacher.add_callback(self._on_teacher_annotation)
                 # Motor Cortex reset on world switch
                 self._motor_cortex = None
                 self._mc_abstract_nodes_injected = False
@@ -1659,6 +1686,13 @@ class Simulation:
     def _maybe_schedule_llm_loop(self, result: dict, snap: dict) -> None:
         if not self._llm_loop_enabled():
             return
+        _inner_voice_active = (
+            _INNER_VOICE_AVAILABLE
+            and self._inner_voice is not None
+            and self._inner_voice.total_inferences > 20
+        )
+        if _inner_voice_active:
+            return
         if self._llm_level2_inflight or self._pending_llm_bundle is not None:
             return
         try:
@@ -1707,12 +1741,20 @@ class Simulation:
 
         from engine.phase3_teacher import _slot_lexicon_summary
 
+        try:
+            _ctx_val = float(result.get("value", 0.0))
+        except (TypeError, ValueError):
+            _ctx_val = 0.0
+        try:
+            _ctx_pe = float(result.get("prediction_error", 0.0))
+        except (TypeError, ValueError):
+            _ctx_pe = 0.0
         ctx = {
             "variable_ids": list(self.agent.graph.nodes.keys()),
             "triggers": triggers,
             "variable": result.get("variable"),
-            "value": float(result.get("value", 0.0)),
-            "prediction_error": float(result.get("prediction_error", 0.0)),
+            "value": _ctx_val,
+            "prediction_error": _ctx_pe,
             "discovery_rate": float(snap.get("discovery_rate", 0.0)),
             "block_rate": float(vl.block_rate),
             "cf_predicted": result.get("cf_predicted") or {},
@@ -1742,6 +1784,16 @@ class Simulation:
                 self._proprio.snapshot().get("abstracts", {})
                 if self._proprio is not None
                 else {}
+            ),
+            "inner_voice_concepts": (
+                self._inner_voice.get_concept_str(max_concepts=5)
+                if self._inner_voice is not None
+                else ""
+            ),
+            "inner_voice_verbal": (
+                (self._llm_teacher.get_latest().verbal or "")
+                if self._llm_teacher is not None and self._llm_teacher.get_latest()
+                else ""
             ),
             "run_level3": self._should_run_level3(triggers),
             "llm_url": get_ollama_generate_url(),
@@ -2025,6 +2077,125 @@ class Simulation:
 
         self._reward_coord = RewardCoordinator(d=d, device=self.device)
         print(f"[Simulation] RewardCoordinator init d={d}")
+
+    def _on_teacher_annotation(self, ann: "TeacherAnnotation") -> None:
+        """LLM τ3 teacher callback: distill + intents + GNN seeds + UI event."""
+        if ann.error or not ann.primary_concepts:
+            return
+
+        if self._inner_voice is not None and hasattr(self.agent, "graph"):
+            node_ids = list(self.agent.graph._node_ids)
+            state_vec = [float(self.agent.graph.nodes.get(n, 0.5)) for n in node_ids]
+            if state_vec:
+                self._inner_voice.push_distill_sample(state_vec, ann.primary_concepts)
+                if len(self._inner_voice._train_buf) >= 8:
+                    self._inner_voice.train_step()
+
+        if ann.intent_adjustments and self._timescale is not None:
+            for var, val in ann.intent_adjustments.items():
+                self._timescale.set_intent(LEVEL_REFLECT, var, float(val))
+
+        if ann.seeds and hasattr(self, "agent"):
+            self.agent.inject_text_priors(ann.seeds)
+
+        verbal = ann.verbal[:80] if ann.verbal else ""
+        concepts = ", ".join(ann.primary_concepts[:3])
+        mode_icon = {"annotate": "💭", "guide": "🧭", "lesson": "📖"}.get(ann.mode, "💭")
+        if verbal:
+            self._add_event(
+                f"{mode_icon} [{concepts}] {verbal}",
+                "#aaaaff",
+                "inner_voice",
+            )
+
+    def _tick_inner_voice(self, tick: int) -> None:
+        """InnerVoiceNet τ2 — no LLM; gated by timescale LEVEL_COGNIT."""
+        if not _INNER_VOICE_AVAILABLE or self._inner_voice is None:
+            return
+        if self.current_world != "humanoid":
+            return
+        if self._timescale is None or not self._timescale.should_run(LEVEL_COGNIT, tick):
+            return
+
+        graph = getattr(self.agent, "graph", None)
+        if graph is None:
+            return
+
+        inf0 = self._inner_voice.total_inferences
+        result = self._inner_voice.tick(tick, graph, self.agent.env)
+        if self._inner_voice.total_inferences <= inf0:
+            return
+
+        self._timescale.mark_ran(LEVEL_COGNIT, tick)
+
+        active = result.get("active_concepts", []) if result else []
+        if active:
+            top_concept, top_val = active[0]
+            fall_concepts = {
+                "FALLING_NOW",
+                "HIGH_FALL_RISK",
+                "FALLEN",
+                "JOINT_CRITICAL",
+            }
+            if top_concept in fall_concepts and top_val > 0.75:
+                pass
+
+    def _tick_llm_teacher(self, tick: int) -> None:
+        """LLM teacher τ3 — async, non-blocking."""
+        if not _INNER_VOICE_AVAILABLE or self._llm_teacher is None:
+            return
+        if self.current_world != "humanoid":
+            return
+        if not self._llm_teacher.should_call():
+            return
+        if self._timescale is not None and not self._timescale.should_run(LEVEL_REFLECT, tick):
+            return
+
+        obs: dict = {}
+        try:
+            obs = dict(self.agent.env.observe())
+        except Exception:
+            pass
+
+        valid_intents = [k for k in self.agent.graph.nodes if k.startswith("intent_")]
+        valid_graph_vars = list(self.agent.graph.nodes.keys())
+        total_falls = 0
+        if self._episodic_memory is not None:
+            total_falls = int(getattr(self._episodic_memory, "total_falls_recorded", 0))
+
+        import asyncio
+
+        async def _call():
+            await self._llm_teacher.call_async(
+                tick=tick,
+                obs=obs,
+                inner_voice_controller=self._inner_voice,
+                episodic_memory=self._episodic_memory,
+                curriculum=self._curriculum,
+                llm_url=get_ollama_generate_url(),
+                llm_model=get_ollama_model(),
+                valid_intents=valid_intents,
+                valid_graph_vars=valid_graph_vars,
+                total_ticks=tick,
+                total_falls=total_falls,
+            )
+
+        def _run_in_thread() -> None:
+            asyncio.run(_call())
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        try:
+            if loop is not None:
+                asyncio.ensure_future(_call())
+            else:
+                self._llm_loop_executor.submit(_run_in_thread)
+            if self._timescale is not None:
+                self._timescale.mark_ran(LEVEL_REFLECT, tick)
+        except Exception as e:
+            print(f"[Simulation] LLM teacher schedule error: {e}")
 
     def _locomotion_reward_ema(self) -> float:
         lc = self._locomotion_controller
@@ -3016,6 +3187,12 @@ class Simulation:
                     except Exception:
                         pass
 
+        # Phase J: Inner Voice (τ2, fast, no LLM)
+        self._tick_inner_voice(self.tick)
+
+        # Phase J: LLM teacher (τ3, async)
+        self._tick_llm_teacher(self.tick)
+
         # Level 3-G: Proprioception update (after CPG + agent step; fresh obs)
         _proprio_anomaly = 0.0
         _proprio_emp_reward = 0.0
@@ -3831,6 +4008,16 @@ class Simulation:
                     if _TIMESCALE_AVAILABLE
                     else {"enabled": False}
                 )
+            ),
+            "inner_voice": (
+                self._inner_voice.snapshot()
+                if self._inner_voice is not None
+                else {"enabled": _INNER_VOICE_AVAILABLE}
+            ),
+            "llm_teacher": (
+                self._llm_teacher.snapshot()
+                if self._llm_teacher is not None
+                else {"enabled": False}
             ),
             "phase1":        self._phase1_snapshot_meta(),
             "phase2":        self._phase2_snapshot_meta(),
