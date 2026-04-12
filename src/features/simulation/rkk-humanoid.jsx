@@ -241,41 +241,242 @@ export default function RKKHumanoid() {
     const mount = mountRef.current;
     if (!mount) return;
 
-    const renderer = new THREE.WebGLRenderer({antialias:true});
+    const renderer = new THREE.WebGLRenderer({antialias:true, powerPreference:"high-performance"});
     renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setSize(mount.clientWidth,mount.clientHeight);
     mount.appendChild(renderer.domElement);
 
-    const scene  = new THREE.Scene();
-    const bg = 0xd8e4f0;
-    scene.background = new THREE.Color(bg);
-    scene.fog = new THREE.FogExp2(bg,0.006);
+    const scene = new THREE.Scene();
+    const skyHi = 0xe8f4ff;
+    scene.background = new THREE.Color(skyHi);
+    scene.fog = new THREE.FogExp2(0xd0e8ff, 0.0018);
 
-    const camera = new THREE.PerspectiveCamera(55,mount.clientWidth/mount.clientHeight,0.1,100);
-    camera.position.set(0,0.8,4.0);
+    const camera = new THREE.PerspectiveCamera(50,mount.clientWidth/mount.clientHeight,0.15,200);
+    camera.position.set(0,1.2,7.5);
 
-    scene.add(new THREE.HemisphereLight(0xffffff,0xb8c4d0,0.95));
-    scene.add(new THREE.AmbientLight(0xe8eef5,0.85));
-    const key = new THREE.DirectionalLight(0xfff5e6,2.2);
-    key.position.set(4.5, 9.5, 3.2);
-    key.castShadow=true;
-    key.shadow.mapSize.set(2048,2048);
-    key.shadow.bias = -0.0002;
-    scene.add(key);
-    const fill = new THREE.DirectionalLight(0xb8d4ff,0.55);
-    fill.position.set(-3.5, 4.0, -2.0);
-    scene.add(fill);
-    const rim = new THREE.PointLight(0xffeedd,0.9,22);
-    rim.position.set(0,4,-2); scene.add(rim);
+    // IBL — отражения на глянцевом полу (как на референсе)
+    let envRT = null;
+    try {
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      const envScene = new THREE.Scene();
+      envScene.background = new THREE.Color(0xf2f8ff);
+      envScene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 2.5));
+      const ed = new THREE.DirectionalLight(0xffffff, 1.8);
+      ed.position.set(2, 3, 1);
+      envScene.add(ed);
+      envRT = pmrem.fromScene(envScene, 0.04);
+      scene.environment = envRT.texture;
+      pmrem.dispose();
+    } catch (_) { /* PMREM optional */ }
 
-    const floor = new THREE.Mesh(
-      new THREE.PlaneGeometry(24,24),
-      new THREE.MeshStandardMaterial({color:0xc5d0de,roughness:0.92,metalness:0.02})
+    // Яркий дневной свет: «не ночь»
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x6a7a88, 1.35));
+    scene.add(new THREE.AmbientLight(0xd8e8f8, 0.45));
+    const sun = new THREE.DirectionalLight(0xfffaf0, 2.8);
+    sun.position.set(4, 18, 6);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(4096, 4096);
+    sun.shadow.camera.near = 0.5;
+    sun.shadow.camera.far = 80;
+    sun.shadow.camera.left = sun.shadow.camera.bottom = -28;
+    sun.shadow.camera.right = sun.shadow.camera.top = 28;
+    sun.shadow.bias = -0.00025;
+    scene.add(sun);
+    const fillSky = new THREE.DirectionalLight(0xb8d8ff, 0.85);
+    fillSky.position.set(-6, 10, -4);
+    scene.add(fillSky);
+    const bounce = new THREE.DirectionalLight(0xffffff, 0.35);
+    bounce.position.set(0, -1, 0);
+    scene.add(bounce);
+
+    // Скайдом — мягкое небо вокруг сцены
+    const sky = new THREE.Mesh(
+      new THREE.SphereGeometry(140, 48, 32),
+      new THREE.MeshBasicMaterial({
+        color: 0xc8e4f8,
+        side: THREE.BackSide,
+        fog: false,
+      })
     );
-    floor.rotation.x=-Math.PI/2; floor.receiveShadow=true; scene.add(floor);
-    scene.add(new THREE.GridHelper(24,48,0x9aa8b8,0xc8d4e0));
+    sky.position.set(0, 18, 0);
+    scene.add(sky);
+
+    // Пол: тёмный глянец + центральный диск + cyan кольцо (как на скринах)
+    const floorMat = new THREE.MeshPhysicalMaterial({
+      color: 0x0a1424,
+      roughness: 0.06,
+      metalness: 0.38,
+      clearcoat: 0.55,
+      clearcoatRoughness: 0.12,
+      envMapIntensity: 1.35,
+    });
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(56, 56), floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    const plazaMat = new THREE.MeshPhysicalMaterial({
+      color: 0x040810,
+      roughness: 0.04,
+      metalness: 0.48,
+      envMapIntensity: 1.65,
+    });
+    const plaza = new THREE.Mesh(new THREE.CircleGeometry(9, 96), plazaMat);
+    plaza.rotation.x = -Math.PI / 2;
+    plaza.position.y = 0.004;
+    plaza.receiveShadow = true;
+    scene.add(plaza);
+
+    const ringNeon = new THREE.Mesh(
+      new THREE.TorusGeometry(9.35, 0.07, 16, 128),
+      new THREE.MeshStandardMaterial({
+        color: 0x00ccff,
+        emissive: 0x00a8dd,
+        emissiveIntensity: 1.15,
+        metalness: 0.65,
+        roughness: 0.18,
+      })
+    );
+    ringNeon.rotation.x = Math.PI / 2;
+    ringNeon.position.y = 0.018;
+    scene.add(ringNeon);
+
+    // Периметр «окна» — светлые панели
+    const winMat = new THREE.MeshPhysicalMaterial({
+      color: 0xe8f4ff,
+      metalness: 0.05,
+      roughness: 0.12,
+      transmission: 0.35,
+      thickness: 0.5,
+      transparent: true,
+      opacity: 0.65,
+      side: THREE.DoubleSide,
+    });
+    for (let i = 0; i < 8; i++) {
+      const ang = (i / 8) * Math.PI * 2;
+      const w = new THREE.Mesh(new THREE.PlaneGeometry(16, 10), winMat);
+      w.position.set(Math.cos(ang) * 22, 5, Math.sin(ang) * 22);
+      w.lookAt(0, 5, 0);
+      scene.add(w);
+    }
+
+    // Органический «костяной» потолок — торус-кноты и кольца (аппроксимация решётки)
+    const ceilGroup = new THREE.Group();
+    ceilGroup.position.set(0, 10.5, 0);
+    const structMat = new THREE.MeshStandardMaterial({
+      color: 0xf4f7fb,
+      roughness: 0.22,
+      metalness: 0.28,
+      envMapIntensity: 0.9,
+    });
+    for (let i = 0; i < 32; i++) {
+      const t = (i / 32) * Math.PI * 2;
+      const rad = 4 + (i % 4) * 2.2;
+      const knot = new THREE.Mesh(
+        new THREE.TorusKnotGeometry(0.55 + (i % 3) * 0.15, 0.09, 64, 12, 2, 3),
+        structMat
+      );
+      knot.position.set(Math.cos(t) * rad, (i % 5) * 0.15, Math.sin(t) * rad);
+      knot.rotation.set(i * 0.7, i * 0.5, i * 0.3);
+      knot.castShadow = true;
+      ceilGroup.add(knot);
+    }
+    const skyRing = new THREE.Mesh(
+      new THREE.TorusGeometry(7, 0.25, 12, 64),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.18, metalness: 0.15, envMapIntensity: 0.7 })
+    );
+    skyRing.rotation.x = Math.PI / 2;
+    skyRing.position.y = 0.3;
+    ceilGroup.add(skyRing);
+    scene.add(ceilGroup);
+
+    // Мебель и декор (статично, стиль лаунж)
+    const chromeMat = new THREE.MeshStandardMaterial({
+      color: 0xe8eef2,
+      metalness: 0.92,
+      roughness: 0.06,
+      envMapIntensity: 1.1,
+    });
+    const glassTop = new THREE.MeshPhysicalMaterial({
+      color: 0xffffff,
+      metalness: 0,
+      roughness: 0.02,
+      transmission: 0.65,
+      thickness: 0.25,
+      transparent: true,
+      opacity: 0.9,
+    });
+    const seatMat = new THREE.MeshStandardMaterial({ color: 0x1a1e24, roughness: 0.85, metalness: 0.05 });
+    function addCafeSet(px, pz, scale = 1) {
+      const s = scale;
+      const top = new THREE.Mesh(new THREE.CylinderGeometry(0.38 * s, 0.38 * s, 0.025 * s, 32), glassTop);
+      top.position.set(px, 0.78 * s, pz);
+      top.castShadow = true;
+      scene.add(top);
+      const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.05 * s, 0.07 * s, 0.76 * s, 10), chromeMat);
+      leg.position.set(px, 0.38 * s, pz);
+      leg.castShadow = true;
+      scene.add(leg);
+      for (let c = 0; c < 4; c++) {
+        const a = (c / 4) * Math.PI * 2 + 0.4;
+        const ch = new THREE.Mesh(
+          new THREE.BoxGeometry(0.14 * s, 0.06 * s, 0.14 * s),
+          seatMat
+        );
+        ch.position.set(px + Math.cos(a) * 0.55 * s, 0.42 * s, pz + Math.sin(a) * 0.55 * s);
+        ch.castShadow = true;
+        scene.add(ch);
+        const post = new THREE.Mesh(new THREE.CylinderGeometry(0.015 * s, 0.015 * s, 0.38 * s, 6), chromeMat);
+        post.position.set(ch.position.x, 0.6 * s, ch.position.z);
+        scene.add(post);
+      }
+    }
+    addCafeSet(-5, 3, 1);
+    addCafeSet(4, -4, 0.95);
+    addCafeSet(-3, -5, 1);
+    addCafeSet(6, 2, 0.9);
+
+    // Центральное дерево
+    const trunk = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.14, 0.18, 1.1, 10),
+      new THREE.MeshStandardMaterial({ color: 0x3d2a1a, roughness: 0.9 })
+    );
+    trunk.position.set(0, 0.55, 0);
+    trunk.castShadow = true;
+    scene.add(trunk);
+    const foliage = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(1.15, 2),
+      new THREE.MeshStandardMaterial({ color: 0x2d8a44, roughness: 0.85, emissive: 0x0a4020, emissiveIntensity: 0.08 })
+    );
+    foliage.position.set(0, 1.55, 0);
+    foliage.castShadow = true;
+    scene.add(foliage);
+    const planter = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.35, 1.45, 0.22, 40),
+      new THREE.MeshStandardMaterial({ color: 0xf0f4f8, roughness: 0.35, metalness: 0.1 })
+    );
+    planter.position.set(0, 0.11, 0);
+    planter.receiveShadow = true;
+    planter.castShadow = true;
+    scene.add(planter);
+
+    // Хромовые «ленты»-скульптуры
+    for (let k = 0; k < 3; k++) {
+      const ribbon = new THREE.Mesh(
+        new THREE.TorusGeometry(1.2 + k * 0.3, 0.08, 12, 48),
+        chromeMat.clone()
+      );
+      ribbon.position.set(-7 + k * 3, 0.85, -6);
+      ribbon.rotation.x = Math.PI / 2.3;
+      ribbon.rotation.z = k * 0.9;
+      ribbon.castShadow = true;
+      scene.add(ribbon);
+    }
 
     const vS = 0.62;
 
@@ -446,8 +647,8 @@ export default function RKKHumanoid() {
     scene.add(new THREE.Points(pGeom,new THREE.PointsMaterial({color:0xaaccff,size:0.04,transparent:true,opacity:0.18})));
 
     let frame=0;
-    const camTarget=new THREE.Vector3(0,0.5,0);
-    let camAzim=0,camElev=0.28,camRadius=5.5;
+    const camTarget=new THREE.Vector3(0,0.42,0);
+    let camAzim=0,camElev=0.32,camRadius=7.8;
     let camDrag=false,camPtrX=0,camPtrY=0;
 
     function updateBone(b,a,bp){
@@ -566,8 +767,8 @@ export default function RKKHumanoid() {
           const mesh=new THREE.Mesh(
             new THREE.BoxGeometry(hx*2,hy*2,hz*2),
             new THREE.MeshStandardMaterial({
-              color:new THREE.Color(def.r??0.7,def.g??0.7,def.b??0.72),
-              roughness:0.78,metalness:0.04,
+              color:new THREE.Color(def.r??0.92,def.g??0.93,def.b??0.95),
+              roughness:0.42,metalness:0.12,envMapIntensity:0.65,
             })
           );
           mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
@@ -671,6 +872,10 @@ export default function RKKHumanoid() {
       el.removeEventListener("pointerdown",onPD);el.removeEventListener("pointermove",onPM);
       el.removeEventListener("pointerup",onPU);el.removeEventListener("pointercancel",onPU);
       el.removeEventListener("wheel",onW);window.removeEventListener("resize",onR);
+      try {
+        scene.environment = null;
+        if (envRT && typeof envRT.dispose === "function") envRT.dispose();
+      } catch (_) {}
       if(mount.contains(renderer.domElement))mount.removeChild(renderer.domElement);
       renderer.dispose();
     };
@@ -685,7 +890,7 @@ export default function RKKHumanoid() {
   const frColor="#ffcc44";
 
   return(
-    <div style={{position:"relative",width:"100%",height:"100vh",background:"#d8e4f0",overflow:"hidden",...mono}}>
+    <div style={{position:"relative",width:"100%",height:"100vh",background:"#e8f2fa",overflow:"hidden",...mono}}>
       <div ref={mountRef} style={{position:"absolute",inset:0}}/>
 
       {/* Camera overlay */}
