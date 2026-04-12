@@ -245,6 +245,7 @@ async def _startup_post_boot_pipeline() -> None:
 
 @asynccontextmanager
 async def _app_lifespan(_: FastAPI):
+    get_sim()._uvicorn_loop = asyncio.get_running_loop()
     asyncio.create_task(_startup_post_boot_pipeline())
     yield
 
@@ -289,6 +290,67 @@ def health():
 @app.get("/state")
 def state():
     return get_sim().public_state()
+
+
+@app.get("/api/snapshot")
+def api_snapshot():
+    """Alias для UI-виджетов: тот же снимок + поле world."""
+    sim = get_sim()
+    ps = sim.public_state()
+    ps["world"] = ps.get("current_world", "humanoid")
+    return ps
+
+
+@app.get("/api/agent/messages")
+def api_agent_messages(last_n: int = Query(default=50, ge=1, le=200)):
+    """Phase L: история речи агента для чата."""
+    verbal = getattr(get_sim(), "_verbal", None)
+    if verbal is None:
+        return {"messages": [], "available": False}
+    return {
+        "messages": verbal.get_messages_for_ui(last_n=last_n),
+        "available": True,
+        "stats": verbal.snapshot(),
+    }
+
+
+@app.post("/api/agent/reply")
+def api_agent_reply(body: dict | None = Body(default=None)):
+    """Phase L: ответ человека на реплику агента."""
+    b = body if isinstance(body, dict) else {}
+    text = str(b.get("text", "")).strip()
+    if not text:
+        return {"ok": False, "error": "empty text"}
+    return get_sim().handle_human_reply(text)
+
+
+@app.websocket("/api/ws/chat")
+async def api_ws_chat(websocket: WebSocket):
+    """Phase L: realtime чат с агентом."""
+    await websocket.accept()
+    sim = get_sim()
+    sim._chat_ws_clients.append(websocket)
+    try:
+        verbal = getattr(sim, "_verbal", None)
+        if verbal is not None:
+            history = verbal.get_messages_for_ui(last_n=30)
+            await websocket.send_text(
+                json.dumps({"event": "history", "data": history}, ensure_ascii=False)
+            )
+        while True:
+            data = await websocket.receive_json()
+            if data.get("type") == "reply":
+                t = str(data.get("text", "")).strip()
+                if t:
+                    sim.handle_human_reply(t)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        try:
+            sim._chat_ws_clients.remove(websocket)
+        except ValueError:
+            pass
+
 
 @app.post("/step")
 def step():

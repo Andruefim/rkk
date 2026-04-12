@@ -1,6 +1,12 @@
 """
 cpg_locomotion.py — Phase A: Locomotion (CPG поверх агента) + Phase D: CPG Annealing.
 
+Swing (бедро/колено):
+  - Фаза осцилляторов CPG [0],[1] для лев/прав бедра; swing_factor = max(0, sin(phi))
+  - В swing добавляется подъём бедра и сгиб колена (RKK_CPG_SWING_HIP_LIFT / KNEE_FLEX),
+    чтобы не компенсировать только наклоном торса назад.
+  - Компенсация торса от com_lag ослаблена (RKK_CPG_COM_LAG_PITCH, дефолт 0.08) — см. environment_humanoid.
+
 ИЗМЕНЕНИЯ (Motor Cortex / Phase D):
   - get_joint_targets: усилен forward lean, добавлен com_lag компенсатор
   - upper_body_cpg_sync: возвращает com_lag для наклона торса вперёд
@@ -25,6 +31,14 @@ import numpy as np
 
 _COM_VEL_EXPECT = 0.022
 _COM_LAG_GAIN = 42.0
+
+# Swing phase: подъём бедра + сгиб колена (вместо компенсации только торсом назад).
+# Нормализованные дельты к целям 0..1; усилить через RKK_CPG_SWING_HIP_LIFT (напр. 0.10–0.12).
+def _env_cpg_swing_float(key: str, default: str) -> float:
+    try:
+        return float(os.environ.get(key, default))
+    except ValueError:
+        return float(default)
 
 
 class CPGNetwork(nn.Module):
@@ -172,14 +186,32 @@ class LocomotionController:
         s = float(torch.sin(self.cpg._phase[0]).item())
         c_m = float(torch.cos(self.cpg._phase[2]).item())
         
-        # FIXED: com_lag → дополнительный pitch вперёд (был минус, теперь плюс)
+        # com_lag → небольшой pitch вперёд; коэффициент снижен — основную работу делают hip/knee в swing
+        try:
+            _lag_pitch = float(os.environ.get("RKK_CPG_COM_LAG_PITCH", "0.08"))
+        except ValueError:
+            _lag_pitch = 0.08
+        _lag_pitch = float(np.clip(_lag_pitch, 0.0, 0.35))
         pitch_add = (
-            -0.055 * s * gscale           # quality rhythm coupling
-            + 0.18 * com_lag * stride_n   # FORWARD тянем CoM (ключевой фикс)
+            -0.055 * s * gscale
+            + _lag_pitch * com_lag * stride_n
         )
         yaw_add = 0.05 * c_m * gscale
         lsh_add = -0.065 * s * gscale
         rsh_add =  0.065 * s * gscale
+
+        phi_l = float(self.cpg._phase[0].item())
+        phi_r = float(self.cpg._phase[1].item())
+
+        def _swing_factor(phi: float) -> float:
+            # 0 в «низе» синуса, пик около π/2 для положительного подъёма бедра в swing
+            return float(max(0.0, math.sin(phi)))
+
+        swing_l = _swing_factor(phi_l)
+        swing_r = _swing_factor(phi_r)
+        hip_lift = _env_cpg_swing_float("RKK_CPG_SWING_HIP_LIFT", "0.08")
+        knee_flex = _env_cpg_swing_float("RKK_CPG_SWING_KNEE_FLEX", "0.10")
+        walk_gate = float(np.clip(stride_n * (0.35 + 0.65 * gscale), 0.0, 1.0))
 
         self._last_cpg_sync = {
             "sin": s, "cos_mid": c_m,
@@ -187,6 +219,10 @@ class LocomotionController:
             "com_lag": com_lag,
             "gscale": gscale,
             "pitch_add": float(pitch_add),
+            "swing_l": swing_l,
+            "swing_r": swing_r,
+            "phi_l": phi_l,
+            "phi_r": phi_r,
         }
 
         targets: dict[str, float] = {
@@ -197,6 +233,20 @@ class LocomotionController:
             "lankle": float(np.clip(0.50 + 0.09 * (float(cpg_out[4].item())*2 - 1), 0.05, 0.95)),
             "rankle": float(np.clip(0.50 + 0.09 * (float(cpg_out[5].item())*2 - 1), 0.05, 0.95)),
         }
+
+        # Swing phase: hip lift + knee flex (минус = сгибание колена в нормализованных целях)
+        targets["lhip"] = float(
+            np.clip(targets["lhip"] + hip_lift * swing_l * walk_gate, 0.05, 0.95)
+        )
+        targets["lknee"] = float(
+            np.clip(targets["lknee"] - knee_flex * swing_l * walk_gate, 0.05, 0.95)
+        )
+        targets["rhip"] = float(
+            np.clip(targets["rhip"] + hip_lift * swing_r * walk_gate, 0.05, 0.95)
+        )
+        targets["rknee"] = float(
+            np.clip(targets["rknee"] - knee_flex * swing_r * walk_gate, 0.05, 0.95)
+        )
 
         self._step_count += 1
         self._last_command = dict(targets)
@@ -297,6 +347,7 @@ class LocomotionController:
             fr_m = float((torch.sigmoid(self.cpg.frequency) * 3.0 + 0.5).mean().item())
         rh = self._reward_history[-32:] if self._reward_history else []
         lag = float(self._last_cpg_sync.get("com_lag", 0.0)) if self._last_cpg_sync else 0.0
+        sync = self._last_cpg_sync or {}
         return {
             "cpg_steps": self._step_count,
             "amplitude_mean": round(amp_m, 4),
@@ -306,4 +357,7 @@ class LocomotionController:
             "last_intent_stride": round(float(self._last_motor_state.get("intent_stride", 0.5)), 4) if self._last_motor_state else 0.5,
             "cpg_com_lag": round(lag, 4),
             "cpg_weight": round(self.cpg_weight, 4),  # MOTOR_CORTEX
+            "swing_l": round(float(sync.get("swing_l", 0.0)), 4),
+            "swing_r": round(float(sync.get("swing_r", 0.0)), 4),
+            "pitch_add": round(float(sync.get("pitch_add", 0.0)), 5),
         }

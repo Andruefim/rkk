@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import * as THREE from "three";
 import { useRKKStream } from "../../hooks/useRKKStream";
+import NovaChatWidget from "./NovaChatWidget";
 
 const API = "http://localhost:8000";
 const CAMERA_PREVIEW_MS = 500;
@@ -786,8 +787,8 @@ export default function RKKHumanoid() {
         </div>
       )}
 
-      {/* Left HUD */}
-      <div style={{position:"absolute",top:118,left:14}}>
+      {/* Left HUD + Nova chat (under stats) */}
+      <div style={{position:"absolute",top:118,left:14,display:"flex",flexDirection:"column",gap:10,alignItems:"stretch",zIndex:6,maxWidth:340}}>
         <div style={{background:"rgba(2,5,14,0.92)",border:`1px solid ${fallen?"#660011":isFR?frColor+"33":isVis?visColor+"33":wCol+"33"}`,borderLeft:`3px solid ${fallen?"#ff2244":isFR?frColor:isVis?visColor:wCol}`,padding:"10px 14px",minWidth:235,borderRadius:3}}>
           <div style={{color:fallen?"#ff4422":isFR?frColor:isVis?visColor:wCol,fontSize:11,fontWeight:"bold",marginBottom:5}}>
             {fallen?"💀":isFR?"📌":isVis?"👁":"◈"} NOVA {isFR?"Fixed Base":isVis?"Visual":"Singleton"}
@@ -829,6 +830,7 @@ export default function RKKHumanoid() {
             </div>
           </div>}
         </div>
+        <NovaChatWidget />
       </div>
 
       {/* Right HUD */}

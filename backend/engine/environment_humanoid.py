@@ -1839,9 +1839,13 @@ class EnvironmentHumanoid:
             sn = float(np.clip(cpg_sync.get("stride_n", 0.0), 0.0, 1.0))
             lag = float(np.clip(cpg_sync.get("com_lag", 0.0), 0.0, 1.0))
             
-            # ИСПРАВЛЕНО: Меняем знак у lag на плюс и немного увеличиваем вес.
-            # Теперь при отставании массы робот будет наклоняться ВПЕРЕД (+0.15), чтобы поймать баланс.
-            pitch_add = (-0.055 * s * sn) + (0.15 * lag * sn)
+            # com_lag → небольшой наклон вперёд; вес синхронизирован с cpg_locomotion (бедро/колено в swing)
+            try:
+                _lag_pitch_u = float(os.environ.get("RKK_CPG_COM_LAG_PITCH", "0.08"))
+            except ValueError:
+                _lag_pitch_u = 0.08
+            _lag_pitch_u = float(np.clip(_lag_pitch_u, 0.0, 0.35))
+            pitch_add = (-0.055 * s * sn) + (_lag_pitch_u * lag * sn)
             
             yaw_add = 0.05 * c_m * sn
             lsh_add = -0.065 * s * sn
@@ -2127,6 +2131,11 @@ def humanoid_hardcoded_seeds() -> list[dict]:
     """Биомеханические text priors для полного режима (суставы → COM, стопы)."""
     return [
         {"from_": "intent_stride", "to": "intent_gait_coupling", "weight": 0.24, "alpha": 0.05},
+        # Фаза шага → бедро поднимается, колено сгибается в swing (не компенсировать только торсом)
+        {"from_": "gait_phase_l", "to": "lhip", "weight": 0.40, "alpha": 0.05},
+        {"from_": "gait_phase_l", "to": "lknee", "weight": -0.45, "alpha": 0.05},
+        {"from_": "gait_phase_r", "to": "rhip", "weight": 0.40, "alpha": 0.05},
+        {"from_": "gait_phase_r", "to": "rknee", "weight": -0.45, "alpha": 0.05},
         {"from_": "posture_stability", "to": "intent_gait_coupling", "weight": 0.20, "alpha": 0.05},
         {"from_": "intent_stop_recover", "to": "intent_gait_coupling", "weight": -0.20, "alpha": 0.05},
         {"from_": "intent_stride", "to": "intent_torso_forward", "weight": 0.24, "alpha": 0.05},

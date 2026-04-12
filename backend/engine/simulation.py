@@ -43,6 +43,8 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any
+
 import torch
 import numpy as np
 from collections import deque
@@ -172,6 +174,15 @@ except ImportError:
         "[Simulation] Phase K not found — copy sleep_consolidation.py, "
         "physical_curriculum.py, persistent_state.py"
     )
+
+# Phase L: Verbal Action (chat / speech)
+try:
+    from engine.verbal_action import VerbalActionController, speech_enabled
+
+    _VERBAL_AVAILABLE = True
+except ImportError:
+    _VERBAL_AVAILABLE = False
+    print("[Simulation] verbal_action.py not found")
 
 # Motor Cortex import (lazy — инициализируется при первом вызове)
 try:
@@ -606,6 +617,15 @@ class Simulation:
         self._was_fallen_last_tick: bool = False
         self._sleep_prev_fixed_root: bool = False
 
+        # Phase L: Verbal Action + chat WebSocket clients (async sends via _uvicorn_loop)
+        self._uvicorn_loop: Any = None
+        self._verbal: "VerbalActionController | None" = None
+        self._chat_ws_clients: list[Any] = []
+        self._verbal_tick_running: bool = False
+        if _VERBAL_AVAILABLE:
+            self._verbal = VerbalActionController()
+            self._verbal.add_callback(self._broadcast_agent_message)
+
         # Phase D: Motor Cortex (learned motor programs + CPG annealing)
         self._motor_cortex: "_MotorCortexLibrary | None" = None
         self._mc_posture_window: deque = deque(maxlen=200)
@@ -762,6 +782,132 @@ class Simulation:
         if meta is not None:
             restore_meta_to_simulation(self, meta)
         self._meta_restored = True
+
+    async def _async_broadcast_chat_payload(self, payload: dict[str, Any]) -> None:
+        """Send JSON to all chat WebSocket clients (must run on uvicorn loop)."""
+        import json
+
+        data = json.dumps(payload, ensure_ascii=False)
+        dead: list[Any] = []
+        for ws in list(self._chat_ws_clients):
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            try:
+                self._chat_ws_clients.remove(ws)
+            except ValueError:
+                pass
+
+    def _broadcast_agent_message(self, msg: Any) -> None:
+        """Callback from VerbalActionController — push to WS clients."""
+        loop = getattr(self, "_uvicorn_loop", None)
+        if loop is None or not loop.is_running():
+            return
+        payload = {"event": "agent_message", "data": msg.to_dict()}
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._async_broadcast_chat_payload(payload), loop
+            )
+        except Exception:
+            pass
+
+    def _schedule_verbal_tick(self, fallen: bool) -> None:
+        """Run async verbal tick in a daemon thread (agent thread has no asyncio loop)."""
+        if not _VERBAL_AVAILABLE or self._verbal is None:
+            return
+        if self.current_world != "humanoid" or self._inner_voice is None:
+            return
+        if not speech_enabled():
+            return
+        if self._verbal_tick_running:
+            return
+
+        tick_now = int(self.tick)
+
+        def run() -> None:
+            self._verbal_tick_running = True
+            try:
+                asyncio.run(self._tick_verbal(tick_now, fallen))
+            except Exception as e:
+                print(f"[Verbal] tick error: {e}")
+            finally:
+                self._verbal_tick_running = False
+
+        threading.Thread(target=run, daemon=True, name="rkk-verbal-tick").start()
+
+    async def _tick_verbal(self, tick: int, fallen: bool) -> None:
+        if not _VERBAL_AVAILABLE or self._verbal is None:
+            return
+        if self.current_world != "humanoid" or self._inner_voice is None:
+            return
+        obs: dict[str, float] = {}
+        try:
+            obs = dict(self.agent.env.observe())
+        except Exception:
+            return
+
+        total_falls = (
+            getattr(self._episodic_memory, "total_falls_recorded", 0)
+            if self._episodic_memory
+            else 0
+        )
+        fall_history_brief = ""
+        if self._episodic_memory and self._episodic_memory._patterns:
+            fall_history_brief = self._episodic_memory._patterns[0].description[:80]
+
+        msg = await self._verbal.tick(
+            tick=tick,
+            obs=obs,
+            inner_voice_ctrl=self._inner_voice,
+            fallen=fallen,
+            total_falls=total_falls,
+            llm_url=get_ollama_generate_url(),
+            llm_model=get_ollama_model(),
+            fall_history_brief=fall_history_brief,
+        )
+        if msg is None:
+            return
+        icon = {"OBSERVE": "💬", "ASK": "❓", "REPORT": "📊"}.get(
+            msg.speech_type.name, "💬"
+        )
+        self._add_event(f"{icon} {msg.text}", "#88ffcc", "speech")
+
+    def handle_human_reply(self, reply_text: str) -> dict[str, Any]:
+        """HTTP/WS: human reply to agent ASK."""
+        if not _VERBAL_AVAILABLE or self._verbal is None:
+            return {"ok": False, "error": "verbal unavailable"}
+        reward = float(self._verbal.on_human_reply(reply_text))
+
+        lc = self._locomotion_controller
+        if lc is not None and reward > 0 and hasattr(lc, "_reward_history"):
+            lc._reward_history.append(reward)
+
+        if self._reward_coord is not None:
+            cur = float(getattr(self._reward_coord, "_total_verbal_reward", 0.0))
+            setattr(self._reward_coord, "_total_verbal_reward", cur + reward)
+
+        loop = getattr(self, "_uvicorn_loop", None)
+        if loop is not None and loop.is_running():
+            import time
+
+            payload = {
+                "event": "human_message",
+                "data": {
+                    "text": reply_text,
+                    "timestamp": time.time(),
+                    "reward_given": round(reward, 3),
+                },
+            }
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._async_broadcast_chat_payload(payload), loop
+                )
+            except Exception:
+                pass
+
+        return {"ok": True, "reward": round(reward, 3)}
 
     def _maybe_autosave_memory(self) -> None:
         from pathlib import Path
@@ -1297,6 +1443,9 @@ class Simulation:
                     self._sleep_ctrl = SleepController()
                     self._physical_curriculum = PhysicalCurriculum()
                     self._meta_restored = False
+                if _VERBAL_AVAILABLE:
+                    self._verbal = VerbalActionController()
+                    self._verbal.add_callback(self._broadcast_agent_message)
                 # Motor Cortex reset on world switch
                 self._motor_cortex = None
                 self._mc_abstract_nodes_injected = False
@@ -3421,6 +3570,10 @@ class Simulation:
         ):
             self._physical_curriculum.inject_into_scheduler(self._curriculum)
 
+        # Phase L: Verbal Action (async in background thread)
+        if _VERBAL_AVAILABLE and self._verbal is not None:
+            self._schedule_verbal_tick(fallen)
+
         if not result.get("blocked") and not result.get("skipped"):
             _var_now = result.get("variable", "")
             _val_now = result.get("value", 0.5)
@@ -4162,6 +4315,11 @@ class Simulation:
                 self._persist.snapshot()
                 if _PHASE_K_AVAILABLE and self._persist is not None
                 else None
+            ),
+            "verbal": (
+                self._verbal.snapshot()
+                if _VERBAL_AVAILABLE and self._verbal is not None
+                else {"enabled": False}
             ),
             "phase1":        self._phase1_snapshot_meta(),
             "phase2":        self._phase2_snapshot_meta(),
