@@ -467,7 +467,8 @@ class VisualGroundingController:
             except Exception:
                 pass
 
-        # Update VLM lexicon with grounding info
+        # Update VLM lexicon with grounding info (Phase M: simulation._maybe_run_visual_grounding
+        # вызывает _phase_m_sync_from_vision() сразу после этого update).
         if hasattr(visual_env, "_slot_lexicon") and new_slot_to_joint:
             for k, var_name in new_slot_to_joint.items():
                 slot_id = f"slot_{k}"

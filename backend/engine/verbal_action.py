@@ -500,6 +500,7 @@ class VerbalActionController:
         llm_url: str = "",
         llm_model: str = "",
         fall_history_brief: str = "",
+        visual_voice=None,
     ) -> AgentMessage | None:
         """
         Main tick. Returns AgentMessage if agent speaks, else None.
@@ -542,7 +543,8 @@ class VerbalActionController:
         concept_names = [n for n, _ in concepts]
         text = await self._generate_text(
             speech_type, concept_names, concepts, obs, curiosity,
-            stable_ticks, total_falls, fall_history_brief, llm_url, llm_model
+            stable_ticks, total_falls, fall_history_brief, llm_url, llm_model,
+            visual_voice,
         )
         if not text:
             return None
@@ -599,9 +601,18 @@ class VerbalActionController:
         fall_history_brief: str,
         llm_url: str,
         llm_model: str,
+        visual_voice=None,
     ) -> str:
         if speech_type == SpeechType.OBSERVE:
-            return self.decoder.decode_observe(concept_names, obs, curiosity)
+            body_text = self.decoder.decode_observe(concept_names, obs, curiosity)
+            if visual_voice is not None and visual_voice.get_observe_key():
+                vis_key = visual_voice.get_observe_key()
+                vis_text = visual_voice.get_template(vis_key)
+                if vis_text:
+                    if visual_voice.has_blocking_object() or visual_voice.is_novel_scene():
+                        return vis_text
+                    return vis_text if random.random() < 0.6 else body_text
+            return body_text
 
         elif speech_type == SpeechType.REPORT:
             falls_since = total_falls - self._last_fall_count_reported
@@ -614,10 +625,22 @@ class VerbalActionController:
 
         elif speech_type == SpeechType.ASK:
             if self._use_llm_ask and llm_url:
+                if visual_voice is not None and visual_voice.is_novel_scene():
+                    vis_ask_key = visual_voice.get_ask_key()
+                    if vis_ask_key:
+                        vis_text = visual_voice.get_template(vis_ask_key)
+                        if vis_text and random.random() < 0.45:
+                            return vis_text
                 return await self.decoder.decode_ask_llm(
                     concept_names, obs, fall_history_brief, llm_url, llm_model
                 )
             else:
+                if visual_voice is not None and visual_voice.is_novel_scene():
+                    vis_ask_key = visual_voice.get_ask_key()
+                    if vis_ask_key:
+                        vis_text = visual_voice.get_template(vis_ask_key)
+                        if vis_text:
+                            return vis_text
                 return self.decoder.decode_ask_template(concept_names)
 
         return ""

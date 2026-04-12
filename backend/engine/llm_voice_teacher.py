@@ -317,6 +317,7 @@ class LLMVoiceTeacher:
         valid_graph_vars: list[str] | None = None,
         total_ticks: int = 0,
         total_falls: int = 0,
+        visual_voice=None,
     ) -> TeacherAnnotation | None:
         """
         Async LLM call. Non-blocking — fire from asyncio.ensure_future().
@@ -342,6 +343,7 @@ class LLMVoiceTeacher:
                 valid_graph_vars=set(valid_graph_vars or []),
                 total_ticks=total_ticks,
                 total_falls=total_falls,
+                visual_voice=visual_voice,
             )
             if ann is not None and not ann.error:
                 self._annotations.append(ann)
@@ -375,6 +377,7 @@ class LLMVoiceTeacher:
         valid_graph_vars: set[str],
         total_ticks: int,
         total_falls: int,
+        visual_voice=None,
     ) -> TeacherAnnotation | None:
         from engine.ollama_env import get_ollama_generate_url, get_ollama_model, ollama_think_disabled_payload
 
@@ -386,7 +389,7 @@ class LLMVoiceTeacher:
             url = (url.rstrip("/") + "/api/generate") if "/api/" not in url else url
 
         # Build obs summary
-        obs_summary = self._format_obs(obs)
+        obs_summary = self._format_obs(obs, visual_voice=visual_voice)
         concept_str = inner_voice_controller.get_concept_str() if inner_voice_controller else "UNKNOWN"
         fall_history = ""
         if episodic_memory is not None:
@@ -426,7 +429,7 @@ class LLMVoiceTeacher:
 
         return _parse_teacher_response(raw, tick, mode, valid_intents, valid_graph_vars)
 
-    def _format_obs(self, obs: dict[str, float]) -> str:
+    def _format_obs(self, obs: dict[str, float], visual_voice=None) -> str:
         keys = [
             "posture_stability", "com_z", "com_x", "torso_pitch",
             "foot_contact_l", "foot_contact_r", "gait_phase_l", "gait_phase_r",
@@ -442,6 +445,17 @@ class LLMVoiceTeacher:
                 except (TypeError, ValueError):
                     fv = 0.0
                 lines.append(f"  {k}={fv:.3f}")
+        if visual_voice is not None:
+            try:
+                world_desc = visual_voice.get_world_description()
+                if world_desc:
+                    lines.append(f"  world_visual: {world_desc}")
+                active = visual_voice.get_active_concepts()
+                if active:
+                    vis_str = ", ".join(f"{c}({v:.2f})" for c, v in active[:4])
+                    lines.append(f"  visual_concepts: {vis_str}")
+            except Exception:
+                pass
         return "\n".join(lines)
 
     def get_latest(self) -> TeacherAnnotation | None:

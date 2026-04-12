@@ -454,7 +454,11 @@ class EnvironmentVisual:
         tick: int,
         frame_b64: str | None = None,
     ) -> None:
-        """Сохраняем последнюю VLM-разметку (метки по slot_k, не меняя порядок слотов)."""
+        """Сохраняем последнюю VLM-разметку (метки по slot_k, не меняя порядок слотов).
+
+        Phase M: после полного батча VLM вызывается simulation.vlm_label_slots →
+        _phase_m_sync_from_vision(). In-place правки лексикона делаются в visual_grounding.
+        """
         self._slot_lexicon = dict(labels)
         self._slot_lexicon_tick = tick
         self._slot_lexicon_frame_hash = frame_content_hash(frame_b64)

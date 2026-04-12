@@ -184,6 +184,19 @@ except ImportError:
     _VERBAL_AVAILABLE = False
     print("[Simulation] verbal_action.py not found")
 
+# Phase M: Visual Grounding (SlotLabeler + VisualInnerVoice → GNN + speech)
+try:
+    from engine.slot_labeler import SlotLabeler
+    from engine.visual_inner_voice import VisualInnerVoice
+
+    _PHASE_M_AVAILABLE = True
+except ImportError:
+    _PHASE_M_AVAILABLE = False
+    print(
+        "[Simulation] Phase M not found — copy visual_concepts.py, "
+        "slot_labeler.py, visual_inner_voice.py"
+    )
+
 # Motor Cortex import (lazy — инициализируется при первом вызове)
 try:
     from engine.motor_cortex import MotorCortexLibrary as _MotorCortexLibrary
@@ -626,6 +639,14 @@ class Simulation:
             self._verbal = VerbalActionController()
             self._verbal.add_callback(self._broadcast_agent_message)
 
+        # Phase M: Visual Grounding (VLM lexicon + slots → visual concepts)
+        self._slot_labeler: Any = None
+        self._visual_voice: Any = None
+        if _PHASE_M_AVAILABLE:
+            _lang = os.environ.get("RKK_SPEECH_LANG", "ru")
+            self._slot_labeler = SlotLabeler()
+            self._visual_voice = VisualInnerVoice(lang=_lang)
+
         # Phase D: Motor Cortex (learned motor programs + CPG annealing)
         self._motor_cortex: "_MotorCortexLibrary | None" = None
         self._mc_posture_window: deque = deque(maxlen=200)
@@ -866,6 +887,7 @@ class Simulation:
             llm_url=get_ollama_generate_url(),
             llm_model=get_ollama_model(),
             fall_history_brief=fall_history_brief,
+            visual_voice=self._visual_voice if _PHASE_M_AVAILABLE else None,
         )
         if msg is None:
             return
@@ -1446,6 +1468,10 @@ class Simulation:
                 if _VERBAL_AVAILABLE:
                     self._verbal = VerbalActionController()
                     self._verbal.add_callback(self._broadcast_agent_message)
+                if _PHASE_M_AVAILABLE:
+                    self._slot_labeler = SlotLabeler()
+                    _lang_sw = os.environ.get("RKK_SPEECH_LANG", "ru")
+                    self._visual_voice = VisualInnerVoice(lang=_lang_sw)
                 # Motor Cortex reset on world switch
                 self._motor_cortex = None
                 self._mc_abstract_nodes_injected = False
@@ -2314,7 +2340,22 @@ class Simulation:
             node_ids = list(self.agent.graph._node_ids)
             state_vec = [float(self.agent.graph.nodes.get(n, 0.5)) for n in node_ids]
             if state_vec:
-                self._inner_voice.push_distill_sample(state_vec, ann.primary_concepts)
+                cs = self._inner_voice.concept_store
+                known_names = set(cs.name_to_idx.keys())
+                merged: list[str] = list(ann.primary_concepts)
+                if _PHASE_M_AVAILABLE and self._visual_voice is not None:
+                    for c, _ in self._visual_voice.get_active_concepts()[:3]:
+                        if c not in merged:
+                            merged.append(c)
+                labels_for_distill = [n for n in merged if n in known_names][:5]
+                if not labels_for_distill:
+                    labels_for_distill = [
+                        n for n in ann.primary_concepts if n in known_names
+                    ][:5]
+                if not labels_for_distill and "STABLE_BALANCE" in known_names:
+                    labels_for_distill = ["STABLE_BALANCE"]
+                if labels_for_distill:
+                    self._inner_voice.push_distill_sample(state_vec, labels_for_distill)
                 if len(self._inner_voice._train_buf) >= 8:
                     self._inner_voice.train_step()
 
@@ -2405,6 +2446,7 @@ class Simulation:
                 valid_graph_vars=valid_graph_vars,
                 total_ticks=tick,
                 total_falls=total_falls,
+                visual_voice=self._visual_voice if _PHASE_M_AVAILABLE else None,
             )
 
         def _run_in_thread() -> None:
@@ -3026,6 +3068,103 @@ class Simulation:
                     "#44ffcc",
                     "phase",
                 )
+
+        # Phase M (PATCH 4): VisualGroundingController.update() может дописать
+        # visual_env._slot_lexicon[slot_*] in-place (см. visual_grounding.py).
+        # Сразу после этого — SlotLabeler + VisualInnerVoice.
+        if result.get("ok") and _PHASE_M_AVAILABLE:
+            self._phase_m_sync_from_vision()
+
+    @staticmethod
+    def _phase_m_slot_positions_from_visual(visual_env: Any) -> dict[str, tuple[float, float]]:
+        """Center-of-mass of each attention mask → normalized [0,1]×[0,1]."""
+        attn = getattr(visual_env, "_last_attn", None)
+        if attn is None:
+            return {}
+        try:
+            if hasattr(attn, "detach"):
+                a = attn.detach().cpu().numpy()
+            else:
+                a = np.asarray(attn)
+        except Exception:
+            return {}
+        if a.ndim != 3 or a.shape[0] < 1:
+            return {}
+        K, H, W = int(a.shape[0]), int(a.shape[1]), int(a.shape[2])
+        pos: dict[str, tuple[float, float]] = {}
+        for k in range(K):
+            mk = np.maximum(a[k], 0.0)
+            s = float(mk.sum()) + 1e-8
+            yy, xx = np.mgrid[0:H, 0:W]
+            cx = float((mk * xx).sum() / s / max(W, 1))
+            cy = float((mk * yy).sum() / s / max(H, 1))
+            pos[f"slot_{k}"] = (cx, cy)
+        return pos
+
+    def _phase_m_sync_from_vision(self) -> None:
+        """
+        Phase M (PATCH 4): VLM lexicon + slot masks/vectors → SlotLabeler → VisualInnerVoice.
+
+        Вызывается из:
+          1) vlm_label_slots — сразу после EnvironmentVisual.set_slot_lexicon() (полный VLM batch);
+          2) _maybe_run_visual_grounding — после update(), если result['ok']
+             (in-place правки _slot_lexicon из engine/visual_grounding.py);
+          3) каждый тик агента после _maybe_run_visual_grounding — чтобы обновлять
+             позиции/векторы слотов по _last_attn / _last_slot_vecs даже без нового VLM.
+        """
+        if not _PHASE_M_AVAILABLE or self._slot_labeler is None:
+            return
+        if not self._visual_mode or self._visual_env is None:
+            return
+        vis = self._visual_env
+        lex = getattr(vis, "_slot_lexicon", None) or {}
+        vlm_str: dict[str, str] = {}
+        slot_confidences: dict[str, float] = {}
+        for sid, entry in lex.items():
+            if not isinstance(entry, dict):
+                continue
+            lab = entry.get("label")
+            if lab:
+                vlm_str[str(sid)] = str(lab)
+            slot_confidences[str(sid)] = float(entry.get("confidence", 0.6))
+
+        slot_positions = self._phase_m_slot_positions_from_visual(vis)
+        slot_vectors: dict[str, list[float]] = {}
+        vecs = getattr(vis, "_last_slot_vecs", None)
+        if vecs is not None and hasattr(vecs, "shape"):
+            try:
+                v = vecs.detach().cpu().numpy() if hasattr(vecs, "detach") else np.asarray(vecs)
+                for k in range(int(vecs.shape[0])):
+                    sid = f"slot_{k}"
+                    row = v[k].flatten()
+                    slot_vectors[sid] = [float(x) for x in row[:96]]
+            except Exception:
+                pass
+
+        try:
+            visual_concepts = self._slot_labeler.process_slots(
+                vlm_labels=vlm_str,
+                slot_positions=slot_positions,
+                slot_vectors=slot_vectors,
+                slot_confidences=slot_confidences,
+                tick=self.tick,
+            )
+        except Exception as e:
+            print(f"[Simulation] Phase M process_slots: {e}")
+            return
+
+        world_desc = self._slot_labeler.get_world_description()
+        if self._visual_voice is not None:
+            try:
+                self._visual_voice.update(
+                    visual_concepts=visual_concepts,
+                    world_desc=world_desc,
+                    graph=self.agent.graph if hasattr(self.agent, "graph") else None,
+                    inner_voice_ctrl=self._inner_voice,
+                    tick=self.tick,
+                )
+            except Exception as e:
+                print(f"[Simulation] Phase M visual_voice.update: {e}")
 
     def _record_last_action(self, result: dict) -> None:
         """Level 2-D: Track last action for episodic memory."""
@@ -3737,6 +3876,10 @@ class Simulation:
         # Level 1-B: Visual Body Grounding
         self._maybe_run_visual_grounding()
 
+        # Phase M: slot labels + attention → visual concepts / verbal context
+        if _PHASE_M_AVAILABLE:
+            self._phase_m_sync_from_vision()
+
         # Level 1-C: Standalone reconstruction training (warm up decoder early)
         if (
             self._visual_mode
@@ -4004,6 +4147,10 @@ class Simulation:
             }
 
         vis.set_slot_lexicon(labels, self.tick, snap.get("frame"))
+
+        # Phase M (PATCH 4): единственное место с полным set_slot_lexicon() из VLM API
+        if _PHASE_M_AVAILABLE:
+            self._phase_m_sync_from_vision()
 
         injected = 0
         skipped: list[str] = []
@@ -4320,6 +4467,16 @@ class Simulation:
                 self._verbal.snapshot()
                 if _VERBAL_AVAILABLE and self._verbal is not None
                 else {"enabled": False}
+            ),
+            "visual_voice": (
+                self._visual_voice.snapshot()
+                if _PHASE_M_AVAILABLE and self._visual_voice is not None
+                else {"enabled": False}
+            ),
+            "slot_labeler": (
+                self._slot_labeler.snapshot()
+                if _PHASE_M_AVAILABLE and self._slot_labeler is not None
+                else None
             ),
             "phase1":        self._phase1_snapshot_meta(),
             "phase2":        self._phase2_snapshot_meta(),
