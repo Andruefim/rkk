@@ -155,6 +155,24 @@ except ImportError:
     TeacherAnnotation = None  # type: ignore
     print("[Simulation] inner_voice / llm_voice_teacher not found")
 
+# Phase K: Sleep + Physical Curriculum + Persistence
+try:
+    from engine.sleep_consolidation import SleepController
+    from engine.physical_curriculum import PhysicalCurriculum
+    from engine.persistent_state import (
+        PersistenceManager,
+        collect_meta_from_simulation,
+        restore_meta_to_simulation,
+    )
+
+    _PHASE_K_AVAILABLE = True
+except ImportError:
+    _PHASE_K_AVAILABLE = False
+    print(
+        "[Simulation] Phase K not found — copy sleep_consolidation.py, "
+        "physical_curriculum.py, persistent_state.py"
+    )
+
 # Motor Cortex import (lazy — инициализируется при первом вызове)
 try:
     from engine.motor_cortex import MotorCortexLibrary as _MotorCortexLibrary
@@ -577,6 +595,17 @@ class Simulation:
             self._llm_teacher = LLMVoiceTeacher()
             self._llm_teacher.add_callback(self._on_teacher_annotation)
 
+        # Phase K: Sleep / curriculum / persistence (None if imports failed)
+        self._sleep_ctrl: "SleepController | None" = None
+        self._physical_curriculum: "PhysicalCurriculum | None" = None
+        self._persist: "PersistenceManager | None" = None
+        if _PHASE_K_AVAILABLE:
+            self._sleep_ctrl = SleepController()
+            self._physical_curriculum = PhysicalCurriculum()
+        self._meta_restored: bool = False
+        self._was_fallen_last_tick: bool = False
+        self._sleep_prev_fixed_root: bool = False
+
         # Phase D: Motor Cortex (learned motor programs + CPG annealing)
         self._motor_cortex: "_MotorCortexLibrary | None" = None
         self._mc_posture_window: deque = deque(maxlen=200)
@@ -706,24 +735,65 @@ class Simulation:
         self._maybe_materialize_concept_macros(self._concepts_cache)
         self._annotate_concepts_with_graph_nodes()
 
+    def _init_persistence(self, rkk_path: str | None = None) -> None:
+        """Init PersistenceManager (same path as .rkk)."""
+        if not _PHASE_K_AVAILABLE:
+            return
+        from pathlib import Path
+
+        from engine.persistence import default_memory_path
+
+        resolved = (
+            str(Path(rkk_path).resolve())
+            if rkk_path
+            else str(Path(default_memory_path()).resolve())
+        )
+        if self._persist is not None and getattr(self._persist, "_rkk_path", "") == resolved:
+            return
+        self._persist = PersistenceManager(resolved)
+
+    def _try_restore_meta(self) -> None:
+        """Restore autosave.meta.json after .rkk load."""
+        if not _PHASE_K_AVAILABLE or self._persist is None:
+            return
+        if self._meta_restored:
+            return
+        meta = self._persist.try_load()
+        if meta is not None:
+            restore_meta_to_simulation(self, meta)
+        self._meta_restored = True
+
     def _maybe_autosave_memory(self) -> None:
+        from pathlib import Path
+
         from engine.persistence import autosave_every_ticks, default_memory_path, save_simulation
 
         n = autosave_every_ticks()
         if n <= 0 or self.tick <= 0 or self.tick % n != 0:
             return
         try:
-            save_simulation(self, default_memory_path())
+            path = default_memory_path()
+            save_simulation(self, path)
+            if _PHASE_K_AVAILABLE:
+                self._init_persistence(str(Path(path).resolve()))
+                if self._persist is not None:
+                    self._persist.save(collect_meta_from_simulation(self))
         except Exception as e:
             print(f"[RKK] memory autosave: {e}")
 
     def memory_save(self, path: str | None = None) -> dict:
         from pathlib import Path
 
-        from engine.persistence import save_simulation
+        from engine.persistence import default_memory_path, save_simulation
 
         with self._sim_step_lock:
-            return save_simulation(self, Path(path) if path else None)
+            pth = Path(path) if path else default_memory_path()
+            out = save_simulation(self, pth)
+            if out.get("ok") and _PHASE_K_AVAILABLE:
+                self._init_persistence(str(pth.resolve()))
+                if self._persist is not None:
+                    self._persist.save(collect_meta_from_simulation(self))
+            return out
 
     def memory_load(self, path: str | None = None) -> dict:
         from pathlib import Path
@@ -779,6 +849,9 @@ class Simulation:
                     self._curriculum_auto_fr_released = True
                     if self._fixed_root_active:
                         self.disable_fixed_root()
+                self._meta_restored = False
+                self._init_persistence(str(p.resolve()))
+                self._try_restore_meta()
             return out
 
     def concepts_list_payload(self) -> dict:
@@ -1220,6 +1293,10 @@ class Simulation:
                     self._inner_voice = InnerVoiceController(device=self.device)
                     self._llm_teacher = LLMVoiceTeacher()
                     self._llm_teacher.add_callback(self._on_teacher_annotation)
+                if _PHASE_K_AVAILABLE:
+                    self._sleep_ctrl = SleepController()
+                    self._physical_curriculum = PhysicalCurriculum()
+                    self._meta_restored = False
                 # Motor Cortex reset on world switch
                 self._motor_cortex = None
                 self._mc_abstract_nodes_injected = False
@@ -3293,6 +3370,57 @@ class Simulation:
                     if _reward_signal.curiosity > 0.6:
                         self._timescale.set_intent(LEVEL_COGNIT, "causal_eig", 0.8)
 
+        # Phase K: Sleep Controller
+        if (
+            _PHASE_K_AVAILABLE
+            and self._sleep_ctrl is not None
+            and self.current_world == "humanoid"
+        ):
+            if fallen and not self._was_fallen_last_tick:
+                self._sleep_ctrl.notify_fall()
+            self._was_fallen_last_tick = fallen
+
+            _total_falls = (
+                getattr(self._episodic_memory, "total_falls_recorded", 0)
+                if self._episodic_memory
+                else 0
+            )
+            _sleep_reason = self._sleep_ctrl.check_trigger(self.tick, _total_falls)
+
+            if _sleep_reason and not self._sleep_ctrl.is_sleeping:
+                self._sleep_prev_fixed_root = self._fixed_root_active
+                if not self._fixed_root_active:
+                    self.enable_fixed_root()
+                self._sleep_ctrl.begin_sleep(self.tick, _sleep_reason)
+                self._add_event(
+                    f"😴 Sleep: {_sleep_reason} (falls={self._sleep_ctrl._falls_since_sleep})",
+                    "#9988ff",
+                    "sleep",
+                )
+
+            if self._sleep_ctrl.is_sleeping:
+                self._sleep_ctrl.tick(self.tick, self)
+                if not self._sleep_ctrl.is_sleeping:
+                    if (
+                        not self._sleep_prev_fixed_root
+                        and self._fixed_root_active
+                    ):
+                        self.disable_fixed_root()
+                    self._add_event(
+                        f"🌅 Woke up (sleep #{self._sleep_ctrl.sleep_count})",
+                        "#ffff88",
+                        "sleep",
+                    )
+
+        # Phase K: Physical curriculum when scheduler runs low on stages ahead
+        if (
+            _PHASE_K_AVAILABLE
+            and self._physical_curriculum is not None
+            and self._curriculum is not None
+            and self.tick % 1000 == 0
+        ):
+            self._physical_curriculum.inject_into_scheduler(self._curriculum)
+
         if not result.get("blocked") and not result.get("skipped"):
             _var_now = result.get("variable", "")
             _val_now = result.get("value", 0.5)
@@ -4019,6 +4147,21 @@ class Simulation:
                 self._llm_teacher.snapshot()
                 if self._llm_teacher is not None
                 else {"enabled": False}
+            ),
+            "sleep": (
+                self._sleep_ctrl.snapshot()
+                if _PHASE_K_AVAILABLE and self._sleep_ctrl is not None
+                else {"enabled": False}
+            ),
+            "physical_curriculum": (
+                self._physical_curriculum.snapshot()
+                if _PHASE_K_AVAILABLE and self._physical_curriculum is not None
+                else None
+            ),
+            "persistence": (
+                self._persist.snapshot()
+                if _PHASE_K_AVAILABLE and self._persist is not None
+                else None
             ),
             "phase1":        self._phase1_snapshot_meta(),
             "phase2":        self._phase2_snapshot_meta(),

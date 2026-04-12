@@ -708,6 +708,39 @@ def memory_status():
     }
 
 
+@app.post("/sleep")
+def force_sleep():
+    """Phase K: начать цикл консолидации сна (fixed_root на время сна)."""
+    sim = get_sim()
+    sleep_ctrl = getattr(sim, "_sleep_ctrl", None)
+    if sleep_ctrl is None:
+        return JSONResponse({"error": "Sleep controller not available"}, status_code=503)
+    if sleep_ctrl.is_sleeping:
+        return {
+            "error": "Already sleeping",
+            "phase": sleep_ctrl.current_phase.name,
+        }
+    sim._sleep_prev_fixed_root = sim._fixed_root_active
+    if not sim._fixed_root_active:
+        sim.enable_fixed_root()
+    sleep_ctrl.begin_sleep(sim.tick, "manual")
+    return {
+        "ok": True,
+        "tick": sim.tick,
+        "reason": "manual",
+        "message": "Sleep initiated. Will complete in ~200 ticks.",
+    }
+
+
+@app.get("/sleep/status")
+def sleep_status():
+    """Phase K: состояние SleepController."""
+    sleep_ctrl = getattr(get_sim(), "_sleep_ctrl", None)
+    if sleep_ctrl is None:
+        return {"available": False}
+    return sleep_ctrl.snapshot()
+
+
 @app.get("/graph/frozen-edges")
 def graph_frozen_edges():
     """Диагностика замороженных кинематических рёбер."""
