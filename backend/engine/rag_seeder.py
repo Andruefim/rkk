@@ -33,6 +33,7 @@ from typing import Literal
 from engine.llm_json_extract import (
     ollama_json_format_humanoid_bootstrap_payload,
     parse_json_array_loose,
+    parse_json_object_loose,
 )
 from engine.ollama_env import get_ollama_model, ollama_think_disabled_payload
 
@@ -277,9 +278,56 @@ def humanoid_urdf_digest(max_chars: int = 2800) -> str:
     return "\n".join(lines)[:max_chars]
 
 
+def parse_edges_from_response(raw: str) -> list[dict]:
+    """Извлекает рёбра из ответа LLM: голый массив, объект с ключом edges/…, или вырезка из текста."""
+    arr = parse_json_array_loose(raw)
+    if isinstance(arr, list) and arr:
+        return _validate_edges(arr)
+
+    obj = parse_json_object_loose(raw)
+    if obj:
+        for key in ("edges", "seeds", "priors", "connections", "results"):
+            if key in obj and isinstance(obj[key], list):
+                return _validate_edges(obj[key])
+
+    m = re.search(r"\[\s*\{.*?\}\s*\]", raw, re.DOTALL)
+    if m:
+        try:
+            return _validate_edges(json.loads(m.group()))
+        except Exception:
+            pass
+
+    return []
+
+
+def _validate_edges(raw_list: list) -> list[dict]:
+    """Фильтрует кривые edges (типа двойного 'to':'to':)."""
+    result: list[dict] = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        fr = item.get("from_") or item.get("from") or ""
+        to = item.get("to") or ""
+        w = item.get("weight", 0.0)
+        if not fr or not to or ":" in str(to) or ":" in str(fr):
+            continue
+        try:
+            result.append(
+                {
+                    "from_": str(fr).strip(),
+                    "to": str(to).strip(),
+                    "weight": float(w),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 def _parse_json_array_from_llm_text(raw: str) -> list | None:
-    """См. engine.llm_json_extract — фенсы, object.edges, хвостовые запятые."""
-    return parse_json_array_loose(raw)
+    """Совместимость: llm_loop.structure_revision_sync и humanoid RAG."""
+    out = parse_edges_from_response(raw)
+    return out if out else None
 
 
 def _dedupe_cap_edges(
@@ -352,7 +400,10 @@ Each element: {{"from_":"lhip","to":"com_x","weight":0.25}} — use real names f
 Rules:
 - from_ and to MUST be copied exactly from the JSON variable list (same spelling).
 - weight in [-1, 1]; sign = direction of positive association in normalized observation space.
-- 14 to 28 edges, diverse sources, no self-loops."""
+- 14 to 28 edges, diverse sources, no self-loops.
+
+Respond with ONLY a raw JSON array, no wrapper object, no markdown:
+[{{"from_": "...", "to": "...", "weight": ...}}, ...]"""
 
     payload = {
         "model": model,
