@@ -49,7 +49,7 @@ function normFrame(raw) {
     demon:raw.demon??{energy:1,cooldown:0,mode:"probe",success_rate:0},
     events:raw.events??[], valueLayer:raw.value_layer??null,
     fallen:raw.fallen??false, fallCount:raw.fall_count??0,
-    scene:raw.scene??{skeleton:[],cubes:[],target:{x:0,y:0,z:0.9},fallen:false},
+    scene:raw.scene??{skeleton:[],cubes:[],target:{x:0,y:0,z:0.9},fallen:false,static_geometry:[],props:[]},
     visualMode:raw.visual_mode??false,
     visionTicks:raw.vision_ticks??0,
     vision:raw.vision??null,
@@ -249,38 +249,62 @@ export default function RKKHumanoid() {
     mount.appendChild(renderer.domElement);
 
     const scene  = new THREE.Scene();
-    scene.background = new THREE.Color(0x030912);
-    scene.fog = new THREE.FogExp2(0x030912,0.022);
+    const bg = 0xd8e4f0;
+    scene.background = new THREE.Color(bg);
+    scene.fog = new THREE.FogExp2(bg,0.006);
 
     const camera = new THREE.PerspectiveCamera(55,mount.clientWidth/mount.clientHeight,0.1,100);
     camera.position.set(0,0.8,4.0);
 
-    scene.add(new THREE.AmbientLight(0x0a1020,3.0));
-    const key = new THREE.DirectionalLight(0x8899ff,2.5);
-    key.position.set(3,6,4); key.castShadow=true; scene.add(key);
-    const rim = new THREE.PointLight(0x6644ff,1.5,10);
+    scene.add(new THREE.HemisphereLight(0xffffff,0xb8c4d0,0.95));
+    scene.add(new THREE.AmbientLight(0xe8eef5,0.85));
+    const key = new THREE.DirectionalLight(0xfff5e6,2.2);
+    key.position.set(4.5, 9.5, 3.2);
+    key.castShadow=true;
+    key.shadow.mapSize.set(2048,2048);
+    key.shadow.bias = -0.0002;
+    scene.add(key);
+    const fill = new THREE.DirectionalLight(0xb8d4ff,0.55);
+    fill.position.set(-3.5, 4.0, -2.0);
+    scene.add(fill);
+    const rim = new THREE.PointLight(0xffeedd,0.9,22);
     rim.position.set(0,4,-2); scene.add(rim);
 
     const floor = new THREE.Mesh(
-      new THREE.PlaneGeometry(20,20),
-      new THREE.MeshStandardMaterial({color:0x0a0f1a,roughness:0.9})
+      new THREE.PlaneGeometry(24,24),
+      new THREE.MeshStandardMaterial({color:0xc5d0de,roughness:0.92,metalness:0.02})
     );
     floor.rotation.x=-Math.PI/2; floor.receiveShadow=true; scene.add(floor);
-    scene.add(new THREE.GridHelper(20,40,0x0d1a2e,0x071220));
+    scene.add(new THREE.GridHelper(24,48,0x9aa8b8,0xc8d4e0));
 
     const vS = 0.62;
 
-    const ramp = new THREE.Mesh(
-      new THREE.BoxGeometry(3.75,0.12,2.5),
-      new THREE.MeshStandardMaterial({color:0x1a1510,roughness:0.8})
-    );
-    ramp.position.set(3.5,0.48,0); ramp.rotation.x=-0.26; scene.add(ramp);
+    const staticGroup = new THREE.Group();
+    scene.add(staticGroup);
+    let staticBuilt = false;
 
-    const shelf = new THREE.Mesh(
-      new THREE.BoxGeometry(0.6,0.06,0.6),
-      new THREE.MeshStandardMaterial({color:0x1a2030,roughness:0.6})
+    const ballMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.1125, 20, 20),
+      new THREE.MeshStandardMaterial({color:0xf5e85a,roughness:0.35,metalness:0.08,emissive:0x332200,emissiveIntensity:0.12})
     );
-    shelf.position.set(1.2,0.22,0.0); scene.add(shelf);
+    ballMesh.castShadow=true; ballMesh.receiveShadow=true; scene.add(ballMesh);
+
+    const targetMarker = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.22,0.22,0.024,28),
+      new THREE.MeshStandardMaterial({color:0x22cc88,roughness:0.45,emissive:0x114433,emissiveIntensity:0.15,transparent:true,opacity:0.92})
+    );
+    targetMarker.rotation.x = Math.PI/2;
+    targetMarker.receiveShadow=true; scene.add(targetMarker);
+
+    const propMeshes = [];
+    for(let pi=0;pi<8;pi++){
+      const m=new THREE.Mesh(
+        new THREE.BoxGeometry(0.14,0.14,0.14),
+        new THREE.MeshStandardMaterial({color:0x8899aa,roughness:0.5})
+      );
+      m.castShadow=true; m.receiveShadow=true; m.visible=false; scene.add(m);
+      propMeshes.push(m);
+    }
 
     // Гуманоид — Figure 03 aesthetic: smooth matte-white body with dark accents
     const JOINT_COUNT = 18;
@@ -419,11 +443,11 @@ export default function RKKHumanoid() {
     for(let i=0;i<600;i++){pPos[i*3]=(Math.random()-.5)*30;pPos[i*3+1]=Math.random()*12;pPos[i*3+2]=(Math.random()-.5)*30;}
     const pGeom=new THREE.BufferGeometry();
     pGeom.setAttribute("position",new THREE.BufferAttribute(pPos,3));
-    scene.add(new THREE.Points(pGeom,new THREE.PointsMaterial({color:0x220044,size:0.06,transparent:true,opacity:0.4})));
+    scene.add(new THREE.Points(pGeom,new THREE.PointsMaterial({color:0xaaccff,size:0.04,transparent:true,opacity:0.18})));
 
     let frame=0;
     const camTarget=new THREE.Vector3(0,0.5,0);
-    let camAzim=0,camElev=0.25,camRadius=3.5;
+    let camAzim=0,camElev=0.28,camRadius=5.5;
     let camDrag=false,camPtrX=0,camPtrY=0;
 
     function updateBone(b,a,bp){
@@ -521,13 +545,68 @@ export default function RKKHumanoid() {
         const has=c&&typeof c.x==="number";
         cm.visible=showCubesRef.current&&has;
         if(has){
-          cm.position.set(c.x,Math.max(0,c.z??0)+cm.geometry.parameters?.height/2||0.12,c.y??0);
+          let lift=0.12;
+          if(cm.geometry instanceof THREE.BoxGeometry){
+            lift=(cm.geometry.parameters.height||0.25)*0.5;
+          }else if(cm.geometry instanceof THREE.SphereGeometry){
+            lift=cm.geometry.parameters.radius||0.11;
+          }
+          cm.position.set(c.x,Math.max(0,c.z??0)+lift,c.y??0);
         }
         if(showCubesRef.current){
-          // Шар (cube1) вращается быстрее
           cm.rotation.y+=i===1?0.03:0.005;
         }
       });
+
+      const sg=ds.scene?.static_geometry;
+      if(!staticBuilt&&sg&&sg.length){
+        sg.forEach(def=>{
+          if(def.kind!=="box")return;
+          const hx=def.hx??0.1,hy=def.hy??0.1,hz=def.hz??0.1;
+          const mesh=new THREE.Mesh(
+            new THREE.BoxGeometry(hx*2,hy*2,hz*2),
+            new THREE.MeshStandardMaterial({
+              color:new THREE.Color(def.r??0.7,def.g??0.7,def.b??0.72),
+              roughness:0.78,metalness:0.04,
+            })
+          );
+          mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
+          mesh.rotation.set(def.rx??0,def.ry??0,def.rz??0);
+          mesh.castShadow=true; mesh.receiveShadow=true;
+          staticGroup.add(mesh);
+        });
+        staticBuilt=true;
+      }
+
+      const b=ds.scene?.ball;
+      if(b&&typeof b.x==="number"){
+        ballMesh.visible=true;
+        ballMesh.position.set(b.x,b.z??0.12,b.y);
+      }else ballMesh.visible=false;
+
+      const dt=ds.scene?.delivery_target;
+      if(dt&&typeof dt.x==="number"){
+        targetMarker.visible=true;
+        targetMarker.position.set(dt.x,(dt.z??0.02)+0.012,dt.y);
+      }else targetMarker.visible=false;
+
+      const pr=ds.scene?.props;
+      if(pr&&pr.length){
+        propMeshes.forEach((pm,i)=>{
+          const p=pr[i];
+          if(!p||typeof p.x!=="number"){pm.visible=false;return;}
+          pm.visible=true;
+          const hs=p.hx??0.07;
+          if(pm.geometry.parameters&&Math.abs(pm.geometry.parameters.width-hs*2)>1e-4){
+            pm.geometry.dispose();
+            pm.geometry=new THREE.BoxGeometry(hs*2,hs*2,hs*2);
+          }
+          pm.position.set(p.x,(p.z??0)+hs,p.y);
+          if(pm.material&&pm.material.color){
+            pm.material.color.setRGB(p.r??0.5,p.g??0.5,p.b??0.5);
+          }
+        });
+      }else propMeshes.forEach(pm=>{pm.visible=false;});
 
       // Рычаг
       const lever=ds.scene?.lever;
@@ -606,7 +685,7 @@ export default function RKKHumanoid() {
   const frColor="#ffcc44";
 
   return(
-    <div style={{position:"relative",width:"100%",height:"100vh",background:"#030912",overflow:"hidden",...mono}}>
+    <div style={{position:"relative",width:"100%",height:"100vh",background:"#d8e4f0",overflow:"hidden",...mono}}>
       <div ref={mountRef} style={{position:"absolute",inset:0}}/>
 
       {/* Camera overlay */}

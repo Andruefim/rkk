@@ -542,6 +542,8 @@ class _FallbackHumanoid(InstrumentalSandbox):
                 "y": float(self._target_pad[1]),
                 "z": float(self._target_pad[2]),
             },
+            "static_geometry": [],
+            "props": [],
         }
 
     def get_frame_base64(self, view="side", **kwargs) -> str | None:
@@ -599,6 +601,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         pb.setPhysicsEngineParameter(numSolverIterations=80, physicsClientId=self.client)
 
         self.floor_id = pb.loadURDF("plane.urdf", physicsClientId=self.client)
+        # Экспорт для Three.js (tx,ty,tz = y-up): заполняется в _build_* и _build_rich_environment
+        self._static_scene_export: list[dict] = []
         self._build_ramp()
 
         self.cube_ids = []
@@ -647,6 +651,10 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self._build_low_incline()
         self._build_lever_pedestal()
         self._build_target_marker()
+        self.prop_ids: list[int] = []
+        self._prop_starts: list[list[float]] = []
+        self._prop_meta: list[dict] = []
+        self._build_rich_environment()
 
         self.robot_id = self._load_humanoid()
         self.n_joints = pb.getNumJoints(self.robot_id, physicsClientId=self.client)
@@ -800,11 +808,19 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         vis = pb.createVisualShape(pb.GEOM_BOX, halfExtents=half,
                                     rgbaColor=[0.4, 0.35, 0.3, 1.0], physicsClientId=self.client)
         orn = pb.getQuaternionFromEuler([angle, 0, 0])
+        zc = 0.3 * math.sin(angle) + 0.03
         pb.createMultiBody(
             baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
-            basePosition=[2.0, 0, 0.3*math.sin(angle) + 0.03],
+            basePosition=[2.0, 0, zc],
             baseOrientation=orn, physicsClientId=self.client
         )
+        self._static_scene_export.append({
+            "kind": "box",
+            "tx": 2.0, "ty": float(zc), "tz": 0.0,
+            "hx": 1.0, "hy": 0.03, "hz": 0.5,
+            "r": 0.42, "g": 0.35, "b": 0.30,
+            "rx": -float(angle), "ry": 0.0, "rz": 0.0,
+        })
 
     def _build_low_incline(self) -> None:
         """Второй пологий наклон — другое направление, больше контактов / скольжения."""
@@ -817,11 +833,19 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             rgbaColor=[0.32, 0.38, 0.42, 1.0], physicsClientId=self.client,
         )
         orn = pb.getQuaternionFromEuler([0, 0, ang])
+        zc = 0.22 * math.sin(ang) + 0.03
         pb.createMultiBody(
             baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
-            basePosition=[-1.35, -0.95, 0.22 * math.sin(ang) + 0.03],
+            basePosition=[-1.35, -0.95, zc],
             baseOrientation=orn, physicsClientId=self.client,
         )
+        self._static_scene_export.append({
+            "kind": "box",
+            "tx": -1.35, "ty": float(zc), "tz": -0.95,
+            "hx": 0.55, "hy": 0.028, "hz": 0.4,
+            "r": 0.32, "g": 0.38, "b": 0.42,
+            "rx": 0.0, "ry": float(ang), "rz": 0.0,
+        })
 
     def _build_lever_pedestal(self) -> None:
         """Визуальный «рычаг» / кнопка — каузальность через lever_pin (проксимити объектов)."""
@@ -837,6 +861,13 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             basePosition=[float(lc[0]), float(lc[1]), float(lc[2])],
             physicsClientId=self.client,
         )
+        self._static_scene_export.append({
+            "kind": "box",
+            "tx": float(lc[0]), "ty": float(lc[2]), "tz": float(lc[1]),
+            "hx": 0.07, "hy": 0.055, "hz": 0.07,
+            "r": 0.88, "g": 0.62, "b": 0.15,
+            "rx": 0.0, "ry": 0.0, "rz": 0.0,
+        })
 
     def _build_target_marker(self) -> None:
         """Плоская мишень — зона доставки куба (target_dist в observe)."""
@@ -852,6 +883,91 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             basePosition=[float(tp[0]), float(tp[1]), float(tp[2])],
             physicsClientId=self.client,
         )
+        self._static_scene_export.append({
+            "kind": "box",
+            "tx": float(tp[0]), "ty": float(tp[2]), "tz": float(tp[1]),
+            "hx": 0.22, "hy": 0.012, "hz": 0.22,
+            "r": 0.15, "g": 0.85, "b": 0.55,
+            "rx": 0.0, "ry": 0.0, "rz": 0.0,
+        })
+
+    def _build_rich_environment(self) -> None:
+        """
+        Комната + мебель (статика) + доп. динамические объекты для манипуляций.
+        Координаты Three.js: tx=x_pb, ty=z_pb, tz=y_pb.
+        """
+        cid = self.client
+
+        def _wall(tx: float, ty: float, tz: float, hx: float, hy: float, hz: float, rgb: tuple[float, float, float]) -> None:
+            # Three: (tx,ty,tz), half (hx,hy,hz) с y вверх → PyBullet: pos [x_pb,y_pb,z_pb], half [hx, hz, hy]
+            half = [hx, hz, hy]
+            pos_pb = [tx, tz, ty]
+            col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half, physicsClientId=cid)
+            vis = pb.createVisualShape(
+                pb.GEOM_BOX, halfExtents=half,
+                rgbaColor=[rgb[0], rgb[1], rgb[2], 1.0], physicsClientId=cid,
+            )
+            pb.createMultiBody(
+                baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+                basePosition=pos_pb, physicsClientId=cid,
+            )
+            self._static_scene_export.append({
+                "kind": "box",
+                "tx": float(tx), "ty": float(ty), "tz": float(tz),
+                "hx": float(hx), "hy": float(hy), "hz": float(hz),
+                "r": rgb[0], "g": rgb[1], "b": rgb[2],
+                "rx": 0.0, "ry": 0.0, "rz": 0.0,
+            })
+
+        cream = (0.92, 0.90, 0.86)
+        wood = (0.45, 0.32, 0.22)
+        glass = (0.75, 0.82, 0.88)
+        # Периметр ~9×9 м; hy = высота по Y (Three), hz = толщина по «глубине» Z
+        _wall(0.0, 1.1, -4.5, 4.85, 1.1, 0.06, cream)
+        _wall(0.0, 1.1, 4.5, 4.85, 1.1, 0.06, cream)
+        _wall(-4.5, 1.1, 0.0, 0.06, 1.1, 4.85, cream)
+        _wall(4.5, 1.1, 0.0, 0.06, 1.1, 4.85, cream)
+        # Низкая перегородка
+        _wall(1.2, 0.55, 1.8, 1.4, 0.55, 0.05, glass)
+        # Лавка / низкий блок
+        _wall(-3.1, 0.38, 3.0, 0.95, 0.38, 0.35, wood)
+        # Стол
+        _wall(-1.0, 0.42, 2.1, 0.55, 0.42, 0.32, wood)
+        # Колонна
+        _wall(2.3, 1.05, -1.1, 0.14, 1.05, 0.14, (0.55, 0.55, 0.58))
+
+        prop_cfgs = [
+            {"pos": [-0.2, 2.4, 0.09], "half": 0.07, "mass": 0.35, "color": [0.9, 0.35, 0.25, 1.0]},
+            {"pos": [1.1, -2.0, 0.08], "half": 0.065, "mass": 0.28, "color": [0.35, 0.55, 0.95, 1.0]},
+            {"pos": [-2.4, -1.2, 0.075], "half": 0.06, "mass": 0.22, "color": [0.45, 0.85, 0.4, 1.0]},
+            {"pos": [3.0, 0.9, 0.085], "half": 0.07, "mass": 0.4, "color": [0.95, 0.75, 0.2, 1.0]},
+            {"pos": [-1.0, -2.8, 0.07], "half": 0.065, "mass": 0.3, "color": [0.75, 0.45, 0.85, 1.0]},
+            {"pos": [0.5, 3.2, 0.08], "half": 0.06, "mass": 0.25, "color": [0.3, 0.85, 0.75, 1.0]},
+        ]
+        for cfg in prop_cfgs:
+            hs = float(cfg["half"])
+            colp = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=[hs, hs, hs], physicsClientId=cid)
+            visp = pb.createVisualShape(
+                pb.GEOM_BOX, halfExtents=[hs, hs, hs],
+                rgbaColor=cfg["color"], physicsClientId=cid,
+            )
+            pos = cfg["pos"]
+            bid = pb.createMultiBody(
+                baseMass=float(cfg["mass"]),
+                baseCollisionShapeIndex=colp,
+                baseVisualShapeIndex=visp,
+                basePosition=pos,
+                physicsClientId=cid,
+            )
+            pb.changeDynamics(bid, -1, lateralFriction=0.55, physicsClientId=cid)
+            self.prop_ids.append(bid)
+            self._prop_starts.append([float(pos[0]), float(pos[1]), float(pos[2])])
+            self._prop_meta.append({
+                "half": hs,
+                "r": float(cfg["color"][0]),
+                "g": float(cfg["color"][1]),
+                "b": float(cfg["color"][2]),
+            })
 
     def _load_humanoid(self) -> int:
         local = Path(__file__).resolve().parent / "data" / "humanoid" / "humanoid.urdf"
@@ -1120,6 +1236,12 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 self.ball_id, [0, 0, 0], [0, 0, 0], physicsClientId=cid,
             )
 
+        for pid, p0 in zip(getattr(self, "prop_ids", []) or [], getattr(self, "_prop_starts", []) or []):
+            pb.resetBasePositionAndOrientation(
+                pid, p0, [0, 0, 0, 1], physicsClientId=cid,
+            )
+            pb.resetBaseVelocity(pid, [0, 0, 0], [0, 0, 0], physicsClientId=cid)
+
         self._reset_instrumental_hidden()
 
     def set_joint(self, var_name: str, target_pos: float):
@@ -1267,6 +1389,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             out.append(np.array(pos, dtype=np.float64))
         for cid in self.cube_ids:
             pos, _ = pb.getBasePositionAndOrientation(cid, physicsClientId=self.client)
+            out.append(np.array(pos, dtype=np.float64))
+        for pid in getattr(self, "prop_ids", []) or []:
+            pos, _ = pb.getBasePositionAndOrientation(pid, physicsClientId=self.client)
             out.append(np.array(pos, dtype=np.float64))
         return out
 
@@ -1426,6 +1551,18 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 p, _ = pb.getBasePositionAndOrientation(self.ball_id, physicsClientId=self.client)
                 ball = {"x": float(p[0]), "y": float(p[1]), "z": float(p[2])}
             lp = self._compute_lever_pin()
+            props_out: list[dict] = []
+            for i, pid in enumerate(getattr(self, "prop_ids", []) or []):
+                p, _ = pb.getBasePositionAndOrientation(pid, physicsClientId=self.client)
+                meta = (self._prop_meta[i] if i < len(self._prop_meta) else {"half": 0.07, "r": 0.5, "g": 0.5, "b": 0.5})
+                hs = float(meta.get("half", 0.07))
+                props_out.append({
+                    "x": float(p[0]), "y": float(p[1]), "z": float(p[2]),
+                    "hx": hs, "hy": hs, "hz": hs,
+                    "r": float(meta.get("r", 0.5)),
+                    "g": float(meta.get("g", 0.5)),
+                    "b": float(meta.get("b", 0.5)),
+                })
             return {
                 "ball": ball,
                 "lever": {
@@ -1440,6 +1577,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     "y": float(self.target_pad[1]),
                     "z": float(self.target_pad[2]),
                 },
+                "static_geometry": [{**row} for row in getattr(self, "_static_scene_export", [])],
+                "props": props_out,
             }
 
     def _link_world_pos(self, link_name: str) -> np.ndarray | None:
