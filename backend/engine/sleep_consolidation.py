@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -476,10 +477,19 @@ class SleepController:
             if ann:
                 _on_lesson(ann)
 
+        # Agent tick runs in rkk-agent-loop thread — no asyncio loop there.
+        def _run_lesson_in_thread() -> None:
+            try:
+                asyncio.run(_lesson_call())
+            except Exception as e:
+                print(f"[Sleep] Lesson async error: {e}")
+
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(_lesson_call())
+            threading.Thread(
+                target=_run_lesson_in_thread,
+                daemon=True,
+                name="rkk-sleep-lesson",
+            ).start()
         except Exception as e:
             print(f"[Sleep] Lesson schedule error: {e}")
 
