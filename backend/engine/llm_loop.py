@@ -30,6 +30,15 @@ def _prompt_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def _llm_loop_http_timeout() -> float:
+    """Ollama generate for L2/L3; large models need generous read timeout (seconds)."""
+    try:
+        v = float(os.environ.get("RKK_LLM_LOOP_TIMEOUT", "900"))
+    except ValueError:
+        v = 900.0
+    return max(60.0, min(v, 7200.0))
+
+
 def _normalize_generate_url(llm_url: str) -> str:
     url = llm_url.strip().rstrip("/")
     if url.endswith("/generate"):
@@ -159,9 +168,11 @@ def consult_counterfactual_sync(
     llm_model: str,
     ctx: dict[str, Any],
     valid_vars: set[str],
-    timeout: float = 500.0,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """Synchronous Ollama /api/generate call (for background thread)."""
+    if timeout is None:
+        timeout = _llm_loop_http_timeout()
     prompt = build_counterfactual_prompt(ctx)
     url = _normalize_generate_url(llm_url)
     payload = {
@@ -174,14 +185,17 @@ def consult_counterfactual_sync(
         },
         **ollama_json_format_payload(),
     }
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(url, json=payload)
-        if resp.status_code != 200:
-            return {
-                "ok": False,
-                "error": f"HTTP {resp.status_code}: {resp.text[:240]}",
-            }
-        raw = (resp.json().get("response") or "").strip()
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(url, json=payload)
+    except httpx.TimeoutException:
+        return {"ok": False, "error": "timed out"}
+    if resp.status_code != 200:
+        return {
+            "ok": False,
+            "error": f"HTTP {resp.status_code}: {resp.text[:240]}",
+        }
+    raw = (resp.json().get("response") or "").strip()
     expl, edges, nxt = parse_counterfactual_response(raw, valid_vars)
     return {
         "ok": True,
@@ -217,9 +231,11 @@ def structure_revision_sync(
     llm_url: str,
     llm_model: str,
     var_names: list[str],
-    timeout: float = 500.0,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """Уровень 3: редкая полная перезапись списка гипотез (как bootstrap, sync)."""
+    if timeout is None:
+        timeout = _llm_loop_http_timeout()
     url = _normalize_generate_url(llm_url)
     prompt = build_structure_revision_prompt(var_names)
     payload = {
@@ -231,11 +247,14 @@ def structure_revision_sync(
         **ollama_json_format_payload(),
     }
     valid = set(var_names)
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(url, json=payload)
-        if resp.status_code != 200:
-            return {"ok": False, "error": f"HTTP {resp.status_code}", "edges": []}
-        raw = (resp.json().get("response") or "").strip()
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(url, json=payload)
+    except httpx.TimeoutException:
+        return {"ok": False, "error": "timed out", "edges": []}
+    if resp.status_code != 200:
+        return {"ok": False, "error": f"HTTP {resp.status_code}", "edges": []}
+    raw = (resp.json().get("response") or "").strip()
     arr = _parse_json_array_from_llm_text(raw)
     if not arr:
         return {"ok": False, "error": "no JSON array in response", "edges": []}

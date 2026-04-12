@@ -36,6 +36,7 @@ Phase C (full RSI):
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import os
 import queue
