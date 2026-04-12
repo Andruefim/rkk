@@ -167,6 +167,9 @@ FALLEN_Z     = 0.30
 STAND_Z      = 0.80
 HUMANOID_URDF_STAND_EULER = (np.pi / 2, 0.0, 0.0)
 HUMANOID_URDF_SPAWN_Z = 1.10
+# Старт гуманоида рядом с центром, но вне кашпо/ствола (см. Three.js penthouse + static_geometry)
+PENTHOUSE_SPAWN_X = 1.85
+PENTHOUSE_SPAWN_Y = -1.15
 
 
 def _np_quat_from_axis_angle(axis: np.ndarray, angle: float) -> list[float]:
@@ -427,13 +430,13 @@ class _FallbackHumanoid(InstrumentalSandbox):
         self.com    = np.array([0.0, 0.0, STAND_Z])
         self.torso_euler = np.zeros(3)
         self.cubes  = np.array([
-            [ 0.8,  0.3, 0.15],
-            [-0.5,  0.6, 0.15],
-            [ 0.2, -0.7, 0.25],
+            [-3.8, 2.6, 0.16],
+            [3.4, -3.2, 0.14],
+            [-1.8, -3.5, 0.24],
         ])
-        self.ball = np.array([0.5, -0.35, 0.12], dtype=np.float64)
-        self._lever_center = np.array([-1.0, 0.5, 0.1], dtype=np.float64)
-        self._target_pad = np.array([1.85, -0.75, 0.02], dtype=np.float64)
+        self.ball = np.array([1.8, 1.4, 0.14], dtype=np.float64)
+        self._lever_center = np.array([-4.2, 2.5, 0.1], dtype=np.float64)
+        self._target_pad = np.array([3.6, -3.9, 0.02], dtype=np.float64)
         self._vel   = np.zeros(3)
         self._dt    = 0.02
         self._init_instrumental()
@@ -560,7 +563,7 @@ class _FallbackHumanoid(InstrumentalSandbox):
         self.com = np.array([0.0, 0.0, STAND_Z], dtype=np.float64)
         self.torso_euler = np.zeros(3)
         self._vel = np.zeros(3)
-        self.ball = np.array([0.5, -0.35, 0.12], dtype=np.float64)
+        self.ball = np.array([1.8, 1.4, 0.14], dtype=np.float64)
         self._reset_instrumental_hidden()
 
     # fixed_root controls для fallback — только флаг
@@ -601,15 +604,14 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         pb.setPhysicsEngineParameter(numSolverIterations=80, physicsClientId=self.client)
 
         self.floor_id = pb.loadURDF("plane.urdf", physicsClientId=self.client)
-        # Экспорт для Three.js (tx,ty,tz = y-up): заполняется в _build_* и _build_rich_environment
+        # Экспорт для Three.js (tx,ty,tz = y-up): penthouse + рычаг/мишень
         self._static_scene_export: list[dict] = []
-        self._build_ramp()
 
         self.cube_ids = []
         cube_configs = [
-            {"pos": [1.25,  0.375, 0.1875], "size": 0.15, "mass": 2.0,  "color": [1.0, 0.4, 0.1, 1]},
-            {"pos": [-0.75, 1.0, 0.15], "size": 0.125, "mass": 0.5,  "color": [0.2, 0.7, 1.0, 1]},
-            {"pos": [0.375, -1.125, 0.25], "size": 0.20, "mass": 6.0,  "color": [0.25, 0.85, 0.35, 1]},
+            {"pos": [-3.8, 2.6, 0.16], "size": 0.15, "mass": 2.0, "color": [1.0, 0.4, 0.1, 1]},
+            {"pos": [3.4, -3.2, 0.14], "size": 0.125, "mass": 0.5, "color": [0.2, 0.7, 1.0, 1]},
+            {"pos": [-1.8, -3.5, 0.24], "size": 0.20, "mass": 6.0, "color": [0.25, 0.85, 0.35, 1]},
         ]
         for cfg in cube_configs:
             hs = cfg["size"] / 2
@@ -627,10 +629,10 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             self.cube_ids.append(b)
 
         # Песочница: рычаг (зона проксимити), цель доставки, лёгкий мяч
-        self.lever_center = np.array([-1.05, 0.55, 0.10], dtype=np.float64)
-        self.target_pad = np.array([1.85, -0.72, 0.02], dtype=np.float64)
+        self.lever_center = np.array([-4.2, 2.5, 0.10], dtype=np.float64)
+        self.target_pad = np.array([3.6, -3.9, 0.02], dtype=np.float64)
         self.lever_trigger_r = 0.26
-        self._ball_start = [0.6875, -0.5625, 0.1375]
+        self._ball_start = [1.8, 1.4, 0.1375]
         br = 0.1125
         col_ball = pb.createCollisionShape(pb.GEOM_SPHERE, radius=br, physicsClientId=self.client)
         vis_ball = pb.createVisualShape(
@@ -648,7 +650,6 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             self.ball_id, -1, restitution=0.55, lateralFriction=0.35,
             rollingFriction=0.02, physicsClientId=self.client,
         )
-        self._build_low_incline()
         self._build_lever_pedestal()
         self._build_target_marker()
         self.prop_ids: list[int] = []
@@ -800,52 +801,219 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         return self._root_constraint is not None
 
     # ─────────────────────────────────────────────────────────────────────────
-    def _build_ramp(self):
-        import math
-        angle = math.radians(15)
-        half  = [1.0, 0.5, 0.03]
-        col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half, physicsClientId=self.client)
-        vis = pb.createVisualShape(pb.GEOM_BOX, halfExtents=half,
-                                    rgbaColor=[0.4, 0.35, 0.3, 1.0], physicsClientId=self.client)
-        orn = pb.getQuaternionFromEuler([angle, 0, 0])
-        zc = 0.3 * math.sin(angle) + 0.03
+    def _static_box_three(
+        self,
+        tx: float,
+        ty: float,
+        tz: float,
+        hx: float,
+        hy: float,
+        hz: float,
+        rgb: tuple[float, float, float],
+        rx: float = 0.0,
+        ry: float = 0.0,
+        rz: float = 0.0,
+        *,
+        style: str = "default",
+    ) -> None:
+        """Статика: центр в координатах Three.js (tx,ty,tz), полуразмеры (hx,hy,hz), y-up."""
+        half = [hx, hz, hy]
+        pos_pb = [tx, tz, ty]
+        orn = pb.getQuaternionFromEuler([rx, ry, rz])
+        cid = self.client
+        col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half, physicsClientId=cid)
+        vis = pb.createVisualShape(
+            pb.GEOM_BOX,
+            halfExtents=half,
+            rgbaColor=[rgb[0], rgb[1], rgb[2], 1.0],
+            physicsClientId=cid,
+        )
         pb.createMultiBody(
-            baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
-            basePosition=[2.0, 0, zc],
-            baseOrientation=orn, physicsClientId=self.client
+            baseMass=0,
+            baseCollisionShapeIndex=col,
+            baseVisualShapeIndex=vis,
+            basePosition=pos_pb,
+            baseOrientation=orn,
+            physicsClientId=cid,
         )
         self._static_scene_export.append({
             "kind": "box",
-            "tx": 2.0, "ty": float(zc), "tz": 0.0,
-            "hx": 1.0, "hy": 0.03, "hz": 0.5,
-            "r": 0.42, "g": 0.35, "b": 0.30,
-            "rx": -float(angle), "ry": 0.0, "rz": 0.0,
+            "tx": float(tx),
+            "ty": float(ty),
+            "tz": float(tz),
+            "hx": float(hx),
+            "hy": float(hy),
+            "hz": float(hz),
+            "r": rgb[0],
+            "g": rgb[1],
+            "b": rgb[2],
+            "rx": float(rx),
+            "ry": float(ry),
+            "rz": float(rz),
+            "style": style,
         })
 
-    def _build_low_incline(self) -> None:
-        """Второй пологий наклон — другое направление, больше контактов / скольжения."""
-        import math
-        ang = math.radians(10)
-        half = [0.55, 0.4, 0.028]
-        col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half, physicsClientId=self.client)
-        vis = pb.createVisualShape(
-            pb.GEOM_BOX, halfExtents=half,
-            rgbaColor=[0.32, 0.38, 0.42, 1.0], physicsClientId=self.client,
+    def _static_cylinder_pb(
+        self,
+        pos_pb: list[float],
+        radius: float,
+        height: float,
+        rgb: tuple[float, float, float],
+        *,
+        style: str = "default",
+    ) -> None:
+        """Статический цилиндр (ось Z в PyBullet = высота в Three)."""
+        cid = self.client
+        col = pb.createCollisionShape(
+            pb.GEOM_CYLINDER, radius=radius, height=height, physicsClientId=cid
         )
-        orn = pb.getQuaternionFromEuler([0, 0, ang])
-        zc = 0.22 * math.sin(ang) + 0.03
+        vis = pb.createVisualShape(
+            pb.GEOM_CYLINDER,
+            radius=radius,
+            length=height,
+            rgbaColor=[rgb[0], rgb[1], rgb[2], 1.0],
+            physicsClientId=cid,
+        )
         pb.createMultiBody(
-            baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
-            basePosition=[-1.35, -0.95, zc],
-            baseOrientation=orn, physicsClientId=self.client,
+            baseMass=0,
+            baseCollisionShapeIndex=col,
+            baseVisualShapeIndex=vis,
+            basePosition=pos_pb,
+            physicsClientId=cid,
         )
         self._static_scene_export.append({
-            "kind": "box",
-            "tx": -1.35, "ty": float(zc), "tz": -0.95,
-            "hx": 0.55, "hy": 0.028, "hz": 0.4,
-            "r": 0.32, "g": 0.38, "b": 0.42,
-            "rx": 0.0, "ry": float(ang), "rz": 0.0,
+            "kind": "cylinder",
+            "tx": float(pos_pb[0]),
+            "ty": float(pos_pb[2]),
+            "tz": float(pos_pb[1]),
+            "radius": float(radius),
+            "height": float(height),
+            "r": rgb[0],
+            "g": rgb[1],
+            "b": rgb[2],
+            "rx": 0.0,
+            "ry": 0.0,
+            "rz": 0.0,
+            "style": style,
         })
+
+    def _static_sphere_pb(
+        self,
+        pos_pb: list[float],
+        radius: float,
+        rgb: tuple[float, float, float],
+        *,
+        style: str = "default",
+    ) -> None:
+        cid = self.client
+        col = pb.createCollisionShape(pb.GEOM_SPHERE, radius=radius, physicsClientId=cid)
+        vis = pb.createVisualShape(
+            pb.GEOM_SPHERE,
+            radius=radius,
+            rgbaColor=[rgb[0], rgb[1], rgb[2], 1.0],
+            physicsClientId=cid,
+        )
+        pb.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=col,
+            baseVisualShapeIndex=vis,
+            basePosition=pos_pb,
+            physicsClientId=cid,
+        )
+        self._static_scene_export.append({
+            "kind": "sphere",
+            "tx": float(pos_pb[0]),
+            "ty": float(pos_pb[2]),
+            "tz": float(pos_pb[1]),
+            "radius": float(radius),
+            "r": rgb[0],
+            "g": rgb[1],
+            "b": rgb[2],
+            "style": style,
+        })
+
+    def _export_torus_visual(
+        self,
+        tx: float,
+        ty: float,
+        tz: float,
+        radius: float,
+        tube: float,
+        rgb: tuple[float, float, float],
+        rx: float,
+        ry: float,
+        rz: float,
+    ) -> None:
+        """Только визуал для Three.js; коллизии см. _ribbon_collision_ring."""
+        self._static_scene_export.append({
+            "kind": "torus",
+            "tx": float(tx),
+            "ty": float(ty),
+            "tz": float(tz),
+            "radius": float(radius),
+            "tube": float(tube),
+            "r": rgb[0],
+            "g": rgb[1],
+            "b": rgb[2],
+            "rx": float(rx),
+            "ry": float(ry),
+            "rz": float(rz),
+            "style": "chrome",
+        })
+
+    def _ribbon_collision_ring(self, cx: float, cy: float, z: float, major_r: float) -> None:
+        import math
+
+        cid = self.client
+        n = 16
+        for i in range(n):
+            ang = (i / n) * math.tau
+            mx = cx + math.cos(ang) * major_r
+            my = cy + math.sin(ang) * major_r
+            col = pb.createCollisionShape(
+                pb.GEOM_BOX, halfExtents=[0.22, 0.09, 0.12], physicsClientId=cid
+            )
+            pb.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=col,
+                baseVisualShapeIndex=-1,
+                basePosition=[mx, my, z],
+                baseOrientation=pb.getQuaternionFromEuler([0.0, 0.0, ang]),
+                physicsClientId=cid,
+            )
+
+    def _add_cafe_set_pb(self, px: float, pz: float, scale: float) -> None:
+        import math
+
+        s = float(scale)
+        self._static_cylinder_pb(
+            [px, pz, 0.78 * s], 0.38 * s, 0.025 * s, (0.95, 0.97, 1.0), style="glass"
+        )
+        self._static_cylinder_pb(
+            [px, pz, 0.38 * s], 0.06 * s, 0.76 * s, (0.9, 0.92, 0.94), style="chrome"
+        )
+        for c in range(4):
+            ang = (c / 4) * math.tau + 0.4
+            sx = px + math.cos(ang) * 0.55 * s
+            sz = pz + math.sin(ang) * 0.55 * s
+            self._static_box_three(
+                sx,
+                0.42 * s,
+                sz,
+                0.07 * s,
+                0.03 * s,
+                0.07 * s,
+                (0.12, 0.14, 0.17),
+                style="seat",
+            )
+            self._static_cylinder_pb(
+                [sx, sz, 0.6 * s], 0.015 * s, 0.38 * s, (0.88, 0.9, 0.92), style="chrome"
+            )
+
+    def _build_central_tree(self) -> None:
+        self._static_cylinder_pb([0.0, 0.0, 0.11], 1.42, 0.22, (0.94, 0.96, 0.98), style="planter")
+        self._static_cylinder_pb([0.0, 0.0, 0.55], 0.16, 1.1, (0.24, 0.16, 0.1), style="wood")
+        self._static_sphere_pb([0.0, 0.0, 1.55], 1.15, (0.15, 0.48, 0.22), style="plant")
 
     def _build_lever_pedestal(self) -> None:
         """Визуальный «рычаг» / кнопка — каузальность через lever_pin (проксимити объектов)."""
@@ -893,56 +1061,56 @@ class _PyBulletHumanoid(InstrumentalSandbox):
 
     def _build_rich_environment(self) -> None:
         """
-        Комната + мебель (статика) + доп. динамические объекты для манипуляций.
-        Координаты Three.js: tx=x_pb, ty=z_pb, tz=y_pb.
+        Penthouse lounge (как Three.js): центральное дерево, кафе-столы, хром-ленты,
+        киоск/барьер по периметру. Координаты Three.js: tx=x_pb, ty=z_pb, tz=y_pb.
         """
+        import math
+
         cid = self.client
 
-        def _wall(tx: float, ty: float, tz: float, hx: float, hy: float, hz: float, rgb: tuple[float, float, float]) -> None:
-            # Three: (tx,ty,tz), half (hx,hy,hz) с y вверх → PyBullet: pos [x_pb,y_pb,z_pb], half [hx, hz, hy]
-            half = [hx, hz, hy]
-            pos_pb = [tx, tz, ty]
-            col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half, physicsClientId=cid)
-            vis = pb.createVisualShape(
-                pb.GEOM_BOX, halfExtents=half,
-                rgbaColor=[rgb[0], rgb[1], rgb[2], 1.0], physicsClientId=cid,
-            )
-            pb.createMultiBody(
-                baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
-                basePosition=pos_pb, physicsClientId=cid,
-            )
-            self._static_scene_export.append({
-                "kind": "box",
-                "tx": float(tx), "ty": float(ty), "tz": float(tz),
-                "hx": float(hx), "hy": float(hy), "hz": float(hz),
-                "r": rgb[0], "g": rgb[1], "b": rgb[2],
-                "rx": 0.0, "ry": 0.0, "rz": 0.0,
-            })
+        self._build_central_tree()
+        cafe_sets = [
+            (-5.0, 3.0, 1.0),
+            (4.0, -4.0, 0.95),
+            (-3.0, -5.0, 1.0),
+            (6.0, 2.0, 0.9),
+        ]
+        for px, pz, sc in cafe_sets:
+            self._add_cafe_set_pb(px, pz, sc)
 
-        cream = (0.92, 0.90, 0.86)
-        wood = (0.45, 0.32, 0.22)
-        glass = (0.75, 0.82, 0.88)
-        # Периметр ~9×9 м; hy = высота по Y (Three), hz = толщина по «глубине» Z
-        _wall(0.0, 1.1, -4.5, 4.85, 1.1, 0.06, cream)
-        _wall(0.0, 1.1, 4.5, 4.85, 1.1, 0.06, cream)
-        _wall(-4.5, 1.1, 0.0, 0.06, 1.1, 4.85, cream)
-        _wall(4.5, 1.1, 0.0, 0.06, 1.1, 4.85, cream)
-        # Низкая перегородка
-        _wall(1.2, 0.55, 1.8, 1.4, 0.55, 0.05, glass)
-        # Лавка / низкий блок
-        _wall(-3.1, 0.38, 3.0, 0.95, 0.38, 0.35, wood)
-        # Стол
-        _wall(-1.0, 0.42, 2.1, 0.55, 0.42, 0.32, wood)
-        # Колонна
-        _wall(2.3, 1.05, -1.1, 0.14, 1.05, 0.14, (0.55, 0.55, 0.58))
+        for k in range(3):
+            major = 1.2 + 0.3 * k
+            tx = -7.0 + k * 3.0
+            ty = 0.85
+            tz = -6.0
+            self._ribbon_collision_ring(tx, tz, ty, major)
+            self._export_torus_visual(
+                tx,
+                ty,
+                tz,
+                major,
+                0.08,
+                (0.9, 0.92, 0.95),
+                math.pi / 2.3,
+                0.0,
+                float(k) * 0.9,
+            )
+
+        # Низкий круглый «киоск» (как на референсе справа)
+        self._static_cylinder_pb([7.2, -2.5, 0.45], 0.55, 0.9, (0.96, 0.98, 1.0), style="planter")
+        self._static_box_three(7.2, 0.98, -2.5, 0.42, 0.32, 0.02, (0.4, 0.85, 0.95), style="default")
+
+        # Изогнутые лавки (белые блоки)
+        self._static_box_three(-5.5, 0.22, -4.5, 1.1, 0.11, 0.35, (0.96, 0.97, 0.99), style="default")
+        self._static_box_three(5.5, 0.22, 4.0, 1.0, 0.11, 0.38, (0.96, 0.97, 0.99), style="default")
 
         prop_cfgs = [
-            {"pos": [-0.2, 2.4, 0.09], "half": 0.07, "mass": 0.35, "color": [0.9, 0.35, 0.25, 1.0]},
-            {"pos": [1.1, -2.0, 0.08], "half": 0.065, "mass": 0.28, "color": [0.35, 0.55, 0.95, 1.0]},
-            {"pos": [-2.4, -1.2, 0.075], "half": 0.06, "mass": 0.22, "color": [0.45, 0.85, 0.4, 1.0]},
-            {"pos": [3.0, 0.9, 0.085], "half": 0.07, "mass": 0.4, "color": [0.95, 0.75, 0.2, 1.0]},
+            {"pos": [-4.2, 4.0, 0.09], "half": 0.07, "mass": 0.35, "color": [0.9, 0.35, 0.25, 1.0]},
+            {"pos": [4.5, -0.5, 0.08], "half": 0.065, "mass": 0.28, "color": [0.35, 0.55, 0.95, 1.0]},
+            {"pos": [-2.4, -4.5, 0.075], "half": 0.06, "mass": 0.22, "color": [0.45, 0.85, 0.4, 1.0]},
+            {"pos": [3.0, 4.2, 0.085], "half": 0.07, "mass": 0.4, "color": [0.95, 0.75, 0.2, 1.0]},
             {"pos": [-1.0, -2.8, 0.07], "half": 0.065, "mass": 0.3, "color": [0.75, 0.45, 0.85, 1.0]},
-            {"pos": [0.5, 3.2, 0.08], "half": 0.06, "mass": 0.25, "color": [0.3, 0.85, 0.75, 1.0]},
+            {"pos": [0.5, 5.0, 0.08], "half": 0.06, "mass": 0.25, "color": [0.3, 0.85, 0.75, 1.0]},
         ]
         for cfg in prop_cfgs:
             hs = float(cfg["half"])
@@ -987,7 +1155,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     pos = [0.0, 0.0, 1.0]
                     orn = pb.getQuaternionFromEuler([0.0, 0.0, 0.0])
                 else:
-                    pos = [0.0, 0.0, HUMANOID_URDF_SPAWN_Z]
+                    pos = [float(PENTHOUSE_SPAWN_X), float(PENTHOUSE_SPAWN_Y), float(HUMANOID_URDF_SPAWN_Z)]
                     orn = pb.getQuaternionFromEuler(HUMANOID_URDF_STAND_EULER)
                 robot = pb.loadURDF(
                     rel,

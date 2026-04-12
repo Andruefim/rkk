@@ -412,71 +412,14 @@ export default function RKKHumanoid() {
       opacity: 0.9,
     });
     const seatMat = new THREE.MeshStandardMaterial({ color: 0x1a1e24, roughness: 0.85, metalness: 0.05 });
-    function addCafeSet(px, pz, scale = 1) {
-      const s = scale;
-      const top = new THREE.Mesh(new THREE.CylinderGeometry(0.38 * s, 0.38 * s, 0.025 * s, 32), glassTop);
-      top.position.set(px, 0.78 * s, pz);
-      top.castShadow = true;
-      scene.add(top);
-      const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.05 * s, 0.07 * s, 0.76 * s, 10), chromeMat);
-      leg.position.set(px, 0.38 * s, pz);
-      leg.castShadow = true;
-      scene.add(leg);
-      for (let c = 0; c < 4; c++) {
-        const a = (c / 4) * Math.PI * 2 + 0.4;
-        const ch = new THREE.Mesh(
-          new THREE.BoxGeometry(0.14 * s, 0.06 * s, 0.14 * s),
-          seatMat
-        );
-        ch.position.set(px + Math.cos(a) * 0.55 * s, 0.42 * s, pz + Math.sin(a) * 0.55 * s);
-        ch.castShadow = true;
-        scene.add(ch);
-        const post = new THREE.Mesh(new THREE.CylinderGeometry(0.015 * s, 0.015 * s, 0.38 * s, 6), chromeMat);
-        post.position.set(ch.position.x, 0.6 * s, ch.position.z);
-        scene.add(post);
-      }
-    }
-    addCafeSet(-5, 3, 1);
-    addCafeSet(4, -4, 0.95);
-    addCafeSet(-3, -5, 1);
-    addCafeSet(6, 2, 0.9);
-
-    // Центральное дерево
-    const trunk = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.14, 0.18, 1.1, 10),
-      new THREE.MeshStandardMaterial({ color: 0x3d2a1a, roughness: 0.9 })
-    );
-    trunk.position.set(0, 0.55, 0);
-    trunk.castShadow = true;
-    scene.add(trunk);
-    const foliage = new THREE.Mesh(
-      new THREE.IcosahedronGeometry(1.15, 2),
-      new THREE.MeshStandardMaterial({ color: 0x2d8a44, roughness: 0.85, emissive: 0x0a4020, emissiveIntensity: 0.08 })
-    );
-    foliage.position.set(0, 1.55, 0);
-    foliage.castShadow = true;
-    scene.add(foliage);
-    const planter = new THREE.Mesh(
-      new THREE.CylinderGeometry(1.35, 1.45, 0.22, 40),
-      new THREE.MeshStandardMaterial({ color: 0xf0f4f8, roughness: 0.35, metalness: 0.1 })
-    );
-    planter.position.set(0, 0.11, 0);
-    planter.receiveShadow = true;
-    planter.castShadow = true;
-    scene.add(planter);
-
-    // Хромовые «ленты»-скульптуры
-    for (let k = 0; k < 3; k++) {
-      const ribbon = new THREE.Mesh(
-        new THREE.TorusGeometry(1.2 + k * 0.3, 0.08, 12, 48),
-        chromeMat.clone()
-      );
-      ribbon.position.set(-7 + k * 3, 0.85, -6);
-      ribbon.rotation.x = Math.PI / 2.3;
-      ribbon.rotation.z = k * 0.9;
-      ribbon.castShadow = true;
-      scene.add(ribbon);
-    }
+    const woodMat = new THREE.MeshStandardMaterial({ color: 0x3d2a1a, roughness: 0.9 });
+    const plantMat = new THREE.MeshStandardMaterial({
+      color: 0x2d8a44, roughness: 0.85, emissive: 0x0a4020, emissiveIntensity: 0.08,
+    });
+    const planterMat = new THREE.MeshStandardMaterial({
+      color: 0xf0f4f8, roughness: 0.35, metalness: 0.1,
+    });
+    // Мебель / дерево / ленты — из static_geometry (PyBullet), синхрон с backend
 
     const vS = 0.62;
 
@@ -761,20 +704,46 @@ export default function RKKHumanoid() {
 
       const sg=ds.scene?.static_geometry;
       if(!staticBuilt&&sg&&sg.length){
+        const rgb=(d)=>new THREE.Color(d.r??0.9,d.g??0.9,d.b??0.9);
+        const matFor=(d)=>{
+          const st=d.style??"default";
+          if(st==="glass")return glassTop.clone();
+          if(st==="chrome")return chromeMat.clone();
+          if(st==="seat")return seatMat.clone();
+          if(st==="wood")return woodMat.clone();
+          if(st==="plant")return plantMat.clone();
+          if(st==="planter")return planterMat.clone();
+          return new THREE.MeshStandardMaterial({
+            color:rgb(d),roughness:0.42,metalness:0.12,envMapIntensity:0.65,
+          });
+        };
         sg.forEach(def=>{
-          if(def.kind!=="box")return;
-          const hx=def.hx??0.1,hy=def.hy??0.1,hz=def.hz??0.1;
-          const mesh=new THREE.Mesh(
-            new THREE.BoxGeometry(hx*2,hy*2,hz*2),
-            new THREE.MeshStandardMaterial({
-              color:new THREE.Color(def.r??0.92,def.g??0.93,def.b??0.95),
-              roughness:0.42,metalness:0.12,envMapIntensity:0.65,
-            })
-          );
-          mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
-          mesh.rotation.set(def.rx??0,def.ry??0,def.rz??0);
-          mesh.castShadow=true; mesh.receiveShadow=true;
-          staticGroup.add(mesh);
+          const k=def.kind??"box";
+          let mesh=null;
+          if(k==="box"){
+            const hx=def.hx??0.1,hy=def.hy??0.1,hz=def.hz??0.1;
+            mesh=new THREE.Mesh(new THREE.BoxGeometry(hx*2,hy*2,hz*2),matFor(def));
+            mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
+            mesh.rotation.set(def.rx??0,def.ry??0,def.rz??0);
+          }else if(k==="cylinder"){
+            const r=def.radius??0.1,h=def.height??0.2;
+            mesh=new THREE.Mesh(new THREE.CylinderGeometry(r,r,h,28,1),matFor(def));
+            mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
+            mesh.rotation.set(def.rx??0,def.ry??0,def.rz??0);
+          }else if(k==="sphere"){
+            const rad=def.radius??0.1;
+            mesh=new THREE.Mesh(new THREE.IcosahedronGeometry(rad,2),matFor(def));
+            mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
+          }else if(k==="torus"){
+            const R=def.radius??1,t=def.tube??0.08;
+            mesh=new THREE.Mesh(new THREE.TorusGeometry(R,t,12,48),matFor(def));
+            mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
+            mesh.rotation.set(def.rx??0,def.ry??0,def.rz??0);
+          }
+          if(mesh){
+            mesh.castShadow=true; mesh.receiveShadow=true;
+            staticGroup.add(mesh);
+          }
         });
         staticBuilt=true;
       }
