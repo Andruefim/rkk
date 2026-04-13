@@ -102,11 +102,17 @@ CAUSAL_PATTERNS = [
     (r'higher\s+(\w[\w\s]+?)\s+(?:means?|leads? to|results? in)\s+(?:lower|less)\s+(\w[\w\s]+)', -0.5),
 ]
 
-# Слова-якоря для определения темы среды из запроса
+# Слова-якоря для определения темы среды из запроса (только humanoid)
 ENV_KEYWORDS = {
-    "physics":   ["temperature", "pressure", "volume", "gas", "thermodynamics", "entropy", "energy", "heat"],
-    "chemistry": ["reaction", "catalyst", "reactant", "chemical", "synthesis", "yield", "rate", "enzyme"],
-    "logic":     ["logic", "boolean", "condition", "branch", "algorithm", "input", "output", "state"],
+    "humanoid": [
+        "balance",
+        "locomotion",
+        "gait",
+        "posture",
+        "humanoid",
+        "biped",
+        "walking",
+    ],
 }
 
 
@@ -462,8 +468,8 @@ class RAGSeeder:
     Использование:
       seeder = RAGSeeder()
       hypotheses = await seeder.generate(
-          env_preset="physics",
-          available_vars=["Temp","Pressure","Volume","Energy","StateChange","Entropy"],
+          env_preset="humanoid",
+          available_vars=[...],
       )
     """
 
@@ -477,16 +483,14 @@ class RAGSeeder:
         self.llm_model = (llm_model or "").strip() or get_ollama_model()
         self.backend   = backend
 
-        # Темы поиска для каждой среды
         self.env_topics = {
-            "physics":   ["ideal gas law", "thermodynamics laws", "Boyle's law",
-                          "Charles's law", "heat transfer", "entropy thermodynamics"],
-            "chemistry": ["chemical kinetics", "reaction rate", "catalysis chemistry",
-                          "Arrhenius equation", "activation energy"],
-            "logic":     ["boolean logic", "conditional branching", "logic gates",
-                          "control flow programming"],
-            "humanoid":  ["humanoid balance", "bipedal locomotion", "inverted pendulum",
-                          "gait biomechanics", "center of mass stability"],
+            "humanoid": [
+                "humanoid balance",
+                "bipedal locomotion",
+                "inverted pendulum",
+                "gait biomechanics",
+                "center of mass stability",
+            ],
         }
 
     async def generate(
@@ -606,7 +610,7 @@ class RAGSeeder:
 
     async def generate_all_agents(
         self,
-        agents_config: list[dict],  # [{"preset": "physics", "vars": [...]}]
+        agents_config: list[dict],  # [{"preset": "humanoid", "vars": [...]}]
     ) -> dict[int, list[CausalHypothesis]]:
         """Генерируем seeds для всех агентов параллельно."""
         tasks = [
@@ -620,32 +624,5 @@ class RAGSeeder:
         return {i: hyps for i, hyps in enumerate(results)}
 
 
-# ─── Жёстко заданные seeds (fallback без интернета) ──────────────────────────
-HARDCODED_SEEDS = {
-    "physics": [
-        {"from_": "Temp",     "to": "Pressure",    "weight": 0.25, "alpha": 0.05},
-        {"from_": "Temp",     "to": "Energy",      "weight": 0.22, "alpha": 0.05},
-        {"from_": "Pressure", "to": "Volume",      "weight":-0.20, "alpha": 0.05},
-        {"from_": "Energy",   "to": "Entropy",     "weight": 0.18, "alpha": 0.05},
-    ],
-    "chemistry": [
-        {"from_": "Catalyst",   "to": "Rate",    "weight": 0.28, "alpha": 0.05},
-        {"from_": "Temp",       "to": "Rate",    "weight": 0.22, "alpha": 0.05},
-        {"from_": "Rate",       "to": "Product", "weight": 0.30, "alpha": 0.05},
-        {"from_": "Reactant_A", "to": "Rate",    "weight": 0.20, "alpha": 0.05},
-    ],
-    "logic": [
-        {"from_": "Input",     "to": "Condition", "weight": 0.28, "alpha": 0.05},
-        {"from_": "Condition", "to": "Branch_A",  "weight": 0.30, "alpha": 0.05},
-        {"from_": "Branch_A",  "to": "Output",    "weight": 0.25, "alpha": 0.05},
-        {"from_": "Condition", "to": "Branch_B",  "weight":-0.28, "alpha": 0.05},
-    ],
-    "pybullet": [
-        {"from_": "obj0_vx", "to": "obj0_x", "weight": 0.25, "alpha": 0.05},
-        {"from_": "obj0_vy", "to": "obj0_y", "weight": 0.25, "alpha": 0.05},
-        {"from_": "obj1_vx", "to": "obj1_x", "weight": 0.25, "alpha": 0.05},
-        {"from_": "obj1_vy", "to": "obj1_y", "weight": 0.25, "alpha": 0.05},
-        {"from_": "obj2_vx", "to": "obj2_x", "weight": 0.25, "alpha": 0.05},
-        {"from_": "obj2_vy", "to": "obj2_y", "weight": 0.25, "alpha": 0.05},
-    ],
-}
+# ─── Жёстко заданные seeds (fallback без интернета) — только humanoid в основном UI
+HARDCODED_SEEDS: dict[str, list[dict]] = {}

@@ -67,16 +67,16 @@ export interface StreamFrame {
 
 const DEFAULT_FRAME: StreamFrame = {
   tick: 0, phase: 1, entropy: 100,
-  agents: [0, 1, 2].map(i => ({
-    id: i, name: ["Nova","Aether","Lyra"][i],
-    env_type: ["physics","chemistry","logic"][i],
-    activation: ["relu","gelu","tanh"][i],
+  agents: [{
+    id: 0, name: "Nova",
+    env_type: "humanoid",
+    activation: "relu",
     graph_mdl: 0, compression_gain: 0, alpha_mean: 0.05,
     phi: 0.1, node_count: 6, edge_count: 0,
     total_interventions: 0, last_do: "—",
     discovery_rate: 0, peak_discovery_rate: 0,
     h_W: 0, notears: null, edges: [],
-  })),
+  }],
   demon: { energy: 1, cooldown: 0, last_target: 0, last_action_complexity: 0 },
   tom_links: [], events: [], graph_deltas: {},
 };

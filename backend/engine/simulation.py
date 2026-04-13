@@ -52,7 +52,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 from engine.agent       import RKKAgent
 from engine.demon       import AdversarialDemon
-from engine.environment import Environment
 from engine.visual_concept_store import VisualConceptStore
 from engine.hierarchical_graph import HierarchicalGraph, hierarchical_graph_enabled
 from engine.ollama_env  import get_ollama_generate_url, get_ollama_model
@@ -400,26 +399,16 @@ def resolve_torch_device(requested: str | None = None) -> torch.device:
         return torch.device("cpu")
 
 WORLDS = {
-    "humanoid":  {"label": "Humanoid",          "color": "#cc44ff"},
-    "robot":     {"label": "Robot Arm",          "color": "#aa22dd"},
-    "pybullet":  {"label": "3D Physics",         "color": "#ff44aa"},
-    "physics":   {"label": "Thermodynamics",     "color": "#00ff99"},
-    "chemistry": {"label": "Chemical Kinetics",  "color": "#0099ff"},
-    "logic":     {"label": "Logic Gates",        "color": "#ff9900"},
+    "humanoid": {"label": "Humanoid", "color": "#cc44ff"},
 }
 
 
 def _make_env(world: str, device: torch.device):
-    if world == "humanoid":
-        from engine.environment_humanoid import EnvironmentHumanoid
-        return EnvironmentHumanoid(device=device)
-    if world == "robot":
-        from engine.environment_robot import EnvironmentRobot
-        return EnvironmentRobot(device=device)
-    if world == "pybullet":
-        from engine.environment_pybullet import EnvironmentPyBullet
-        return EnvironmentPyBullet(n_objects=3, device=device, use_pybullet=True)
-    return Environment(world, device)
+    if world != "humanoid":
+        raise ValueError(f"only humanoid world is supported (got {world!r})")
+    from engine.environment_humanoid import EnvironmentHumanoid
+
+    return EnvironmentHumanoid(device=device)
 
 
 def _default_bounds() -> HomeostaticBounds:
@@ -1380,128 +1369,14 @@ class Simulation:
 
     # ── World switch ──────────────────────────────────────────────────────────
     def switch_world(self, new_world: str) -> dict:
+        """Только humanoid; переключение сцен отключено."""
         if new_world not in WORLDS:
-            return {"error": f"unknown world: {new_world}"}
-
-        self._stop_rkk_agent_loop_thread()
-
-        # Если visual mode — сначала отключаем; switch + сброс — под одним lock с тиком агента
-        with self._sim_step_lock:
-            was_visual = self._visual_mode
-            if was_visual:
-                self._disable_visual_internal()
-
-            result = self.switcher.switch(new_world)
-            if result.get("switched"):
-                self._stop_cpg_background_loop()
-                self.current_world = new_world
-                self._locomotion_controller = None
-                self._skill_library = None
-                self._skill_exec = None
-                self._rsi_full = None
-                self._fixed_root_active = False
-                self._phase3_teacher_rules = []
-                self._phase3_vl_overlay = None
-                self.agent.value_layer.set_teacher_vl_overlay(None)
-                self._pending_llm_bundle = None
-                self._llm_level2_inflight = False
-                winfo = WORLDS[new_world]
-                self._add_event(
-                    f"🌍 → {winfo['label']} "
-                    f"(+{len(result.get('new_nodes',[]))} vars, d={result.get('gnn_d')})",
-                    winfo["color"], "phase"
-                )
-                if new_world == "humanoid":
-                    self._curriculum_auto_fr_released = False
-                    fr = os.environ.get("RKK_FREEZE_URDF", "1").strip().lower()
-                    if fr not in ("0", "false", "no", "off") and "lhip" in self.agent.graph.nodes:
-                        self.agent.graph.freeze_kinematic_priors()
-                else:
-                    self.agent.graph._frozen_edge_set.clear()
-                    nv = list(self.agent.env.variable_ids)
-                    obs = dict(self.agent.env.observe())
-                    vals = {
-                        k: float(obs.get(k, self.agent.graph.nodes.get(k, 0.5)))
-                        for k in nv
-                    }
-                    self.agent.graph.rebind_variables(nv, vals)
-                self._materialized_detector_concept_ids.clear()
-                self._discovery_plateau_count = 0
-                self._last_dr_snapshot = None
-                self._hierarchical_graph = None
-                self._concept_store = None
-                self._stop_l4_worker()
-                self._l4_last_snapshot = {"n_concepts": 0, "concepts": []}
-                self._l3_next_due_ts = 0.0
-                self._l3_last_tick = 0
-                self._motor_state = MotorState()
-                # Reset Level 1 controllers on world switch
-                if _EMBODIED_REWARD_AVAILABLE and self._embodied_reward_ctrl is not None:
-                    self._embodied_reward_ctrl = EmbodiedRewardController()
-                if _VISUAL_GROUNDING_AVAILABLE and self._visual_grounding_ctrl is not None:
-                    self._visual_grounding_ctrl = VisualGroundingController()
-                if hasattr(self, "_mc_posture_window"):
-                    self._mc_posture_window.clear()
-                if hasattr(self, "_mc_fallen_count_window"):
-                    self._mc_fallen_count_window.clear()
-                # Reset Level 2 controllers
-                if _EPISODIC_MEMORY_AVAILABLE and self._episodic_memory is not None:
-                    from engine.episodic_memory import EpisodicMemory
-
-                    self._episodic_memory = EpisodicMemory()
-                if _CURRICULUM_AVAILABLE and self._curriculum is not None:
-                    from engine.llm_curriculum import CurriculumScheduler
-
-                    self._curriculum = CurriculumScheduler()
-                self._last_action_for_memory = None
-                self._last_fall_memory_tick = -999_999
-                self._rssm_upgraded = False
-                self._rssm_trainer = None
-                self._rssm_imagination = None
-                # Reset Level 3 controllers
-                if _PROPRIO_AVAILABLE:
-                    self._proprio = ProprioceptionStream(device=self.device)
-                if _TIMESCALE_AVAILABLE:
-                    self._timescale = MultiscaleTimeController()
-                self._reward_coord = None
-                self._reward_X_prev = []
-                self._reward_a_prev = []
-                self._was_blocked = False
-                if _INNER_VOICE_AVAILABLE:
-                    from engine.inner_voice_net import InnerVoiceController
-                    from engine.llm_voice_teacher import LLMVoiceTeacher
-
-                    self._inner_voice = InnerVoiceController(device=self.device)
-                    self._llm_teacher = LLMVoiceTeacher()
-                    self._llm_teacher.add_callback(self._on_teacher_annotation)
-                if _PHASE_K_AVAILABLE:
-                    self._sleep_ctrl = SleepController()
-                    self._physical_curriculum = PhysicalCurriculum()
-                    self._meta_restored = False
-                if _VERBAL_AVAILABLE:
-                    self._verbal = VerbalActionController()
-                    self._verbal.add_callback(self._broadcast_agent_message)
-                if _PHASE_M_AVAILABLE:
-                    self._slot_labeler = SlotLabeler()
-                    _lang_sw = os.environ.get("RKK_SPEECH_LANG", "ru")
-                    self._visual_voice = VisualInnerVoice(lang=_lang_sw)
-                if _WORLD_BRIDGE_AVAILABLE and world_bridge_enabled():
-                    self._world_bridge = WorldStateBridge()
-                else:
-                    self._world_bridge = None
-                # Motor Cortex reset on world switch
-                self._motor_cortex = None
-                self._mc_abstract_nodes_injected = False
-                self._clear_fall_recovery()
-                self._drain_simple_queue(self._l1_motor_q)
-                self._l1_last_cmd_tick = 0
-                self._l1_last_apply_tick = 0
-
-        # Восстанавливаем visual mode если был (вне lock: enable_visual сам берёт lock)
-        if was_visual and result.get("switched"):
-            self.enable_visual()
-
-        return result
+            return {"error": f"unknown world: {new_world}", "switched": False}
+        return {
+            "switched": False,
+            "world": "humanoid",
+            "current_world": self.current_world,
+        }
 
     # ── Фаза 12: Visual mode ──────────────────────────────────────────────────
     def enable_visual(self, n_slots: int = 8, mode: str = "hybrid") -> dict:
@@ -3899,7 +3774,7 @@ class Simulation:
 
         if _WORLD_BRIDGE_AVAILABLE and self._world_bridge is not None:
             try:
-                self._world_bridge.on_tick(self)
+                self._world_bridge.on_tick(self, tick_obs=_obs_for_d_e)
             except Exception as e:
                 print(f"[Simulation] world_bridge.on_tick: {e}")
 

@@ -435,15 +435,6 @@ def bootstrap_humanoid():
     result = get_sim().inject_seeds(agent_id=0, edges=seeds)
     return {"source": "humanoid_hardcoded", **result}
 
-@app.post("/bootstrap/robot")
-def bootstrap_robot():
-    try:
-        from engine.environment_robot import robot_hardcoded_seeds
-        seeds = robot_hardcoded_seeds()
-    except ImportError:
-        seeds = HARDCODED_SEEDS.get(get_sim().current_world, [])
-    return get_sim().inject_seeds(agent_id=0, edges=seeds)
-
 class LLMBootstrapRequest(BaseModel):
     world:          str | None = None
     mode:           Literal["rag_wiki", "humanoid_structured"] = "humanoid_structured"

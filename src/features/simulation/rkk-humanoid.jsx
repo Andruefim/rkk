@@ -7,10 +7,7 @@ const API = "http://localhost:8000";
 const CAMERA_PREVIEW_MS = 500;
 const CAM_VIEW = "fp";
 
-const WORLD_COLORS = {
-  humanoid:"#cc44ff", robot:"#aa22dd", pybullet:"#ff44aa",
-  physics:"#00ff99", chemistry:"#0099ff", logic:"#ff9900",
-};
+const HUMANOID_WORLD_COLOR = "#cc44ff";
 
 const SLOT_COLORS = [
   "#ff5050","#50c8ff","#50ff64","#ffc850",
@@ -147,14 +144,6 @@ export default function RKKHumanoid() {
   }, [selectedSlot, visionEnabled, activePanel]);
 
   // ── Actions ────────────────────────────────────────────────────────────────
-  const switchWorld = async w => {
-    try {
-      const d = await fetch(`${API}/world/switch`,{method:"POST",
-        headers:{"Content-Type":"application/json"},body:JSON.stringify({world:w})}).then(r=>r.json());
-      if (d.switched) setStatus(`✓ ${w} (+${d.new_nodes?.length??0} nodes)`);
-    } catch(e) { setStatus(`✗ ${e.message}`); }
-  };
-
   const injectSeeds = async () => {
     try {
       const edges = JSON.parse(seedText);
@@ -908,9 +897,7 @@ export default function RKKHumanoid() {
           <button key={s} onClick={()=>setSpeed(s)} style={{padding:"2px 7px",borderRadius:2,fontSize:9,cursor:"pointer",background:speed===s?"#080f22":"transparent",border:`1px solid ${speed===s?"#4455ff":"#0a1a2e"}`,color:speed===s?"#8899ff":"#334466"}}>{s}×</button>
         ))}
         <span style={{color:"#0a1a2e"}}>│</span>
-        {Object.entries(WORLD_COLORS).map(([w,c])=>(
-          <button key={w} onClick={()=>switchWorld(w)} style={{padding:"2px 7px",borderRadius:2,fontSize:9,cursor:"pointer",background:ui.currentWorld===w?"#0a0520":"transparent",border:`1px solid ${ui.currentWorld===w?c:"#111"}`,color:ui.currentWorld===w?c:"#334455"}}>{w}</button>
-        ))}
+        <span style={{padding:"2px 8px",borderRadius:2,fontSize:9,border:`1px solid ${HUMANOID_WORLD_COLOR}`,color:HUMANOID_WORLD_COLOR,background:"#0a0520"}}>humanoid</span>
         <span style={{color:"#0a1a2e"}}>│</span>
         {/* Fixed root toggle */}
         <button onClick={toggleFixedRoot} disabled={fixedRootLoading}
@@ -1110,11 +1097,7 @@ export default function RKKHumanoid() {
         </div>
 
         <div style={{...sep}}>
-          {Object.entries(WORLD_COLORS).map(([w,c])=>(
-            <div key={w} onClick={()=>switchWorld(w)} style={{fontSize:8,marginBottom:2,cursor:"pointer",color:ui.currentWorld===w?c:"#223344"}}>
-              {ui.currentWorld===w?"▶ ":"  "}{w}
-            </div>
-          ))}
+          <div style={{fontSize:8,marginBottom:2,color:HUMANOID_WORLD_COLOR}}>▶ humanoid</div>
         </div>
 
         {isVis&&ui.vision&&<div style={{...sep}}>

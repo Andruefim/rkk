@@ -1,10 +1,7 @@
 """
-agent_worker.py — Windows-safe multiprocessing worker (v2 + PyBullet).
+agent_worker.py — Windows-safe multiprocessing worker.
 
-Изменения v2:
-  - preset "pybullet" → EnvironmentPyBullet вместо Environment
-  - AgentPool теперь поддерживает 4 агентов: Nova/Aether/Lyra/Ignis
-  - "get_variable_ids" команда → нужна для RAG context без Environment re-init
+Среда: только EnvironmentHumanoid (env_preset игнорируется для совместимости API).
 
 Команды (dict):
   {"cmd": "step", "tick": int, "other_phi": list}
@@ -41,13 +38,10 @@ def _agent_worker_fn(
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
     bounds = HomeostaticBounds(**bounds_dict)
 
-    # ── Создаём среду ─────────────────────────────────────────────────────────
-    if env_preset == "pybullet":
-        from engine.environment_pybullet import EnvironmentPyBullet
-        env = EnvironmentPyBullet(n_objects=3, device=device, use_pybullet=True)
-    else:
-        from engine.environment import Environment
-        env = Environment(env_preset, device)
+    # ── Создаём среду (только humanoid) ───────────────────────────────────────
+    from engine.environment_humanoid import EnvironmentHumanoid
+
+    env = EnvironmentHumanoid(device=device)
 
     agent = RKKAgent(agent_id, agent_name, env, device, bounds)
 
