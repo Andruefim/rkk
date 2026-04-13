@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from engine.features.simulation.mixin_imports import *
+from engine.visual_concept_store import VisualConceptStore
 
 
 class SimulationPhaseHierarchyMixin:

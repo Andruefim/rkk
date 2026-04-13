@@ -1,12 +1,9 @@
-"""
-Совместимость: реэкспорт из `engine.features.humanoid` (пакет features/humanoid/).
-"""
+"""Humanoid: среда, константы переменных, PyBullet backend, seeds."""
 from __future__ import annotations
 
-from engine.features.humanoid import (
+from engine.features.humanoid.constants import (
     ARM_VARS,
     CUBE_VARS,
-    EnvironmentHumanoid,
     FIXED_BASE_VARS,
     FOOT_VARS,
     HEAD_VARS,
@@ -17,14 +14,16 @@ from engine.features.humanoid import (
     MOTOR_INTENT_DEFAULTS,
     MOTOR_INTENT_VARS,
     MOTOR_OBSERVABLE_VARS,
-    PIL_AVAILABLE,
-    PYBULLET_AVAILABLE,
     SANDBOX_VARS,
     SELF_VARS,
     SPINE_VARS,
     TORSO_VARS,
     URDF_FROZEN_EDGES,
     VAR_NAMES,
+)
+from engine.features.humanoid.deps import PIL_AVAILABLE, PYBULLET_AVAILABLE
+from engine.features.humanoid.environment import EnvironmentHumanoid
+from engine.features.humanoid.seeds import (
     fixed_root_seeds,
     humanoid_hardcoded_seeds,
     merge_humanoid_golden_with_llm_edges,
