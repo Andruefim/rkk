@@ -197,6 +197,15 @@ except ImportError:
         "slot_labeler.py, visual_inner_voice.py"
     )
 
+# Unified world ↔ semantic bridge (buffer + sleep consolidation)
+try:
+    from engine.world_state_bridge import WorldStateBridge, world_bridge_enabled
+
+    _WORLD_BRIDGE_AVAILABLE = True
+except ImportError:
+    _WORLD_BRIDGE_AVAILABLE = False
+    world_bridge_enabled = lambda: False  # type: ignore[misc, assignment]
+
 # Motor Cortex import (lazy — инициализируется при первом вызове)
 try:
     from engine.motor_cortex import MotorCortexLibrary as _MotorCortexLibrary
@@ -646,6 +655,10 @@ class Simulation:
             _lang = os.environ.get("RKK_SPEECH_LANG", "ru")
             self._slot_labeler = SlotLabeler()
             self._visual_voice = VisualInnerVoice(lang=_lang)
+
+        self._world_bridge: Any = None
+        if _WORLD_BRIDGE_AVAILABLE and world_bridge_enabled():
+            self._world_bridge = WorldStateBridge()
 
         # Phase D: Motor Cortex (learned motor programs + CPG annealing)
         self._motor_cortex: "_MotorCortexLibrary | None" = None
@@ -1472,6 +1485,10 @@ class Simulation:
                     self._slot_labeler = SlotLabeler()
                     _lang_sw = os.environ.get("RKK_SPEECH_LANG", "ru")
                     self._visual_voice = VisualInnerVoice(lang=_lang_sw)
+                if _WORLD_BRIDGE_AVAILABLE and world_bridge_enabled():
+                    self._world_bridge = WorldStateBridge()
+                else:
+                    self._world_bridge = None
                 # Motor Cortex reset on world switch
                 self._motor_cortex = None
                 self._mc_abstract_nodes_injected = False
@@ -3880,6 +3897,12 @@ class Simulation:
         if _PHASE_M_AVAILABLE:
             self._phase_m_sync_from_vision()
 
+        if _WORLD_BRIDGE_AVAILABLE and self._world_bridge is not None:
+            try:
+                self._world_bridge.on_tick(self)
+            except Exception as e:
+                print(f"[Simulation] world_bridge.on_tick: {e}")
+
         # Level 1-C: Standalone reconstruction training (warm up decoder early)
         if (
             self._visual_mode
@@ -4477,6 +4500,11 @@ class Simulation:
                 self._slot_labeler.snapshot()
                 if _PHASE_M_AVAILABLE and self._slot_labeler is not None
                 else None
+            ),
+            "world_bridge": (
+                self._world_bridge.snapshot()
+                if _WORLD_BRIDGE_AVAILABLE and self._world_bridge is not None
+                else {"enabled": False}
             ),
             "phase1":        self._phase1_snapshot_meta(),
             "phase2":        self._phase2_snapshot_meta(),

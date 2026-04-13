@@ -102,6 +102,10 @@ class SleepSession:
     completed: bool = False
     ticks_slept: int = 0
 
+    # Grounded world ↔ semantic (world_state_bridge)
+    grounded_samples: int = 0
+    grounded_loss_last: float = 0.0
+
     def duration_sec(self) -> float:
         return (self.end_time or time.time()) - self.start_time
 
@@ -109,6 +113,7 @@ class SleepSession:
         return (
             f"Sleep @ tick={self.trigger_tick} ({self.trigger_reason}): "
             f"REM={self.rem_episodes_replayed} eps, "
+            f"grounded={self.grounded_samples} (loss={self.grounded_loss_last:.4f}), "
             f"pruned={self.edges_pruned} edges, "
             f"lesson={self.lesson_concepts[:3]}"
         )
@@ -392,6 +397,20 @@ class SleepController:
                 session.rem_loss_before = l_before
                 session.rem_loss_after = l_after
                 print(f"[Sleep] REM: replayed {n} episodes, loss {l_before:.4f}→{l_after:.4f}")
+
+                try:
+                    from engine.world_state_bridge import grounded_sleep_consolidate
+
+                    gsn = grounded_sleep_consolidate(sim)
+                    if gsn.get("ok"):
+                        session.grounded_samples = int(gsn.get("samples_pushed", 0))
+                        session.grounded_loss_last = float(gsn.get("loss_last") or 0.0)
+                        print(
+                            f"[Sleep] Grounded: samples={session.grounded_samples} "
+                            f"loss={session.grounded_loss_last}"
+                        )
+                except Exception as e:
+                    print(f"[Sleep] Grounded consolidate: {e}")
 
                 # Schedule LLM lesson (async, non-blocking)
                 self._schedule_lesson(tick, sim)
