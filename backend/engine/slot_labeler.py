@@ -3,13 +3,9 @@ slot_labeler.py — Phase M: SlotLabeler.
 
 Мост между SlotAttention (числовые векторы) и ConceptStore (язык).
 
-Три источника информации о слотах:
-  A. VLM labels — текстовые описания от VLM ("green sphere", "ramp ahead")
-     → text→concept mapping через SLOT_PROPERTY_TO_CONCEPTS
-  B. Slot position — нормализованные 2D координаты слота в изображении
-     → spatial concepts (OBJECT_LEFT, OBJECT_AHEAD и т.д.)
-  C. Slot vector — сырой embedding вектор
-     → visual curiosity (насколько необычен этот слот)
+Источники (после замены keyword/position-хуков на neural path в engine.neural_lang_integration):
+  A. Slot vector — embedding слота → NeuralConceptProjector (в патче process_slots)
+  B. Motion / scene / novelty — как раньше (без keyword text→concept и без фиксированной сетки position→spatial)
 
 Выход:
   activated_concepts: list[tuple[str, float]] — (concept_name, confidence)
@@ -38,10 +34,7 @@ from typing import Any
 
 import numpy as np
 
-from engine.visual_concepts import (
-    VISUAL_CONCEPT_DEFS, VISUAL_CONCEPT_NAMES,
-    SLOT_PROPERTY_TO_CONCEPTS, VISUAL_BY_DOMAIN,
-)
+from engine.visual_concepts import VISUAL_CONCEPT_NAMES
 
 
 def slot_label_enabled() -> bool:
@@ -87,65 +80,6 @@ class SlotState:
     def is_moving(self, threshold: float = 0.02) -> bool:
         dx, dy = self.position_delta()
         return (dx**2 + dy**2) ** 0.5 > threshold
-
-
-# ── Text → Concepts ────────────────────────────────────────────────────────────
-def text_to_concepts(label: str, confidence: float = 1.0) -> list[tuple[str, float]]:
-    """
-    Map VLM text label to visual concept names.
-    E.g. "large green sphere" → [("GREEN_OBJECT", 0.9), ("SPHERE_DETECTED", 0.9), ...]
-    """
-    label_lower = label.lower()
-    activated: dict[str, float] = {}
-
-    for keyword, concept_names in SLOT_PROPERTY_TO_CONCEPTS.items():
-        if keyword in label_lower:
-            for cname in concept_names:
-                if cname in VISUAL_CONCEPT_NAMES:
-                    score = confidence * (0.9 if keyword in label_lower[:20] else 0.7)
-                    activated[cname] = max(activated.get(cname, 0.0), score)
-
-    return sorted(activated.items(), key=lambda x: -x[1])
-
-
-# ── Position → Spatial concepts ────────────────────────────────────────────────
-def position_to_spatial_concepts(
-    x: float, y: float, confidence: float = 1.0
-) -> list[tuple[str, float]]:
-    """
-    Map normalized 2D position [0,1]×[0,1] to spatial concepts.
-    x=0 left, x=1 right, y=0 top, y=1 bottom (image convention)
-    """
-    activated: list[tuple[str, float]] = []
-
-    # Horizontal position
-    if x < 0.35:
-        activated.append(("OBJECT_LEFT", confidence * 0.85))
-        activated.append(("ATTENDING_LEFT", confidence * 0.6))
-    elif x > 0.65:
-        activated.append(("OBJECT_RIGHT", confidence * 0.85))
-        activated.append(("ATTENDING_RIGHT", confidence * 0.6))
-    else:
-        activated.append(("OBJECT_AHEAD", confidence * 0.80))
-        activated.append(("ATTENDING_CENTER", confidence * 0.6))
-
-    # Depth from vertical position (rough approximation)
-    # In perspective: y close to 0.5-0.7 = close, y < 0.3 = far
-    if y < 0.3:
-        activated.append(("OBJECT_FAR", confidence * 0.7))
-    elif y < 0.5:
-        activated.append(("OBJECT_MEDIUM", confidence * 0.7))
-    elif y < 0.7:
-        activated.append(("OBJECT_CLOSE", confidence * 0.75))
-    else:
-        activated.append(("OBJECT_VERY_CLOSE", confidence * 0.80))
-        activated.append(("COLLISION_RISK", confidence * 0.5))
-
-    # Object directly in path
-    if 0.35 < x < 0.65 and y > 0.55:
-        activated.append(("OBJECT_BLOCKING_PATH", confidence * 0.65))
-
-    return activated
 
 
 # ── Motion concepts ────────────────────────────────────────────────────────────
@@ -329,15 +263,8 @@ class SlotLabeler:
             self._slot_states[slot_id] = state
             slot_list.append(state)
 
-        # A. Text → concepts
-        for state in slot_list:
-            for cname, score in text_to_concepts(state.label, state.confidence):
-                all_concepts[cname] = max(all_concepts.get(cname, 0.0), score)
-
-        # B. Position → spatial concepts
-        for state in slot_list:
-            for cname, score in position_to_spatial_concepts(*state.position_2d, state.confidence):
-                all_concepts[cname] = max(all_concepts.get(cname, 0.0), score * 0.85)
+        # A–B: VLM text → concept и position → spatial перенесены в NeuralConceptProjector /
+        #      InterventionalSpatialMemory (engine.neural_lang_integration).
 
         # C. Motion concepts
         for state in slot_list:

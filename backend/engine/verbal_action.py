@@ -15,10 +15,10 @@ Reward структура:
   REPORT подтверждённое достижение   → +0.20
   Спам (>3 сообщений за 100 тиков)   → -0.05 / сообщение
 
-Генерация без LLM:
-  SpeechDecoder: thought_embedding → template selection → filled text
-  Шаблоны на русском/английском (configurable)
-  LLM используется только для ASK (нужен осмысленный вопрос)
+Генерация речи:
+  При RKK_NEURAL_LANG=1 основной путь — NeuralLanguageGrounding (engine.neural_lang_integration).
+  Ниже — короткие fallback-строки для cold start / отключённой нейросети.
+  LLM для ASK — при RKK_SPEECH_LLM_ASK=1.
 
 RKK_SPEECH_ENABLED=1
 RKK_SPEECH_LANG=ru            — ru | en
@@ -106,154 +106,39 @@ class AgentMessage:
         }
 
 
-# ── Speech templates ───────────────────────────────────────────────────────────
+# ── Fallback templates (нейросеть: engine.neural_lang_integration) ─────────────
 TEMPLATES_RU: dict[str, list[str]] = {
-    # OBSERVE — balance/fall states
-    "OBSERVE_LOSING_BALANCE": [
-        "Теряю равновесие.",
-        "Что-то не так с балансом.",
-        "Левая нога нестабильна.",
-        "Сложно удержаться.",
-    ],
-    "OBSERVE_STABLE": [
-        "Хорошо стою.",
-        "Баланс стабильный.",
-        "Это работает.",
-        "Чувствую почву под ногами.",
-    ],
-    "OBSERVE_FALLING": [
-        "Падаю!",
-        "Не удержался.",
-        "Слишком быстро.",
-    ],
-    "OBSERVE_RECOVERED": [
-        "Встал.",
-        "Восстановился.",
-        "Получилось подняться.",
-    ],
-    "OBSERVE_OVERSTRIDE": [
-        "Шаг слишком широкий.",
-        "Перестараюсь со шагом.",
-        "Нужно короче.",
-    ],
-    "OBSERVE_CURIOUS": [
-        "Интересно что будет если попробовать иначе.",
-        "Не понимаю почему так происходит.",
-        "Хочу исследовать это движение.",
-        "Что-то необычное.",
-    ],
-    "OBSERVE_IMPROVING": [
-        "Становится лучше.",
-        "Прогресс есть.",
-        "Учусь.",
-    ],
-    "OBSERVE_PLATEAU": [
-        "Застрял на одном месте.",
-        "Не улучшаюсь.",
-        "Нужно что-то менять.",
-    ],
-    # REPORT
-    "REPORT_STABLE_WALK": [
-        "Иду стабильно уже {ticks} тиков.",
-        "Прошёл {ticks} шагов без падения.",
-        "Получается ходить.",
-    ],
-    "REPORT_FALL_COUNT": [
-        "Упал уже {count} раз.",
-        "{count} падений. Ищу причину.",
-    ],
-    "REPORT_SLEEP": [
-        "Нужен отдых. Много падений.",
-        "Хочу обдумать что происходит.",
-    ],
-    # ASK templates (fallback if no LLM)
-    "ASK_BALANCE": [
-        "Почему я теряю баланс при быстром шаге?",
-        "Как улучшить устойчивость?",
-        "Что не так с моим балансом?",
-    ],
-    "ASK_STRIDE": [
-        "Какой шаг оптимальный для моего роста?",
-        "Почему я падаю при широком шаге?",
-    ],
-    "ASK_GENERAL": [
-        "Что мне делать дальше?",
-        "Как мне улучшиться?",
-        "Есть идеи почему это не работает?",
-    ],
+    "OBSERVE_LOSING_BALANCE": ["Теряю равновесие."],
+    "OBSERVE_STABLE": ["Стою устойчиво."],
+    "OBSERVE_FALLING": ["Падаю."],
+    "OBSERVE_RECOVERED": ["Встал."],
+    "OBSERVE_OVERSTRIDE": ["Шаг слишком широкий."],
+    "OBSERVE_CURIOUS": ["Интересно, что будет дальше."],
+    "OBSERVE_IMPROVING": ["Становится лучше."],
+    "OBSERVE_PLATEAU": ["Застрял, почти без прогресса."],
+    "REPORT_STABLE_WALK": ["Стабильно иду уже {ticks} тиков."],
+    "REPORT_FALL_COUNT": ["Упал {count} раз."],
+    "REPORT_SLEEP": ["Нужен отдых."],
+    "ASK_BALANCE": ["Как улучшить баланс?"],
+    "ASK_STRIDE": ["Какой шаг безопаснее?"],
+    "ASK_GENERAL": ["Что делать дальше?"],
 }
 
 TEMPLATES_EN: dict[str, list[str]] = {
-    "OBSERVE_LOSING_BALANCE": [
-        "Losing balance.",
-        "Something's off.",
-        "Left leg feels unstable.",
-        "Hard to stay upright.",
-    ],
-    "OBSERVE_STABLE": [
-        "Stable.",
-        "This feels good.",
-        "Balance is solid.",
-        "I can feel the ground.",
-    ],
-    "OBSERVE_FALLING": [
-        "Falling!",
-        "Lost it.",
-        "Too fast.",
-    ],
-    "OBSERVE_RECOVERED": [
-        "Got up.",
-        "Recovered.",
-        "Made it back.",
-    ],
-    "OBSERVE_OVERSTRIDE": [
-        "Stride too wide.",
-        "Overstepping.",
-        "Need shorter steps.",
-    ],
-    "OBSERVE_CURIOUS": [
-        "Wonder what happens if I try differently.",
-        "Don't understand why this is happening.",
-        "Want to explore this motion.",
-        "Something unexpected.",
-    ],
-    "OBSERVE_IMPROVING": [
-        "Getting better.",
-        "Progress.",
-        "Learning.",
-    ],
-    "OBSERVE_PLATEAU": [
-        "Stuck.",
-        "Not improving.",
-        "Need to change something.",
-    ],
-    "REPORT_STABLE_WALK": [
-        "Walking stable for {ticks} ticks.",
-        "Walked {ticks} steps without falling.",
-        "Getting the hang of walking.",
-    ],
-    "REPORT_FALL_COUNT": [
-        "Fallen {count} times.",
-        "{count} falls. Looking for the pattern.",
-    ],
-    "REPORT_SLEEP": [
-        "Need rest. Too many falls.",
-        "Want to consolidate what I've learned.",
-    ],
-    "ASK_BALANCE": [
-        "Why do I lose balance at higher stride?",
-        "How can I improve stability?",
-        "What's wrong with my balance?",
-    ],
-    "ASK_STRIDE": [
-        "What's the optimal stride length for me?",
-        "Why do I fall with wide steps?",
-    ],
-    "ASK_GENERAL": [
-        "What should I do next?",
-        "How can I improve?",
-        "Any ideas why this isn't working?",
-    ],
+    "OBSERVE_LOSING_BALANCE": ["Losing balance."],
+    "OBSERVE_STABLE": ["Standing stable."],
+    "OBSERVE_FALLING": ["Falling."],
+    "OBSERVE_RECOVERED": ["Back up."],
+    "OBSERVE_OVERSTRIDE": ["Stride too wide."],
+    "OBSERVE_CURIOUS": ["Curious what happens next."],
+    "OBSERVE_IMPROVING": ["Getting better."],
+    "OBSERVE_PLATEAU": ["Stuck, little progress."],
+    "REPORT_STABLE_WALK": ["Stable walk for {ticks} ticks."],
+    "REPORT_FALL_COUNT": ["Fallen {count} times."],
+    "REPORT_SLEEP": ["Need rest."],
+    "ASK_BALANCE": ["How can I improve balance?"],
+    "ASK_STRIDE": ["What stride is safer?"],
+    "ASK_GENERAL": ["What should I do next?"],
 }
 
 
@@ -261,8 +146,8 @@ TEMPLATES_EN: dict[str, list[str]] = {
 class SpeechDecoder:
     """
     Converts thought_embedding + concepts + obs → natural language text.
-    Template-based, ~0ms, no LLM required.
-    LLM used only for ASK type when RKK_SPEECH_LLM_ASK=1.
+    Основной путь: NeuralLanguageGrounding (engine.neural_lang_integration).
+    Ниже — компактный fallback; ASK может идти через LLM при RKK_SPEECH_LLM_ASK=1.
     """
 
     def __init__(self):

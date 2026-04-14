@@ -294,3 +294,16 @@ class Simulation(
                     print(f"[Simulation] Memory resumed at tick={self.tick}")
             except Exception as e:
                 print(f"[Simulation] Memory resume skipped: {type(e).__name__}: {e}")
+
+        if os.environ.get("RKK_NEURAL_LANG", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            try:
+                from engine.neural_lang_integration import apply_neural_lang_patch
+
+                apply_neural_lang_patch(self)
+            except Exception as e:
+                print(f"[Simulation] Neural lang patch skipped: {type(e).__name__}: {e}")

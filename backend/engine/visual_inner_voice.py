@@ -11,13 +11,8 @@ visual_inner_voice.py — Phase M: Visual Inner Voice.
   OBSERVE раньше смотрел только на bodily concepts
   OBSERVE теперь смотрит на visual + bodily → выбирает наиболее релевантный
 
-Новые шаблоны (добавляются к существующим в verbal_action.py):
-  OBSERVE_OBJECT_AHEAD   → "Впереди что-то. Нужно решить как обойти."
-  OBSERVE_RAMP_DETECTED  → "Вижу наклонную поверхность. Попробую подойти."
-  OBSERVE_OPEN_SCENE     → "Путь открыт. Продолжаю."
-  OBSERVE_NOVEL_OBJECT   → "Что-то новое. Не видел раньше."
-  ASK_OBJECT             → "Что это за объект передо мной?"
-  ASK_NAVIGATE           → "Как мне лучше обойти это препятствие?"
+Фразы для OBSERVE/ASK формирует NeuralLanguageGrounding (engine.neural_lang_integration),
+а не статические VISUAL_TEMPLATES (удалены).
 
 GNN инъекция:
   concept_vis_ramp_detected    = 0.85
@@ -58,202 +53,7 @@ def concept_to_gnn_node(concept_name: str) -> str:
     return f"concept_vis_{concept_name.lower()}"
 
 
-# ── Visual verbal templates (Russian) ─────────────────────────────────────────
-VISUAL_TEMPLATES_RU: dict[str, list[str]] = {
-    # Object detection
-    "OBSERVE_OBJECT_AHEAD": [
-        "Впереди объект. Нужно обойти или перешагнуть.",
-        "Вижу что-то на пути.",
-        "Путь заблокирован. Думаю как пройти.",
-    ],
-    "OBSERVE_OBJECT_CLOSE": [
-        "Что-то совсем рядом.",
-        "Объект в непосредственной близости.",
-        "Очень близко к чему-то.",
-    ],
-    "OBSERVE_OBJECT_LEFT": [
-        "Что-то слева.",
-        "Объект с левой стороны.",
-    ],
-    "OBSERVE_OBJECT_RIGHT": [
-        "Что-то справа.",
-        "Объект справа от меня.",
-    ],
-    "OBSERVE_RAMP_DETECTED": [
-        "Вижу наклонную поверхность.",
-        "Рампа. Интересно, смогу ли я подняться.",
-        "Поверхность под углом. Осторожно.",
-    ],
-    "OBSERVE_STAIRS_DETECTED": [
-        "Ступени. Сложно для меня пока.",
-        "Лестница впереди.",
-        "Вижу ступени. Нужно попробовать.",
-    ],
-    "OBSERVE_BEAM_DETECTED": [
-        "Узкая балка. Сложный баланс.",
-        "Балка. Нужно очень точно двигаться.",
-    ],
-    "OBSERVE_PLATFORM_DETECTED": [
-        "Платформа. Можно попробовать залезть.",
-        "Возвышение впереди.",
-    ],
-    "OBSERVE_BALL_DETECTED": [
-        "Шар. Могу попробовать его толкнуть.",
-        "Круглый объект. Он подвижный.",
-    ],
-    "OBSERVE_OPEN_SCENE": [
-        "Путь открыт. Продолжаю движение.",
-        "Свободное пространство впереди.",
-        "Ничего не мешает.",
-    ],
-    "OBSERVE_CLEAR_PATH": [
-        "Путь свободен.",
-        "Ничего не блокирует путь.",
-    ],
-    "OBSERVE_CLUTTERED": [
-        "Много объектов вокруг. Сложная навигация.",
-        "Загромождено. Нужно быть аккуратным.",
-    ],
-    "OBSERVE_NOVEL_OBJECT": [
-        "Что-то незнакомое. Раньше не видел.",
-        "Новый объект в поле зрения. Интересно.",
-        "Это я вижу впервые.",
-    ],
-    "OBSERVE_SENSOR_PLATE": [
-        "Светящаяся плитка. Интересно что это.",
-        "Сенсорная платформа. Попробую встать.",
-    ],
-    "OBSERVE_WALL_NEARBY": [
-        "Близко стена. Нужно повернуть.",
-        "Стена рядом. Осторожно.",
-    ],
-    "OBSERVE_MOVING_OBJECT": [
-        "Что-то движется.",
-        "Объект в движении. Слежу.",
-    ],
-    "OBSERVE_I_MOVED_IT": [
-        "Я это сдвинул!",
-        "Объект отреагировал на моё действие.",
-        "Я могу влиять на окружение.",
-    ],
-    # ASK — world-aware questions
-    "ASK_OBJECT_UNKNOWN": [
-        "Что это за объект передо мной?",
-        "Что это такое?",
-        "Не понимаю что я вижу. Можешь объяснить?",
-    ],
-    "ASK_HOW_TO_NAVIGATE": [
-        "Как мне лучше обойти это?",
-        "Как пройти мимо этого объекта?",
-        "Что мне делать с этим препятствием?",
-    ],
-    "ASK_CAN_CLIMB": [
-        "Я смогу залезть на эту поверхность?",
-        "Эта наклонная поверхность безопасна для меня?",
-    ],
-    "ASK_WHAT_IS_GOAL": [
-        "Куда мне нужно идти?",
-        "Есть ли цель в этом пространстве?",
-    ],
-}
-
-VISUAL_TEMPLATES_EN: dict[str, list[str]] = {
-    "OBSERVE_OBJECT_AHEAD": [
-        "Something ahead. Need to decide: go around or step over.",
-        "Object in my path.",
-        "Path is blocked. Thinking.",
-    ],
-    "OBSERVE_OBJECT_CLOSE": [
-        "Something very close.",
-        "Object nearby.",
-    ],
-    "OBSERVE_OBJECT_LEFT": [
-        "Something to my left.",
-        "Object on the left side.",
-    ],
-    "OBSERVE_OBJECT_RIGHT": [
-        "Something to my right.",
-        "Object on the right.",
-    ],
-    "OBSERVE_RAMP_DETECTED": [
-        "I see an inclined surface.",
-        "Ramp ahead. Can I climb it?",
-        "Angled surface. Be careful.",
-    ],
-    "OBSERVE_STAIRS_DETECTED": [
-        "Stairs. Hard for me right now.",
-        "Steps ahead.",
-    ],
-    "OBSERVE_BEAM_DETECTED": [
-        "Narrow beam. Challenging balance.",
-        "Balance beam ahead.",
-    ],
-    "OBSERVE_PLATFORM_DETECTED": [
-        "Platform. Could try to get up there.",
-        "Elevated surface ahead.",
-    ],
-    "OBSERVE_BALL_DETECTED": [
-        "A ball. I could push it.",
-        "Round object. It can move.",
-    ],
-    "OBSERVE_OPEN_SCENE": [
-        "Path is open. Continuing.",
-        "Open space ahead.",
-        "Nothing blocking.",
-    ],
-    "OBSERVE_CLEAR_PATH": [
-        "Clear path.",
-        "Nothing in the way.",
-    ],
-    "OBSERVE_CLUTTERED": [
-        "Many objects. Complex navigation.",
-        "Cluttered. Need to be careful.",
-    ],
-    "OBSERVE_NOVEL_OBJECT": [
-        "Something unfamiliar. Never seen this before.",
-        "New object in view. Interesting.",
-    ],
-    "OBSERVE_SENSOR_PLATE": [
-        "Glowing tile. What is that?",
-        "Sensor plate. Maybe step on it.",
-    ],
-    "OBSERVE_WALL_NEARBY": [
-        "Wall close. Need to turn.",
-        "Approaching boundary.",
-    ],
-    "OBSERVE_MOVING_OBJECT": [
-        "Something is moving.",
-        "Object in motion. Watching.",
-    ],
-    "OBSERVE_I_MOVED_IT": [
-        "I moved it!",
-        "Object reacted to my action.",
-        "I can affect the environment.",
-    ],
-    "ASK_OBJECT_UNKNOWN": [
-        "What is that object in front of me?",
-        "What am I looking at?",
-    ],
-    "ASK_HOW_TO_NAVIGATE": [
-        "How should I get around this?",
-        "Best way past this obstacle?",
-    ],
-    "ASK_CAN_CLIMB": [
-        "Can I climb that surface?",
-        "Is that ramp safe for me?",
-    ],
-    "ASK_WHAT_IS_GOAL": [
-        "Where should I go?",
-        "Is there a goal in this space?",
-    ],
-}
-
-
-def get_visual_templates(lang: str = "ru") -> dict[str, list[str]]:
-    return VISUAL_TEMPLATES_RU if lang == "ru" else VISUAL_TEMPLATES_EN
-
-
-# ── Concept → Template key mapper ─────────────────────────────────────────────
+# ── Concept → Template key mapper (текст — через NeuralLanguageGrounding) ────
 def concepts_to_observe_key(concepts: list[str]) -> str | None:
     """Select most relevant OBSERVE template from active visual concepts."""
     # Priority order
@@ -324,7 +124,6 @@ class VisualInnerVoice:
 
     def __init__(self, lang: str = "ru"):
         self._lang = lang
-        self._templates = get_visual_templates(lang)
         self._every = _env_int("RKK_VISUAL_VOICE_EVERY", 30)
         self._inject_top = _env_int("RKK_VISUAL_INJECT_TOP", 5)
         self._last_tick = -999
@@ -443,10 +242,8 @@ class VisualInnerVoice:
         return concepts_to_ask_key(self._concept_names)
 
     def get_template(self, key: str) -> str | None:
-        """Get random template text for given key."""
-        import random
-        templates = self._templates.get(key, [])
-        return random.choice(templates) if templates else None
+        """Речь идёт через NeuralLanguageGrounding; ключи остаются для маршрутизации в verbal_action."""
+        return None
 
     def get_world_description(self) -> str:
         return self._world_desc

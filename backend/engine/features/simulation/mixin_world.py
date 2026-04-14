@@ -257,6 +257,25 @@ class SimulationWorldMixin:
             }
 
     # ── Seeds ─────────────────────────────────────────────────────────────────
+    def agent_seed_context(self, agent_id: int) -> dict | None:
+        """
+        Контекст для POST /bootstrap/llm, GET /variables/{id}, RAG auto-seed:
+        preset (имя мира) и список имён переменных текущей среды агента.
+        """
+        if agent_id != 0:
+            return None
+        try:
+            vars_ = list(self.agent.env.variable_ids)
+        except Exception:
+            return None
+        if not vars_:
+            return None
+        return {
+            "preset": self.current_world,
+            "variables": vars_,
+            "agent_id": agent_id,
+        }
+
     def inject_seeds(self, agent_id: int, edges: list[dict]) -> dict:
         with self._sim_step_lock:
             result = self.agent.inject_text_priors(edges)
