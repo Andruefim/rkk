@@ -32,9 +32,6 @@ from typing import Any
 
 import numpy as np
 
-from engine.visual_concepts import VISUAL_CONCEPT_NAMES, VISUAL_BY_DOMAIN
-
-
 def visual_voice_enabled() -> bool:
     return os.environ.get("RKK_VISUAL_VOICE_ENABLED", "1").strip().lower() not in (
         "0", "false", "no", "off"
@@ -240,10 +237,6 @@ class VisualInnerVoice:
     def get_ask_key(self) -> str | None:
         """Get ASK template key if visual curiosity warrants asking."""
         return concepts_to_ask_key(self._concept_names)
-
-    def get_template(self, key: str) -> str | None:
-        """Речь идёт через NeuralLanguageGrounding; ключи остаются для маршрутизации в verbal_action."""
-        return None
 
     def get_world_description(self) -> str:
         return self._world_desc

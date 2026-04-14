@@ -3,12 +3,6 @@ from __future__ import annotations
 
 from engine.features.simulation.mixin_imports import *
 
-try:
-    from engine.intristic_objective import use_intrinsic_only_rewards
-except ImportError:
-    def use_intrinsic_only_rewards() -> bool:
-        return False
-
 
 class SimulationMotorPipelineMixin:
     def _locomotion_reward_ema(self) -> float:
@@ -149,16 +143,4 @@ class SimulationMotorPipelineMixin:
                 intents=intents,
             )
             self._l1_last_credit_tick = self.tick
-        lc = self._locomotion_controller
-        if lc is not None and not use_intrinsic_only_rewards():
-            fallen = False
-            is_fn = getattr(self.agent.env, "is_fallen", None)
-            if callable(is_fn) and not self._fixed_root_active:
-                fallen = bool(is_fn())
-            lc.learn_from_reward(
-                float(obs_after.get("com_z", 0.5)),
-                float(obs_after.get("com_x", 0.5)),
-                fallen,
-                motor_obs=self._motor_obs_payload(obs_after),
-            )
         self._l1_last_apply_tick = self.tick

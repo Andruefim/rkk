@@ -119,96 +119,19 @@ class CurriculumStage:
         }
 
 
-# ── Hardcoded fallback curriculum ─────────────────────────────────────────────
-DEFAULT_CURRICULUM: list[CurriculumStage] = [
-    CurriculumStage(
-        stage_id=0,
-        name="static_stance",
-        description="Stand still. Both feet planted, minimal sway.",
-        intent_targets={
-            "intent_stride": 0.50,
-            "intent_stop_recover": 0.65,
-            "intent_support_left": 0.58,
-            "intent_support_right": 0.58,
-            "intent_torso_forward": 0.52,
-        },
-        advance_conditions={"posture_stability": 0.70, "foot_contact_min": 0.60},
-        skill_goals=["stand"],
-        min_ticks=300,
-        seeds=[
-            {"from_": "foot_contact_l", "to": "support_bias", "weight": 0.30, "alpha": 0.05},
-            {"from_": "foot_contact_r", "to": "support_bias", "weight": 0.30, "alpha": 0.05},
-        ],
-    ),
-    CurriculumStage(
-        stage_id=1,
-        name="weight_shift",
-        description="Learn to shift weight between legs without falling.",
-        intent_targets={
-            "intent_stride": 0.50,
-            "intent_support_left": 0.65,
-            "intent_support_right": 0.45,
-            "intent_torso_forward": 0.54,
-        },
-        advance_conditions={"posture_stability": 0.65, "foot_contact_min": 0.55, "support_bias_range": 0.25},
-        skill_goals=["stand"],
-        min_ticks=400,
-        seeds=[
-            {"from_": "support_bias", "to": "torso_roll", "weight": -0.20, "alpha": 0.05},
-        ],
-    ),
-    CurriculumStage(
-        stage_id=2,
-        name="forward_lean",
-        description="Maintain stable forward lean. CoM ahead of feet.",
-        intent_targets={
-            "intent_stride": 0.52,
-            "intent_torso_forward": 0.62,
-            "intent_gait_coupling": 0.82,
-            "intent_arm_counterbalance": 0.54,
-        },
-        advance_conditions={"posture_stability": 0.62, "com_x_mean": 0.46, "foot_contact_min": 0.52},
-        skill_goals=["stand", "walk"],
-        min_ticks=400,
-        seeds=[
-            {"from_": "spine_pitch", "to": "com_x", "weight": 0.35, "alpha": 0.05},
-            {"from_": "intent_torso_forward", "to": "spine_pitch", "weight": 0.40, "alpha": 0.05},
-        ],
-    ),
-    CurriculumStage(
-        stage_id=3,
-        name="slow_step",
-        description="Attempt slow single steps. stride=0.6, full weight transfer.",
-        intent_targets={
-            "intent_stride": 0.60,
-            "intent_torso_forward": 0.64,
-            "intent_gait_coupling": 0.88,
-            "intent_arm_counterbalance": 0.58,
-        },
-        advance_conditions={"posture_stability": 0.60, "com_x_mean": 0.47, "gait_symmetry": 0.50},
-        skill_goals=["walk"],
-        min_ticks=500,
-        seeds=[
-            {"from_": "intent_stride", "to": "com_x", "weight": 0.28, "alpha": 0.05},
-            {"from_": "gait_phase_l", "to": "foot_contact_l", "weight": 0.30, "alpha": 0.05},
-            {"from_": "gait_phase_r", "to": "foot_contact_r", "weight": 0.30, "alpha": 0.05},
-        ],
-    ),
-    CurriculumStage(
-        stage_id=4,
-        name="continuous_walk",
-        description="Continuous walking gait. stride=0.65, symmetric.",
-        intent_targets={
-            "intent_stride": 0.65,
-            "intent_torso_forward": 0.66,
-            "intent_gait_coupling": 0.90,
-            "intent_arm_counterbalance": 0.60,
-        },
-        advance_conditions={"posture_stability": 0.62, "gait_symmetry": 0.60, "com_x_mean": 0.48},
-        skill_goals=["walk"],
-        min_ticks=600,
-    ),
-]
+# ── Без ручных этапов: прогрессия из intrinsic objective; этапы только от LLM при необходимости ──
+_INTRINSIC_PLACEHOLDER_STAGE = CurriculumStage(
+    stage_id=-1,
+    name="intrinsic",
+    description="No hand-authored stages; progression from compression (intrinsic objective).",
+    intent_targets={},
+    advance_conditions={},
+    seeds=[],
+    skill_goals=[],
+    min_ticks=999999,
+)
+
+DEFAULT_CURRICULUM: list[CurriculumStage] = []
 
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
@@ -393,7 +316,7 @@ class CurriculumScheduler:
     @property
     def current_stage(self) -> CurriculumStage:
         if not self._stages:
-            return DEFAULT_CURRICULUM[0]
+            return _INTRINSIC_PLACEHOLDER_STAGE
         return self._stages[min(self._current_idx, len(self._stages) - 1)]
 
     def compute_metrics(self, obs: dict[str, float]) -> dict[str, float]:

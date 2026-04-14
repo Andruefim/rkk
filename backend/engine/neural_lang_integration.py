@@ -1,10 +1,11 @@
 """
 neural_lang_integration.py — Патч интеграции NeuralLanguageGrounding в Simulation.
 
-Что заменяется:
-  verbal_action.py длинные TEMPLATES_* → CausalSpeechDecoder (нейросеть) + короткий fallback
-  slot_labeler.py text_to_concepts / position_to_spatial_concepts → projector + spatial memory
-  visual_inner_voice.py VISUAL_TEMPLATES_* → тот же нейросетевой путь (get_template не используется)
+Основной путь речи и slot→concept:
+  verbal_action — CausalSpeechDecoder через generate_utterance; в SpeechDecoder остались только
+    короткие строки на cold start (без таблиц TEMPLATES_*).
+  slot_labeler — motion / scene / novelty; доп. концепты из NeuralConceptProjector (не keyword map).
+  visual_inner_voice — маршрутизация по ключам OBSERVE/ASK для нейросети; VISUAL_TEMPLATES удалены.
 
 Включается из `Simulation.__init__` при RKK_NEURAL_LANG=1 (по умолчанию), если доступен
 `engine.neural_causal_language`.
@@ -213,8 +214,8 @@ def _patch_slot_labeler(sim, nlg) -> None:
     Перехватываем SlotLabeler.process_slots:
     Вместо keyword matching → NeuralConceptProjector.project()
     
-    Concept names теперь берутся из SemanticConceptStore (через project()),
-    а не из SLOT_PROPERTY_TO_CONCEPTS.
+    Concept names дополняются проекцией слота в SemanticConceptStore (NeuralConceptProjector),
+    а не keyword lookup по словарю свойств слота.
     """
     slot_labeler = getattr(sim, "_slot_labeler", None)
     if slot_labeler is None:

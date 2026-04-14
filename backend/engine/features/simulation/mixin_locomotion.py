@@ -1,13 +1,7 @@
-"""Simulation mixin: CPG, motor cortex, reward coord."""
+"""Simulation mixin: CPG, motor cortex (обучение — intrinsic objective)."""
 from __future__ import annotations
 
 from engine.features.simulation.mixin_imports import *
-
-try:
-    from engine.intristic_objective import use_intrinsic_only_rewards
-except ImportError:
-    def use_intrinsic_only_rewards() -> bool:
-        return False
 
 
 class SimulationLocomotionMixin:
@@ -107,19 +101,8 @@ class SimulationLocomotionMixin:
             com_z = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
             com_x = float(obs.get("com_x", obs.get("phys_com_x", 0.5)))
 
-            # Phase D: train motor cortex programs + anneal CPG (biomechanical — не при intrinsic-only)
-            if mc is not None and not use_intrinsic_only_rewards():
-                reward = (
-                    posture * 2.0
-                    + min(foot_l, foot_r) * 1.5
-                    + com_z * 1.0
-                    + max(0.0, com_x - 0.46) * 1.5   # forward bonus
-                    - (3.0 if fallen else 0.0)
-                )
-                mc.push_and_train(nodes, cpg_targets, reward, posture, foot_l, foot_r)
-                mc.anneal_step(posture, foot_l, foot_r, fallen, self.tick)
-
-                # Inject abstract nodes once when first program spawned
+            # Phase D: motor cortex — только синхронизация узлов; обучение из IntrinsicObjective
+            if mc is not None:
                 if not self._mc_abstract_nodes_injected and len(mc.programs) > 0:
                     added = mc.inject_abstract_nodes_into_graph(self.agent.graph)
                     if added > 0:
@@ -129,12 +112,6 @@ class SimulationLocomotionMixin:
                             "#ff88ff", "phase"
                         )
                 mc.sync_abstract_nodes_to_graph(self.agent.graph)
-            elif mc is not None and use_intrinsic_only_rewards():
-                mc.sync_abstract_nodes_to_graph(self.agent.graph)
-
-            self._locomotion_controller.learn_from_reward(
-                com_z, com_x, fallen, motor_obs=self._motor_obs_payload(obs)
-            )
             # Track for embodied reward and motor cortex
             self._mc_posture_window.append(posture)
             self._mc_fallen_count_window.append(1 if fallen else 0)
@@ -160,28 +137,3 @@ class SimulationLocomotionMixin:
         if self._motor_cortex is None:
             self._motor_cortex = _MotorCortexLibrary(self.device)
         return self._motor_cortex
-
-    def _ensure_reward_coord(self) -> None:
-        """Lazy-init RewardCoordinator; rebuild CuriosityICM when graph dimension changes."""
-        if not _REWARD_COORD_AVAILABLE:
-            return
-        if not hasattr(self, "agent") or self.agent is None:
-            return
-        graph = getattr(self.agent, "graph", None)
-        if graph is None:
-            return
-        nids = list(getattr(graph, "_node_ids", []) or [])
-        d = len(nids) if nids else int(getattr(graph, "_d", 30) or 30)
-
-        if self._reward_coord is not None:
-            cur = getattr(self._reward_coord.curiosity, "d", -1)
-            if cur != d:
-                self._reward_coord = None
-                self._reward_X_prev = []
-                self._reward_a_prev = []
-
-        if self._reward_coord is not None:
-            return
-
-        self._reward_coord = RewardCoordinator(d=d, device=self.device)
-        print(f"[Simulation] RewardCoordinator init d={d}")

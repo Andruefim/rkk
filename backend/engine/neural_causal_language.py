@@ -1,18 +1,16 @@
 """
 neural_causal_language.py — Фаза P: Neural Causal Language Emergence.
 
-Полная замена хардкода на нейросети:
-  - TEMPLATES_RU/EN → CausalSpeechDecoder (GRU + vocab head)
-  - SLOT_PROPERTY_TO_CONCEPTS → NeuralConceptProjector (learned mapping)
-  - position_to_spatial_concepts → InterventionalSpatialMemory (causal)
-  - text_to_concepts keyword matching → LearnedSlotSemantics (contrastive)
+Нейросетевой путь вместо снятых lookup-таблиц и keyword matching:
+  - Речь: CausalSpeechDecoder (GRU + vocab head); в verbal_action нет TEMPLATES_RU/EN.
+  - Slot→concept: NeuralConceptProjector (раньше слой SLOT_PROPERTY_TO_CONCEPTS в visual_concepts).
+  - Пространство: InterventionalSpatialMemory (раньше фиксированные position→spatial правила).
 
 Принцип: язык, зрение, движение — один поток каузального обучения.
-Агент учится описывать мир через интервенции, а не через lookup table.
 
 Обучение:
   τ3 LLM teacher → verbal annotation → дистилляция в CausalSpeechDecoder
-  Slot vectors × GNN interventional co-variance → LearnedSlotSemantics
+  Slot vectors × co-variance в NeuralConceptProjector
   Agent actions × slot_delta → InterventionalSpatialMemory
 
 RKK_NEURAL_LANG_ENABLED=1
@@ -334,7 +332,7 @@ class NeuralConceptProjector(nn.Module):
     """
     Slot vectors → semantic concept activations.
     
-    Заменяет захардкоженный SLOT_PROPERTY_TO_CONCEPTS.
+    Заменяет keyword lookup «свойство слота → концепты» (старый слой в visual_concepts удалён).
     
     Обучается через contrastive loss:
       - Positive pairs: (slot_vec, concept_emb) когда slot causally связан с concept
@@ -833,14 +831,10 @@ class NeuralLanguageGrounding:
     """
     Единая точка интеграции: зрение + тело + язык без хардкода.
     
-    Заменяет:
-      - VerbalActionController с TEMPLATES_RU/EN
-      - SlotLabeler с SLOT_PROPERTY_TO_CONCEPTS  
-      - VisualInnerVoice с VISUAL_TEMPLATES_RU
-      - position_to_spatial_concepts
-      - text_to_concepts keyword matching
-      
-    Всё что генерируется — выучено из experience, дистиллировано от LLM.
+    Заменяет снятые таблицы и keyword-пути (шаблоны речи, словарь slot→concept, визуальные шаблоны,
+    жёсткие spatial rules, text→concept по ключевым словам).
+
+    Генерация опирается на обучаемые модули и дистилляцию от LLM teacher где доступно.
     
     Цикл обучения:
       1. Агент действует (do(var, val))

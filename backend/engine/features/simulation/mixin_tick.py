@@ -3,12 +3,6 @@ from __future__ import annotations
 
 from engine.features.simulation.mixin_imports import *
 
-try:
-    from engine.intristic_objective import use_intrinsic_only_rewards
-except ImportError:
-    def use_intrinsic_only_rewards() -> bool:
-        return False
-
 
 class SimulationTickMixin:
     # ── Tick ──────────────────────────────────────────────────────────────────
@@ -177,92 +171,6 @@ class SimulationTickMixin:
                 if self._timescale.should_run(LEVEL_REFLEX, self.tick):
                     self._timescale.mark_ran(LEVEL_REFLEX, self.tick)
 
-        # Level 3-H: Unified reward signal (humanoid) — отключается при intrinsic-only
-        _reward_signal = None
-        if (
-            _REWARD_COORD_AVAILABLE
-            and self.current_world == "humanoid"
-            and not use_intrinsic_only_rewards()
-        ):
-            self._ensure_reward_coord()
-            if self._reward_coord is not None:
-                node_ids = (
-                    list(self.agent.graph._node_ids)
-                    if hasattr(self.agent.graph, "_node_ids")
-                    else []
-                )
-                X_now = [float(_obs_for_d_e.get(n, 0.0)) for n in node_ids]
-                a_vec = [
-                    float(self._reward_action_val) if n == self._reward_action_var else 0.0
-                    for n in node_ids
-                ]
-
-                _task_r = 0.0
-                _task_src = "heuristic"
-                if _EMBODIED_REWARD_AVAILABLE and self._embodied_reward_ctrl is not None:
-                    emb_sn = self._embodied_reward_ctrl.snapshot()
-                    lr = emb_sn.get("last_result")
-                    if isinstance(lr, dict):
-                        _task_r = float(lr.get("combined_reward", 0.0))
-                        err = str(lr.get("error") or "").strip()
-                        _task_src = "llm" if lr.get("ok") and not err else "heuristic"
-
-                if self._reward_action_var:
-                    self._reward_coord.record_action(
-                        self._reward_action_var, self._reward_action_val
-                    )
-
-                _h_W = 0.0
-                try:
-                    _h_W = float(self.agent.graph._core.dag_constraint().item())
-                except Exception:
-                    pass
-
-                _reward_signal = self._reward_coord.compute(
-                    tick=self.tick,
-                    obs=_obs_for_d_e,
-                    X_t=self._reward_X_prev if self._reward_X_prev else X_now,
-                    a_t=self._reward_a_prev if self._reward_a_prev else a_vec,
-                    X_tp1=X_now,
-                    fallen=fallen,
-                    anomaly=_proprio_anomaly,
-                    empowerment_reward=_proprio_emp_reward,
-                    task_reward=_task_r,
-                    task_source=_task_src,
-                    h_W=_h_W,
-                    llm_url=get_ollama_generate_url(),
-                    llm_model=get_ollama_model(),
-                )
-
-                self._reward_X_prev = X_now
-                self._reward_a_prev = a_vec
-
-                self._reward_coord.apply_to_learners(
-                    signal=_reward_signal,
-                    locomotion_ctrl=self._locomotion_controller,
-                    motor_cortex=getattr(self, "_motor_cortex", None),
-                    agent=self.agent,
-                )
-
-                if _reward_signal.constitution < 0.5 and _reward_signal.constitution_warning:
-                    self._add_event(
-                        f"⚠️ Constitution: {_reward_signal.constitution_warning[:60]}",
-                        "#ffaa44",
-                        "constitution",
-                    )
-
-                if _reward_signal.blocked and not self._was_blocked:
-                    self._add_event(
-                        f"🛑 Survival veto: {_reward_signal.survival_reason}",
-                        "#ff4444",
-                        "veto",
-                    )
-                self._was_blocked = bool(_reward_signal.blocked)
-
-                if _TIMESCALE_AVAILABLE and self._timescale is not None:
-                    if _reward_signal.curiosity > 0.6:
-                        self._timescale.set_intent(LEVEL_COGNIT, "causal_eig", 0.8)
-
         # Phase K: Sleep Controller
         if (
             _PHASE_K_AVAILABLE
@@ -317,16 +225,6 @@ class SimulationTickMixin:
         # Phase L: Verbal Action (async in background thread)
         if _VERBAL_AVAILABLE and self._verbal is not None:
             self._schedule_verbal_tick(fallen)
-
-        if not result.get("blocked") and not result.get("skipped"):
-            _var_now = result.get("variable", "")
-            _val_now = result.get("value", 0.5)
-            if _var_now:
-                self._reward_action_var = str(_var_now)
-                try:
-                    self._reward_action_val = float(_val_now)
-                except (TypeError, ValueError):
-                    self._reward_action_val = 0.5
 
         if _TIMESCALE_AVAILABLE and self._timescale is not None:
             if self._timescale.should_run(LEVEL_MOTOR, self.tick):
@@ -447,36 +345,6 @@ class SimulationTickMixin:
         if dr > self._best_discovery_rate + 1e-5:
             self._best_discovery_rate = dr
             self._last_dr_gain_tick = self.tick
-
-        # Level 1-A: Embodied LLM Reward Shaping (async task)
-        if (
-            _EMBODIED_REWARD_AVAILABLE
-            and self._embodied_reward_ctrl is not None
-            and self.current_world == "humanoid"
-            and not self._fixed_root_active
-            and embodied_reward_enabled()
-            and self._embodied_reward_ctrl.should_run(self.tick)
-        ):
-            import asyncio
-
-            def _run_embodied_in_thread() -> None:
-                asyncio.run(self._run_embodied_reward_async())
-
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            try:
-                if loop is not None:
-                    try:
-                        loop.create_task(self._run_embodied_reward_async())
-                    except RuntimeError:
-                        self._llm_loop_executor.submit(_run_embodied_in_thread)
-                else:
-                    # rkk-agent-loop и др.: в потоке нет loop — не блокируем тик
-                    self._llm_loop_executor.submit(_run_embodied_in_thread)
-            except Exception as e:
-                print(f"[Simulation] embodied reward schedule error: {e}")
 
         # Level 1-B: Visual Body Grounding
         self._maybe_run_visual_grounding()

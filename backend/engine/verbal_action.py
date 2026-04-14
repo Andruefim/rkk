@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import random
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -106,54 +105,16 @@ class AgentMessage:
         }
 
 
-# ── Fallback templates (нейросеть: engine.neural_lang_integration) ─────────────
-TEMPLATES_RU: dict[str, list[str]] = {
-    "OBSERVE_LOSING_BALANCE": ["Теряю равновесие."],
-    "OBSERVE_STABLE": ["Стою устойчиво."],
-    "OBSERVE_FALLING": ["Падаю."],
-    "OBSERVE_RECOVERED": ["Встал."],
-    "OBSERVE_OVERSTRIDE": ["Шаг слишком широкий."],
-    "OBSERVE_CURIOUS": ["Интересно, что будет дальше."],
-    "OBSERVE_IMPROVING": ["Становится лучше."],
-    "OBSERVE_PLATEAU": ["Застрял, почти без прогресса."],
-    "REPORT_STABLE_WALK": ["Стабильно иду уже {ticks} тиков."],
-    "REPORT_FALL_COUNT": ["Упал {count} раз."],
-    "REPORT_SLEEP": ["Нужен отдых."],
-    "ASK_BALANCE": ["Как улучшить баланс?"],
-    "ASK_STRIDE": ["Какой шаг безопаснее?"],
-    "ASK_GENERAL": ["Что делать дальше?"],
-}
-
-TEMPLATES_EN: dict[str, list[str]] = {
-    "OBSERVE_LOSING_BALANCE": ["Losing balance."],
-    "OBSERVE_STABLE": ["Standing stable."],
-    "OBSERVE_FALLING": ["Falling."],
-    "OBSERVE_RECOVERED": ["Back up."],
-    "OBSERVE_OVERSTRIDE": ["Stride too wide."],
-    "OBSERVE_CURIOUS": ["Curious what happens next."],
-    "OBSERVE_IMPROVING": ["Getting better."],
-    "OBSERVE_PLATEAU": ["Stuck, little progress."],
-    "REPORT_STABLE_WALK": ["Stable walk for {ticks} ticks."],
-    "REPORT_FALL_COUNT": ["Fallen {count} times."],
-    "REPORT_SLEEP": ["Need rest."],
-    "ASK_BALANCE": ["How can I improve balance?"],
-    "ASK_STRIDE": ["What stride is safer?"],
-    "ASK_GENERAL": ["What should I do next?"],
-}
-
-
-# ── Speech Decoder (template-based, no LLM) ────────────────────────────────────
+# ── Speech Decoder (minimal fallback; основной путь — neural_lang_integration) ─
 class SpeechDecoder:
     """
     Converts thought_embedding + concepts + obs → natural language text.
     Основной путь: NeuralLanguageGrounding (engine.neural_lang_integration).
-    Ниже — компактный fallback; ASK может идти через LLM при RKK_SPEECH_LLM_ASK=1.
+    Ниже — короткие строки для cold start; ASK может идти через LLM при RKK_SPEECH_LLM_ASK=1.
     """
 
     def __init__(self):
-        lang = _env("RKK_SPEECH_LANG", "ru")
-        self._T = TEMPLATES_RU if lang == "ru" else TEMPLATES_EN
-        self._lang = lang
+        self._lang = _env("RKK_SPEECH_LANG", "ru")
 
     def decode_observe(
         self,
@@ -161,38 +122,30 @@ class SpeechDecoder:
         obs: dict[str, float],
         curiosity: float,
     ) -> str:
-        """Pick OBSERVE template based on dominant concept."""
+        """Fallback OBSERVE when neural decoder недоступен."""
         def g(k: str) -> float:
             return float(obs.get(k, obs.get(f"phys_{k}", 0.5)))
 
         concept_names = [c for c, _ in concepts] if concepts and isinstance(concepts[0], tuple) else concepts
         posture = g("posture_stability")
         fallen = g("com_z") < 0.35
+        ru = self._lang == "ru"
 
-        # Map concept to template key
-        if fallen or "FALLEN" in concept_names:
-            key = "OBSERVE_FALLING"
-        elif "FALL_BACKWARD" in concept_names or "FALL_FORWARD" in concept_names:
-            key = "OBSERVE_FALLING"
-        elif "LOSING_BALANCE" in concept_names or "LOW_STABILITY" in concept_names:
-            key = "OBSERVE_LOSING_BALANCE"
-        elif "OVERSTRIDE" in concept_names:
-            key = "OBSERVE_OVERSTRIDE"
-        elif curiosity > 0.65:
-            key = "OBSERVE_CURIOUS"
-        elif "HIGH_STABILITY" in concept_names or "STABLE_BALANCE" in concept_names:
-            key = "OBSERVE_STABLE"
-        elif "IMPROVING" in concept_names:
-            key = "OBSERVE_IMPROVING"
-        elif "PLATEAU" in concept_names:
-            key = "OBSERVE_PLATEAU"
-        elif posture < 0.5:
-            key = "OBSERVE_LOSING_BALANCE"
-        else:
-            key = "OBSERVE_STABLE"
-
-        templates = self._T.get(key, self._T.get("OBSERVE_STABLE", ["..."]))
-        return random.choice(templates)
+        if fallen or "FALLEN" in concept_names or "FALL_BACKWARD" in concept_names or "FALL_FORWARD" in concept_names:
+            return "Падаю." if ru else "Falling."
+        if "LOSING_BALANCE" in concept_names or "LOW_STABILITY" in concept_names or posture < 0.5:
+            return "Теряю равновесие." if ru else "Losing balance."
+        if "OVERSTRIDE" in concept_names:
+            return "Шаг слишком широкий." if ru else "Stride too wide."
+        if curiosity > 0.65:
+            return "Интересно, что будет дальше." if ru else "Curious what happens next."
+        if "HIGH_STABILITY" in concept_names or "STABLE_BALANCE" in concept_names:
+            return "Стою устойчиво." if ru else "Standing stable."
+        if "IMPROVING" in concept_names:
+            return "Становится лучше." if ru else "Getting better."
+        if "PLATEAU" in concept_names:
+            return "Застрял, почти без прогресса." if ru else "Stuck, little progress."
+        return "Стою устойчиво." if ru else "Standing stable."
 
     def decode_report(
         self,
@@ -200,21 +153,22 @@ class SpeechDecoder:
         ticks: int = 0,
         count: int = 0,
     ) -> str:
-        key = f"REPORT_{report_type}"
-        templates = self._T.get(key, ["..."])
-        t = random.choice(templates)
-        return t.format(ticks=ticks, count=count)
+        ru = self._lang == "ru"
+        if "STABLE" in report_type.upper():
+            return f"Стабильно {ticks} тиков." if ru else f"Stable {ticks} ticks."
+        if "SLEEP" in report_type.upper():
+            return "Нужен отдых." if ru else "Need rest."
+        return f"Упал {count} раз." if ru else f"Fallen {count} times."
 
     def decode_ask_template(self, concepts: list[str]) -> str:
         """Fallback ASK without LLM."""
         concept_names = [c for c, _ in concepts] if concepts and isinstance(concepts[0], tuple) else concepts
+        ru = self._lang == "ru"
         if any(c in concept_names for c in ("LOSING_BALANCE", "HIGH_FALL_RISK", "FALLEN")):
-            key = "ASK_BALANCE"
-        elif "OVERSTRIDE" in concept_names:
-            key = "ASK_STRIDE"
-        else:
-            key = "ASK_GENERAL"
-        return random.choice(self._T.get(key, ["?"]))
+            return "Как улучшить баланс?" if ru else "How can I improve balance?"
+        if "OVERSTRIDE" in concept_names:
+            return "Какой шаг безопаснее?" if ru else "What stride is safer?"
+        return "Что делать дальше?" if ru else "What should I do next?"
 
     async def decode_ask_llm(
         self,
@@ -385,7 +339,6 @@ class VerbalActionController:
         llm_url: str = "",
         llm_model: str = "",
         fall_history_brief: str = "",
-        visual_voice=None,
     ) -> AgentMessage | None:
         """
         Main tick. Returns AgentMessage if agent speaks, else None.
@@ -429,7 +382,6 @@ class VerbalActionController:
         text = await self._generate_text(
             speech_type, concept_names, concepts, obs, curiosity,
             stable_ticks, total_falls, fall_history_brief, llm_url, llm_model,
-            visual_voice,
         )
         if not text:
             return None
@@ -486,18 +438,9 @@ class VerbalActionController:
         fall_history_brief: str,
         llm_url: str,
         llm_model: str,
-        visual_voice=None,
     ) -> str:
         if speech_type == SpeechType.OBSERVE:
-            body_text = self.decoder.decode_observe(concept_names, obs, curiosity)
-            if visual_voice is not None and visual_voice.get_observe_key():
-                vis_key = visual_voice.get_observe_key()
-                vis_text = visual_voice.get_template(vis_key)
-                if vis_text:
-                    if visual_voice.has_blocking_object() or visual_voice.is_novel_scene():
-                        return vis_text
-                    return vis_text if random.random() < 0.6 else body_text
-            return body_text
+            return self.decoder.decode_observe(concept_names, obs, curiosity)
 
         elif speech_type == SpeechType.REPORT:
             falls_since = total_falls - self._last_fall_count_reported
@@ -510,23 +453,10 @@ class VerbalActionController:
 
         elif speech_type == SpeechType.ASK:
             if self._use_llm_ask and llm_url:
-                if visual_voice is not None and visual_voice.is_novel_scene():
-                    vis_ask_key = visual_voice.get_ask_key()
-                    if vis_ask_key:
-                        vis_text = visual_voice.get_template(vis_ask_key)
-                        if vis_text and random.random() < 0.45:
-                            return vis_text
                 return await self.decoder.decode_ask_llm(
                     concept_names, obs, fall_history_brief, llm_url, llm_model
                 )
-            else:
-                if visual_voice is not None and visual_voice.is_novel_scene():
-                    vis_ask_key = visual_voice.get_ask_key()
-                    if vis_ask_key:
-                        vis_text = visual_voice.get_template(vis_ask_key)
-                        if vis_text:
-                            return vis_text
-                return self.decoder.decode_ask_template(concept_names)
+            return self.decoder.decode_ask_template(concept_names)
 
         return ""
 
@@ -567,7 +497,7 @@ class VerbalActionController:
         if not recent_observes:
             return 0.0
         last = recent_observes[-1]
-        if fell_as_predicted and "Falling" in last.text or "Падаю" in last.text:
+        if fell_as_predicted and ("Falling" in last.text or "Падаю" in last.text):
             last.outcome_matched = True
             last.reward_received = 0.15
             self._total_verbal_reward += 0.15

@@ -7,12 +7,7 @@ intrinsic_objective.py — Unified Intrinsic Objective.
 Операционально:
   R_intrinsic(t) = Δcompression(t) + λ·Δprediction_surprise(t)
 
-Это заменяет ВСЁ:
-  ❌ cpg_locomotion.learn_from_reward() — 20+ строк человеческой формулы
-  ❌ reward_coordinator.EfficiencyEvaluator — человек решил что симметрия важна
-  ❌ DEFAULT_CURRICULUM — человек решил что нужно стоять перед ходьбой
-  ❌ forward_bonus, posture*3.0, symmetry*2.0 — всё это априорные ценности
-  ❌ EmbodiedRewardController — LLM как внешняя цель
+Внешние hand-crafted награды и RewardCoordinator удалены из симуляции.
 
 Остаётся ОДНО:
   ✓ "Насколько лучше агент понимает мир после этого действия?"
@@ -34,7 +29,6 @@ RKK_INTRINSIC_ENABLED=1
 RKK_INTRINSIC_LAMBDA=0.4        — вес prediction surprise vs compression
 RKK_INTRINSIC_GOAL_HORIZON=12   — шагов imagination для goal generation
 RKK_INTRINSIC_DISCOVERY_EIG=0.3 — порог EIG для создания нового узла
-RKK_INTRINSIC_REPLACE_ALL=1     — заменить ВСЕ внешние rewards (0 = только добавить)
 """
 from __future__ import annotations
 
@@ -62,17 +56,6 @@ def _ef(key: str, default: float) -> float:
 def _ei(key: str, default: int) -> int:
     try: return max(1, int(os.environ.get(key, str(default))))
     except ValueError: return default
-
-def replace_all_rewards() -> bool:
-    return os.environ.get("RKK_INTRINSIC_REPLACE_ALL", "1").strip().lower() not in (
-        "0", "false", "no", "off"
-    )
-
-
-def use_intrinsic_only_rewards() -> bool:
-    """Один сигнал: CausalSurprise; внешние награды отключены."""
-    return intrinsic_enabled() and replace_all_rewards()
-
 
 # ─── CausalSurprise ───────────────────────────────────────────────────────────
 class CausalSurprise:
@@ -537,13 +520,6 @@ class IntrinsicObjective:
           locomotion_ctrl=self._locomotion_controller,
       )
 
-    Если RKK_INTRINSIC_REPLACE_ALL=1:
-      - locomotion_ctrl._reward_history получает r вместо biomechanical formula
-      - motor_cortex получает r вместо posture*3.0+symmetry*2.0
-      - curriculum не применяется (агент сам находит прогрессию)
-
-    Если RKK_INTRINSIC_REPLACE_ALL=0:
-      - r добавляется к существующим наградам (мягкая интеграция)
     """
 
     def __init__(self, device: torch.device):
@@ -628,12 +604,7 @@ class IntrinsicObjective:
         except Exception:
             neuro_event = None
 
-        # --- Применяем награду к учащимся ---
-        if replace_all_rewards():
-            self._apply_intrinsic_reward(r, locomotion_ctrl, motor_cortex, agent)
-        else:
-            # Мягкая интеграция: добавляем к существующим
-            self._blend_reward(r, locomotion_ctrl, motor_cortex)
+        self._apply_intrinsic_reward(r, locomotion_ctrl, motor_cortex, agent)
 
         self._reward_history.append(r)
         return r
@@ -674,11 +645,6 @@ class IntrinsicObjective:
                 foot_r=foot_r,
             )
 
-    def _blend_reward(self, r: float, locomotion_ctrl, motor_cortex) -> None:
-        """Мягкое добавление к существующим наградам."""
-        if locomotion_ctrl is not None:
-            locomotion_ctrl._reward_history.append(r * 0.5)
-
     def get_current_goal(self) -> dict[str, Any] | None:
         return self.goal_imagination._current_goal
 
@@ -690,7 +656,6 @@ class IntrinsicObjective:
     def snapshot(self) -> dict[str, Any]:
         return {
             "enabled": intrinsic_enabled(),
-            "replace_all": replace_all_rewards(),
             "total_steps": self.total_steps,
             "recent_reward": round(self.recent_reward(), 6),
             "causal_surprise": self.causal_surprise.snapshot(),
@@ -706,16 +671,14 @@ def apply_intrinsic_patch(sim) -> bool:
 
     Применяет:
     1. IntrinsicObjective создаётся и сохраняется в sim._intrinsic
-    2. Хук в _run_single_agent_timestep_inner после agent.step()
-    3. Если replace_all=True: отключает DEFAULT_CURRICULUM reward logic
-    4. Snapshot добавляет intrinsic секцию
+    2. Хук после agent.step() в _run_agent_or_skill_step
 
     Вызов: apply_intrinsic_patch(sim)  # после создания Simulation
     """
     device = getattr(sim, "device", torch.device("cpu"))
     intrinsic = IntrinsicObjective(device)
     sim._intrinsic = intrinsic
-    print(f"[Intrinsic] IntrinsicObjective applied. replace_all={replace_all_rewards()}")
+    print("[Intrinsic] IntrinsicObjective applied")
 
     # Патч _run_agent_or_skill_step
     original = sim._run_agent_or_skill_step
@@ -760,19 +723,5 @@ def apply_intrinsic_patch(sim) -> bool:
         return result
 
     sim._run_agent_or_skill_step = patched_run
-
-    # Если replace_all: отключаем curriculum intent forcing
-    if replace_all_rewards():
-        curriculum = getattr(sim, "_curriculum", None)
-        if curriculum is not None:
-            # Не применяем intent targets из curriculum
-            # Агент сам найдёт прогрессию через compression gain
-            original_apply = curriculum.apply_stage_intents
-
-            def noop_apply_stage_intents(agent_env) -> None:
-                pass  # Убрано: агент учится сам
-
-            curriculum.apply_stage_intents = noop_apply_stage_intents
-            print("[Intrinsic] Disabled curriculum.apply_stage_intents (agent self-progresses)")
 
     return True

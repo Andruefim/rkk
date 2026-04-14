@@ -14,7 +14,6 @@ from engine.features.simulation.imports import (
     _INNER_VOICE_AVAILABLE,
     _PHASE_K_AVAILABLE,
     _PHASE_M_AVAILABLE,
-    _REWARD_COORD_AVAILABLE,
     _RSSM_AVAILABLE,
     _TIMESCALE_AVAILABLE,
     _VERBAL_AVAILABLE,
@@ -129,11 +128,7 @@ def build_simulation_snapshot(
             for c in sim._concepts_cache
         ],
         "memory": sim._memory_snapshot_meta(),
-        "embodied_reward": (
-            sim._embodied_reward_ctrl.snapshot()
-            if sim._embodied_reward_ctrl is not None
-            else None
-        ),
+        "embodied_reward": None,
         "visual_grounding": (
             sim._visual_grounding_ctrl.snapshot()
             if sim._visual_grounding_ctrl is not None
@@ -155,11 +150,7 @@ def build_simulation_snapshot(
         "proprioception": (
             sim._proprio.snapshot() if sim._proprio is not None else None
         ),
-        "reward_coordinator": (
-            sim._reward_coord.snapshot()
-            if sim._reward_coord is not None
-            else {"enabled": _REWARD_COORD_AVAILABLE}
-        ),
+        "reward_coordinator": {"enabled": False, "replaced_by": "intrinsic_objective"},
         "intrinsic_objective": (
             sim._intrinsic.snapshot()
             if getattr(sim, "_intrinsic", None) is not None

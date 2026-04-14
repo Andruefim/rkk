@@ -4,18 +4,8 @@
 """
 from __future__ import annotations
 
-# Level 1-A: Embodied LLM Reward
-try:
-    from engine.embodied_llm_reward import (
-        EmbodiedRewardController,
-        PoseSnapshot,
-        embodied_reward_enabled,
-    )
-
-    _EMBODIED_REWARD_AVAILABLE = True
-except ImportError:
-    _EMBODIED_REWARD_AVAILABLE = False
-    print("[Simulation] embodied_llm_reward.py not found")
+# Level 1-A: Embodied LLM reward удалён (заменён intrinsic objective).
+_EMBODIED_REWARD_AVAILABLE = False
 
 # Level 1-B: Visual Grounding
 try:
@@ -70,14 +60,8 @@ except ImportError:
     _PROPRIO_AVAILABLE = False
     print("[Simulation] proprioception.py not found")
 
-# Level 3-H: Unified Reward Coordinator
-try:
-    from engine.reward_coordinator import RewardCoordinator
-
-    _REWARD_COORD_AVAILABLE = True
-except ImportError:
-    _REWARD_COORD_AVAILABLE = False
-    print("[Simulation] reward_coordinator.py not found")
+# Level 3-H: RewardCoordinator удалён — единый сигнал: engine.intristic_objective
+_REWARD_COORD_AVAILABLE = False
 
 # Level 3-I: Multi-scale Time
 try:

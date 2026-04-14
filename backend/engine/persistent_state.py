@@ -268,13 +268,11 @@ def collect_meta_from_simulation(sim) -> PersistentMeta:
     if sim._llm_teacher is not None:
         meta.llm_teacher_calls = sim._llm_teacher.total_calls
 
-    # Reward
-    if sim._reward_coord is not None:
-        meta.reward_total_signals = sim._reward_coord.total_signals
-        cf = sim._reward_coord.constitution
-        meta.constitution_violations = int(
-            getattr(cf, "_violations", 0) if cf is not None else 0
-        )
+    # Intrinsic objective steps (раньше reward coordinator)
+    intr = getattr(sim, "_intrinsic", None)
+    if intr is not None:
+        meta.reward_total_signals = int(getattr(intr, "total_steps", 0))
+    meta.constitution_violations = 0
 
     # Physical curriculum mastery
     if sim._physical_curriculum is not None:

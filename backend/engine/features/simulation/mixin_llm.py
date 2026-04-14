@@ -215,8 +215,8 @@ class SimulationLlmLoopMixin:
                 else ""
             ),
             "reward_breakdown": (
-                self._reward_coord.snapshot().get("last_signal", {})
-                if self._reward_coord is not None
+                self._intrinsic.snapshot()
+                if getattr(self, "_intrinsic", None) is not None
                 else {}
             ),
             "proprio_abstracts": (

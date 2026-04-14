@@ -88,7 +88,6 @@ class SimulationVerbalMixin:
             llm_url=get_ollama_generate_url(),
             llm_model=get_ollama_model(),
             fall_history_brief=fall_history_brief,
-            visual_voice=self._visual_voice if _PHASE_M_AVAILABLE else None,
         )
         if msg is None:
             return
@@ -107,9 +106,9 @@ class SimulationVerbalMixin:
         if lc is not None and reward > 0 and hasattr(lc, "_reward_history"):
             lc._reward_history.append(reward)
 
-        if self._reward_coord is not None:
-            cur = float(getattr(self._reward_coord, "_total_verbal_reward", 0.0))
-            setattr(self._reward_coord, "_total_verbal_reward", cur + reward)
+        self._verbal_reward_total = float(
+            getattr(self, "_verbal_reward_total", 0.0)
+        ) + float(reward)
 
         loop = getattr(self, "_uvicorn_loop", None)
         if loop is not None and loop.is_running():

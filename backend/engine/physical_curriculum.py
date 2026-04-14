@@ -547,8 +547,8 @@ class PhysicalCurriculum:
     Интеграция в simulation.py:
       self._physical_curriculum = PhysicalCurriculum()
 
-    В CurriculumScheduler: при достижении конца DEFAULT_CURRICULUM,
-    передаём управление PhysicalCurriculum вместо LLM генерации.
+    В CurriculumScheduler: при пустом предопределённом плане этапов
+    можно передавать управление PhysicalCurriculum (см. inject_into_scheduler).
 
     Unlock sequence:
       mastered = {"0.0_static_stance", "0.1_weight_shift"}

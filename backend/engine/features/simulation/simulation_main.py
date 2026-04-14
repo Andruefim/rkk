@@ -189,9 +189,8 @@ class Simulation(
         }
         self._rsi_full = None
         self.neuro_engine = NeurogenesisEngine()
-        self._embodied_reward_ctrl = (
-            EmbodiedRewardController() if _EMBODIED_REWARD_AVAILABLE else None
-        )
+        self._embodied_reward_ctrl = None
+        self._verbal_reward_total: float = 0.0
         self._visual_grounding_ctrl = (
             VisualGroundingController() if _VISUAL_GROUNDING_AVAILABLE else None
         )
@@ -211,13 +210,7 @@ class Simulation(
         if _PROPRIO_AVAILABLE:
             self._proprio = ProprioceptionStream(device=self.device)
 
-        self._reward_coord: "RewardCoordinator | None" = None
         self._intrinsic: Any = None
-        self._reward_X_prev: list[float] = []
-        self._reward_a_prev: list[float] = []
-        self._reward_action_var: str = ""
-        self._reward_action_val: float = 0.5
-        self._was_blocked: bool = False
 
         self._timescale: "MultiscaleTimeController | None" = None
         if _TIMESCALE_AVAILABLE:

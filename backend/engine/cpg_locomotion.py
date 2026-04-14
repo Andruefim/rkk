@@ -10,7 +10,7 @@ Swing (бедро/колено):
 ИЗМЕНЕНИЯ (Motor Cortex / Phase D):
   - get_joint_targets: усилен forward lean, добавлен com_lag компенсатор
   - upper_body_cpg_sync: возвращает com_lag для наклона торса вперёд
-  - learn_from_reward: фазовый reward (stance → walk) с явным forward_bonus
+  - Обучение CPG: train_cpg_from_intrinsic_history() (engine.intristic_objective)
 
 Проблема «заваливается назад»: при stride>0 торс должен быть наклонён вперёд.
 Основные фиксы:
@@ -257,103 +257,6 @@ class LocomotionController:
         Обучение CPG только из _reward_history (заполняется IntrinsicObjective).
         Вызывается после agent.step; см. engine.intristic_objective.
         """
-        try:
-            win = int(os.environ.get("RKK_CPG_REWARD_WINDOW", "24"))
-        except ValueError:
-            win = 24
-        win = max(4, min(win, 256))
-
-        if len(self._reward_history) < win:
-            return
-
-        r_mean = float(np.mean(self._reward_history[-win:]))
-        self.optim.zero_grad()
-        dev = next(self.cpg.parameters()).device
-        scale = torch.tensor(r_mean, device=dev, dtype=torch.float32)
-        loss = -scale * (
-            0.35 * self.cpg.amplitude.mean()
-            + 0.15 * self.cpg.frequency.mean()
-            - 0.15 * torch.abs(self.cpg.phase_bias).mean()
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.cpg.parameters(), 0.3)
-        self.optim.step()
-
-    def learn_from_reward(
-        self,
-        com_z: float,
-        com_x: float,
-        fallen: bool,
-        *,
-        motor_obs: dict[str, float] | None = None,
-    ) -> None:
-        """
-        Phased reward с явным forward_bonus за продвижение CoM.
-        При RKK_INTRINSIC_REPLACE_ALL=1 отключено — CPG учится из train_cpg_from_intrinsic_history().
-        """
-        try:
-            from engine.intristic_objective import use_intrinsic_only_rewards
-            if use_intrinsic_only_rewards():
-                return
-        except ImportError:
-            pass
-
-        dx = float(com_x) - self._last_com_x
-        rz = float(np.clip(com_z, 0.0, 1.0))
-        motor_obs = motor_obs or {}
-        posture = float(np.clip(motor_obs.get("posture_stability", 0.5), 0.0, 1.0))
-        contact_l = float(np.clip(motor_obs.get("foot_contact_l", 0.5), 0.0, 1.0))
-        contact_r = float(np.clip(motor_obs.get("foot_contact_r", 0.5), 0.0, 1.0))
-        bias = float(np.clip(motor_obs.get("support_bias", 0.5), 0.0, 1.0))
-        gait_l = float(np.clip(motor_obs.get("gait_phase_l", 0.5), 0.0, 1.0))
-        gait_r = float(np.clip(motor_obs.get("gait_phase_r", 0.5), 0.0, 1.0))
-        symmetry = 1.0 - min(1.0, abs(gait_l - gait_r) + abs(contact_l - contact_r) + abs(bias - 0.5) * 1.4)
-
-        upright = rz > 0.35
-
-        if not upright:
-            reward = (
-                rz * 4.0
-                + (rz - self._last_com_z) * 8.0
-                + posture * 1.5
-                + min(contact_l, contact_r) * 1.0
-                - (5.0 if fallen else 0.0)
-            )
-        else:
-            stride_n = abs(float(self._last_motor_state.get("intent_stride", 0.5)) - 0.5) * 2.0
-            torso_n = abs(float(self._last_motor_state.get("intent_torso_forward", 0.5)) - 0.5) * 2.0
-            walk_drive = float(np.clip(0.5 * stride_n + 0.5 * torso_n, 0.0, 1.0))
-            bias_pen = abs(bias - 0.5) * (1.0 - 0.55 * walk_drive)
-            cx = float(com_x)
-
-            # FORWARD BONUS: более агрессивное поощрение за CoM впереди стопы
-            forward_bonus = 3.5 * max(0.0, cx - 0.45)   # усилен с 2.0
-            back_penalty  = 2.5 * max(0.0, 0.42 - cx)   # усилен с 1.6
-
-            coherence = 0.0
-            if self._last_cpg_sync:
-                cl = float(self._last_cpg_sync.get("com_lag", 0.0))
-                sn = float(self._last_cpg_sync.get("stride_n", 0.0))
-                gs = float(self._last_cpg_sync.get("gscale", 1.0))
-                coherence = 0.35 * (1.0 - cl) * min(1.0, sn * 2.0) * gs
-
-            reward = (
-                rz * 3.0
-                + posture * 3.0
-                + symmetry * 2.0
-                + min(contact_l, contact_r) * 1.5
-                + dx * 2.2          # усилен с 1.85
-                + forward_bonus
-                - back_penalty
-                + coherence
-                - bias_pen * 1.0
-                - (5.0 if fallen else 0.0)
-            )
-
-        self._last_com_x = float(com_x)
-        self._last_com_z = float(com_z)
-        self._reward_history.append(reward)
-
         try:
             win = int(os.environ.get("RKK_CPG_REWARD_WINDOW", "24"))
         except ValueError:
