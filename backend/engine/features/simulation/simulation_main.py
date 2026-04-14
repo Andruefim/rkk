@@ -212,6 +212,7 @@ class Simulation(
             self._proprio = ProprioceptionStream(device=self.device)
 
         self._reward_coord: "RewardCoordinator | None" = None
+        self._intrinsic: Any = None
         self._reward_X_prev: list[float] = []
         self._reward_a_prev: list[float] = []
         self._reward_action_var: str = ""
@@ -307,3 +308,16 @@ class Simulation(
                 apply_neural_lang_patch(self)
             except Exception as e:
                 print(f"[Simulation] Neural lang patch skipped: {type(e).__name__}: {e}")
+
+        if os.environ.get("RKK_INTRINSIC_ENABLED", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            try:
+                from engine.intristic_objective import apply_intrinsic_patch
+
+                apply_intrinsic_patch(self)
+            except Exception as e:
+                print(f"[Simulation] Intrinsic objective patch skipped: {type(e).__name__}: {e}")

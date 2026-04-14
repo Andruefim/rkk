@@ -3,6 +3,12 @@ from __future__ import annotations
 
 from engine.features.simulation.mixin_imports import *
 
+try:
+    from engine.intristic_objective import use_intrinsic_only_rewards
+except ImportError:
+    def use_intrinsic_only_rewards() -> bool:
+        return False
+
 
 class SimulationLocomotionMixin:
     @staticmethod
@@ -101,8 +107,8 @@ class SimulationLocomotionMixin:
             com_z = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
             com_x = float(obs.get("com_x", obs.get("phys_com_x", 0.5)))
 
-            # Phase D: train motor cortex programs + anneal CPG
-            if mc is not None:
+            # Phase D: train motor cortex programs + anneal CPG (biomechanical — не при intrinsic-only)
+            if mc is not None and not use_intrinsic_only_rewards():
                 reward = (
                     posture * 2.0
                     + min(foot_l, foot_r) * 1.5
@@ -122,6 +128,8 @@ class SimulationLocomotionMixin:
                             f"🧠 MotorCortex: +{added} abstract nodes (mc_walk_drive, mc_balance_signal, …)",
                             "#ff88ff", "phase"
                         )
+                mc.sync_abstract_nodes_to_graph(self.agent.graph)
+            elif mc is not None and use_intrinsic_only_rewards():
                 mc.sync_abstract_nodes_to_graph(self.agent.graph)
 
             self._locomotion_controller.learn_from_reward(

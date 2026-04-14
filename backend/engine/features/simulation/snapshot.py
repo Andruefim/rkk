@@ -160,6 +160,11 @@ def build_simulation_snapshot(
             if sim._reward_coord is not None
             else {"enabled": _REWARD_COORD_AVAILABLE}
         ),
+        "intrinsic_objective": (
+            sim._intrinsic.snapshot()
+            if getattr(sim, "_intrinsic", None) is not None
+            else None
+        ),
         "timescale": (
             sim._timescale.snapshot()
             if sim._timescale is not None

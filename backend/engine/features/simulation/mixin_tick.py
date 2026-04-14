@@ -3,6 +3,12 @@ from __future__ import annotations
 
 from engine.features.simulation.mixin_imports import *
 
+try:
+    from engine.intristic_objective import use_intrinsic_only_rewards
+except ImportError:
+    def use_intrinsic_only_rewards() -> bool:
+        return False
+
 
 class SimulationTickMixin:
     # ── Tick ──────────────────────────────────────────────────────────────────
@@ -171,9 +177,13 @@ class SimulationTickMixin:
                 if self._timescale.should_run(LEVEL_REFLEX, self.tick):
                     self._timescale.mark_ran(LEVEL_REFLEX, self.tick)
 
-        # Level 3-H: Unified reward signal (humanoid)
+        # Level 3-H: Unified reward signal (humanoid) — отключается при intrinsic-only
         _reward_signal = None
-        if _REWARD_COORD_AVAILABLE and self.current_world == "humanoid":
+        if (
+            _REWARD_COORD_AVAILABLE
+            and self.current_world == "humanoid"
+            and not use_intrinsic_only_rewards()
+        ):
             self._ensure_reward_coord()
             if self._reward_coord is not None:
                 node_ids = (

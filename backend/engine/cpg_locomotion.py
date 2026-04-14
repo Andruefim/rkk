@@ -252,6 +252,33 @@ class LocomotionController:
         self._last_command = dict(targets)
         return targets
 
+    def train_cpg_from_intrinsic_history(self) -> None:
+        """
+        Обучение CPG только из _reward_history (заполняется IntrinsicObjective).
+        Вызывается после agent.step; см. engine.intristic_objective.
+        """
+        try:
+            win = int(os.environ.get("RKK_CPG_REWARD_WINDOW", "24"))
+        except ValueError:
+            win = 24
+        win = max(4, min(win, 256))
+
+        if len(self._reward_history) < win:
+            return
+
+        r_mean = float(np.mean(self._reward_history[-win:]))
+        self.optim.zero_grad()
+        dev = next(self.cpg.parameters()).device
+        scale = torch.tensor(r_mean, device=dev, dtype=torch.float32)
+        loss = -scale * (
+            0.35 * self.cpg.amplitude.mean()
+            + 0.15 * self.cpg.frequency.mean()
+            - 0.15 * torch.abs(self.cpg.phase_bias).mean()
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.cpg.parameters(), 0.3)
+        self.optim.step()
+
     def learn_from_reward(
         self,
         com_z: float,
@@ -262,7 +289,15 @@ class LocomotionController:
     ) -> None:
         """
         Phased reward с явным forward_bonus за продвижение CoM.
+        При RKK_INTRINSIC_REPLACE_ALL=1 отключено — CPG учится из train_cpg_from_intrinsic_history().
         """
+        try:
+            from engine.intristic_objective import use_intrinsic_only_rewards
+            if use_intrinsic_only_rewards():
+                return
+        except ImportError:
+            pass
+
         dx = float(com_x) - self._last_com_x
         rz = float(np.clip(com_z, 0.0, 1.0))
         motor_obs = motor_obs or {}
