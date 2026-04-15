@@ -309,3 +309,11 @@ class Simulation(
         apply_llm_mediator_patch(self)
         apply_motor_primitives_patch(self)
         apply_intrinsic_patch(self)
+
+        # ── Variable Registry: dynamic ontology ──────────────────────────────
+        try:
+            from engine.variable_bootstrap import get_variable_registry
+            self._variable_registry = get_variable_registry()
+        except Exception as e:
+            self._variable_registry = None
+            print(f"[Simulation] VariableRegistry skipped: {type(e).__name__}: {e}")

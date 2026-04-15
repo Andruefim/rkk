@@ -186,7 +186,10 @@ class SimulationTickMixin:
                 if self._episodic_memory
                 else 0
             )
-            _sleep_reason = self._sleep_ctrl.check_trigger(self.tick, _total_falls)
+            _sleep_reason = self._sleep_ctrl.check_trigger(
+                self.tick, _total_falls,
+                intrinsic_objective=getattr(self, "_intrinsic", None),
+            )
 
             if _sleep_reason and not self._sleep_ctrl.is_sleeping:
                 self._sleep_prev_fixed_root = self._fixed_root_active

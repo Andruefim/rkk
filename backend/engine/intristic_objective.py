@@ -604,6 +604,38 @@ class IntrinsicObjective:
         except Exception:
             neuro_event = None
 
+        # --- Variable Discovery: auto-discover new variable groups ---
+        try:
+            from engine.variable_bootstrap import get_variable_registry
+            registry = get_variable_registry()
+            if registry.is_bootstrap:
+                # Update pressure from high-error nodes
+                high_err = self.variable_discovery.find_high_error_nodes(top_k=5)
+                registry.update_pressure(
+                    high_error_nodes=high_err,
+                    compression_stagnant=self.causal_surprise.compression_is_stagnant(),
+                    tick=tick,
+                )
+                # Auto-discover if pressure threshold met
+                new_vars = registry.auto_discover(tick)
+                if new_vars:
+                    # Add new variables to the agent's graph
+                    for var in new_vars:
+                        if var not in graph.nodes:
+                            graph.set_node(var, 0.5)
+                    # Rebind agent environment if needed
+                    try:
+                        env_obs = dict(agent.env.observe())
+                        for var in new_vars:
+                            if var in env_obs and var in graph.nodes:
+                                graph.nodes[var] = env_obs[var]
+                    except Exception:
+                        pass
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
         self._apply_intrinsic_reward(r, locomotion_ctrl, motor_cortex, agent)
 
         self._reward_history.append(r)

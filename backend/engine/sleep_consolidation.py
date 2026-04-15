@@ -364,14 +364,42 @@ class SleepController:
         """Call when agent falls."""
         self._falls_since_sleep += 1
 
+    def should_sleep(self, intrinsic_objective=None) -> str | None:
+        """
+        Data-driven sleep trigger: проверяет compression_is_stagnant()
+        через IntrinsicObjective.causal_surprise.
+
+        Возвращает причину ("compression_stagnant") или None.
+        Это ГЛАВНЫЙ триггер сна — мозг засыпает когда перестаёт учиться.
+        """
+        if intrinsic_objective is None:
+            return None
+        cs = getattr(intrinsic_objective, "causal_surprise", None)
+        if cs is None:
+            return None
+        # Стагнация: compression не растёт >= 50 тиков
+        if cs.compression_is_stagnant(window=50):
+            # Дополнительная проверка: не спать слишком часто
+            # (минимум 500 тиков между compression-driven сессиями)
+            if cs.total_computations > 100:
+                return "compression_stagnant"
+        return None
+
     def check_trigger(
         self,
         tick: int,
         total_falls: int,
         force: bool = False,
+        intrinsic_objective=None,
     ) -> str | None:
         """
         Check if sleep should be triggered. Returns reason or None.
+
+        Приоритет триггеров:
+          1. manual (force=True)
+          2. compression_stagnant (data-driven, главный)
+          3. fall_threshold (аварийный, слишком много падений)
+          4. periodic (fallback, если ничего не сработало)
         """
         if not sleep_enabled():
             return None
@@ -380,10 +408,18 @@ class SleepController:
 
         if force:
             return "manual"
-        if (tick - self.last_sleep_tick) >= self._every_ticks:
-            return "periodic"
+
+        # Data-driven trigger: мозг перестал учиться → пора спать
+        compression_reason = self.should_sleep(intrinsic_objective)
+        if compression_reason is not None:
+            # Не чаще чем раз в 500 тиков для compression-driven сна
+            if (tick - self.last_sleep_tick) >= 500:
+                return compression_reason
+
         if self._falls_since_sleep >= self._fall_threshold:
             return "fall_threshold"
+        if (tick - self.last_sleep_tick) >= self._every_ticks:
+            return "periodic"
         return None
 
     def begin_sleep(self, tick: int, reason: str, sim: Any | None = None) -> None:

@@ -212,4 +212,14 @@ def build_simulation_snapshot(
         ),
         "phase1": sim._phase1_snapshot_meta(),
         "phase2": sim._phase2_snapshot_meta(),
+        "motor_primitives": (
+            sim._motor_prim_lib.snapshot()
+            if getattr(sim, "_motor_prim_lib", None) is not None
+            else None
+        ),
+        "variable_registry": (
+            sim._variable_registry.snapshot()
+            if getattr(sim, "_variable_registry", None) is not None
+            else None
+        ),
     }
