@@ -61,22 +61,8 @@ class SimulationFallMixin:
         if not self._fall_recovery_active:
             self._fall_recovery_active = True
             self._fall_recovery_start_tick = self.tick
-            self._fall_recovery_last_progress_tick = self.tick
-            self._fall_recovery_best_score = score
-            self._add_event("🦿 Recovery window after fall", "#ffbb66", "value")
-            return False
+            self._add_event("🦿 Recovery window after fall (INF)", "#ffbb66", "value")
 
-        if score > self._fall_recovery_best_score + min_gain:
-            self._fall_recovery_best_score = score
-            self._fall_recovery_last_progress_tick = self.tick
-
-        total_elapsed = self.tick - self._fall_recovery_start_tick
-        stalled_for = self.tick - self._fall_recovery_last_progress_tick
-        if total_elapsed < max_ticks and stalled_for < stall_ticks:
-            return False
-
-        if self._try_reset_pose_after_fall():
-            self._clear_fall_recovery()
-            return True
+        # Агент предоставлен сам себе на полу. Никаких автоматических подъемов!
         return False
 

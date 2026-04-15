@@ -418,8 +418,7 @@ class SleepController:
 
         if self._falls_since_sleep >= self._fall_threshold:
             return "fall_threshold"
-        if (tick - self.last_sleep_tick) >= self._every_ticks:
-            return "periodic"
+
         return None
 
     def begin_sleep(self, tick: int, reason: str, sim: Any | None = None) -> None:

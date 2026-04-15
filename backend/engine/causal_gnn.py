@@ -132,12 +132,35 @@ class CausalGNNCore(nn.Module):
     def _message_pass(self, h: torch.Tensor) -> torch.Tensor:
         """h: (B, d, hidden) → (B, d) предсказание скаляров узлов."""
         B, d, _hd = h.shape
-        h_src = h.unsqueeze(1).expand(B, d, d, self.hidden)
-        h_dst = h.unsqueeze(2).expand(B, d, d, self.hidden)
-        msg = self.msg_fn(torch.cat([h_src, h_dst], dim=-1))
-        A       = self.W_masked()
-        weights = A.t().unsqueeze(0).unsqueeze(-1)
-        agg     = (msg * weights).sum(dim=2)
+        A = self.W_masked()
+
+        if torch.is_grad_enabled():
+            # Dense mode: required for training to pass gradients through A=0
+            h_src = h.unsqueeze(1).expand(B, d, d, self.hidden)
+            h_dst = h.unsqueeze(2).expand(B, d, d, self.hidden)
+            msg = self.msg_fn(torch.cat([h_src, h_dst], dim=-1))
+            weights = A.t().unsqueeze(0).unsqueeze(-1)
+            agg = (msg * weights).sum(dim=2)
+        else:
+            # Sparse mode: massive speedup & memory reduction during inference (EIG scoring)
+            active_edges = (A.abs() > 1e-4).nonzero(as_tuple=False)
+            if active_edges.numel() == 0:
+                agg = torch.zeros_like(h)
+            else:
+                j = active_edges[:, 0]
+                i = active_edges[:, 1]
+                h_src_sparse = h[:, j, :]  # (B, E, hidden)
+                h_dst_sparse = h[:, i, :]  # (B, E, hidden)
+                
+                msg = self.msg_fn(torch.cat([h_src_sparse, h_dst_sparse], dim=-1))
+                weights = A[j, i].unsqueeze(0).unsqueeze(-1)  # (1, E, 1)
+                weighted_msg = msg * weights
+
+                agg = torch.zeros_like(h)
+                # Scatter add across the node dimension
+                idx = i.unsqueeze(0).unsqueeze(2).expand(B, len(i), _hd)
+                agg.scatter_add_(1, idx, weighted_msg)
+
         out = self.out_dec(torch.cat([h, agg], dim=-1))
         return out.squeeze(-1)
 

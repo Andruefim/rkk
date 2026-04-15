@@ -314,7 +314,7 @@ class RKKAgent:
                 if idx is not None:
                     a_batch[bi, idx] = float(cand["value"])
             with torch.no_grad():
-                pred = integrate_world_model_step(core, x_batch, a_batch)
+                pred = fd(x_batch, a_batch)
             delta = (pred - x_batch).abs().cpu().numpy()
             ab = np.abs(delta)
             S = np.clip(ab[:, :, None] + ab[:, None, :], 0.0, 1.0)
