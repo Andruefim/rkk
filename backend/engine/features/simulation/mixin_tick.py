@@ -192,7 +192,7 @@ class SimulationTickMixin:
                 self._sleep_prev_fixed_root = self._fixed_root_active
                 if not self._fixed_root_active:
                     self.enable_fixed_root()
-                self._sleep_ctrl.begin_sleep(self.tick, _sleep_reason)
+                self._sleep_ctrl.begin_sleep(self.tick, _sleep_reason, sim=self)
                 self._add_event(
                     f"😴 Sleep: {_sleep_reason} (falls={self._sleep_ctrl._falls_since_sleep})",
                     "#9988ff",
@@ -429,5 +429,19 @@ class SimulationTickMixin:
 
         self._maybe_refresh_concepts_cache()
         self._maybe_autosave_memory()
+
+        try:
+            from engine.memory_diag import log_sim_memory, memory_diag_enabled
+
+            _mem_iv = int(os.environ.get("RKK_MEMORY_DIAG_INTERVAL", "0") or "0")
+            if (
+                memory_diag_enabled()
+                and _mem_iv > 0
+                and self.current_world == "humanoid"
+                and self.tick % _mem_iv == 0
+            ):
+                log_sim_memory(self, f"tick={self.tick}")
+        except Exception:
+            pass
 
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)

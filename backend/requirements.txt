@@ -19,3 +19,6 @@ pybullet            # Фаза 9+: pip install pybullet
 
 # Neural ODE world model: RKK_WM_NEURAL_ODE=1
 torchdiffeq>=0.2.3
+
+# Опционально: точный RSS в логах RKK_MEMORY_DIAG (иначе ctypes на Windows / resource на Unix)
+# psutil>=5.9.0

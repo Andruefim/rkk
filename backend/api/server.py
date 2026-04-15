@@ -776,7 +776,7 @@ def force_sleep():
     sim._sleep_prev_fixed_root = sim._fixed_root_active
     if not sim._fixed_root_active:
         sim.enable_fixed_root()
-    sleep_ctrl.begin_sleep(sim.tick, "manual")
+    sleep_ctrl.begin_sleep(sim.tick, "manual", sim=sim)
     return {
         "ok": True,
         "tick": sim.tick,

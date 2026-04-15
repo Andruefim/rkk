@@ -31,10 +31,15 @@ RKK_SLEEP_FALL_THRESHOLD=50
 RKK_SLEEP_DURATION_TICKS=200   — тиков на сон (с fixed_root)
 RKK_SLEEP_REM_LR_MULT=10.0     — множитель lr во время REM
 RKK_SLEEP_PRUNE_THRESHOLD=0.05 — обрезать edges с |w| < threshold
+
+Диагностика памяти:
+  RKK_MEMORY_DIAG=1 — RSS + размеры GNN/мостов (см. engine.memory_diag)
+  RKK_MEMORY_TRACE=1 — tracemalloc diff между этапами сна
 """
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import threading
 import time
@@ -65,6 +70,16 @@ def _env_float(key: str, default: float) -> float:
         return float(os.environ.get(key, str(default)))
     except ValueError:
         return default
+
+
+def _memory_diag_log(sim: Any, tag: str) -> None:
+    try:
+        from engine.memory_diag import log_sim_memory, trace_snapshot
+
+        log_sim_memory(sim, tag)
+        trace_snapshot(tag)
+    except Exception:
+        pass
 
 
 # ── Sleep phases ───────────────────────────────────────────────────────────────
@@ -214,6 +229,10 @@ class REMReplay:
 
         node_ids = list(graph._node_ids)
         d = len(node_ids)
+        try:
+            dev = next(core.parameters()).device
+        except StopIteration:
+            dev = torch.device("cpu")
 
         # Temporarily boost LR
         optim = getattr(graph, "_optim", None)
@@ -235,15 +254,17 @@ class REMReplay:
             X_t = torch.tensor(
                 [float(obs_before.get(n, obs_before.get(f"phys_{n}", 0.5))) for n in node_ids],
                 dtype=torch.float32,
+                device=dev,
             )
             X_fall = torch.tensor(
                 [float(obs_fall.get(n, obs_fall.get(f"phys_{n}", 0.5))) for n in node_ids],
                 dtype=torch.float32,
+                device=dev,
             )
 
             # Action: what was done before falling
             action = ep.trigger_action
-            a = torch.zeros(d)
+            a = torch.zeros(d, dtype=torch.float32, device=dev)
             if action and action[0] in node_ids:
                 a[node_ids.index(action[0])] = float(action[1])
 
@@ -255,22 +276,23 @@ class REMReplay:
                 from engine.wm_neural_ode import integrate_world_model_step
                 import torch.nn.functional as F
 
-                # Forward pass
-                X_pred = integrate_world_model_step(core, X_t, a)
-
-                # Loss: prediction should have matched X_fall
-                loss_before = float(F.mse_loss(X_pred.detach(), X_fall).item())
+                # Metric-only: no autograd. With RKK_WM_NEURAL_ODE=1, odeint otherwise
+                # materializes a huge graph; we already run a full train forward below.
+                with torch.inference_mode():
+                    X_pred_metric = integrate_world_model_step(core, X_t, a)
+                    loss_before = float(F.mse_loss(X_pred_metric, X_fall).item())
                 losses_before.append(loss_before)
 
-                # Train
+                # Train (single graph per episode)
                 if optim is not None:
                     optim.zero_grad()
-                    X_pred_train = integrate_world_model_step(core, X_t.detach(), a.detach())
-                    loss = F.mse_loss(X_pred_train, X_fall.detach())
+                    X_pred_train = integrate_world_model_step(core, X_t, a)
+                    loss = F.mse_loss(X_pred_train, X_fall)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(core.parameters(), 0.5)
                     optim.step()
                     losses_after.append(float(loss.item()))
+                    del loss, X_pred_train
 
                 n_replayed += 1
             except Exception:
@@ -284,6 +306,11 @@ class REMReplay:
 
         l_before = float(np.mean(losses_before)) if losses_before else 0.0
         l_after = float(np.mean(losses_after)) if losses_after else 0.0
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return n_replayed, l_before, l_after
 
 
@@ -359,9 +386,11 @@ class SleepController:
             return "fall_threshold"
         return None
 
-    def begin_sleep(self, tick: int, reason: str) -> None:
+    def begin_sleep(self, tick: int, reason: str, sim: Any | None = None) -> None:
         """Start a sleep cycle."""
         print(f"[Sleep] 😴 Beginning sleep at tick={tick} reason={reason}")
+        if sim is not None:
+            _memory_diag_log(sim, f"sleep_begin tick={tick} reason={reason}")
         self._phase = SleepPhase.REM
         self._phase_start_tick = tick
         self._session = SleepSession(trigger_tick=tick, trigger_reason=reason)
@@ -397,6 +426,7 @@ class SleepController:
                 session.rem_loss_before = l_before
                 session.rem_loss_after = l_after
                 print(f"[Sleep] REM: replayed {n} episodes, loss {l_before:.4f}→{l_after:.4f}")
+                _memory_diag_log(sim, "sleep_after_REM_replay")
 
                 try:
                     from engine.world_state_bridge import grounded_sleep_consolidate
@@ -411,6 +441,7 @@ class SleepController:
                         )
                 except Exception as e:
                     print(f"[Sleep] Grounded consolidate: {e}")
+                _memory_diag_log(sim, "sleep_after_grounded_inner_voice")
 
                 # Schedule LLM lesson (async, non-blocking)
                 self._schedule_lesson(tick, sim)
@@ -425,6 +456,7 @@ class SleepController:
                 # Apply lesson result if arrived
                 if self._lesson_result is not None:
                     self._apply_lesson(tick, sim, self._lesson_result)
+                    _memory_diag_log(sim, "sleep_after_lesson_applied")
                 self._phase = SleepPhase.PRUNE
                 self._phase_start_tick = tick
 
@@ -436,6 +468,7 @@ class SleepController:
                 session.edges_before = before
                 session.edges_after = after
                 print(f"[Sleep] Prune: {before}→{after} edges ({before-after} pruned)")
+                _memory_diag_log(sim, "sleep_after_prune")
 
             if ticks_in_phase >= 20:
                 self._end_sleep(tick, sim)
@@ -553,6 +586,7 @@ class SleepController:
 
     def _end_sleep(self, tick: int, sim) -> None:
         """Finalize sleep, wake up."""
+        _memory_diag_log(sim, f"sleep_wake tick={tick}")
         session = self._session
         if session:
             session.end_time = time.time()
