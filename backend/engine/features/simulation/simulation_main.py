@@ -302,15 +302,10 @@ class Simulation(
             except Exception as e:
                 print(f"[Simulation] Neural lang patch skipped: {type(e).__name__}: {e}")
 
-        if os.environ.get("RKK_INTRINSIC_ENABLED", "1").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-            "off",
-        ):
-            try:
-                from engine.intristic_objective import apply_intrinsic_patch
+        from engine.intristic_objective import apply_intrinsic_patch
+        from engine.llm_hint_mediator import apply_llm_mediator_patch
+        from engine.learned_motor_primitives import apply_motor_primitives_patch
 
-                apply_intrinsic_patch(self)
-            except Exception as e:
-                print(f"[Simulation] Intrinsic objective patch skipped: {type(e).__name__}: {e}")
+        apply_llm_mediator_patch(self)
+        apply_motor_primitives_patch(self)
+        apply_intrinsic_patch(self)
