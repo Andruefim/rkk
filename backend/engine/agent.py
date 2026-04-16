@@ -642,13 +642,6 @@ class RKKAgent:
                 for c in candidates
                 if c["variable"] not in _LOCOMOTION_CPG_LEG_EIG_BLOCK
             ]
-            if posture_now < 0.65:
-                candidates = [
-                    c
-                    for c in candidates
-                    if str(c["variable"]).startswith("intent_")
-                    or str(c["variable"]).startswith("phys_intent_")
-                ]
 
         if not candidates or not features_batch:
             return []

@@ -206,9 +206,8 @@ class EnvironmentHumanoid:
 
     @classmethod
     def _comfort_zone(cls, var: str) -> tuple[float, float]:
-        n = cls._JOINT_NEUTRAL.get(var, 0.5)
-        r = cls._JOINT_COMFORT_RANGE.get(var, 0.45)
-        return (max(0.05, n - r), min(0.95, n + r))
+        # Убраны жесткие лимиты _JOINT_COMFORT_RANGE для открытого обучения моторике.
+        return 0.05, 0.95
 
     def intervene(self, variable: str, value: float, *, count_intervention: bool = True) -> dict[str, float]:
         if count_intervention:

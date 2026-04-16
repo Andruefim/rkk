@@ -279,28 +279,7 @@ class SimulationSkillsMixin:
                     return self._execute_skill_frame()
             return self.agent.step(engine_tick=engine_tick, enable_l3=False)
 
-        # Humanoid: при нестабильной позе не даём EIG выбирать сырые суставы — только скиллы / stand.
-        if self.current_world == "humanoid" and not self._fixed_root_active:
-            obs = self.agent.env.observe()
-            posture = float(
-                obs.get(
-                    "posture_stability", obs.get("phys_posture_stability", 0.5)
-                )
-            )
-            if posture < 0.65:
-                if self._skill_exec is not None:
-                    return self._execute_skill_frame()
-                if self._skill_library_enabled():
-                    lib = self._ensure_skill_library()
-                    obs_st = self._skill_state_dict(obs)
-                    sk = lib.select_skill(obs_st, "stand")
-                    if sk is not None:
-                        self._skill_exec = {
-                            "skill": sk,
-                            "index": 0,
-                            "obs_before": dict(obs_st),
-                        }
-                        return self._execute_skill_frame()
+        # Removed hardcoded skill lock. The agent will rely on its causal EIG for learning.
         if (
             self._skill_library_enabled()
             and self.current_world == "humanoid"
