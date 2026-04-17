@@ -10,7 +10,7 @@ TORSO_VARS = ["com_x", "com_y", "com_z", "torso_roll", "torso_pitch"]
 SPINE_VARS = ["spine_yaw", "spine_pitch"]
 HEAD_VARS = ["neck_yaw", "neck_pitch"]
 LEG_VARS = ["lhip", "lknee", "lankle", "rhip", "rknee", "rankle"]
-ARM_VARS = ["lshoulder", "lelbow", "rshoulder", "relbow"]
+ARM_VARS = ["lshoulder", "lelbow", "lwrist", "rshoulder", "relbow", "rwrist"]
 FOOT_VARS = ["lfoot_z", "rfoot_z"]
 CUBE_VARS = [f"cube{i}_{d}" for i in range(3) for d in ["x", "y", "z"]]
 SANDBOX_VARS = [
@@ -73,7 +73,9 @@ URDF_FROZEN_EDGES: dict[tuple[str, str], dict[str, float]] = {
     ("rhip", "rknee"): {"alpha_trust": 1.0},
     ("rknee", "rankle"): {"alpha_trust": 1.0},
     ("lshoulder", "lelbow"): {"alpha_trust": 1.0},
+    ("lelbow", "lwrist"): {"alpha_trust": 1.0},
     ("rshoulder", "relbow"): {"alpha_trust": 1.0},
+    ("relbow", "rwrist"): {"alpha_trust": 1.0},
     ("spine_yaw", "spine_pitch"): {"alpha_trust": 1.0},
     ("spine_pitch", "neck_yaw"): {"alpha_trust": 1.0},
     ("neck_yaw", "neck_pitch"): {"alpha_trust": 1.0},
@@ -83,8 +85,8 @@ HUMANOID_KINEMATIC_EDGE_PRIORS: tuple[tuple[str, str], ...] = tuple(URDF_FROZEN_
 KINEMATIC_CHAINS: tuple[tuple[str, ...], ...] = (
     ("lhip", "lknee", "lankle"),
     ("rhip", "rknee", "rankle"),
-    ("lshoulder", "lelbow"),
-    ("rshoulder", "relbow"),
+    ("lshoulder", "lelbow", "lwrist"),
+    ("rshoulder", "relbow", "rwrist"),
     ("spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch"),
 )
 
@@ -116,6 +118,8 @@ for v in LEG_VARS:
         _RANGES[v] = (-1.5, 1.5)
 for v in ARM_VARS:
     _RANGES[v] = (-2.0, 2.0)
+for v in ("lwrist", "rwrist"):
+    _RANGES[v] = (-0.8, 0.8)
 for v in FOOT_VARS:
     _RANGES[v] = (-0.1, 0.5)
 for v in CUBE_VARS:
@@ -137,7 +141,8 @@ for _sv in SELF_VARS:
     _RANGES[_sv] = (0.0, 1.0)
 
 HUMANOID_URDF_LEGACY_SCALE = 0.45
-HUMANOID_URDF_GLOBAL_SCALING = 0.225
+# URDF linear dims in-file were scaled down ~3.25×; keep same world size as pre-rescale × 0.225.
+HUMANOID_URDF_GLOBAL_SCALING = 0.225 * 3.25
 _HSZ = HUMANOID_URDF_GLOBAL_SCALING / HUMANOID_URDF_LEGACY_SCALE
 
 FALLEN_Z = 0.30

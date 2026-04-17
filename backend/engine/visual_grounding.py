@@ -85,8 +85,8 @@ LINK_TO_VAR = {
     "left_elbow": "lelbow", "right_elbow": "relbow",
     "neck": "neck_yaw", "spine": "spine_yaw",
     "chest": "spine_pitch", "root": "com_z",
-    "left_wrist": "lelbow",  # approximate
-    "right_wrist": "relbow",
+    "left_wrist": "lwrist",
+    "right_wrist": "rwrist",
 }
 
 # Цвета для UI (slot colors)
@@ -553,6 +553,7 @@ def _var_to_body_label(var_name: str) -> str:
         "lankle": "left ankle", "rankle": "right ankle",
         "lshoulder": "left shoulder", "rshoulder": "right shoulder",
         "lelbow": "left elbow", "relbow": "right elbow",
+        "lwrist": "left wrist", "rwrist": "right wrist",
         "spine_yaw": "spine", "spine_pitch": "torso",
         "neck_yaw": "neck", "com_z": "body center",
     }

@@ -49,6 +49,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         "rightShoulder":"rshoulder","right_shoulder":"rshoulder",
         "leftElbow":   "lelbow", "left_elbow":  "lelbow",
         "rightElbow":  "relbow", "right_elbow": "relbow",
+        "leftWrist":   "lwrist", "left_wrist":  "lwrist",
+        "rightWrist":  "rwrist", "right_wrist": "rwrist",
     }
 
     def __init__(self, fixed_root: bool = False):
@@ -1114,7 +1116,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
 
     def _skeleton_from_urdf_links(self) -> list[dict] | None:
         need = {
-            "neck", "spine", "chest", "root",
+            "head", "neck", "spine", "chest", "root",
             "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
             "left_wrist", "right_wrist",
             "left_hip", "right_hip", "left_knee", "right_knee",
@@ -1136,7 +1138,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         else:
             up = up / ln
         sk = float(HUMANOID_URDF_GLOBAL_SCALING) / float(HUMANOID_URDF_LEGACY_SCALE)
-        head_v = neck_v + 0.26 * sk * up
+        head_v = vec("head") if "head" in p else neck_v + 0.26 * sk * up
 
         order = [
             head_v, neck_v, vec("spine"), vec("root"),
