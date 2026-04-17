@@ -903,10 +903,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if not callable(motor_m) or jt != pb.JOINT_SPHERICAL:
                     return
                 if var_name == "spine_yaw":
-                    self._spine_euler[2] = 0.50 * real_pos
+                    self._spine_euler[2] = 0.65 * real_pos
                 else:
-                    # БЫЛО: self._spine_euler[0] = 0.25 * real_pos
-                    self._spine_euler[1] = 0.25 * real_pos  # ИСПРАВЛЕНО: Индекс 1 (Ось Y - Pitch)
+                    self._spine_euler[1] = 0.85 * real_pos  # Увеличена гибкость для подъема торса
                 ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
@@ -921,9 +920,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 elif var_name == "rshoulder":
                     q = pb.getQuaternionFromEuler((0.32 * real_pos, -0.42 * real_pos, -0.28 * real_pos))
                 elif var_name == "lhip":
-                    q = pb.getQuaternionFromEuler((0.1 * real_pos, 0.42 * real_pos, 0.05 * real_pos))
+                    q = pb.getQuaternionFromEuler((0.4 * real_pos, 0.85 * real_pos, 0.1 * real_pos))
                 elif var_name == "rhip":
-                    q = pb.getQuaternionFromEuler((0.1 * real_pos, -0.42 * real_pos, -0.05 * real_pos))
+                    q = pb.getQuaternionFromEuler((0.4 * real_pos, -0.85 * real_pos, -0.1 * real_pos))
                 elif var_name == "lankle":
                     q = pb.getQuaternionFromEuler((-0.22 * real_pos, 0.1 * real_pos, 0.0))
                 elif var_name == "rankle":

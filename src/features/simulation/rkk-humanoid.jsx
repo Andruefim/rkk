@@ -231,7 +231,7 @@ export default function RKKHumanoid() {
     if (!mount) return;
 
     const renderer = new THREE.WebGLRenderer({antialias:true, powerPreference:"high-performance"});
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -269,12 +269,12 @@ export default function RKKHumanoid() {
     const sun = new THREE.DirectionalLight(0xfffaf0, 2.8);
     sun.position.set(4, 18, 6);
     sun.castShadow = true;
-    sun.shadow.mapSize.set(4096, 4096);
+    sun.shadow.mapSize.set(1024, 1024);
     sun.shadow.camera.near = 0.5;
     sun.shadow.camera.far = 80;
     sun.shadow.camera.left = sun.shadow.camera.bottom = -28;
     sun.shadow.camera.right = sun.shadow.camera.top = 28;
-    sun.shadow.bias = -0.00025;
+    sun.shadow.bias = -0.0005;
     scene.add(sun);
     const fillSky = new THREE.DirectionalLight(0xb8d8ff, 0.85);
     fillSky.position.set(-6, 10, -4);
