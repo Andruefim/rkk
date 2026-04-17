@@ -110,7 +110,10 @@ for v in SPINE_VARS:
 for v in HEAD_VARS:
     _RANGES[v] = (-1.2, 1.2)
 for v in LEG_VARS:
-    _RANGES[v] = (-1.5, 1.5)
+    if "knee" in v:
+        _RANGES[v] = (-3.14, 0.1)
+    else:
+        _RANGES[v] = (-1.5, 1.5)
 for v in ARM_VARS:
     _RANGES[v] = (-2.0, 2.0)
 for v in FOOT_VARS:

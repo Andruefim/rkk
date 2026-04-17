@@ -73,7 +73,7 @@ export default function RKKHumanoid() {
 
   const [speed,        setSpeedLocal]    = useState(1);
   const [ui,           setUI]            = useState(() => normFrame(wsFrame));
-  const [activePanel,  setPanel]         = useState(null);
+  const [activePanel,  setPanel]         = useState("vision");
   const [seedText,     setSeedText]      = useState('[\n  {"from_": "lshoulder", "to": "cube0_x", "weight": 0.6}\n]');
   const [status,       setStatus]        = useState("");
   const [camFrame,     setCamFrame]      = useState(null);

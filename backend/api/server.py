@@ -138,6 +138,7 @@ async def _startup_auto_vision_and_one_vlm() -> None:
     RKK_AUTO_VLM_TEXT_ONLY=1 — только текстовый режим (без картинок в chat).
     RKK_AUTO_VLM_MAX_MASKS — маски в chat (0 = только кадр при bootstrap, быстрее; по умолчанию 0).
     """
+    # По умолчанию теперь ВКЛЮЧЕНО при старте, если не задано RKK_SKIP_AUTO_VISION=1
     if _env_flag("RKK_SKIP_AUTO_VISION"):
         print("[RKK] Auto vision skipped (RKK_SKIP_AUTO_VISION)")
         return
