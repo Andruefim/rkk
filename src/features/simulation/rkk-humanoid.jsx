@@ -16,6 +16,89 @@ const SLOT_COLORS = [
 
 const SHOW_SCENE_DEMON = false;
 
+/** Качество Three.js: в .env задайте VITE_RKK_GRAPHICS_QUALITY=low | medium | high (по умолчанию high). */
+const GFX_MODE = (import.meta.env.VITE_RKK_GRAPHICS_QUALITY || "high").toLowerCase();
+const GFX = (() => {
+  const high = {
+    antialias: true,
+    dprCap: 1.25,
+    shadows: true,
+    shadowSize: 1024,
+    envMap: true,
+    useFog: true,
+    fogDensity: 0.0018,
+    toneMapping: THREE.ACESFilmicToneMapping,
+    toneExposure: 1.05,
+    skySeg: [48, 32],
+    plazaSeg: 96,
+    ringNeon: [16, 128],
+    floorPhysical: true,
+    ceilingMode: "full",
+    ceilingKnots: 32,
+    knotTubeSegs: 64,
+    knotRadialSegs: 12,
+    particles: 600,
+    jointSphere: [16, 10, 10],
+    boneRadialSeg: 8,
+    staticCylinderSeg: 28,
+    staticIcosaDetail: 2,
+    staticTorus: [12, 48],
+    winCount: 8,
+    usePhysicalGlass: true,
+    ballSeg: 20,
+    targetCylSeg: 28,
+    cubeSphereSeg: 12,
+  };
+  const medium = {
+    ...high,
+    shadowSize: 512,
+    skySeg: [36, 24],
+    plazaSeg: 72,
+    ringNeon: [12, 96],
+    ceilingMode: "lite",
+    ceilingKnots: 12,
+    knotTubeSegs: 48,
+    knotRadialSegs: 8,
+    particles: 280,
+    jointSphere: [14, 10, 10],
+    staticCylinderSeg: 22,
+    staticTorus: [12, 40],
+  };
+  const low = {
+    antialias: false,
+    dprCap: 1,
+    shadows: false,
+    shadowSize: 512,
+    envMap: false,
+    useFog: false,
+    fogDensity: 0,
+    toneMapping: THREE.LinearToneMapping,
+    toneExposure: 1.0,
+    skySeg: [20, 14],
+    plazaSeg: 48,
+    ringNeon: [8, 64],
+    floorPhysical: false,
+    ceilingMode: "none",
+    ceilingKnots: 0,
+    knotTubeSegs: 32,
+    knotRadialSegs: 8,
+    particles: 0,
+    jointSphere: [12, 8, 8],
+    boneRadialSeg: 6,
+    staticCylinderSeg: 16,
+    staticIcosaDetail: 1,
+    staticTorus: [10, 32],
+    winCount: 4,
+    usePhysicalGlass: false,
+    ballSeg: 14,
+    targetCylSeg: 16,
+    cubeSphereSeg: 8,
+  };
+  if (GFX_MODE === "low") return low;
+  if (GFX_MODE === "medium") return medium;
+  return high;
+})();
+
 const phiC  = p => p>0.6?"#00ff99":p>0.3?"#aacc00":"#ff8844";
 const hWC   = h => h<0.01?"#00ff99":h<0.5?"#aacc00":h<2?"#ffaa00":"#ff4422";
 const blkC  = r => r>0.3?"#ff4422":r>0.1?"#ffaa00":"#335544";
@@ -230,12 +313,15 @@ export default function RKKHumanoid() {
     const mount = mountRef.current;
     if (!mount) return;
 
-    const renderer = new THREE.WebGLRenderer({antialias:true, powerPreference:"high-performance"});
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.05;
+    const renderer = new THREE.WebGLRenderer({
+      antialias: GFX.antialias,
+      powerPreference: GFX.antialias ? "high-performance" : "default",
+    });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, GFX.dprCap));
+    renderer.shadowMap.enabled = GFX.shadows;
+    if (GFX.shadows) renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = GFX.toneMapping;
+    renderer.toneMappingExposure = GFX.toneExposure;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setSize(mount.clientWidth,mount.clientHeight);
     mount.appendChild(renderer.domElement);
@@ -243,33 +329,35 @@ export default function RKKHumanoid() {
     const scene = new THREE.Scene();
     const skyHi = 0xe8f4ff;
     scene.background = new THREE.Color(skyHi);
-    scene.fog = new THREE.FogExp2(0xd0e8ff, 0.0018);
+    scene.fog = GFX.useFog ? new THREE.FogExp2(0xd0e8ff, GFX.fogDensity) : null;
 
     const camera = new THREE.PerspectiveCamera(50,mount.clientWidth/mount.clientHeight,0.15,200);
     camera.position.set(0,1.2,7.5);
 
     // IBL — отражения на глянцевом полу (как на референсе)
     let envRT = null;
-    try {
-      const pmrem = new THREE.PMREMGenerator(renderer);
-      const envScene = new THREE.Scene();
-      envScene.background = new THREE.Color(0xf2f8ff);
-      envScene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 2.5));
-      const ed = new THREE.DirectionalLight(0xffffff, 1.8);
-      ed.position.set(2, 3, 1);
-      envScene.add(ed);
-      envRT = pmrem.fromScene(envScene, 0.04);
-      scene.environment = envRT.texture;
-      pmrem.dispose();
-    } catch (_) { /* PMREM optional */ }
+    if (GFX.envMap) {
+      try {
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        const envScene = new THREE.Scene();
+        envScene.background = new THREE.Color(0xf2f8ff);
+        envScene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 2.5));
+        const ed = new THREE.DirectionalLight(0xffffff, 1.8);
+        ed.position.set(2, 3, 1);
+        envScene.add(ed);
+        envRT = pmrem.fromScene(envScene, 0.04);
+        scene.environment = envRT.texture;
+        pmrem.dispose();
+      } catch (_) { /* PMREM optional */ }
+    }
 
     // Яркий дневной свет: «не ночь»
     scene.add(new THREE.HemisphereLight(0xffffff, 0x6a7a88, 1.35));
     scene.add(new THREE.AmbientLight(0xd8e8f8, 0.45));
     const sun = new THREE.DirectionalLight(0xfffaf0, 2.8);
     sun.position.set(4, 18, 6);
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(1024, 1024);
+    sun.castShadow = GFX.shadows;
+    sun.shadow.mapSize.set(GFX.shadowSize, GFX.shadowSize);
     sun.shadow.camera.near = 0.5;
     sun.shadow.camera.far = 80;
     sun.shadow.camera.left = sun.shadow.camera.bottom = -28;
@@ -285,7 +373,7 @@ export default function RKKHumanoid() {
 
     // Скайдом — мягкое небо вокруг сцены
     const sky = new THREE.Mesh(
-      new THREE.SphereGeometry(140, 48, 32),
+      new THREE.SphereGeometry(140, GFX.skySeg[0], GFX.skySeg[1]),
       new THREE.MeshBasicMaterial({
         color: 0xc8e4f8,
         side: THREE.BackSide,
@@ -296,33 +384,47 @@ export default function RKKHumanoid() {
     scene.add(sky);
 
     // Пол: тёмный глянец + центральный диск + cyan кольцо (как на скринах)
-    const floorMat = new THREE.MeshPhysicalMaterial({
-      color: 0x0a1424,
-      roughness: 0.06,
-      metalness: 0.38,
-      clearcoat: 0.55,
-      clearcoatRoughness: 0.12,
-      envMapIntensity: 1.35,
-    });
+    const floorMat = GFX.floorPhysical
+      ? new THREE.MeshPhysicalMaterial({
+          color: 0x0a1424,
+          roughness: 0.06,
+          metalness: 0.38,
+          clearcoat: 0.55,
+          clearcoatRoughness: 0.12,
+          envMapIntensity: GFX.envMap ? 1.35 : 0.5,
+        })
+      : new THREE.MeshStandardMaterial({
+          color: 0x0f1828,
+          roughness: 0.55,
+          metalness: 0.12,
+          envMapIntensity: GFX.envMap ? 0.85 : 0,
+        });
     const floor = new THREE.Mesh(new THREE.PlaneGeometry(56, 56), floorMat);
     floor.rotation.x = -Math.PI / 2;
     floor.receiveShadow = true;
     scene.add(floor);
 
-    const plazaMat = new THREE.MeshPhysicalMaterial({
-      color: 0x040810,
-      roughness: 0.04,
-      metalness: 0.48,
-      envMapIntensity: 1.65,
-    });
-    const plaza = new THREE.Mesh(new THREE.CircleGeometry(9, 96), plazaMat);
+    const plazaMat = GFX.floorPhysical
+      ? new THREE.MeshPhysicalMaterial({
+          color: 0x040810,
+          roughness: 0.04,
+          metalness: 0.48,
+          envMapIntensity: GFX.envMap ? 1.65 : 0.55,
+        })
+      : new THREE.MeshStandardMaterial({
+          color: 0x060a12,
+          roughness: 0.48,
+          metalness: 0.2,
+          envMapIntensity: GFX.envMap ? 0.9 : 0,
+        });
+    const plaza = new THREE.Mesh(new THREE.CircleGeometry(9, GFX.plazaSeg), plazaMat);
     plaza.rotation.x = -Math.PI / 2;
     plaza.position.y = 0.004;
     plaza.receiveShadow = true;
     scene.add(plaza);
 
     const ringNeon = new THREE.Mesh(
-      new THREE.TorusGeometry(9.35, 0.07, 16, 128),
+      new THREE.TorusGeometry(9.35, 0.07, GFX.ringNeon[0], GFX.ringNeon[1]),
       new THREE.MeshStandardMaterial({
         color: 0x00ccff,
         emissive: 0x00a8dd,
@@ -336,18 +438,27 @@ export default function RKKHumanoid() {
     scene.add(ringNeon);
 
     // Периметр «окна» — светлые панели
-    const winMat = new THREE.MeshPhysicalMaterial({
-      color: 0xe8f4ff,
-      metalness: 0.05,
-      roughness: 0.12,
-      transmission: 0.35,
-      thickness: 0.5,
-      transparent: true,
-      opacity: 0.65,
-      side: THREE.DoubleSide,
-    });
-    for (let i = 0; i < 8; i++) {
-      const ang = (i / 8) * Math.PI * 2;
+    const winMat = GFX.usePhysicalGlass
+      ? new THREE.MeshPhysicalMaterial({
+          color: 0xe8f4ff,
+          metalness: 0.05,
+          roughness: 0.12,
+          transmission: 0.35,
+          thickness: 0.5,
+          transparent: true,
+          opacity: 0.65,
+          side: THREE.DoubleSide,
+        })
+      : new THREE.MeshStandardMaterial({
+          color: 0xe8f4ff,
+          metalness: 0.06,
+          roughness: 0.18,
+          transparent: true,
+          opacity: 0.55,
+          side: THREE.DoubleSide,
+        });
+    for (let i = 0; i < GFX.winCount; i++) {
+      const ang = (i / GFX.winCount) * Math.PI * 2;
       const w = new THREE.Mesh(new THREE.PlaneGeometry(16, 10), winMat);
       w.position.set(Math.cos(ang) * 22, 5, Math.sin(ang) * 22);
       w.lookAt(0, 5, 0);
@@ -361,23 +472,43 @@ export default function RKKHumanoid() {
       color: 0xf4f7fb,
       roughness: 0.22,
       metalness: 0.28,
-      envMapIntensity: 0.9,
+      envMapIntensity: GFX.envMap ? 0.9 : 0.35,
     });
-    for (let i = 0; i < 32; i++) {
-      const t = (i / 32) * Math.PI * 2;
-      const rad = 4 + (i % 4) * 2.2;
-      const knot = new THREE.Mesh(
-        new THREE.TorusKnotGeometry(0.55 + (i % 3) * 0.15, 0.09, 64, 12, 2, 3),
-        structMat
-      );
-      knot.position.set(Math.cos(t) * rad, (i % 5) * 0.15, Math.sin(t) * rad);
-      knot.rotation.set(i * 0.7, i * 0.5, i * 0.3);
-      knot.castShadow = true;
-      ceilGroup.add(knot);
+    if (GFX.ceilingMode !== "none") {
+      const nk = GFX.ceilingMode === "full" ? GFX.ceilingKnots : Math.min(GFX.ceilingKnots, 32);
+      for (let i = 0; i < nk; i++) {
+        const t = (i / nk) * Math.PI * 2;
+        const rad = 4 + (i % 4) * 2.2;
+        const knot = new THREE.Mesh(
+          new THREE.TorusKnotGeometry(
+            0.55 + (i % 3) * 0.15,
+            0.09,
+            GFX.knotTubeSegs,
+            GFX.knotRadialSegs,
+            2,
+            3,
+          ),
+          structMat,
+        );
+        knot.position.set(Math.cos(t) * rad, (i % 5) * 0.15, Math.sin(t) * rad);
+        knot.rotation.set(i * 0.7, i * 0.5, i * 0.3);
+        if (GFX.shadows) knot.castShadow = true;
+        ceilGroup.add(knot);
+      }
     }
     const skyRing = new THREE.Mesh(
-      new THREE.TorusGeometry(7, 0.25, 12, 64),
-      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.18, metalness: 0.15, envMapIntensity: 0.7 })
+      new THREE.TorusGeometry(
+        7,
+        0.25,
+        Math.max(8, GFX.ringNeon[0]),
+        Math.max(24, Math.floor(GFX.ringNeon[1] / 2)),
+      ),
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.18,
+        metalness: 0.15,
+        envMapIntensity: GFX.envMap ? 0.7 : 0.25,
+      }),
     );
     skyRing.rotation.x = Math.PI / 2;
     skyRing.position.y = 0.3;
@@ -389,17 +520,26 @@ export default function RKKHumanoid() {
       color: 0xe8eef2,
       metalness: 0.92,
       roughness: 0.06,
-      envMapIntensity: 1.1,
+      envMapIntensity: GFX.envMap ? 1.1 : 0.45,
     });
-    const glassTop = new THREE.MeshPhysicalMaterial({
-      color: 0xffffff,
-      metalness: 0,
-      roughness: 0.02,
-      transmission: 0.65,
-      thickness: 0.25,
-      transparent: true,
-      opacity: 0.9,
-    });
+    const glassTop = GFX.usePhysicalGlass
+      ? new THREE.MeshPhysicalMaterial({
+          color: 0xffffff,
+          metalness: 0,
+          roughness: 0.02,
+          transmission: 0.65,
+          thickness: 0.25,
+          transparent: true,
+          opacity: 0.9,
+        })
+      : new THREE.MeshStandardMaterial({
+          color: 0xe8f4ff,
+          metalness: 0.05,
+          roughness: 0.22,
+          transparent: true,
+          opacity: 0.55,
+          side: THREE.DoubleSide,
+        });
     const seatMat = new THREE.MeshStandardMaterial({ color: 0x1a1e24, roughness: 0.85, metalness: 0.05 });
     const woodMat = new THREE.MeshStandardMaterial({ color: 0x3d2a1a, roughness: 0.9 });
     const plantMat = new THREE.MeshStandardMaterial({
@@ -417,13 +557,13 @@ export default function RKKHumanoid() {
     let staticBuilt = false;
 
     const ballMesh = new THREE.Mesh(
-      new THREE.SphereGeometry(0.1125, 20, 20),
+      new THREE.SphereGeometry(0.1125, GFX.ballSeg, GFX.ballSeg),
       new THREE.MeshStandardMaterial({color:0xf5e85a,roughness:0.35,metalness:0.08,emissive:0x332200,emissiveIntensity:0.12})
     );
     ballMesh.castShadow=true; ballMesh.receiveShadow=true; scene.add(ballMesh);
 
     const targetMarker = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.22,0.22,0.024,28),
+      new THREE.CylinderGeometry(0.22, 0.22, 0.024, GFX.targetCylSeg),
       new THREE.MeshStandardMaterial({color:0x22cc88,roughness:0.45,emissive:0x114433,emissiveIntensity:0.15,transparent:true,opacity:0.92})
     );
     targetMarker.rotation.x = Math.PI/2;
@@ -457,6 +597,7 @@ export default function RKKHumanoid() {
       0.038, 0.038,        // 12,13=knees
       0.042, 0.042,        // 14,15=ankles/feet
     ];
+    const [jSegHead, jSegBody, jSegHand] = GFX.jointSphere;
     const jointMeshes = Array.from({length:JOINT_COUNT},(_,i)=>{
       if (i>=16){const o=new THREE.Object3D();o.visible=false;scene.add(o);return o;}
       const r = (JOINT_RADII[i] || 0.04) * vS;
@@ -465,16 +606,16 @@ export default function RKKHumanoid() {
       const isFoot = i===14||i===15;
       let geo, mat;
       if (isHead) {
-        geo = new THREE.SphereGeometry(r, 16, 16);
+        geo = new THREE.SphereGeometry(r, jSegHead, jSegHead);
         mat = headMat;
       } else if (isFoot) {
         geo = new THREE.BoxGeometry(r*2.2, r*0.7, r*1.6);
         mat = accentMat;
       } else if (isHand) {
-        geo = new THREE.SphereGeometry(r, 10, 10);
+        geo = new THREE.SphereGeometry(r, jSegHand, jSegHand);
         mat = accentMat;
       } else {
-        geo = new THREE.SphereGeometry(r, 10, 10);
+        geo = new THREE.SphereGeometry(r, jSegBody, jSegBody);
         mat = jointMat;
       }
       const m = new THREE.Mesh(geo, mat);
@@ -494,7 +635,7 @@ export default function RKKHumanoid() {
       const r = (BONE_RADII[bi] || 0.025) * vS;
       const isLeg = bi >= 9;
       const m = new THREE.Mesh(
-        new THREE.CylinderGeometry(r, r * 0.85, 1, 8),
+        new THREE.CylinderGeometry(r, r * 0.85, 1, GFX.boneRadialSeg),
         isLeg ? bodyMat.clone() : bodyMat
       );
       m.castShadow = true;
@@ -516,7 +657,7 @@ export default function RKKHumanoid() {
 
     // cube1 — sphere
     const cm1=new THREE.Mesh(
-      new THREE.SphereGeometry(0.11,12,12),
+      new THREE.SphereGeometry(0.11, GFX.cubeSphereSeg, GFX.cubeSphereSeg),
       new THREE.MeshStandardMaterial({color:0x22aaff,emissive:0x0066ff,emissiveIntensity:0.2,roughness:0.2,metalness:0.1})
     );
     cm1.castShadow=true; cm1.receiveShadow=true;
@@ -571,12 +712,23 @@ export default function RKKHumanoid() {
     const fallenLight = new THREE.PointLight(0xff0022,0,3);
     fallenLight.position.set(0,0.1,0); scene.add(fallenLight);
 
-    // Particles
-    const pPos=new Float32Array(600*3);
-    for(let i=0;i<600;i++){pPos[i*3]=(Math.random()-.5)*30;pPos[i*3+1]=Math.random()*12;pPos[i*3+2]=(Math.random()-.5)*30;}
-    const pGeom=new THREE.BufferGeometry();
-    pGeom.setAttribute("position",new THREE.BufferAttribute(pPos,3));
-    scene.add(new THREE.Points(pGeom,new THREE.PointsMaterial({color:0xaaccff,size:0.04,transparent:true,opacity:0.18})));
+    // Particles (отключаются при GFX.particles=0)
+    if (GFX.particles > 0) {
+      const pPos = new Float32Array(GFX.particles * 3);
+      for (let i = 0; i < GFX.particles; i++) {
+        pPos[i * 3] = (Math.random() - 0.5) * 30;
+        pPos[i * 3 + 1] = Math.random() * 12;
+        pPos[i * 3 + 2] = (Math.random() - 0.5) * 30;
+      }
+      const pGeom = new THREE.BufferGeometry();
+      pGeom.setAttribute("position", new THREE.BufferAttribute(pPos, 3));
+      scene.add(
+        new THREE.Points(
+          pGeom,
+          new THREE.PointsMaterial({ color: 0xaaccff, size: 0.04, transparent: true, opacity: 0.18 }),
+        ),
+      );
+    }
 
     let frame=0;
     const camTarget=new THREE.Vector3(0,0.42,0);
@@ -703,7 +855,10 @@ export default function RKKHumanoid() {
           if(st==="plant")return plantMat.clone();
           if(st==="planter")return planterMat.clone();
           return new THREE.MeshStandardMaterial({
-            color:rgb(d),roughness:0.42,metalness:0.12,envMapIntensity:0.65,
+            color: rgb(d),
+            roughness: 0.42,
+            metalness: 0.12,
+            envMapIntensity: GFX.envMap ? 0.65 : 0,
           });
         };
         sg.forEach(def=>{
@@ -716,16 +871,16 @@ export default function RKKHumanoid() {
             mesh.rotation.set(def.rx??0,def.ry??0,def.rz??0);
           }else if(k==="cylinder"){
             const r=def.radius??0.1,h=def.height??0.2;
-            mesh=new THREE.Mesh(new THREE.CylinderGeometry(r,r,h,28,1),matFor(def));
+            mesh=new THREE.Mesh(new THREE.CylinderGeometry(r,r,h,GFX.staticCylinderSeg,1),matFor(def));
             mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
             mesh.rotation.set(def.rx??0,def.ry??0,def.rz??0);
           }else if(k==="sphere"){
             const rad=def.radius??0.1;
-            mesh=new THREE.Mesh(new THREE.IcosahedronGeometry(rad,2),matFor(def));
+            mesh=new THREE.Mesh(new THREE.IcosahedronGeometry(rad,GFX.staticIcosaDetail),matFor(def));
             mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
           }else if(k==="torus"){
             const R=def.radius??1,t=def.tube??0.08;
-            mesh=new THREE.Mesh(new THREE.TorusGeometry(R,t,12,48),matFor(def));
+            mesh=new THREE.Mesh(new THREE.TorusGeometry(R,t,GFX.staticTorus[0],GFX.staticTorus[1]),matFor(def));
             mesh.position.set(def.tx??0,def.ty??0,def.tz??0);
             mesh.rotation.set(def.rx??0,def.ry??0,def.rz??0);
           }
