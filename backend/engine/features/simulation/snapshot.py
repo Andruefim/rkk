@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from engine.json_util import sanitize_for_json
 from engine.core.constants import (
     agent_loop_hz_from_env as _agent_loop_hz_from_env,
     cpg_loop_hz_from_env as _cpg_loop_hz_from_env,
@@ -36,7 +37,7 @@ def build_simulation_snapshot(
     if sim._visual_mode and sim._visual_env is not None:
         vision_summary = sim._visual_env.cortex.snapshot()
 
-    return {
+    payload = {
         "tick": sim.tick,
         "phase": sim.phase,
         "max_phase": sim.max_phase,
@@ -223,3 +224,4 @@ def build_simulation_snapshot(
             else None
         ),
     }
+    return sanitize_for_json(payload)

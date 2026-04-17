@@ -38,6 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from engine.json_util import sanitize_for_json
 from engine.ollama_env import get_ollama_generate_url, get_ollama_model
 from engine.simulation import Simulation
 from engine.rag_seeder import RAGSeeder, HARDCODED_SEEDS
@@ -308,11 +309,11 @@ def api_agent_messages(last_n: int = Query(default=50, ge=1, le=200)):
     verbal = getattr(get_sim(), "_verbal", None)
     if verbal is None:
         return {"messages": [], "available": False}
-    return {
+    return sanitize_for_json({
         "messages": verbal.get_messages_for_ui(last_n=last_n),
         "available": True,
         "stats": verbal.snapshot(),
-    }
+    })
 
 
 @app.post("/api/agent/reply")
@@ -878,7 +879,7 @@ async def causal_stream(websocket: WebSocket):
             for _ in range(max(1, speed)):
                 data = sim.tick_step()
 
-            await websocket.send_json(data)
+            await websocket.send_json(sanitize_for_json(data))
             await asyncio.sleep(0.05)
 
     except WebSocketDisconnect:
