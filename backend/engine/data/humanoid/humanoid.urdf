@@ -63,14 +63,14 @@
 	</joint>
 	<link name="neck">
 		<inertial>
-			<origin rpy="0 0 0" xyz="0 0.215385 0" />
-			<mass value="3.010753" />
-			<inertia ixx="0.003563" ixy="0" ixz="0" iyy="0.003563" iyz="0" izz="0.003563" />
+			<origin rpy="0 0 0" xyz="0 0.11 0" />
+			<mass value="2.35" />
+			<inertia ixx="0.00485" ixy="0" ixz="0" iyy="0.00485" iyz="0" izz="0.00485" />
 		</inertial>
 		<collision>
-			<origin rpy="0 0 0" xyz="0 0.215385 0" />
+			<origin rpy="0 0 0" xyz="0 0.11 0" />
 			<geometry>
-				<sphere radius="0.126154" />
+				<sphere radius="0.072" />
 			</geometry>
 		</collision>
 	</link>
@@ -102,7 +102,7 @@
 	<joint name="head" type="fixed">
 		<parent link="neck" />
 		<child link="head" />
-		<origin rpy="0 0 0" xyz="0 0.341538 0" />
+		<origin rpy="0 0 0" xyz="0 0.202 0" />
 	</joint>
 	<link name="right_hip">
 		<inertial>

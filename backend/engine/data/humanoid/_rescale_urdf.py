@@ -114,8 +114,8 @@ def main() -> None:
     neck_link = root.find('.//link[@name="neck"]')
     neck_j = root.find('.//joint[@name="neck"]')
     if neck_link is not None and neck_j is not None:
-        # Offset along neck +Y to top of scaled neck sphere (com0.7*s + radius 0.41*s)
-        top_y = (0.7 + 0.41) * S
+        # Head base above neck joint (~0.20 m: compromise between stub and original long neck)
+        top_y = 0.202
         head = ET.Element("link", {"name": "head"})
         head_in = ET.SubElement(head, "inertial")
         ho = ET.SubElement(head_in, "origin", {"rpy": "0 0 0", "xyz": f"0 {sf(0.06)} 0"})
