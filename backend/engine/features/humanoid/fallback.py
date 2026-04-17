@@ -13,6 +13,7 @@ from engine.features.humanoid.constants import (
 )
 from engine.features.humanoid.kinematics import _forward_kinematics_skeleton
 from engine.features.humanoid.sandbox import InstrumentalSandbox
+from engine.features.humanoid.vestibular import gravity_dir_fallback_torso_then_neck
 
 
 class _FallbackHumanoid(InstrumentalSandbox):
@@ -94,6 +95,19 @@ class _FallbackHumanoid(InstrumentalSandbox):
         s["torso_pitch"] = float(self.torso_euler[1])
         for v in LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS:
             s[v] = float(self.joints.get(v, 0.0))
+        tr, tp, ty = (
+            float(self.torso_euler[0]),
+            float(self.torso_euler[1]),
+            float(self.torso_euler[2]),
+        )
+        gx, gy, gz = gravity_dir_fallback_torso_then_neck(
+            tr,
+            tp,
+            ty,
+            float(self.joints.get("neck_yaw", 0.0)),
+            float(self.joints.get("neck_pitch", 0.0)),
+        )
+        s["vestibular_gx"], s["vestibular_gy"], s["vestibular_gz"] = gx, gy, gz
         s["lfoot_z"] = float(lf_z)
         s["rfoot_z"] = float(rf_z)
         for i, cube in enumerate(self.cubes):

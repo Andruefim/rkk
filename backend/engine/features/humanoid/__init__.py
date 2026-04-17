@@ -19,6 +19,7 @@ from engine.features.humanoid.constants import (
     SPINE_VARS,
     TORSO_VARS,
     URDF_FROZEN_EDGES,
+    VESTIBULAR_VARS,
     VAR_NAMES,
 )
 from engine.features.humanoid.deps import PIL_AVAILABLE, PYBULLET_AVAILABLE
@@ -50,6 +51,7 @@ __all__ = [
     "SPINE_VARS",
     "TORSO_VARS",
     "URDF_FROZEN_EDGES",
+    "VESTIBULAR_VARS",
     "VAR_NAMES",
     "fixed_root_seeds",
     "humanoid_hardcoded_seeds",

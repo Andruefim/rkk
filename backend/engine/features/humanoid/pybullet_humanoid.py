@@ -35,6 +35,7 @@ from engine.features.humanoid.kinematics import (
     _rotmat_to_xyzw,
 )
 from engine.features.humanoid.sandbox import InstrumentalSandbox
+from engine.features.humanoid.vestibular import gravity_dir_in_link_frame
 
 class _PyBulletHumanoid(InstrumentalSandbox):
 
@@ -1043,6 +1044,21 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             best = min(best, float(np.linalg.norm(np.array(pos[:2]) - tg)))
         return float(best)
 
+    def _vestibular_gravity_head(self) -> tuple[float, float, float]:
+        """Направление g (вниз) в локальной СК головы; при отсутствии link head — neck, иначе база."""
+        rid, cid = self.robot_id, self.client
+        for name in ("head", "neck"):
+            if name not in self.link_names:
+                continue
+            i = self.link_names.index(name)
+            st = pb.getLinkState(rid, i, computeForwardKinematics=1, physicsClientId=cid)
+            orn = st[5]
+            x, y, z, w = float(orn[0]), float(orn[1]), float(orn[2]), float(orn[3])
+            return gravity_dir_in_link_frame((x, y, z, w))
+        _, orn = pb.getBasePositionAndOrientation(rid, physicsClientId=cid)
+        x, y, z, w = float(orn[0]), float(orn[1]), float(orn[2]), float(orn[3])
+        return gravity_dir_in_link_frame((x, y, z, w))
+
     def get_state(self) -> dict:
         with self._physics_lock:
             com, euler = self.get_com()
@@ -1055,6 +1071,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             s["torso_pitch"] = float(euler[1])
             for v in SPINE_VARS + HEAD_VARS:
                 s[v] = self.get_joint_angle(v)
+            gx, gy, gz = self._vestibular_gravity_head()
+            s["vestibular_gx"], s["vestibular_gy"], s["vestibular_gz"] = gx, gy, gz
             for v in LEG_VARS + ARM_VARS:
                 s[v] = self.get_joint_angle(v)
             s["lfoot_z"] = lf

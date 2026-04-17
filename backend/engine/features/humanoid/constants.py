@@ -9,6 +9,8 @@ import numpy as np
 TORSO_VARS = ["com_x", "com_y", "com_z", "torso_roll", "torso_pitch"]
 SPINE_VARS = ["spine_yaw", "spine_pitch"]
 HEAD_VARS = ["neck_yaw", "neck_pitch"]
+# Один сенсорный канал (3 скаляра): единичный вектор g в системе координат головы (вестибулярный ориентир).
+VESTIBULAR_VARS: tuple[str, ...] = ("vestibular_gx", "vestibular_gy", "vestibular_gz")
 LEG_VARS = ["lhip", "lknee", "lankle", "rhip", "rknee", "rankle"]
 ARM_VARS = ["lshoulder", "lelbow", "lwrist", "rshoulder", "relbow", "rwrist"]
 FOOT_VARS = ["lfoot_z", "rfoot_z"]
@@ -57,6 +59,7 @@ VAR_NAMES = (
     TORSO_VARS
     + SPINE_VARS
     + HEAD_VARS
+    + list(VESTIBULAR_VARS)
     + LEG_VARS
     + ARM_VARS
     + FOOT_VARS
@@ -94,6 +97,7 @@ FIXED_BASE_VARS: list[str] = (
     ARM_VARS
     + SPINE_VARS
     + HEAD_VARS
+    + list(VESTIBULAR_VARS)
     + CUBE_VARS
     + SANDBOX_VARS
     + list(MOTOR_INTENT_VARS)
@@ -111,6 +115,8 @@ for v in SPINE_VARS:
     _RANGES[v] = (-1.2, 1.2)
 for v in HEAD_VARS:
     _RANGES[v] = (-1.2, 1.2)
+for v in VESTIBULAR_VARS:
+    _RANGES[v] = (-1.0, 1.0)
 for v in LEG_VARS:
     if "knee" in v:
         _RANGES[v] = (-3.14, 0.1)

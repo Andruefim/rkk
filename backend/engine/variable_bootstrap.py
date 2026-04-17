@@ -51,6 +51,7 @@ from engine.features.humanoid.constants import (
     SELF_VARS,
     SPINE_VARS,
     TORSO_VARS,
+    VESTIBULAR_VARS,
     VAR_NAMES as FULL_VAR_NAMES,
 )
 
@@ -81,7 +82,7 @@ DISCOVERABLE_GROUPS: dict[str, list[str]] = {
     "feet":       ["lfoot_z", "rfoot_z"],
     "torso_xy":   ["com_x", "com_y"],
     "spine":      list(SPINE_VARS),
-    "head":       list(HEAD_VARS),
+    "head":       list(HEAD_VARS) + list(VESTIBULAR_VARS),
     "arms":       list(ARM_VARS),
     "cubes":      list(CUBE_VARS),
     "sandbox":    list(SANDBOX_VARS),
