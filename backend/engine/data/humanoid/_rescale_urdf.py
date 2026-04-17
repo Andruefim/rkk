@@ -85,30 +85,16 @@ def main() -> None:
     for joint in root.findall(".//joint"):
         for o in joint.findall("origin"):
             process_origin(o)
-    # Revolute wrists (origins already scaled above); left had invalid XML before rescale
+    # Rigid wrists: no revolute DOF (origins already scaled above)
     for jname in ("right_wrist", "left_wrist"):
         j = root.find(f'.//joint[@name="{jname}"]')
         if j is None:
             continue
-        j.set("type", "revolute")
-        o = j.find("origin")
-        if o is None:
-            o = ET.SubElement(j, "origin")
-        o.set("rpy", "0 0 0")
-        if jname == "left_wrist":
-            o.set("xyz", f"0 0 -{sf(1.035788 * S)}")
-        axis = j.find("axis")
-        if axis is None:
-            axis = ET.SubElement(j, "axis")
-        axis.set("xyz", "0 0 1")
-        old_lim = j.find("limit")
-        if old_lim is not None:
-            j.remove(old_lim)
-        lim = ET.SubElement(j, "limit")
-        lim.set("effort", "200")
-        lim.set("lower", "-0.8")
-        lim.set("upper", "0.8")
-        lim.set("velocity", "2")
+        j.set("type", "fixed")
+        for tag in ("axis", "limit"):
+            el = j.find(tag)
+            if el is not None:
+                j.remove(el)
 
     # Add head (fixed to neck); neck link name is "neck"
     neck_link = root.find('.//link[@name="neck"]')

@@ -50,8 +50,6 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         "rightShoulder":"rshoulder","right_shoulder":"rshoulder",
         "leftElbow":   "lelbow", "left_elbow":  "lelbow",
         "rightElbow":  "relbow", "right_elbow": "relbow",
-        "leftWrist":   "lwrist", "left_wrist":  "lwrist",
-        "rightWrist":  "rwrist", "right_wrist": "rwrist",
     }
 
     def __init__(self, fixed_root: bool = False):

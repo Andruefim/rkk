@@ -12,7 +12,7 @@ HEAD_VARS = ["neck_yaw", "neck_pitch"]
 # Один сенсорный канал (3 скаляра): единичный вектор g в системе координат головы (вестибулярный ориентир).
 VESTIBULAR_VARS: tuple[str, ...] = ("vestibular_gx", "vestibular_gy", "vestibular_gz")
 LEG_VARS = ["lhip", "lknee", "lankle", "rhip", "rknee", "rankle"]
-ARM_VARS = ["lshoulder", "lelbow", "lwrist", "rshoulder", "relbow", "rwrist"]
+ARM_VARS = ["lshoulder", "lelbow", "rshoulder", "relbow"]
 FOOT_VARS = ["lfoot_z", "rfoot_z"]
 CUBE_VARS = [f"cube{i}_{d}" for i in range(3) for d in ["x", "y", "z"]]
 SANDBOX_VARS = [
@@ -76,9 +76,7 @@ URDF_FROZEN_EDGES: dict[tuple[str, str], dict[str, float]] = {
     ("rhip", "rknee"): {"alpha_trust": 1.0},
     ("rknee", "rankle"): {"alpha_trust": 1.0},
     ("lshoulder", "lelbow"): {"alpha_trust": 1.0},
-    ("lelbow", "lwrist"): {"alpha_trust": 1.0},
     ("rshoulder", "relbow"): {"alpha_trust": 1.0},
-    ("relbow", "rwrist"): {"alpha_trust": 1.0},
     ("spine_yaw", "spine_pitch"): {"alpha_trust": 1.0},
     ("spine_pitch", "neck_yaw"): {"alpha_trust": 1.0},
     ("neck_yaw", "neck_pitch"): {"alpha_trust": 1.0},
@@ -88,8 +86,8 @@ HUMANOID_KINEMATIC_EDGE_PRIORS: tuple[tuple[str, str], ...] = tuple(URDF_FROZEN_
 KINEMATIC_CHAINS: tuple[tuple[str, ...], ...] = (
     ("lhip", "lknee", "lankle"),
     ("rhip", "rknee", "rankle"),
-    ("lshoulder", "lelbow", "lwrist"),
-    ("rshoulder", "relbow", "rwrist"),
+    ("lshoulder", "lelbow"),
+    ("rshoulder", "relbow"),
     ("spine_yaw", "spine_pitch", "neck_yaw", "neck_pitch"),
 )
 
@@ -124,8 +122,6 @@ for v in LEG_VARS:
         _RANGES[v] = (-1.5, 1.5)
 for v in ARM_VARS:
     _RANGES[v] = (-2.0, 2.0)
-for v in ("lwrist", "rwrist"):
-    _RANGES[v] = (-0.8, 0.8)
 for v in FOOT_VARS:
     _RANGES[v] = (-0.1, 0.5)
 for v in CUBE_VARS:

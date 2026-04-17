@@ -159,7 +159,6 @@ class EnvironmentHumanoid:
         joint_deviations = [
             abs(lsh - lsh_neutral) * 0.6, abs(rsh - rsh_neutral) * 0.6,
             abs(lel) * 0.8, abs(rel) * 0.8,
-            abs(float(raw.get("lwrist", 0.0))) * 0.6, abs(float(raw.get("rwrist", 0.0))) * 0.6,
             abs(sp_pitch) * 2.0, abs(sp_yaw) * 2.0,
         ]
         joint_penalty = float(np.clip(np.mean(joint_deviations), 0.0, 1.0))
@@ -189,7 +188,6 @@ class EnvironmentHumanoid:
     _JOINT_NEUTRAL: dict[str, float] = {
         "lshoulder": 0.50, "rshoulder": 0.50,
         "lelbow": 0.50, "relbow": 0.50,
-        "lwrist": 0.50, "rwrist": 0.50,
         "spine_pitch": 0.50, "spine_yaw": 0.50,
         "neck_pitch": 0.50, "neck_yaw": 0.50,
         "lhip": 0.50, "rhip": 0.50,
@@ -199,7 +197,6 @@ class EnvironmentHumanoid:
     _JOINT_COMFORT_RANGE: dict[str, float] = {
         "lshoulder": 0.10, "rshoulder": 0.10,
         "lelbow": 0.08, "relbow": 0.08,
-        "lwrist": 0.08, "rwrist": 0.08,
         "spine_pitch": 0.05, "spine_yaw": 0.05,
         "neck_pitch": 0.06, "neck_yaw": 0.06,
         "lhip": 0.12, "rhip": 0.12,
@@ -354,13 +351,13 @@ class EnvironmentHumanoid:
         st = self._self_state
         pred = predicted or {}
 
-        if variable in ("lshoulder", "lelbow", "lwrist"):
+        if variable in ("lshoulder", "lelbow"):
             actual = float(observed.get(variable, intended_norm))
             gap = actual - intended_norm
             st["self_intention_larm"] = float(
                 np.clip(st["self_intention_larm"] + lr * gap, 0.05, 0.95)
             )
-        elif variable in ("rshoulder", "relbow", "rwrist"):
+        elif variable in ("rshoulder", "relbow"):
             actual = float(observed.get(variable, intended_norm))
             gap = actual - intended_norm
             st["self_intention_rarm"] = float(

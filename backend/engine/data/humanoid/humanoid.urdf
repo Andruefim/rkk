@@ -238,12 +238,10 @@
 			</geometry>
 		</collision>
 	</link>
-	<joint name="right_wrist" type="revolute">
+	<joint name="right_wrist" type="fixed">
 		<parent link="right_elbow" />
 		<child link="right_wrist" />
 		<origin rpy="0 0 0" xyz="0 -0.318704 0" />
-		<axis xyz="0 0 1" />
-		<limit effort="200" lower="-0.8" upper="0.8" velocity="2" />
 	</joint>
 	<link name="left_hip">
 		<inertial>
@@ -379,11 +377,9 @@
 			</geometry>
 		</collision>
 	</link>
-	<joint name="left_wrist" type="revolute">
+	<joint name="left_wrist" type="fixed">
 		<parent link="left_elbow" />
 		<child link="left_wrist" />
 		<origin rpy="0 0 0" xyz="0 -0.318704 0" />
-		<axis xyz="0 0 1" />
-		<limit effort="200" lower="-0.8" upper="0.8" velocity="2" />
 	</joint>
 </robot>
