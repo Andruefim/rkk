@@ -598,8 +598,14 @@ class CausalGraph:
         B = batch_size
         d = self._d
 
+        # Coerce all sequences to current dimension _d before tensor creation
+        # (fixes crashes when variable discovery adds new nodes dynamically)
+        coerced_seqs = []
+        for seq in seqs:
+            coerced_seqs.append([self._coerce_row_to_d(row) for row in seq])
+
         # Build tensors: (B, T, d)
-        X_seq = torch.tensor(seqs, dtype=torch.float32, device=self.device)  # (B, T, d)
+        X_seq = torch.tensor(coerced_seqs, dtype=torch.float32, device=self.device)  # (B, T, d)
         # Actions are zero for passive dynamics (no interventions in sequences)
         A_seq = torch.zeros(B, T, d, dtype=torch.float32, device=self.device)
 
