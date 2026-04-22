@@ -857,6 +857,181 @@ class CausalGraph:
             pred = integrate_world_model_step(self._core, state_vec, z)
         return {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
 
+    # ── LeWM: Differentiable propagation + CEM planner ────────────────────────
+
+    def propagate_tensor(
+        self, var: str, value: float, *, base: dict[str, float] | None = None,
+    ) -> torch.Tensor | None:
+        """
+        Torch-версия propagate: возвращает тензор (d,) с градиентным графом.
+
+        Для differentiable planning / CEM:
+          pred = graph.propagate_tensor("lhip", 0.7)
+          loss = -pred[com_z_idx]   # maximize CoM height
+          loss.backward()           # gradient flows into GNN weights
+        """
+        if self._core is None or not self._node_ids:
+            return None
+        src = base or self.nodes
+        x = torch.tensor(
+            [float(src.get(n, 0.0)) for n in self._node_ids],
+            dtype=torch.float32, device=self.device,
+        ).unsqueeze(0)  # (1, d)
+        a = torch.zeros(1, self._d, dtype=torch.float32, device=self.device)
+        if var in self._node_ids:
+            a[0, self._node_ids.index(var)] = float(value)
+        pred = self._core.forward_dynamics(x, a)  # (1, d) — differentiable!
+        return pred.squeeze(0)  # (d,)
+
+    def propagate_batch(
+        self,
+        actions: torch.Tensor,
+        *,
+        base: dict[str, float] | None = None,
+        rollout_steps: int = 0,
+    ) -> torch.Tensor:
+        """
+        Batch forward через world model: N кандидатов за один forward pass.
+
+        Args:
+            actions: (N, d) — каждая строка = action vector (sparse: do(var)=val)
+            base: начальное состояние (если None → self.nodes)
+            rollout_steps: число дополнительных free-rollout шагов после do()
+
+        Returns:
+            (N, d) — предсказанные состояния после действия + rollout.
+        """
+        if self._core is None:
+            return actions  # fallback
+        src = base or self.nodes
+        N = actions.shape[0]
+        x0 = torch.tensor(
+            [float(src.get(n, 0.0)) for n in self._node_ids],
+            dtype=torch.float32, device=self.device,
+        ).unsqueeze(0).expand(N, -1)  # (N, d)
+        with torch.no_grad():
+            pred = self._core.forward_dynamics(x0, actions)  # (N, d)
+            # Multi-step rollout: free dynamics (a=0)
+            for _ in range(rollout_steps):
+                pred = self._core.forward_dynamics(pred, torch.zeros_like(pred))
+        return pred
+
+    def cem_plan(
+        self,
+        objective_idx: int | list[int],
+        *,
+        variable_mask: list[str] | None = None,
+        n_samples: int = 64,
+        n_elite: int = 8,
+        n_iters: int = 5,
+        rollout_steps: int = 2,
+        maximize: bool = True,
+    ) -> dict[str, float] | None:
+        """
+        CEM (Cross-Entropy Method) planner поверх world model.
+
+        Суть (LeWM Appendix B):
+          1. Сэмплировать N кандидатов-действий из N(μ, σ)
+          2. Прогнать каждый через forward_dynamics (параллельно!)
+          3. Оценить objective по целевым узлам
+          4. Выбрать top-K elite → обновить μ, σ
+          5. Повторить → финальный μ = лучшее действие
+
+        Args:
+            objective_idx: индекс(ы) узла для оптимизации (напр. com_z)
+            variable_mask: какие переменные можно менять (None = все)
+            n_samples: число кандидатов на итерацию
+            n_elite: число лучших для обновления распределения
+            n_iters: число итераций CEM
+            rollout_steps: шаги free-rollout после действия
+            maximize: True = max objective, False = min
+
+        Returns:
+            dict {var_name: value} — best action found, or None
+        """
+        if self._core is None or not self._node_ids:
+            return None
+
+        d = self._d
+        device = self.device
+
+        # Which variables can be acted upon
+        if variable_mask is not None:
+            act_indices = [
+                self._node_ids.index(v) for v in variable_mask
+                if v in self._node_ids
+            ]
+        else:
+            act_indices = list(range(d))
+        if not act_indices:
+            return None
+        n_act = len(act_indices)
+
+        # Objective indices
+        if isinstance(objective_idx, int):
+            obj_idx = [objective_idx]
+        else:
+            obj_idx = list(objective_idx)
+
+        # CEM distribution: μ=0.5 (normalized action space), σ=0.2
+        mu = torch.full((n_act,), 0.5, device=device)
+        sigma = torch.full((n_act,), 0.2, device=device)
+
+        best_action = None
+        best_score = float('-inf') if maximize else float('inf')
+
+        for _it in range(n_iters):
+            # Sample (N, n_act) from N(μ, σ), clamp to [0.05, 0.95]
+            noise = torch.randn(n_samples, n_act, device=device)
+            samples = (mu.unsqueeze(0) + sigma.unsqueeze(0) * noise).clamp(0.05, 0.95)
+
+            # Build full action tensor (N, d) — sparse
+            actions = torch.zeros(n_samples, d, device=device)
+            for ki, ai in enumerate(act_indices):
+                actions[:, ai] = samples[:, ki]
+
+            # Parallel forward through world model
+            pred = self.propagate_batch(
+                actions, rollout_steps=rollout_steps
+            )  # (N, d)
+
+            # Evaluate objective
+            obj_vals = pred[:, obj_idx].sum(dim=-1)  # (N,)
+
+            # Select elites
+            if maximize:
+                _, elite_idx = obj_vals.topk(n_elite, largest=True)
+            else:
+                _, elite_idx = obj_vals.topk(n_elite, largest=False)
+
+            elite_samples = samples[elite_idx]  # (K, n_act)
+            elite_score = obj_vals[elite_idx[0]].item()
+
+            # Update best
+            if maximize and elite_score > best_score:
+                best_score = elite_score
+                best_action = actions[elite_idx[0]]
+            elif not maximize and elite_score < best_score:
+                best_score = elite_score
+                best_action = actions[elite_idx[0]]
+
+            # Update distribution
+            mu = elite_samples.mean(dim=0)
+            sigma = elite_samples.std(dim=0).clamp(min=0.02)
+
+        if best_action is None:
+            return None
+
+        # Convert to dict
+        result = {}
+        for ki, ai in enumerate(act_indices):
+            val = float(best_action[ai].item())
+            if abs(val) > 0.01:  # only non-trivial actions
+                result[self._node_ids[ai]] = val
+        result["_cem_score"] = best_score
+
+        return result
+
     def _invalidate_cache(self):
         self._edge_cache = None
         self._mdl_cache  = None

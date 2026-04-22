@@ -83,6 +83,8 @@ _SELF_VAR_SET = frozenset(SELF_VARS)
 _LOCOMOTION_CPG_LEG_EIG_BLOCK = frozenset(
     {"lhip", "lknee", "lankle", "rhip", "rknee", "rankle"}
 )
+# CEM motor vars: intent variables that CEM planner can optimize over.
+_CEM_MOTOR_PREFIXES = ("intent_", "phys_intent_")
 
 
 def _is_motor_intent_var(name: str) -> bool:
@@ -482,6 +484,110 @@ class RKKAgent:
         v = os.environ.get("RKK_LOCOMOTION_CPG", "0").strip().lower()
         return v in ("1", "true", "yes", "on")
 
+    # ── CEM planning: model-based action selection via world model ─────────────
+    def _cem_planning_enabled(self) -> bool:
+        v = os.environ.get("RKK_CEM_PLANNING", "1").strip().lower()
+        return v in ("1", "true", "yes", "on")
+
+    def _maybe_cem_candidate(self, engine_tick: int) -> dict | None:
+        """
+        CEM planner: use world model for model-based action selection.
+
+        Replaces the broken feedback loop:
+          OLD: score_interventions → numpy propagate → scalar actual_ig → System1
+          NEW: CEM samples 64 actions → forward_dynamics batch → pick best com_z
+
+        Only activates for motor intent variables (intent_stride, intent_stop_recover, etc.)
+        and only when the world model has trained enough to be informative.
+        """
+        if not self._cem_planning_enabled():
+            return None
+        if self.graph._core is None:
+            return None
+        # Wait for world model to train a bit before trusting CEM
+        if self._notears_steps < 20:
+            return None
+        # Don't CEM every tick — every 4th tick is enough
+        try:
+            cem_every = int(os.environ.get("RKK_CEM_EVERY", "4"))
+        except ValueError:
+            cem_every = 4
+        if engine_tick % max(1, cem_every) != 0:
+            return None
+
+        # Find objective indices: com_z and posture_stability
+        nids = self.graph._node_ids
+        obj_indices = []
+        for target in ("com_z", "phys_com_z", "posture_stability", "phys_posture_stability"):
+            if target in nids:
+                obj_indices.append(nids.index(target))
+        if not obj_indices:
+            return None
+
+        # Motor intent variables that CEM can optimize
+        motor_vars = [
+            v for v in nids
+            if any(v.startswith(p) for p in _CEM_MOTOR_PREFIXES)
+        ]
+        if not motor_vars:
+            return None
+
+        # Read CEM hyperparams from env
+        try:
+            n_samples = int(os.environ.get("RKK_CEM_SAMPLES", "64"))
+        except ValueError:
+            n_samples = 64
+        try:
+            n_iters = int(os.environ.get("RKK_CEM_ITERS", "5"))
+        except ValueError:
+            n_iters = 5
+        try:
+            rollout = int(os.environ.get("RKK_CEM_ROLLOUT", "2"))
+        except ValueError:
+            rollout = 2
+
+        try:
+            result = self.graph.cem_plan(
+                objective_idx=obj_indices,
+                variable_mask=motor_vars,
+                n_samples=min(128, max(16, n_samples)),
+                n_elite=max(4, n_samples // 8),
+                n_iters=min(10, max(2, n_iters)),
+                rollout_steps=min(4, max(0, rollout)),
+                maximize=True,
+            )
+        except Exception:
+            return None
+
+        if result is None:
+            return result
+        cem_score = result.pop("_cem_score", 0.0)
+
+        # Pick the variable with highest action magnitude as the "chosen" do()
+        best_var = None
+        best_val = 0.0
+        for var, val in result.items():
+            if abs(val) > abs(best_val):
+                best_var = var
+                best_val = val
+        if best_var is None:
+            return None
+
+        # Build candidate in the same format as score_interventions
+        target_name = nids[obj_indices[0]] if obj_indices else best_var
+        feat = self._features_for_intervention_pair(best_var, target_name)
+
+        return {
+            "variable":     best_var,
+            "target":       target_name,
+            "value":        float(np.clip(best_val, 0.05, 0.95)),
+            "uncertainty":  0.5,
+            "features":     feat,
+            "expected_ig":  float(np.clip(cem_score, 0.0, 1.0)),
+            "from_cem":     True,
+            "cem_score":    cem_score,
+        }
+
     # ── Epistemic scoring ─────────────────────────────────────────────────────
     def score_interventions(self) -> list[dict]:
         var_ids   = self.env.variable_ids
@@ -766,6 +872,12 @@ class RKKAgent:
             symbolic_verifier_enabled() and self._symbolic_prediction_bad
         ):
             scores.insert(0, gp)
+
+        # ── CEM planning: use world model for model-based action selection ────
+        cem_cand = self._maybe_cem_candidate(engine_tick) if enable_l3 else None
+        if cem_cand is not None:
+            scores.insert(0, cem_cand)
+
         if not scores:
             return {
                 "blocked": False, "skipped": True, "prediction_error": 0.0,
@@ -969,6 +1081,7 @@ class RKKAgent:
             "cf_predicted": {k: float(round(float(predicted.get(k, 0.0)), 4)) for k in _cf_keys},
             "cf_observed":  {k: float(round(float(observed_full.get(k, 0.0)), 4)) for k in _cf_keys},
             "goal_planned":  bool(chosen.get("from_goal_plan")),
+            "from_cem":      bool(chosen.get("from_cem")),
             "symbolic_ok": sym_ok,
             "symbolic_violations": sym_fail,
             "rsi_lite": rsi_event,
