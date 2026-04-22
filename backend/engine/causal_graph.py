@@ -17,7 +17,15 @@ causal_graph.py — NOTEARS / GNN как nn.Module.
   USE_GNN = True   → CausalGNNCore  (message passing + action_enc)
   USE_GNN = False  → NOTEARSCore    (forward_dynamics ≈ forward(X+a))
 
-  L_total = L_rec + λ_dag*h(W_free) + λ_l1*|W|₁ (на frozen позициях L1 и DAG не давят; см. dag_constraint_masked)
+Фаза N (LeWM integration):
+  Parallel sequence training (teacher forcing по всей траектории):
+    - _seq_buffer хранит последовательности длиной T (RKK_WM_SEQ_LEN, default 16)
+    - forward_dynamics_seq: один forward pass для B×T тиков вместо цикла
+    - SIGReg anti-collapse: isotropic Gaussian regularizer на латентных embeddings
+    - Автоматический fallback к legacy single-transition training пока нет sequences
+  Config: RKK_WM_SEQ_LEN, RKK_WM_SIGREG_LAMBDA, RKK_WM_SIGREG_PROJ
+
+  L_total = L_rec + λ_sig*SIGReg(Z) + λ_dag*h(W_free) + λ_l1*|W|₁
 h(W)    = tr(exp(W∘W)) - d
 """
 from __future__ import annotations
@@ -155,6 +163,16 @@ class CausalGraph:
         self._frozen_edge_set: set[tuple[str, str]] = set()
         # Макро-узлы concept_N: агрегат по members, метаданные детектора.
         self._concept_meta: dict[str, dict] = {}
+        # LeWM: SIGReg anti-collapse regularizer (lazy init after core is built)
+        self._sigreg = None
+        # LeWM: sequence buffer — consecutive observation runs for parallel training
+        self._seq_obs_run: list[list[float]] = []  # current contiguous run
+        self._seq_buffer: list[list[list[float]]] = []  # completed sequences
+        try:
+            self._seq_len = int(os.environ.get("RKK_WM_SEQ_LEN", "16"))
+        except ValueError:
+            self._seq_len = 16
+        self._seq_len = max(4, min(64, self._seq_len))
 
     def set_node(self, id_: str, value: float = 0.0) -> None:
         self._invalidate_cache()
@@ -442,6 +460,21 @@ class CausalGraph:
         if len(self._obs_buffer) > self.BUFFER_SIZE * 4:
             self._obs_buffer = self._obs_buffer[-self.BUFFER_SIZE * 2:]
 
+        # LeWM: accumulate contiguous sequences for parallel training
+        coerced = self._coerce_row_to_d(vec)
+        self._seq_obs_run.append(coerced)
+        T = self._seq_len
+        if len(self._seq_obs_run) >= T:
+            # slice last T observations as one complete sequence
+            seq = self._seq_obs_run[-T:]
+            self._seq_buffer.append(seq)
+            # keep overlap of T//2 for next sequence
+            self._seq_obs_run = self._seq_obs_run[-(T // 2):]
+            # cap buffer
+            max_seqs = max(8, self.BUFFER_SIZE // T)
+            if len(self._seq_buffer) > max_seqs * 2:
+                self._seq_buffer = self._seq_buffer[-max_seqs:]
+
     def record_intervention(self, var_name: str, val: float,
                             obs_before: dict, obs_after: dict) -> None:
         if is_read_only_macro_var(var_name):
@@ -459,12 +492,157 @@ class CausalGraph:
 
     def train_step(self) -> dict[str, float] | None:
         """
-        World model: батч = интервенции + пассивные переходы из подряд идущих наблюдений.
-        Пассив: a=0, L_rec штрафует f(X_t,0) vs X_{t+1} (кубы/физика между тиками).
+        World model training step.
+
+        LeWM mode (when sequences available):
+          - Sample B sequences of length T from _seq_buffer
+          - Parallel forward: forward_dynamics_seq(X_seq, A_seq) → all timesteps at once
+          - Teacher forcing: X_pred[t] → X_target[t+1], for all t in parallel
+          - SIGReg: anti-collapse on flattened latent embeddings (B*T, D)
+          - Loss = L_rec + λ_dag * h(W) + λ_l1 * |W|₁ + λ_sig * SIGReg(Z)
+
+        Legacy mode (fallback when no sequences yet):
+          - Batch = interventions + passive single-transitions (original behavior)
         """
         if self._core is None:
             return None
 
+        # ── Try LeWM parallel sequence training first ─────────────────────────
+        has_seq = (
+            USE_GNN
+            and len(self._seq_buffer) >= 2
+            and hasattr(self._core, "forward_dynamics_seq")
+        )
+        if has_seq:
+            return self._train_step_seq()
+
+        # ── Legacy single-transition training (fallback) ──────────────────────
+        return self._train_step_legacy()
+
+    def _ensure_sigreg(self) -> None:
+        """Lazy-init SIGReg on first use (needs device from core)."""
+        if self._sigreg is not None:
+            return
+        from engine.causal_gnn import SIGReg
+        try:
+            n_proj = int(os.environ.get("RKK_WM_SIGREG_PROJ", "256"))
+        except ValueError:
+            n_proj = 256
+        n_proj = max(32, min(2048, n_proj))
+        self._sigreg = SIGReg(knots=17, num_proj=n_proj).to(self.device)
+
+    def _compute_dag_and_l1(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shared DAG constraint + L1 computation for both training modes."""
+        dag_mask_frozen = os.environ.get("RKK_DAG_MASK_FROZEN", "1").strip().lower() not in (
+            "0", "false", "no", "off",
+        )
+        dag_free = torch.ones(self._d, self._d, device=self.device, dtype=torch.float32)
+        for f, t in self._frozen_edge_set:
+            if f in self._node_ids and t in self._node_ids:
+                i, j = self._node_ids.index(f), self._node_ids.index(t)
+                dag_free[i, j] = 0.0
+        if (
+            dag_mask_frozen
+            and self._frozen_edge_set
+            and hasattr(self._core, "dag_constraint_masked")
+        ):
+            h_W = self._core.dag_constraint_masked(dag_free)
+        else:
+            h_W = self._core.dag_constraint()
+        l_dag = self.LAMBDA_DAG * h_W.abs()
+
+        wm = self._core.W_masked()
+        l1_mask = torch.ones_like(wm)
+        for f, t in self._frozen_edge_set:
+            if f in self._node_ids and t in self._node_ids:
+                i, j = self._node_ids.index(f), self._node_ids.index(t)
+                l1_mask[i, j] = 0.0
+        l_l1 = self.LAMBDA_L1 * (wm.abs() * l1_mask).sum()
+
+        return h_W, l_dag, l_l1
+
+    def _finish_train_step(self, loss: torch.Tensor) -> None:
+        """Shared backward + optimizer step for both training modes."""
+        loss.backward()
+        self._zero_grad_frozen_W()
+        torch.nn.utils.clip_grad_norm_(self._core.parameters(), max_norm=1.0)
+        self._optim.step()
+        self._clamp_frozen_W_after_step()
+        self._invalidate_cache()
+        self.train_losses.append(loss.item())
+        if len(self.train_losses) > 100:
+            self.train_losses.pop(0)
+
+    def _train_step_seq(self) -> dict[str, float] | None:
+        """
+        LeWM-style parallel sequence training.
+        Teacher forcing по всей траектории → все шаги независимы → один forward.
+        """
+        import random
+
+        self._ensure_sigreg()
+
+        # Read SIGReg weight from env
+        try:
+            lambda_sig = float(os.environ.get("RKK_WM_SIGREG_LAMBDA", "0.1"))
+        except ValueError:
+            lambda_sig = 0.1
+
+        # Sample batch of sequences
+        buf = self._seq_buffer
+        batch_size = min(4, len(buf))
+        indices = random.sample(range(len(buf)), batch_size)
+        seqs = [buf[i] for i in indices]
+
+        T = len(seqs[0])
+        B = batch_size
+        d = self._d
+
+        # Build tensors: (B, T, d)
+        X_seq = torch.tensor(seqs, dtype=torch.float32, device=self.device)  # (B, T, d)
+        # Actions are zero for passive dynamics (no interventions in sequences)
+        A_seq = torch.zeros(B, T, d, dtype=torch.float32, device=self.device)
+
+        self._optim.zero_grad()
+
+        # ── Parallel forward (LeWM core) ──────────────────────────────────────
+        X_pred, Z_flat = self._core.forward_dynamics_seq(X_seq, A_seq)
+        # X_pred: (B, T-1, d) — predicted next states
+        # Z_flat: (B*T, d*hidden) — latent embeddings for SIGReg
+
+        # Teacher forcing target: actual observations at t+1
+        X_target = X_seq[:, 1:]  # (B, T-1, d)
+
+        # ── Losses ────────────────────────────────────────────────────────────
+        l_rec = F.mse_loss(X_pred, X_target)
+
+        # SIGReg anti-collapse
+        l_sig = lambda_sig * self._sigreg(Z_flat)
+
+        # DAG + L1 (shared)
+        h_W, l_dag, l_l1 = self._compute_dag_and_l1()
+
+        loss = l_rec + l_sig + l_dag + l_l1
+
+        self._finish_train_step(loss)
+
+        return {
+            "loss":    round(loss.item(), 5),
+            "l_rec":   round(l_rec.item(), 5),
+            "l_sig":   round(l_sig.item(), 5),
+            "l_dag":   round(l_dag.item(), 5),
+            "l_l1":    round(l_l1.item(), 5),
+            "h_W":     round(h_W.item(), 5),
+            "mode":    "seq",
+            "batch_B": B,
+            "seq_T":   T,
+        }
+
+    def _train_step_legacy(self) -> dict[str, float] | None:
+        """
+        Legacy single-transition training (original behavior).
+        Used as fallback when sequences haven't accumulated yet.
+        """
         int_b = self._int_buffer
         obs_b = self._obs_buffer
         batch_cap = 32
@@ -514,30 +692,7 @@ class CausalGraph:
         X_pred = integrate_world_model_step(self._core, X_t, a_t)
         l_rec = F.mse_loss(X_pred, X_tp1)
 
-        dag_mask_frozen = os.environ.get("RKK_DAG_MASK_FROZEN", "1").strip().lower() not in (
-            "0", "false", "no", "off",
-        )
-        dag_free = torch.ones(self._d, self._d, device=self.device, dtype=torch.float32)
-        for f, t in self._frozen_edge_set:
-            if f in self._node_ids and t in self._node_ids:
-                i, j = self._node_ids.index(f), self._node_ids.index(t)
-                dag_free[i, j] = 0.0
-        if (
-            dag_mask_frozen
-            and self._frozen_edge_set
-            and hasattr(self._core, "dag_constraint_masked")
-        ):
-            h_W = self._core.dag_constraint_masked(dag_free)
-        else:
-            h_W = self._core.dag_constraint()
-        l_dag = self.LAMBDA_DAG * h_W.abs()
-        wm = self._core.W_masked()
-        l1_mask = torch.ones_like(wm)
-        for f, t in self._frozen_edge_set:
-            if f in self._node_ids and t in self._node_ids:
-                i, j = self._node_ids.index(f), self._node_ids.index(t)
-                l1_mask[i, j] = 0.0
-        l_l1 = self.LAMBDA_L1 * (wm.abs() * l1_mask).sum()
+        h_W, l_dag, l_l1 = self._compute_dag_and_l1()
 
         if n_i > 0:
             int_pred = X_pred[:n_i]
@@ -547,16 +702,8 @@ class CausalGraph:
             l_int = torch.tensor(0.0, device=self.device)
 
         loss = l_rec + l_dag + l_l1 + l_int
-        loss.backward()
-        self._zero_grad_frozen_W()
-        torch.nn.utils.clip_grad_norm_(self._core.parameters(), max_norm=1.0)
-        self._optim.step()
-        self._clamp_frozen_W_after_step()
 
-        self._invalidate_cache()
-        self.train_losses.append(loss.item())
-        if len(self.train_losses) > 100:
-            self.train_losses.pop(0)
+        self._finish_train_step(loss)
 
         return {
             "loss":  round(loss.item(), 5),
@@ -565,6 +712,7 @@ class CausalGraph:
             "l_int": round(l_int.item(), 5),
             "l_l1":  round(l_l1.item(), 5),
             "h_W":   round(h_W.item(), 5),
+            "mode":  "legacy",
             "batch_int": n_i,
             "batch_passive": n_p,
         }

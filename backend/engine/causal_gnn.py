@@ -23,6 +23,11 @@ Drop-in замена NOTEARSCore в causal_graph.py.
   .forward_dynamics(X, a) → X_{t+1} pred (world model)
   .forward(X)          → forward_dynamics(X, 0) — пассивный шаг
 
+LeWM integration (Фаза N):
+  .encode_latent(X, a)        → (B, d, hidden) latent node embeddings
+  .forward_dynamics_seq(X, A) → parallel (B, T, d) teacher-forcing prediction
+  SIGReg                      → anti-collapse regularizer from LeWorldModel
+
 Масштабируемость:
   d=6   (physics/chemistry/logic): быстрее чем NOTEARS за счёт меньшего hidden
   d=18  (PyBullet 3 объекта):      GNN выигрывает при нелинейных взаимодействиях
@@ -36,6 +41,7 @@ Drop-in замена NOTEARSCore в causal_graph.py.
 """
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,6 +54,87 @@ try:
     _TG_AVAILABLE = True
 except ImportError:
     _TG_AVAILABLE = False
+
+
+# ─── SIGReg: Sketched-Isotropic-Gaussian Regularizer (from LeWorldModel) ──────
+class SIGReg(nn.Module):
+    """
+    Anti-collapse regularizer from LeWorldModel paper (Maes et al., 2026).
+
+    Enforces isotropic Gaussian distribution on latent embeddings via:
+    1. Project embeddings onto M random unit-norm directions (Cramér-Wold theorem)
+    2. Compute univariate Epps-Pulley test statistic for Gaussianity
+    3. Minimize divergence from N(0,1) along each projection
+
+    By the Cramér-Wold theorem, matching all 1D marginals ≡ matching the full
+    joint distribution. This makes the regularizer scale gracefully with
+    embedding dimension.
+
+    Usage:
+        sigreg = SIGReg(knots=17, num_proj=1024)
+        loss = sigreg(embeddings)  # embeddings: (B, D) or (T, B, D)
+
+    Args:
+        knots: number of quadrature nodes for Epps-Pulley integral (default 17)
+        num_proj: number of random projection directions M (default 1024)
+    """
+
+    def __init__(self, knots: int = 17, num_proj: int = 1024):
+        super().__init__()
+        self.num_proj = num_proj
+        # Quadrature grid for Epps-Pulley test statistic
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3.0 / (knots - 1)
+        # Trapezoidal weights
+        weights = torch.full((knots,), 2.0 * dt, dtype=torch.float32)
+        weights[0] = dt
+        weights[-1] = dt
+        # Gaussian window (target characteristic function of N(0,1))
+        window = torch.exp(-t.square() / 2.0)
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Compute SIGReg loss.
+
+        Args:
+            z: latent embeddings, shape (B, D) or (T, B, D).
+               For 2D input, we treat it as a single batch of B samples.
+               For 3D input, T steps are computed independently and averaged.
+
+        Returns:
+            Scalar loss (lower = closer to isotropic Gaussian).
+        """
+        if z.dim() == 2:
+            z = z.unsqueeze(0)  # (1, B, D) — single "timestep"
+
+        # z: (T, B, D) — T timesteps, B batch samples, D embedding dim
+        D = z.size(-1)
+        # Random projections: unit-norm directions on S^{D-1}
+        A = torch.randn(D, self.num_proj, device=z.device, dtype=z.dtype)
+        A = A / A.norm(p=2, dim=0, keepdim=True)
+
+        # Project: (T, B, D) @ (D, M) → (T, B, M)
+        proj = z @ A
+
+        # Epps-Pulley: compare empirical char func vs Gaussian char func
+        # x_t: (T, B, M, knots)
+        x_t = proj.unsqueeze(-1) * self.t
+
+        # Empirical char func: E[cos(t·h)], E[sin(t·h)] over batch dim (dim=-3 = B)
+        cos_mean = x_t.cos().mean(dim=-3)   # (T, M, knots)
+        sin_mean = x_t.sin().mean(dim=-3)   # (T, M, knots)
+
+        # |ϕ_N(t) - ϕ_0(t)|² where ϕ_0(t) = exp(-t²/2) for N(0,1)
+        err = (cos_mean - self.phi).square() + sin_mean.square()
+
+        # Integrate with trapezoidal weights, scale by batch size
+        B = z.size(-2)
+        statistic = (err @ self.weights) * B  # (T, M)
+
+        return statistic.mean()  # average over projections and timesteps
 
 
 # ─── Вспомогательные блоки ───────────────────────────────────────────────────
@@ -181,6 +268,61 @@ class CausalGNNCore(nn.Module):
         (например подача предсказания в visual cortex).
         """
         return self.forward_dynamics(X, torch.zeros_like(X))
+
+    # ── LeWM: Latent encoding + parallel sequence forward ─────────────────────
+    def encode_latent(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        """
+        Encode state + action into latent node embeddings (before message passing).
+
+        X, a: (B, d) or (B*T, d)
+        Returns: (B, d, hidden) — latent embedding per node.
+        """
+        am = (torch.abs(a).unsqueeze(-1) > 1e-8).float()
+        h_a = self.action_enc(a.unsqueeze(-1))
+        h = self.node_enc(X.unsqueeze(-1)) + am * h_a
+        return h
+
+    def forward_dynamics_seq(
+        self, X_seq: torch.Tensor, A_seq: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parallel teacher-forcing prediction over sequences (LeWM-style).
+
+        Instead of processing transitions one-by-one:
+            for t in range(T): predict(X_t, a_t)
+        We reshape → one forward pass → reshape back.
+
+        Args:
+            X_seq: (B, T, d) — sequence of observations
+            A_seq: (B, T, d) — sequence of actions (sparse, mostly zeros)
+
+        Returns:
+            X_pred: (B, T-1, d)  — predicted next states (teacher forcing)
+            Z_flat: (B*T, d*hidden) — flattened latent embeddings for SIGReg
+        """
+        B, T, d = X_seq.shape
+
+        # 1. Flatten B and T → one big batch for parallel encoding
+        X_flat = X_seq.reshape(B * T, d)        # (B*T, d)
+        A_flat = A_seq.reshape(B * T, d)        # (B*T, d)
+
+        # 2. Encode all timesteps in one pass → latent node embeddings
+        H_flat = self.encode_latent(X_flat, A_flat)  # (B*T, d, hidden)
+
+        # 3. Message pass → predicted next-state scalars for all timesteps
+        X_pred_flat = self._message_pass(H_flat)     # (B*T, d)
+
+        # 4. Reshape back
+        X_pred_all = X_pred_flat.reshape(B, T, d)    # (B, T, d)
+
+        # 5. Teacher forcing: X_pred[t] predicts X[t+1]
+        #    Use predictions from t=0..T-2 to predict targets t=1..T-1
+        X_pred = X_pred_all[:, :-1]                  # (B, T-1, d)
+
+        # 6. Flatten latents for SIGReg (anti-collapse on full batch)
+        Z_flat = H_flat.reshape(B * T, d * self.hidden)  # (B*T, d*hidden)
+
+        return X_pred, Z_flat
 
     def dag_constraint(self) -> torch.Tensor:
         """
