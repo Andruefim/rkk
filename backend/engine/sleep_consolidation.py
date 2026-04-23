@@ -313,6 +313,77 @@ class REMReplay:
 
         return n_replayed, l_before, l_after
 
+    def inject_mocap_dreams(self, graph, n_steps: int = 150, sim: Any | None = None) -> int:
+        """
+        Генерирует "идеальные" траектории (Motion Capture priors) через физику PyBullet!
+        Агент будет "лунатить" (sleepwalk) под управлением CPG:
+        1. Сбрасываем стойку (встает).
+        2. CPG ведет его идеальной походкой.
+        3. Наблюдения (настоящая физика!) записываются в буфер графа.
+        4. GNN учится этому manifold'у.
+        """
+        if sim is None or not hasattr(sim, "agent"):
+            return 0
+            
+        env = sim.agent.env
+        node_ids = list(graph._node_ids)
+        if not node_ids:
+            return 0
+
+        # Временное повышение LR для быстрого усвоения "снов"
+        optim = getattr(graph, "_optim", None)
+        original_lrs = []
+        if optim is not None:
+            for pg in optim.param_groups:
+                original_lrs.append(pg["lr"])
+                pg["lr"] = pg["lr"] * 3.0
+
+        print(f"[Sleep] 🧠 Dreaming of perfect walking (Physical Sleepwalking for {n_steps} ticks)...")
+
+        # Импортируем CPG для генерации идеальной походки
+        try:
+            from engine.cpg_locomotion import LocomotionController
+            cpg = LocomotionController(graph.device)
+            # Убедимся что CPG настроен на ходьбу (intent_stride > 0.5)
+            agent_nodes = {k: 0.5 for k in node_ids}
+            agent_nodes["intent_stride"] = 0.65
+            
+            # Поднимаем агента
+            env.reset_stance()
+            
+            # Разгоняем CPG и записываем настоящую физику
+            for t in range(n_steps):
+                # 1. Получаем идеальные углы от CPG
+                targets = cpg.get_joint_targets(agent_nodes)
+                
+                # 2. Применяем их в PyBullet
+                env.apply_cpg_leg_targets(targets, cpg.upper_body_cpg_sync())
+                
+                # 3. Читаем настоящую физику (com_z, posture_stability и тд)
+                obs_raw = env.observe()
+                obs = dict(obs_raw)
+                # Добавляем intent, чтобы модель знала ПРИЧИНУ ходьбы
+                obs["intent_stride"] = 0.65
+                obs["intent_stop_recover"] = 0.3
+                
+                # Записываем в буфер снов
+                graph.record_observation(obs)
+                
+        except Exception as e:
+            print(f"[Sleep] Physical dreaming failed: {e}")
+
+        # 2. Обучаем мировую модель на этих физических снах
+        for _ in range(15):
+            graph.train_step()
+
+        # Восстанавливаем LR
+        if optim is not None:
+            for i, pg in enumerate(optim.param_groups):
+                if i < len(original_lrs):
+                    pg["lr"] = original_lrs[i]
+
+        return n_steps
+
 
 # ── Sleep Controller ───────────────────────────────────────────────────────────
 class SleepController:
@@ -461,6 +532,10 @@ class SleepController:
                 session.rem_loss_before = l_before
                 session.rem_loss_after = l_after
                 print(f"[Sleep] REM: replayed {n} episodes, loss {l_before:.4f}→{l_after:.4f}")
+                
+                # ИНЪЕКЦИЯ СНОВ О ХОДЬБЕ (Physical Priors)
+                n_mocap = self._rem_replayer.inject_mocap_dreams(sim.agent.graph, n_steps=150)
+                print(f"[Sleep] REM: injected {n_mocap} steps of MoCap dreams (Walking manifold learned)")
                 _memory_diag_log(sim, "sleep_after_REM_replay")
 
                 try:

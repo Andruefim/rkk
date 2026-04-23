@@ -192,9 +192,6 @@ class SimulationTickMixin:
             )
 
             if _sleep_reason and not self._sleep_ctrl.is_sleeping:
-                self._sleep_prev_fixed_root = self._fixed_root_active
-                if not self._fixed_root_active:
-                    self.enable_fixed_root()
                 self._sleep_ctrl.begin_sleep(self.tick, _sleep_reason, sim=self)
                 self._add_event(
                     f"😴 Sleep: {_sleep_reason} (falls={self._sleep_ctrl._falls_since_sleep})",
@@ -205,11 +202,6 @@ class SimulationTickMixin:
             if self._sleep_ctrl.is_sleeping:
                 self._sleep_ctrl.tick(self.tick, self)
                 if not self._sleep_ctrl.is_sleeping:
-                    if (
-                        not self._sleep_prev_fixed_root
-                        and self._fixed_root_active
-                    ):
-                        self.disable_fixed_root()
                     self._add_event(
                         f"🌅 Woke up (sleep #{self._sleep_ctrl.sleep_count})",
                         "#ffff88",
