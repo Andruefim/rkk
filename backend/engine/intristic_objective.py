@@ -566,6 +566,26 @@ class IntrinsicObjective:
         if cf_pred and cf_obs:
             self.variable_discovery.update_node_errors(cf_pred, cf_obs)
 
+        # --- УРОВЕНЬ 2: AMP Reward (Adversarial Motion Prior) ---
+        amp_reward = 0.0
+        try:
+            if getattr(agent, "_motion_discriminator", None) is None:
+                from engine.mocap_loader import MotionDiscriminator
+                agent._motion_discriminator = MotionDiscriminator(state_dim=8).to(self.device)
+            
+            # Собираем вектор состояния для AMP: 8 ключевых переменных походки
+            obs = dict(agent.env.observe())
+            keys = ["lhip", "rhip", "lknee", "rknee", "lankle", "rankle", "com_z", "posture_stability"]
+            state_vec = []
+            for k in keys:
+                val = obs.get(k, obs.get(f"phys_{k}", 0.5))
+                state_vec.append(float(val))
+            
+            state_t = torch.tensor(state_vec, dtype=torch.float32, device=self.device)
+            amp_reward = agent._motion_discriminator.compute_amp_reward(state_t)
+        except Exception as e:
+            pass
+
         # --- Вычисляем интринсивную награду ---
         r = self.causal_surprise.compute(
             compression_delta=compression_delta,
@@ -574,6 +594,19 @@ class IntrinsicObjective:
             graph_mdl_after=mdl_after,
             n_interventions=int(agent._total_interventions),
         )
+
+        # Интегрируем AMP бонус (Уровень 2)
+        try:
+            lambda_amp = float(os.environ.get("RKK_INTRINSIC_AMP_LAMBDA", "0.3"))
+        except:
+            lambda_amp = 0.3
+        
+        # Если это самое начало, полагаемся в основном на AMP, иначе миксуем
+        if agent._total_interventions < 2000:
+            # Behavioral cloning bias early on
+            r = r * 0.5 + amp_reward * 1.5
+        else:
+            r = r + lambda_amp * amp_reward
 
         # --- Обновляем активную цель ---
         active_goal = self.goal_imagination.tick_goal(compression_delta)

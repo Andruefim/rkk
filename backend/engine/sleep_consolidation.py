@@ -316,10 +316,10 @@ class REMReplay:
     def inject_mocap_dreams(self, graph, n_steps: int = 150, sim: Any | None = None) -> int:
         """
         Генерирует "идеальные" траектории (Motion Capture priors) через физику PyBullet!
-        Агент будет "лунатить" (sleepwalk) под управлением CPG:
+        Агент "лунатит" (sleepwalk), воспроизводя реальные MoCap клипы (CMU/MediaPipe).
         1. Сбрасываем стойку (встает).
-        2. CPG ведет его идеальной походкой.
-        3. Наблюдения (настоящая физика!) записываются в буфер графа.
+        2. Проигрываем кусок реального человеческого движения через PyBullet (apply_cpg_leg_targets).
+        3. Настоящая физика (с учетом ZMP и гравитации) записывается в буфер графа.
         4. GNN учится этому manifold'у.
         """
         if sim is None or not hasattr(sim, "agent"):
@@ -338,30 +338,38 @@ class REMReplay:
                 original_lrs.append(pg["lr"])
                 pg["lr"] = pg["lr"] * 3.0
 
-        print(f"[Sleep] 🧠 Dreaming of perfect walking (Physical Sleepwalking for {n_steps} ticks)...")
+        print(f"[Sleep] 🧠 Dreaming of perfect walking (MoCap replay for {n_steps} ticks)...")
 
-        # Импортируем CPG для генерации идеальной походки
         try:
-            from engine.cpg_locomotion import LocomotionController
-            cpg = LocomotionController(graph.device)
-            # Убедимся что CPG настроен на ходьбу (intent_stride > 0.5)
-            agent_nodes = {k: 0.5 for k in node_ids}
-            agent_nodes["intent_stride"] = 0.65
-            
+            from engine.mocap_loader import MoCapDataLoader
+            loader = MoCapDataLoader()
+            clip = loader.sample_clip(n_steps)
+            actual_steps = len(clip)
+
             # Поднимаем агента
             env.reset_stance()
             
-            # Разгоняем CPG и записываем настоящую физику
-            for t in range(n_steps):
-                # 1. Получаем идеальные углы от CPG
-                targets = cpg.get_joint_targets(agent_nodes)
+            # Проигрываем MoCap клип через физику
+            for t in range(actual_steps):
+                # Извлекаем суставные углы из клипа: 
+                # 0:lhip, 1:rhip, 2:lknee, 3:rknee, 4:lankle, 5:rankle
+                frame = clip[t]
+                targets = {
+                    "lhip": frame[0],
+                    "rhip": frame[1],
+                    "lknee": frame[2],
+                    "rknee": frame[3],
+                    "lankle": frame[4],
+                    "rankle": frame[5],
+                }
                 
-                # 2. Применяем их в PyBullet
-                env.apply_cpg_leg_targets(targets, cpg.upper_body_cpg_sync())
+                # Применяем их в PyBullet (как force-цели, чтобы симулятор обсчитал физику)
+                env.apply_cpg_leg_targets(targets)
                 
-                # 3. Читаем настоящую физику (com_z, posture_stability и тд)
+                # Читаем настоящую физику (com_z, posture_stability и тд)
                 obs_raw = env.observe()
                 obs = dict(obs_raw)
+                
                 # Добавляем intent, чтобы модель знала ПРИЧИНУ ходьбы
                 obs["intent_stride"] = 0.65
                 obs["intent_stop_recover"] = 0.3
@@ -370,7 +378,7 @@ class REMReplay:
                 graph.record_observation(obs)
                 
         except Exception as e:
-            print(f"[Sleep] Physical dreaming failed: {e}")
+            print(f"[Sleep] MoCap dreaming failed: {e}")
 
         # 2. Обучаем мировую модель на этих физических снах
         for _ in range(15):
