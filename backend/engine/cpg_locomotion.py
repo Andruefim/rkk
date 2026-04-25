@@ -225,11 +225,12 @@ class LocomotionController:
             "phi_r": phi_r,
         }
 
+        knee_base = 0.45
         targets: dict[str, float] = {
             "lhip":   float(np.clip(0.50 + 0.17 * (float(cpg_out[0].item())*2 - 1), 0.05, 0.95)),
             "rhip":   float(np.clip(0.50 + 0.17 * (float(cpg_out[1].item())*2 - 1), 0.05, 0.95)),
-            "lknee":  float(np.clip(0.50 + 0.14 * (float(cpg_out[2].item())*2 - 1), 0.05, 0.95)),
-            "rknee":  float(np.clip(0.50 + 0.14 * (float(cpg_out[3].item())*2 - 1), 0.05, 0.95)),
+            "lknee":  float(np.clip(knee_base + 0.14 * (float(cpg_out[2].item())*2 - 1), 0.05, 0.95)),
+            "rknee":  float(np.clip(knee_base + 0.14 * (float(cpg_out[3].item())*2 - 1), 0.05, 0.95)),
             "lankle": float(np.clip(0.50 + 0.09 * (float(cpg_out[4].item())*2 - 1), 0.05, 0.95)),
             "rankle": float(np.clip(0.50 + 0.09 * (float(cpg_out[5].item())*2 - 1), 0.05, 0.95)),
         }

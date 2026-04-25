@@ -117,7 +117,7 @@ for v in VESTIBULAR_VARS:
     _RANGES[v] = (-1.0, 1.0)
 for v in LEG_VARS:
     if "knee" in v:
-        _RANGES[v] = (-3.14, 0.1)
+        _RANGES[v] = (-1.5, 1.5)
     else:
         _RANGES[v] = (-1.5, 1.5)
 for v in ARM_VARS:

@@ -191,7 +191,7 @@ class EnvironmentHumanoid:
         "spine_pitch": 0.50, "spine_yaw": 0.50,
         "neck_pitch": 0.50, "neck_yaw": 0.50,
         "lhip": 0.50, "rhip": 0.50,
-        "lknee": 0.50, "rknee": 0.50,
+        "lknee": 0.45, "rknee": 0.45,
         "lankle": 0.50, "rankle": 0.50,
     }
     _JOINT_COMFORT_RANGE: dict[str, float] = {

@@ -692,7 +692,6 @@ class IntrinsicObjective:
                 train_fn()
 
         if motor_cortex is not None:
-            # Все программы получают один и тот же интринсивный сигнал
             obs = {}
             try:
                 obs = dict(agent.env.observe())
@@ -701,9 +700,12 @@ class IntrinsicObjective:
             posture = float(obs.get("posture_stability", obs.get("phys_posture_stability", 0.5)))
             foot_l = float(obs.get("foot_contact_l", obs.get("phys_foot_contact_l", 0.5)))
             foot_r = float(obs.get("foot_contact_r", obs.get("phys_foot_contact_r", 0.5)))
+            cpg_tgt = {}
+            if locomotion_ctrl is not None:
+                cpg_tgt = dict(getattr(locomotion_ctrl, "_last_command", {}))
             motor_cortex.push_and_train(
                 nodes=dict(agent.graph.nodes),
-                cpg_targets={},
+                cpg_targets=cpg_tgt,
                 reward=r,
                 posture=posture,
                 foot_l=foot_l,
