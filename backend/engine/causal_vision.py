@@ -392,7 +392,8 @@ class CausalVisualCortex(nn.Module):
         values_after = self.projector(slots_after).squeeze(0)  # (K,)
 
         # L_pred: predictive coding loss (original)
-        l_pred = F.mse_loss(values_after, gnn_predicted.detach().to(self.device))
+        # BUGFIX: Убрано .detach(), теперь градиент течет обратно в World Model
+        l_pred = F.mse_loss(values_after, gnn_predicted.to(self.device))
 
         # L_ent: entropy regularization
         l_ent = -(

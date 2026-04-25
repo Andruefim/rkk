@@ -405,6 +405,11 @@ class EnvironmentVisual:
                     self._last_frame,
                     self._gnn_predicted[:self.n_slots],
                 )
+                if getattr(self, "_gnn_optim", None) is not None:
+                    # Clip gradients to avoid exploding gradients from vision loss
+                    torch.nn.utils.clip_grad_norm_(self._gnn_optim.param_groups[0]['params'], max_norm=1.0)
+                    self._gnn_optim.step()
+                    self._gnn_optim.zero_grad()
             except Exception:
                 pass
 
@@ -444,9 +449,11 @@ class EnvironmentVisual:
         return []
 
     # ── Visual cortex helpers ─────────────────────────────────────────────────
-    def set_gnn_prediction(self, predicted: torch.Tensor):
+    def set_gnn_prediction(self, predicted: torch.Tensor, gnn_optim=None):
         """Агент сообщает что GNN предсказал → для predictive coding."""
-        self._gnn_predicted = predicted.detach()
+        # BUGFIX: Убрали .detach(), чтобы World Model получала градиент ошибки зрения.
+        self._gnn_predicted = predicted
+        self._gnn_optim = gnn_optim
 
     def set_slot_lexicon(
         self,

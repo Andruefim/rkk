@@ -606,8 +606,11 @@ class CausalGraph:
 
         # Build tensors: (B, T, d)
         X_seq = torch.tensor(coerced_seqs, dtype=torch.float32, device=self.device)  # (B, T, d)
-        # Actions are zero for passive dynamics (no interventions in sequences)
+        # BUGFIX: WM needs to know what the agent did. Inject motor intent variables as actions.
         A_seq = torch.zeros(B, T, d, dtype=torch.float32, device=self.device)
+        for i, nid in enumerate(self._node_ids):
+            if nid.startswith("intent_"):
+                A_seq[:, :, i] = X_seq[:, :, i]
 
         self._optim.zero_grad()
 
