@@ -159,8 +159,9 @@ class CausalGraph:
         self._edge_cache: list[Edge] | None = None
         self._mdl_cache:  float | None      = None
         self.train_losses: list[float]      = []
-        # (from, to) — не обновляются градиентом WM; W[i,j] фиксируется на FROZEN_EDGE_W.
         self._frozen_edge_set: set[tuple[str, str]] = set()
+        # Фаза 3: запрещённые рёбра (например world -> intent) W[i,j] = 0
+        self._forbidden_edge_set: set[tuple[str, str]] = set()
         # Макро-узлы concept_N: агрегат по members, метаданные детектора.
         self._concept_meta: dict[str, dict] = {}
         # LeWM: SIGReg anti-collapse regularizer (lazy init after core is built)
@@ -339,8 +340,15 @@ class CausalGraph:
         self._frozen_edge_set = {(a, b) for a, b in pairs}
         self._sync_frozen_W_into_core()
 
+    def freeze_forbidden_priors(self, forbidden: list[tuple[str, str]]) -> None:
+        """Топологическое Я: запрещенные рёбра (вес = 0, градиент = 0)."""
+        self._forbidden_edge_set = {(a, b) for a, b in forbidden}
+        self._sync_frozen_W_into_core()
+
     def _sync_frozen_W_into_core(self) -> None:
-        if self._core is None or not self._frozen_edge_set:
+        if self._core is None:
+            return
+        if not self._frozen_edge_set and not self._forbidden_edge_set:
             return
         wval = float(self.FROZEN_EDGE_W)
         with torch.no_grad():
@@ -350,16 +358,26 @@ class CausalGraph:
                 if f in self._node_ids and t in self._node_ids:
                     i, j = self._node_ids.index(f), self._node_ids.index(t)
                     w[i, j] = wval
+            for f, t in self._forbidden_edge_set:
+                if f in self._node_ids and t in self._node_ids:
+                    i, j = self._node_ids.index(f), self._node_ids.index(t)
+                    w[i, j] = 0.0
             W.copy_(w)
         self._invalidate_cache()
 
     def _zero_grad_frozen_W(self) -> None:
-        if not self._frozen_edge_set or self._core is None:
+        if self._core is None:
+            return
+        if not self._frozen_edge_set and not self._forbidden_edge_set:
             return
         W = self._core.W
         if W.grad is None:
             return
         for f, t in self._frozen_edge_set:
+            if f in self._node_ids and t in self._node_ids:
+                i, j = self._node_ids.index(f), self._node_ids.index(t)
+                W.grad[i, j] = 0.0
+        for f, t in self._forbidden_edge_set:
             if f in self._node_ids and t in self._node_ids:
                 i, j = self._node_ids.index(f), self._node_ids.index(t)
                 W.grad[i, j] = 0.0
@@ -537,13 +555,13 @@ class CausalGraph:
             "0", "false", "no", "off",
         )
         dag_free = torch.ones(self._d, self._d, device=self.device, dtype=torch.float32)
-        for f, t in self._frozen_edge_set:
+        for f, t in self._frozen_edge_set | self._forbidden_edge_set:
             if f in self._node_ids and t in self._node_ids:
                 i, j = self._node_ids.index(f), self._node_ids.index(t)
                 dag_free[i, j] = 0.0
         if (
             dag_mask_frozen
-            and self._frozen_edge_set
+            and (self._frozen_edge_set or self._forbidden_edge_set)
             and hasattr(self._core, "dag_constraint_masked")
         ):
             h_W = self._core.dag_constraint_masked(dag_free)
@@ -553,7 +571,7 @@ class CausalGraph:
 
         wm = self._core.W_masked()
         l1_mask = torch.ones_like(wm)
-        for f, t in self._frozen_edge_set:
+        for f, t in self._frozen_edge_set | self._forbidden_edge_set:
             if f in self._node_ids and t in self._node_ids:
                 i, j = self._node_ids.index(f), self._node_ids.index(t)
                 l1_mask[i, j] = 0.0

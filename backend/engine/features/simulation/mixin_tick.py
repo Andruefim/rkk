@@ -93,6 +93,9 @@ class SimulationTickMixin:
             self._vision_ticks += 1
             if self._vision_ticks % VISION_GNN_FEED_EVERY == 0:
                 self._feed_gnn_prediction_to_visual()
+            # Фаза 3: Топологическое Я
+            if self._vision_ticks % 10 == 0:
+                self._apply_topological_self_priors()
 
         # Фаза 3: annealing teacher_weight; VL-overlay только пока не истёк TTL и weight>0
         try:
@@ -440,3 +443,33 @@ class SimulationTickMixin:
             pass
 
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)
+
+    def _apply_topological_self_priors(self) -> None:
+        """Фаза 3: Топологическое Я. Если найден [EGO] слот, добавляем замороженные/запрещенные связи."""
+        from engine.environment_humanoid import HUMANOID_KINEMATIC_EDGE_PRIORS
+        if not getattr(self, "_visual_mode", False) or self._visual_env is None:
+            return
+            
+        ego_slot = None
+        for slot_id, meta in self._visual_env._slot_lexicon.items():
+            if "[EGO]" in meta.get("label", ""):
+                ego_slot = slot_id
+                break
+                
+        frozen = list(HUMANOID_KINEMATIC_EDGE_PRIORS)
+        forbidden = []
+        nids = self.agent.graph._node_ids
+        
+        for nid in nids:
+            if str(nid).startswith("intent_") or str(nid).startswith("phys_intent_"):
+                # intent_* -> EGO_slot (frozen prior)
+                if ego_slot and ego_slot in nids:
+                    frozen.append((nid, ego_slot))
+                # Запрещаем slot_k -> intent_* (мир не управляет намерениями)
+                for k in range(self._visual_env.n_slots):
+                    slot_name = f"slot_{k}"
+                    if slot_name in nids:
+                        forbidden.append((slot_name, nid))
+                        
+        self.agent.graph.freeze_kinematic_priors(frozen)
+        self.agent.graph.freeze_forbidden_priors(forbidden)
