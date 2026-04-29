@@ -504,6 +504,41 @@ class VariableDiscovery:
         }
 
 
+# ─── AffectiveDrive ───────────────────────────────────────────────────────────
+class AffectiveDrive:
+    """
+    Phase 1 Embodied Cognition: modulates intrinsic reward via interoception.
+
+    Pain (intero_stress) multiplicatively suppresses EIG:
+        R = EIG * sigmoid(-w_stress * intero_stress)
+    This reduces curiosity value during pain but does not block it entirely.
+
+    Energy maintenance bonus encourages homeostasis:
+        R += w_energy * (intero_energy - 0.5)
+    Positive when energy > 0.5 (rewarded), negative when depleted (punished).
+    """
+
+    def __init__(self):
+        self._w_stress = _ef("RKK_AFFECTIVE_W_STRESS", 4.0)
+        self._w_energy = _ef("RKK_AFFECTIVE_W_ENERGY", 0.15)
+
+    def modulate(self, eig_reward: float, intero_energy: float, intero_stress: float) -> float:
+        """Apply affective gating to the raw intrinsic reward."""
+        # Pain suppression: high stress reduces exploration value
+        pain_gate = float(torch.sigmoid(
+            torch.tensor(-self._w_stress * intero_stress)
+        ).item())
+        # Energy bonus: maintaining energy above 0.5 is rewarded
+        energy_bonus = self._w_energy * (intero_energy - 0.5)
+        return eig_reward * pain_gate + energy_bonus
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "w_stress": self._w_stress,
+            "w_energy": self._w_energy,
+        }
+
+
 # ─── IntrinsicObjective ───────────────────────────────────────────────────────
 class IntrinsicObjective:
     """
@@ -527,6 +562,7 @@ class IntrinsicObjective:
         self.causal_surprise = CausalSurprise()
         self.goal_imagination = GoalImagination(device)
         self.variable_discovery = VariableDiscovery()
+        self.affective_drive = AffectiveDrive()
 
         # Когда генерируем следующую цель
         self._goal_generate_every = _ei("RKK_INTRINSIC_GOAL_EVERY", 25)
@@ -607,6 +643,15 @@ class IntrinsicObjective:
             r = r * 0.5 + amp_reward * 1.5
         else:
             r = r + lambda_amp * amp_reward
+
+        # --- AffectiveDrive: interoceptive modulation (Phase 1) ---
+        try:
+            obs = dict(agent.env.observe())
+            intero_energy = float(obs.get("intero_energy", 0.5))
+            intero_stress = float(obs.get("intero_stress", 0.0))
+            r = self.affective_drive.modulate(r, intero_energy, intero_stress)
+        except Exception:
+            pass
 
         # --- Обновляем активную цель ---
         active_goal = self.goal_imagination.tick_goal(compression_delta)
@@ -728,6 +773,7 @@ class IntrinsicObjective:
             "causal_surprise": self.causal_surprise.snapshot(),
             "goal_imagination": self.goal_imagination.snapshot(),
             "variable_discovery": self.variable_discovery.snapshot(),
+            "affective_drive": self.affective_drive.snapshot(),
         }
 
 

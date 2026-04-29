@@ -37,6 +37,7 @@ MOTOR_INTENT_VARS: tuple[str, ...] = (
 MOTOR_INTENT_DEFAULTS: dict[str, float] = {
     "intent_gait_coupling": 0.88,
 }
+INTERO_VARS: tuple[str, ...] = ("intero_energy", "intero_stress")
 MOTOR_OBSERVABLE_VARS: tuple[str, ...] = (
     "gait_phase_l",
     "gait_phase_r",
@@ -67,6 +68,7 @@ VAR_NAMES = (
     + SANDBOX_VARS
     + list(MOTOR_INTENT_VARS)
     + list(MOTOR_OBSERVABLE_VARS)
+    + list(INTERO_VARS)
     + list(SELF_VARS)
 )
 
@@ -100,6 +102,7 @@ FIXED_BASE_VARS: list[str] = (
     + SANDBOX_VARS
     + list(MOTOR_INTENT_VARS)
     + list(MOTOR_OBSERVABLE_VARS)
+    + list(INTERO_VARS)
     + list(SELF_VARS)
 )
 
@@ -139,6 +142,8 @@ _RANGES["stack_height"] = (0.0, 0.8)
 _RANGES["stability_score"] = (0.0, 1.0)
 for _mv in MOTOR_INTENT_VARS + MOTOR_OBSERVABLE_VARS:
     _RANGES[_mv] = (0.0, 1.0)
+for _iv in INTERO_VARS:
+    _RANGES[_iv] = (0.0, 1.0)
 for _sv in SELF_VARS:
     _RANGES[_sv] = (0.0, 1.0)
 

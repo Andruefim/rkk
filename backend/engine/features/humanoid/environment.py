@@ -12,6 +12,7 @@ from engine.features.humanoid.constants import (
     FIXED_BASE_VARS,
     HEAD_VARS,
     HUMANOID_URDF_STAND_EULER,
+    INTERO_VARS,
     LEG_VARS,
     MOTOR_INTENT_DEFAULTS,
     MOTOR_INTENT_VARS,
@@ -69,6 +70,13 @@ class EnvironmentHumanoid:
         self._motor_state: dict[str, float] = {
             k: float(MOTOR_INTENT_DEFAULTS.get(k, 0.5)) for k in MOTOR_INTENT_VARS
         }
+        # ── Interoception (Phase 1: Embodied Cognition) ──
+        self._intero_state: dict[str, float] = {
+            "intero_energy": 1.0,
+            "intero_stress": 0.0,
+        }
+        self._intero_control_lost: bool = False
+        self._prev_raw_obs: dict[str, float] | None = None
 
     # ── Fixed root switch ─────────────────────────────────────────────────────
     @property
@@ -113,6 +121,9 @@ class EnvironmentHumanoid:
         for sk in SELF_VARS:
             if sk in active:
                 out[sk] = float(np.clip(self._self_state.get(sk, 0.5), 0.05, 0.95))
+        for ik in INTERO_VARS:
+            if ik in active:
+                out[ik] = float(np.clip(self._intero_state.get(ik, 0.5), 0.05, 0.95))
         return out
 
     @property
@@ -184,6 +195,90 @@ class EnvironmentHumanoid:
         """Removed GT edges constraint to rely solely on self-supervised discovery."""
         return []
 
+    # ── Interoception update ──────────────────────────────────────────────────
+    # Constants for energy / stress dynamics
+    _ENERGY_DRAIN_PER_INTENT = 0.004   # per unit of intent deviation from current pose
+    _ENERGY_DRAIN_PER_JOINT  = 0.002   # per unit of joint deviation from neutral
+    _ENERGY_RECOVERY         = 0.006   # passive recovery per physics step
+    _ENERGY_LOSS_THRESHOLD   = 0.05    # below this: control lost
+    _ENERGY_RECOVER_THRESHOLD = 0.20   # above this: control regained (hysteresis)
+    _STRESS_LIMIT_ZONE       = 0.10    # norm-distance from [0.05, 0.95] edges
+    _STRESS_IMPACT_GAIN      = 2.5     # multiplier for rapid state changes
+    _STRESS_DECAY            = 0.015   # passive decay per step
+
+    def _update_interoception(self) -> None:
+        """
+        Update intero_energy and intero_stress from current physics.
+
+        Energy drains when motor intents deviate from current joint pose
+        and when joints deviate from neutral (active movement costs energy).
+        Energy passively recovers each step.
+
+        Stress grows when joints approach anatomical limits and when
+        rapid state changes (impacts) occur. Stress decays passively.
+
+        When energy < threshold, agent loses motor control (hysteresis).
+        """
+        raw = self._sim.get_state()
+        st = self._intero_state
+
+        # ── Energy drain ──────────────────────────────────────────────────
+        intent_cost = 0.0
+        for mk in MOTOR_INTENT_VARS:
+            intent_cost += abs(self._motor_state.get(mk, 0.5) - 0.5)
+
+        joint_cost = 0.0
+        all_joints = ARM_VARS + SPINE_VARS + HEAD_VARS
+        if not self._fixed_root:
+            all_joints = LEG_VARS + all_joints
+        for jv in all_joints:
+            if jv in raw:
+                neutral = self._JOINT_NEUTRAL.get(jv, 0.5)
+                joint_cost += abs(self._norm(jv, raw[jv]) - neutral)
+
+        drain = (
+            intent_cost * self._ENERGY_DRAIN_PER_INTENT
+            + joint_cost * self._ENERGY_DRAIN_PER_JOINT
+        )
+        new_energy = st["intero_energy"] - drain + self._ENERGY_RECOVERY
+        st["intero_energy"] = float(np.clip(new_energy, 0.0, 1.0))
+
+        # ── Loss of control (hysteresis) ──────────────────────────────────
+        if st["intero_energy"] <= self._ENERGY_LOSS_THRESHOLD:
+            if not self._intero_control_lost:
+                self._intero_control_lost = True
+        elif st["intero_energy"] >= self._ENERGY_RECOVER_THRESHOLD:
+            if self._intero_control_lost:
+                self._intero_control_lost = False
+
+        # ── Stress from joint limits ──────────────────────────────────────
+        stress_delta = 0.0
+        limit_lo = 0.05 + self._STRESS_LIMIT_ZONE
+        limit_hi = 0.95 - self._STRESS_LIMIT_ZONE
+        for jv in (LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS):
+            if jv not in raw:
+                continue
+            nv = self._norm(jv, raw[jv])
+            if nv < limit_lo:
+                stress_delta += (limit_lo - nv) * 0.6
+            elif nv > limit_hi:
+                stress_delta += (nv - limit_hi) * 0.6
+
+        # ── Stress from impacts (rapid state changes) ─────────────────────
+        if self._prev_raw_obs is not None:
+            for iv in ("com_z", "torso_roll", "torso_pitch"):
+                prev_v = self._prev_raw_obs.get(iv)
+                curr_v = raw.get(iv)
+                if prev_v is not None and curr_v is not None:
+                    delta = abs(float(curr_v) - float(prev_v))
+                    if delta > 0.04:
+                        stress_delta += delta * self._STRESS_IMPACT_GAIN
+
+        self._prev_raw_obs = dict(raw)
+
+        new_stress = st["intero_stress"] + stress_delta - self._STRESS_DECAY
+        st["intero_stress"] = float(np.clip(new_stress, 0.0, 1.0))
+
     # ── do() ─────────────────────────────────────────────────────────────────
     _JOINT_NEUTRAL: dict[str, float] = {
         "lshoulder": 0.50, "rshoulder": 0.50,
@@ -213,15 +308,24 @@ class EnvironmentHumanoid:
         if count_intervention:
             self.n_interventions += 1
 
+        if variable in INTERO_VARS:
+            # Intero vars are read-only sensors; ignore external writes.
+            self._sim.step(self.steps_per_do)
+            self._update_interoception()
+            return self.observe()
+
         if variable in SELF_VARS:
             self._self_state[variable] = float(np.clip(value, 0.05, 0.95))
             self._sim.step(self.steps_per_do)
+            self._update_interoception()
             return self.observe()
 
         if variable in MOTOR_INTENT_VARS:
             self._motor_state[variable] = float(np.clip(value, 0.05, 0.95))
-            self._apply_motor_intents()
+            if not self._intero_control_lost:
+                self._apply_motor_intents()
             self._sim.step(self.steps_per_do)
+            self._update_interoception()
             return self.observe()
 
         if self._fixed_root:
@@ -229,12 +333,13 @@ class EnvironmentHumanoid:
         else:
             controllable = LEG_VARS + ARM_VARS + SPINE_VARS + HEAD_VARS
 
-        if variable in controllable:
+        if variable in controllable and not self._intero_control_lost:
             lo, hi = self._comfort_zone(variable)
             clamped = float(np.clip(value, lo, hi))
             self._sim.set_joint(variable, clamped)
 
         self._sim.step(self.steps_per_do)
+        self._update_interoception()
         return self.observe()
 
     def intervene_burst(
@@ -259,7 +364,9 @@ class EnvironmentHumanoid:
         joints_after: list[tuple[str, float]] = []
         for variable, value in pairs:
             v = float(np.clip(value, 0.05, 0.95))
-            if variable in SELF_VARS:
+            if variable in INTERO_VARS:
+                continue  # read-only sensors
+            elif variable in SELF_VARS:
                 self._self_state[variable] = v
             elif variable in MOTOR_INTENT_VARS:
                 self._motor_state[variable] = v
@@ -267,11 +374,13 @@ class EnvironmentHumanoid:
             elif variable in controllable:
                 lo, hi = self._comfort_zone(variable)
                 joints_after.append((variable, float(np.clip(v, lo, hi))))
-        if touched_intent:
-            self._apply_motor_intents()
-        for variable, v in joints_after:
-            self._sim.set_joint(variable, v)
+        if not self._intero_control_lost:
+            if touched_intent:
+                self._apply_motor_intents()
+            for variable, v in joints_after:
+                self._sim.set_joint(variable, v)
         self._sim.step(self.steps_per_do)
+        self._update_interoception()
         return self.observe()
 
     def _apply_upper_body_from_intents(self, *, cpg_sync: dict[str, float] | None = None) -> None:
@@ -290,8 +399,10 @@ class EnvironmentHumanoid:
     def set_joint_targets(self, targets: dict[str, float]) -> None:
         """
         Execute raw joint targets (for MotorPrimitiveLibrary).
-        Respects fixed root bounds and leg ownership.
+        Respects fixed root bounds, leg ownership, and interoceptive control.
         """
+        if self._intero_control_lost:
+            return
         for name, val in targets.items():
             if self._fixed_root and name in LEG_VARS:
                 continue
@@ -323,11 +434,13 @@ class EnvironmentHumanoid:
         if n_sub <= 0:
             n_sub = max(1, self.steps_per_do // 2)
         n_sub = min(max(n_sub, 1), 32)
-        self._apply_upper_body_from_intents(cpg_sync=cpg_sync)
-        for name, val in targets.items():
-            if name in LEG_VARS:
-                self._sim.set_joint(name, float(np.clip(val, 0.05, 0.95)))
+        if not self._intero_control_lost:
+            self._apply_upper_body_from_intents(cpg_sync=cpg_sync)
+            for name, val in targets.items():
+                if name in LEG_VARS:
+                    self._sim.set_joint(name, float(np.clip(val, 0.05, 0.95)))
         self._sim.step(n_sub)
+        self._update_interoception()
 
     def update_self_feedback(
         self,
@@ -415,6 +528,9 @@ class EnvironmentHumanoid:
             self._self_state[k] = 0.5
         for k in MOTOR_INTENT_VARS:
             self._motor_state[k] = float(MOTOR_INTENT_DEFAULTS.get(k, 0.5))
+        self._intero_state = {"intero_energy": 1.0, "intero_stress": 0.0}
+        self._intero_control_lost = False
+        self._prev_raw_obs = None
 
     # ── Camera / Skeleton ─────────────────────────────────────────────────────
     def get_frame_base64(self, view: str | None = None, **kwargs) -> str | None:

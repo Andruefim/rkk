@@ -1133,25 +1133,27 @@ export default function RKKHumanoid() {
                     const val=visionData.slot_values?.[k]??0;
                     const varV=visionData.variability?.[k]??0;
                     const active=varV>0.02;
-                    const col=SLOT_COLORS[k%SLOT_COLORS.length];
                     const sl=visionData.slot_labels?.[k];
+                    const isEgo=sl?.label?.includes("[EGO]");
+                    const col=isEgo?"#ff22aa":SLOT_COLORS[k%SLOT_COLORS.length];
                     return(
                       <div key={k} onClick={()=>setSelectedSlot(k)}
-                        style={{background:selectedSlot===k?"rgba(68,255,204,0.08)":"rgba(0,10,12,0.8)",
+                        style={{background:selectedSlot===k?"rgba(68,255,204,0.08)":isEgo?"rgba(255,34,170,0.08)":"rgba(0,10,12,0.8)",
                           border:`1px solid ${selectedSlot===k?col:active?"#1a3322":"#0a1a1a"}`,
+                          boxShadow:isEgo?"0 0 6px rgba(255,34,170,0.4)":"none",
                           borderRadius:3,padding:"5px 6px",cursor:"pointer"}}>
                         <div style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
                           <span style={{color:col,fontSize:8,fontWeight:"bold"}}>S{k}</span>
                           <span style={{color:active?"#44ffcc":"#334444",fontSize:7}}>{active?"●":"○"}</span>
                         </div>
-                        {sl?.label&&<div style={{fontSize:6,color:"#66bbaa",marginBottom:2,minHeight:14}}>{sl.label} {typeof sl.confidence==="number"?`${(sl.confidence*100).toFixed(0)}%`:""}</div>}
+                        {sl?.label&&<div style={{fontSize:6,color:isEgo?"#ff66cc":"#66bbaa",marginBottom:2,minHeight:14,fontWeight:isEgo?"bold":"normal"}}>{sl.label} {typeof sl.confidence==="number"?`${(sl.confidence*100).toFixed(0)}%`:""}</div>}
                         <div style={{height:3,background:"#0a1a1a",borderRadius:2,overflow:"hidden",marginBottom:2}}>
                           <div style={{width:`${val*100}%`,height:"100%",background:col,transition:"width 0.5s"}}/>
                         </div>
                         <div style={{height:2,background:"#050d0d",borderRadius:2,overflow:"hidden"}}>
                           <div style={{width:`${Math.min(varV*100*5,100)}%`,height:"100%",background:`${col}88`}}/>
                         </div>
-                        <div style={{fontSize:6,color:"#225544",marginTop:1,display:"flex",justifyContent:"space-between"}}>
+                        <div style={{fontSize:6,color:isEgo?"#cc4488":"#225544",marginTop:1,display:"flex",justifyContent:"space-between"}}>
                           <span>{val.toFixed(2)}</span><span>σ={varV.toFixed(3)}</span>
                         </div>
                       </div>

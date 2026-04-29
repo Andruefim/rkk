@@ -29,6 +29,13 @@ def humanoid_hardcoded_seeds() -> list[dict]:
         {"from_": "self_intention_rarm", "to": "rshoulder", "weight": 0.18, "alpha": 0.05},
         {"from_": "self_attention", "to": "neck_yaw", "weight": 0.12, "alpha": 0.04},
         {"from_": "self_energy", "to": "lshoulder", "weight": 0.10, "alpha": 0.04},
+        # Interoception seeds (Phase 1: Embodied Cognition)
+        {"from_": "intero_energy", "to": "lshoulder", "weight": 0.12, "alpha": 0.04},
+        {"from_": "intero_energy", "to": "rshoulder", "weight": 0.12, "alpha": 0.04},
+        {"from_": "intero_energy", "to": "lhip", "weight": 0.10, "alpha": 0.04},
+        {"from_": "intero_energy", "to": "rhip", "weight": 0.10, "alpha": 0.04},
+        {"from_": "intero_stress", "to": "posture_stability", "weight": -0.15, "alpha": 0.04},
+        {"from_": "intero_stress", "to": "intero_energy", "weight": -0.10, "alpha": 0.04},
     ]
 
 
@@ -59,6 +66,10 @@ def fixed_root_seeds() -> list[dict]:
         {"from_": "self_intention_rarm", "to": "rshoulder", "weight": 0.22, "alpha": 0.05},
         {"from_": "self_attention", "to": "neck_yaw", "weight": 0.14, "alpha": 0.04},
         {"from_": "self_energy", "to": "lshoulder", "weight": 0.12, "alpha": 0.04},
+        # Interoception seeds (Phase 1: Embodied Cognition)
+        {"from_": "intero_energy", "to": "lshoulder", "weight": 0.12, "alpha": 0.04},
+        {"from_": "intero_energy", "to": "rshoulder", "weight": 0.12, "alpha": 0.04},
+        {"from_": "intero_stress", "to": "intero_energy", "weight": -0.10, "alpha": 0.04},
     ]
 
 

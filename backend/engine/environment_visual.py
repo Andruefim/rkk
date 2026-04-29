@@ -144,8 +144,13 @@ class EnvironmentVisual:
         self._slot_lexicon_tick: int = -1
         self._slot_lexicon_frame_hash: str = ""
 
+        # Phase 2: EGO tracking (Self-Slot Identification)
+        self._ego_corr = np.zeros(n_slots, dtype=np.float32)
+        self._prev_ego_intents: np.ndarray | None = None
+        self._prev_ego_slots: np.ndarray | None = None
+
         self._async_encode = VISION_ASYNC_ENCODE
-        self._encode_queue: queue.Queue[tuple[int, np.ndarray] | None] | None = None
+        self._encode_queue: queue.Queue[tuple[int, np.ndarray, np.ndarray] | None] | None = None
         self._encode_thread: threading.Thread | None = None
         self._encode_ui_lock = threading.Lock()
         if self._async_encode:
@@ -207,7 +212,7 @@ class EnvironmentVisual:
             item = q.get()
             if item is None:
                 break
-            _gen, frame = item
+            _gen, frame, intents = item
             try:
                 vals, vecs, attn = self.cortex.encode(frame)
                 self._last_slots = vals
@@ -215,6 +220,7 @@ class EnvironmentVisual:
                 self._last_attn = attn
                 self._cached_frame_b64 = self._encode_frame_jpeg_only(frame, quality=68)
                 with self._encode_ui_lock:
+                    self._update_ego_tracking(vals.cpu().numpy(), intents)
                     self._refresh_index += 1
                     ri = self._refresh_index
                     if ri % VISION_UI_MASK_EVERY == 0:
@@ -248,9 +254,10 @@ class EnvironmentVisual:
             and not force_sync
         )
         if use_async and frame is not None:
+            intents = self._get_current_intents()
             try:
                 self._encode_queue.put_nowait(
-                    (self._vision_generation, np.ascontiguousarray(frame))
+                    (self._vision_generation, np.ascontiguousarray(frame), intents)
                 )
             except queue.Full:
                 try:
@@ -259,7 +266,7 @@ class EnvironmentVisual:
                     pass
                 try:
                     self._encode_queue.put_nowait(
-                        (self._vision_generation, np.ascontiguousarray(frame))
+                        (self._vision_generation, np.ascontiguousarray(frame), intents)
                     )
                 except queue.Full:
                     pass
@@ -273,6 +280,8 @@ class EnvironmentVisual:
             self._last_slot_vecs = vecs    # (K,D)
             self._last_attn      = attn    # (K,H',W')
             self._cached_frame_b64 = self._encode_frame_jpeg_only(frame, quality=68)
+            with self._encode_ui_lock:
+                self._update_ego_tracking(vals.cpu().numpy(), self._get_current_intents())
             if self._refresh_index % VISION_UI_MASK_EVERY == 0:
                 _, self._cached_masks_b64 = self._encode_frame_and_masks_for_ui(frame, attn)
             elif not self._cached_masks_b64:
@@ -289,6 +298,52 @@ class EnvironmentVisual:
             indices = np.linspace(0, len(vals)-1, K)
             pseudo  = np.array([vals[int(round(i))] for i in indices], dtype=np.float32)
             self._last_slots = torch.from_numpy(pseudo).to(self.device)
+
+    def _get_current_intents(self) -> np.ndarray:
+        # We need to access intent values; base_env.observe() or base_env._motor_state
+        obs = self.base_env.observe()
+        return np.array([obs.get(k, 0.5) for k in MOTOR_INTENT_VARS], dtype=np.float32)
+
+    def _update_ego_tracking(self, new_slots: np.ndarray, current_intents: np.ndarray) -> None:
+        """Track covariance between motor intents and slot activations to identify [EGO] slot."""
+        if self._prev_ego_intents is not None and self._prev_ego_slots is not None:
+            # sum of absolute delta across all intent vars
+            delta_intents = np.sum(np.abs(current_intents - self._prev_ego_intents))
+            # absolute delta per slot
+            delta_slots = np.abs(new_slots - self._prev_ego_slots)
+            
+            # Moving average of the product (correlation)
+            self._ego_corr = 0.9 * self._ego_corr + 0.1 * (delta_intents * delta_slots)
+            
+            # If the agent is actually moving
+            if delta_intents > 0.01:
+                ego_idx = int(np.argmax(self._ego_corr))
+                # If correlation is strong enough
+                if self._ego_corr[ego_idx] > 0.0005:
+                    ego_id = f"slot_{ego_idx}"
+                    # Ensure [EGO] is present
+                    if ego_id not in self._slot_lexicon:
+                        self._slot_lexicon[ego_id] = {"label": "[EGO] Self", "likely_phys": [], "confidence": 1.0}
+                    else:
+                        lbl = self._slot_lexicon[ego_id].get("label") or "Self"
+                        if not lbl.startswith("[EGO]"):
+                            self._slot_lexicon[ego_id]["label"] = f"[EGO] {lbl}"
+                    
+                    # Remove [EGO] from other slots
+                    for k in range(self.n_slots):
+                        if k != ego_idx:
+                            sid = f"slot_{k}"
+                            if sid in self._slot_lexicon:
+                                lbl = self._slot_lexicon[sid].get("label") or ""
+                                if "[EGO]" in lbl:
+                                    clean_lbl = lbl.replace("[EGO] ", "").replace("[EGO]", "").strip()
+                                    if clean_lbl:
+                                        self._slot_lexicon[sid]["label"] = clean_lbl
+                                    else:
+                                        del self._slot_lexicon[sid]
+
+        self._prev_ego_intents = current_intents.copy()
+        self._prev_ego_slots = new_slots.copy()
 
     def _encode_frame_and_masks_for_ui(
         self, frame: np.ndarray, attn: torch.Tensor
