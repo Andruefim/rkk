@@ -111,6 +111,7 @@ def build_simulation_snapshot(
             else None
         ),
         "motor_state": sim._motor_state_snapshot(),
+        "hierarchical_pe": getattr(sim, "_hai_last_diag", None),
         "skills": sim._skill_snapshot(),
         "rsi_full": sim._rsi_full.snapshot()
         if sim._rsi_full_enabled() and sim._rsi_full is not None

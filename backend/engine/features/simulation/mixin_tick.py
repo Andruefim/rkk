@@ -29,6 +29,12 @@ class SimulationTickMixin:
 
     def _run_single_agent_timestep_inner(self) -> dict:
         self.tick += 1
+        if self.current_world != "humanoid":
+            self._hai_prev_com_x = None
+            self._hai_pe_fwd_ema = 0.0
+            self._hai_pe_vert_ema = 0.0
+            self._hai_pe_lat_ema = 0.0
+            self._hai_pe_ema = 0.0
         self._apply_pending_llm_bundle()
         self._ensure_phase2()
 
@@ -173,6 +179,24 @@ class SimulationTickMixin:
             if _TIMESCALE_AVAILABLE and self._timescale is not None:
                 if self._timescale.should_run(LEVEL_REFLEX, self.tick):
                     self._timescale.mark_ran(LEVEL_REFLEX, self.tick)
+
+        # Problem 3: hierarchical PE — stride prior vs com_x drift → low-level intent residuals
+        self._hai_last_diag = None
+        if self.current_world == "humanoid":
+            if (
+                not self._fixed_root_active
+                and not fallen
+                and _obs_for_d_e
+            ):
+                from engine.hierarchical_active_inference import run_hierarchical_pe_tick
+
+                self._hai_last_diag = run_hierarchical_pe_tick(self, _obs_for_d_e)
+            elif self._fixed_root_active or fallen:
+                self._hai_prev_com_x = None
+                self._hai_pe_fwd_ema = 0.0
+                self._hai_pe_vert_ema = 0.0
+                self._hai_pe_lat_ema = 0.0
+                self._hai_pe_ema = 0.0
 
         # Phase K: Sleep Controller
         if (

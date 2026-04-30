@@ -396,6 +396,21 @@ class EnvironmentHumanoid:
         """
         self._apply_upper_body_from_intents()
 
+    def apply_motor_intent_residuals(self, residuals: dict[str, float]) -> None:
+        """
+        Add small deltas to motor intents without an extra PyBullet step (L0 reflex).
+        Used by hierarchical active inference: PE → nudge stance / gait coupling only.
+        """
+        if self._intero_control_lost:
+            return
+        for k, delta in (residuals or {}).items():
+            if k not in MOTOR_INTENT_VARS:
+                continue
+            prev = float(self._motor_state.get(k, 0.5))
+            self._motor_state[k] = float(
+                np.clip(prev + float(delta), 0.05, 0.95)
+            )
+
     def set_joint_targets(self, targets: dict[str, float]) -> None:
         """
         Execute raw joint targets (for MotorPrimitiveLibrary).

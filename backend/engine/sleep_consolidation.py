@@ -32,6 +32,12 @@ RKK_SLEEP_DURATION_TICKS=200   — тиков на сон (с fixed_root)
 RKK_SLEEP_REM_LR_MULT=10.0     — множитель lr во время REM
 RKK_SLEEP_PRUNE_THRESHOLD=0.05 — обрезать edges с |w| < threshold
 
+MoCap inverse (inject_mocap_dreams):
+  RKK_SLEEP_QUALITY_THRESH — если MSE(forward_seq, X|A=0) > порога, инверсию не делаем (negative transfer).
+  RKK_SLEEP_INVERSE_INNER — Adam-шагов на каждый одношаговый переход (дефолт 72).
+  RKK_SLEEP_INVERSE_LR — lr для пошагового Adam.
+  forward_dynamics_seq = teacher-forcing stack одношаговых f(X_t,A_t); инверсия по t согласована с этим (не авторегрессия).
+
 Диагностика памяти:
   RKK_MEMORY_DIAG=1 — RSS + размеры GNN/мостов (см. engine.memory_diag)
   RKK_MEMORY_TRACE=1 — tracemalloc diff между этапами сна
@@ -321,6 +327,8 @@ class REMReplay:
         2. Проигрываем кусок реального человеческого движения через PyBullet (apply_cpg_leg_targets).
         3. Настоящая физика (с учетом ZMP и гравитации) записывается в буфер графа.
         4. GNN учится этому manifold'у.
+        Inverse: пошаговый Adam по каждому (X_t→X_{t+1}) с teacher-forcing-совместимым f(X_t,A_t);
+        quality gate по baseline MSE(seq, A=0); градиент только по intent_*; clamp [0.05,0.95].
         """
         if sim is None or not hasattr(sim, "agent"):
             return 0
@@ -372,55 +380,84 @@ class REMReplay:
                 transitions.append(dict(obs_raw))
                 
             # ── Inverse Dynamics (Goal-Conditioned Motor Babbling) ──
-            # Имажинация: подбор intents для минимизации ошибки предсказания World Model
+            # Teacher-forcing stack: forward_dynamics_seq uses true X_t each step (not chain rollout).
+            # Per-timestep inverse: for each t minimize MSE(f(X_t, A_t), X_{t+1}) with Adam on intents only.
             core = getattr(graph, "_core", None)
             intent_indices = [i for i, nid in enumerate(node_ids) if nid.startswith("intent_")]
-            
+            intent_set = set(intent_indices)
+            d_graph = len(node_ids)
+
             if core is not None and intent_indices and len(transitions) > 1:
-                print(f"[Sleep] 🧠 Solving Inverse Dynamics for {actual_steps} steps...")
+                print(f"[Sleep] 🧠 Solving Inverse Dynamics ({actual_steps - 1} one-step problems)...")
                 dev = next(core.parameters()).device
-                
-                # Build X_seq: (1, T, d)
-                X_list = []
-                for obs in transitions:
-                    X_list.append([float(obs.get(n, 0.5)) for n in node_ids])
-                    
-                X_seq = torch.tensor([X_list], dtype=torch.float32, device=dev)
-                X_target = X_seq[:, 1:, :] # (1, T-1, d)
-                
-                # A_seq: learnable actions (1, T, d)
-                A_seq = torch.zeros(1, actual_steps, len(node_ids), dtype=torch.float32, device=dev, requires_grad=True)
-                
-                # Freeze core
-                for p in core.parameters():
-                    p.requires_grad = False
-                    
-                optim_a = torch.optim.Adam([A_seq], lr=0.1)
-                
-                # Backprop on intents
-                for _ in range(20):
-                    optim_a.zero_grad()
-                    X_pred, _ = graph.forward_dynamics_seq(X_seq, A_seq)
-                    loss = torch.nn.functional.mse_loss(X_pred, X_target)
-                    loss.backward()
-                    
-                    with torch.no_grad():
-                        mask = torch.zeros_like(A_seq)
+
+                X_list = [[float(obs.get(n, 0.5)) for n in node_ids] for obs in transitions]
+                X_seq = torch.tensor([X_list], dtype=torch.float32, device=dev)  # (1, T, d)
+                X_target = X_seq[:, 1:, :]  # (1, T-1, d)
+
+                # Quality gate: skip inverse if world model is too poor (bootstrap / negative transfer)
+                q_thresh = _env_float("RKK_SLEEP_QUALITY_THRESH", 0.15)
+                A_zero = torch.zeros(1, actual_steps, d_graph, dtype=torch.float32, device=dev)
+                with torch.no_grad():
+                    X_pred0, _, _ = graph.forward_dynamics_seq(X_seq, A_zero)
+                    baseline_mse = float(
+                        torch.nn.functional.mse_loss(X_pred0, X_target).item()
+                    )
+
+                if baseline_mse > q_thresh:
+                    print(
+                        f"[Sleep] ⏭ Inverse skipped: baseline WM MSE={baseline_mse:.4f} "
+                        f"> {q_thresh} (RKK_SLEEP_QUALITY_THRESH)"
+                    )
+                    for obs in transitions:
+                        obs.setdefault("intent_stride", 0.65)
+                        obs["intent_stride"] = 0.65
+                        obs.setdefault("intent_stop_recover", 0.3)
+                        obs["intent_stop_recover"] = 0.3
+                else:
+                    n_inner = max(8, min(256, _env_int("RKK_SLEEP_INVERSE_INNER", 72)))
+                    lr_inv = _env_float("RKK_SLEEP_INVERSE_LR", 0.08)
+                    lo, hi = 0.05, 0.95
+
+                    for p in core.parameters():
+                        p.requires_grad = False
+
+                    A_acc = np.zeros((actual_steps, d_graph), dtype=np.float32)
+
+                    for t in range(actual_steps - 1):
+                        Xt = X_seq[:, t, :].detach()  # (1, d)
+                        Xtp1 = X_seq[:, t + 1, :].detach()  # (1, d)
+                        At = torch.zeros(1, d_graph, dtype=torch.float32, device=dev, requires_grad=True)
+                        opt_t = torch.optim.Adam([At], lr=lr_inv)
+                        for _ in range(n_inner):
+                            opt_t.zero_grad()
+                            X_hat = graph.forward_dynamics(Xt, At)
+                            loss_t = torch.nn.functional.mse_loss(X_hat, Xtp1)
+                            loss_t.backward()
+                            if At.grad is not None:
+                                for j in range(d_graph):
+                                    if j not in intent_set:
+                                        At.grad[:, j].zero_()
+                            opt_t.step()
+                            with torch.no_grad():
+                                for j in intent_indices:
+                                    At.data[:, j].clamp_(lo, hi)
+                                for j in range(d_graph):
+                                    if j not in intent_set:
+                                        At.data[:, j].zero_()
+                        A_acc[t, :] = At.detach().cpu().numpy()[0]
+
+                    if actual_steps > 1:
+                        A_acc[-1, :] = A_acc[-2, :]
+
+                    for p in core.parameters():
+                        p.requires_grad = True
+
+                    for t, obs in enumerate(transitions):
                         for idx in intent_indices:
-                            mask[:, :, idx] = 1.0
-                        A_seq.grad = A_seq.grad * mask
-                        
-                    optim_a.step()
-                    
-                # Unfreeze core
-                for p in core.parameters():
-                    p.requires_grad = True
-                    
-                # Inject inferred intents into observation sequence
-                A_inferred = A_seq.detach().cpu().numpy()[0]
-                for t, obs in enumerate(transitions):
-                    for idx in intent_indices:
-                        obs[node_ids[idx]] = float(A_inferred[t, idx])
+                            obs[node_ids[idx]] = float(
+                                np.clip(A_acc[t, idx], lo, hi)
+                            )
             else:
                 # Fallback if inverse dynamics cannot run
                 for obs in transitions:

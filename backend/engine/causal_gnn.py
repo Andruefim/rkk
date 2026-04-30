@@ -27,6 +27,8 @@ LeWM integration (Фаза N):
   .encode_latent(X, a)        → (B, d, hidden) latent node embeddings
   .forward_dynamics_seq(X, A) → parallel (B, T, d) teacher-forcing prediction
   SIGReg                      → anti-collapse regularizer from LeWorldModel
+  JEPA: h=node_enc(X)+action_enc(a) in MP; latent_predictor(h,agg) only (no second action_enc).
+        cosine loss in causal_graph._jepa_latent_loss; resize_to preserves target_enc EMA weights.
 
 Масштабируемость:
   d=6   (physics/chemistry/logic): быстрее чем NOTEARS за счёт меньшего hidden
@@ -42,10 +44,27 @@ LeWM integration (Фаза N):
 from __future__ import annotations
 
 import math
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+_DAG_TAYLOR_WARNED: bool = False
+
+
+def _warn_dag_taylor_order4_if_large(d: int) -> None:
+    """Taylor expansion of tr(exp(M)) omits cycle contributions beyond order 4."""
+    global _DAG_TAYLOR_WARNED
+    if d <= 50 or _DAG_TAYLOR_WARNED:
+        return
+    warnings.warn(
+        f"CausalGNNCore(d={d}): DAG Taylor penalty uses expansion to order 4; "
+        "for dense/large W, longer cycles may be underestimated.",
+        UserWarning,
+        stacklevel=3,
+    )
+    _DAG_TAYLOR_WARNED = True
 
 
 # ── Опциональный torch-geometric ─────────────────────────────────────────────
@@ -193,15 +212,33 @@ class CausalGNNCore(nn.Module):
         # Message function: j→i сообщение по ребру с весом W[j,i]
         self.msg_fn = _mlp(hidden * 2, hidden, hidden, nn.ReLU)
 
+        # JEPA latent predictor: concat(h, agg); action already in h via encode_latent (no duplicate path)
+        self.latent_predictor = _mlp(hidden * 2, hidden, hidden, nn.ReLU)
+
         # Output decoder: предсказываем x_i из h_i + агрегированных сообщений
         self.out_dec = _mlp(hidden * 2, hidden, 1, nn.ReLU)
+        
+        # JEPA Target Encoder (EMA from node_enc after each train step)
+        self.target_enc = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.Tanh(),
+        )
 
         # Xavier initialization
-        for m in [self.node_enc, self.action_enc, self.msg_fn, self.out_dec]:
+        for m in [self.node_enc, self.action_enc, self.msg_fn, self.latent_predictor, self.out_dec]:
             for layer in m:
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight, gain=0.5)
                     nn.init.zeros_(layer.bias)
+
+        # Target encoder: same init as node_enc, then frozen (EMA-updated from node_enc)
+        for layer in self.target_enc:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight, gain=0.5)
+                nn.init.zeros_(layer.bias)
+        self.target_enc.load_state_dict(self.node_enc.state_dict())
+        for p in self.target_enc.parameters():
+            p.requires_grad = False
 
         # No-self-loop mask
         mask = 1.0 - torch.eye(d, device=device)
@@ -216,8 +253,12 @@ class CausalGNNCore(nn.Module):
         """W без диагонали."""
         return self.W * self.mask
 
-    def _message_pass(self, h: torch.Tensor) -> torch.Tensor:
-        """h: (B, d, hidden) → (B, d) предсказание скаляров узлов."""
+    def _message_pass(
+        self,
+        h: torch.Tensor,
+        return_latent: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """h: (B, d, hidden) → (B, d) scalars; latent head uses concat(h, agg) only."""
         B, d, _hd = h.shape
         A = self.W_masked()
 
@@ -248,8 +289,13 @@ class CausalGNNCore(nn.Module):
                 idx = i.unsqueeze(0).unsqueeze(2).expand(B, len(i), _hd)
                 agg.scatter_add_(1, idx, weighted_msg)
 
-        out = self.out_dec(torch.cat([h, agg], dim=-1))
-        return out.squeeze(-1)
+        h_next = torch.cat([h, agg], dim=-1)
+        out = self.out_dec(h_next).squeeze(-1)
+
+        if return_latent:
+            h_pred = self.latent_predictor(h_next)
+            return out, h_pred
+        return out
 
     def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         """
@@ -284,7 +330,7 @@ class CausalGNNCore(nn.Module):
 
     def forward_dynamics_seq(
         self, X_seq: torch.Tensor, A_seq: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parallel teacher-forcing prediction over sequences (LeWM-style).
 
@@ -298,6 +344,7 @@ class CausalGNNCore(nn.Module):
 
         Returns:
             X_pred: (B, T-1, d)  — predicted next states (teacher forcing)
+            H_pred: (B, T-1, d, hidden) — predicted next latent states (JEPA)
             Z_flat: (B*T, d*hidden) — flattened latent embeddings for SIGReg
         """
         B, T, d = X_seq.shape
@@ -309,26 +356,28 @@ class CausalGNNCore(nn.Module):
         # 2. Encode all timesteps in one pass → latent node embeddings
         H_flat = self.encode_latent(X_flat, A_flat)  # (B*T, d, hidden)
 
-        # 3. Message pass → predicted next-state scalars for all timesteps
-        X_pred_flat = self._message_pass(H_flat)     # (B*T, d)
+        # 3. Message pass → predicted next-state scalars and latents for all timesteps
+        X_pred_flat, H_pred_flat = self._message_pass(H_flat, return_latent=True)
 
         # 4. Reshape back
         X_pred_all = X_pred_flat.reshape(B, T, d)    # (B, T, d)
+        H_pred_all = H_pred_flat.reshape(B, T, d, self.hidden)
 
         # 5. Teacher forcing: X_pred[t] predicts X[t+1]
-        #    Use predictions from t=0..T-2 to predict targets t=1..T-1
-        X_pred = X_pred_all[:, :-1]                  # (B, T-1, d)
+        X_pred = X_pred_all[:, :-1, :]  # (B, T-1, d)
+        H_pred = H_pred_all[:, :-1, :, :]  # (B, T-1, d, hidden)
 
         # 6. Flatten latents for SIGReg (anti-collapse on full batch)
-        Z_flat = H_flat.reshape(B * T, d * self.hidden)  # (B*T, d*hidden)
+        Z_flat = H_flat.reshape(B * T, d * self.hidden)
 
-        return X_pred, Z_flat
+        return X_pred, H_pred, Z_flat
 
     def dag_constraint(self) -> torch.Tensor:
         """
         Оптимизированный DAG constraint через Taylor expansion (до 4-го порядка).
         Снижает вычислительную нагрузку по сравнению с полным matrix_exp.
         """
+        _warn_dag_taylor_order4_if_large(int(self.d))
         M = self.W_masked() ** 2
         
         # Вычисляем степени матрицы для следа
@@ -346,6 +395,7 @@ class CausalGNNCore(nn.Module):
         Фаза 1: Оптимизированный DAG-штраф с учетом маски свободных параметров.
         Использует разложение Тейлора для ускорения расчета.
         """
+        _warn_dag_taylor_order4_if_large(int(self.d))
         # Применяем маску к весам перед возведением в квадрат
         Wm = self.W_masked() * free_mask
         M = Wm ** 2
@@ -384,6 +434,16 @@ class CausalGNNCore(nn.Module):
             return W_abs / W_abs.max()
         return W_abs
 
+    @torch.no_grad()
+    def update_target_encoder(self, tau: float = 0.006) -> None:
+        """
+        EMA update: target_enc ← (1−τ)·target_enc + τ·node_enc (JEPA / BYOL-style).
+        τ is small (e.g. 0.004–0.01); override via RKK_JEPA_EMA_TAU.
+        """
+        tau = float(max(0.0, min(1.0, tau)))
+        for t_p, s_p in zip(self.target_enc.parameters(), self.node_enc.parameters()):
+            t_p.data.mul_(1.0 - tau).add_(s_p.data, alpha=tau)
+
     # ── Динамическое изменение размера (для PyBullet с переменным n_objects) ──
     def resize_to(self, new_d: int) -> "CausalGNNCore":
         """
@@ -405,7 +465,21 @@ class CausalGNNCore(nn.Module):
         new_core.node_enc.load_state_dict(self.node_enc.state_dict())
         new_core.action_enc.load_state_dict(self.action_enc.state_dict())
         new_core.msg_fn.load_state_dict(self.msg_fn.state_dict())
+        try:
+            new_core.latent_predictor.load_state_dict(self.latent_predictor.state_dict(), strict=True)
+        except Exception:
+            for layer in new_core.latent_predictor:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight, gain=0.5)
+                    nn.init.zeros_(layer.bias)
         new_core.out_dec.load_state_dict(self.out_dec.state_dict())
+        # Preserve slow target branch (EMA history); do not reset to fresh node_enc
+        try:
+            new_core.target_enc.load_state_dict(self.target_enc.state_dict(), strict=True)
+        except Exception:
+            new_core.target_enc.load_state_dict(new_core.node_enc.state_dict())
+        for p in new_core.target_enc.parameters():
+            p.requires_grad = False
 
         return new_core
 

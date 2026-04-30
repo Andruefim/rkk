@@ -300,6 +300,12 @@ class RKKAgent:
         eta = max(0.0, min(0.95, eta))
 
         d = int(X_np.shape[0])
+        if unc_m.ndim != 2 or unc_m.shape[0] < d or unc_m.shape[1] < d:
+            return []
+        if unc_m.shape[0] != d or unc_m.shape[1] != d:
+            unc_m = unc_m[:d, :d]
+        if int(u_node.shape[0]) != d:
+            return []
         device = self.device
         chunk = _eig_chunk_size()
         eigs: list[float] = []
@@ -313,10 +319,16 @@ class RKKAgent:
             a_batch = torch.zeros(b, d, device=device, dtype=torch.float32)
             for bi, cand in enumerate(sub):
                 idx = nid_to_i.get(cand["variable"])
-                if idx is not None:
-                    a_batch[bi, idx] = float(cand["value"])
+                if idx is not None and 0 <= int(idx) < d:
+                    a_batch[bi, int(idx)] = float(cand["value"])
             with torch.no_grad():
                 pred = fd(x_batch, a_batch)
+            d_x = int(x_batch.shape[-1])
+            if int(pred.shape[-1]) != d_x:
+                if int(pred.shape[-1]) > d_x:
+                    pred = pred[..., :d_x]
+                else:
+                    return []
             delta = (pred - x_batch).abs().cpu().numpy()
             ab = np.abs(delta)
             S = np.clip(ab[:, :, None] + ab[:, None, :], 0.0, 1.0)
@@ -754,13 +766,22 @@ class RKKAgent:
 
         use_eig = _hypothesis_eig_from_env() and W_m is not None and unc_m is not None
         if use_eig:
-            x_vec = np.array(
-                [float(self.graph.nodes.get(n, 0.0)) for n in self.graph._node_ids],
-                dtype=np.float64,
-            )
-            u_node = self._marginal_node_uncertainty(unc_m)
+            # Core W / α_trust live on padded MAX_D×MAX_D; EIG uses one vector per WM dim.
+            # forward_dynamics returns (B, graph._d) — x_vec must match that width even if
+            # len(_node_ids) differs (async race / transient desync); pad missing slots.
+            wm_d = int(self.graph._d)
+            unc_active = unc_m[:wm_d, :wm_d] if unc_m.shape[0] >= wm_d else unc_m
+            nids = list(self.graph._node_ids)
+            x_vals: list[float] = []
+            for i in range(wm_d):
+                if i < len(nids):
+                    x_vals.append(float(self.graph.nodes.get(nids[i], 0.0)))
+                else:
+                    x_vals.append(0.5)
+            x_vec = np.array(x_vals, dtype=np.float64)
+            u_node = self._marginal_node_uncertainty(unc_active)
             eigs = self._batch_hypothesis_eig(
-                candidates, x_vec, u_node, nid_to_i, unc_m,
+                candidates, x_vec, u_node, nid_to_i, unc_active,
                 list(self.graph._node_ids), self.env,
             )
             if len(eigs) == len(candidates):

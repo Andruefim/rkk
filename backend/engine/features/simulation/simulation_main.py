@@ -167,6 +167,12 @@ class Simulation(
         self._best_discovery_rate = 0.0
         self._last_dr_gain_tick = 0
         self._rolling_block_bits: deque[int] = deque(maxlen=80)
+        self._hai_prev_com_x: float | None = None
+        self._hai_pe_fwd_ema: float = 0.0
+        self._hai_pe_vert_ema: float = 0.0
+        self._hai_pe_lat_ema: float = 0.0
+        self._hai_pe_ema: float = 0.0  # mirror of _hai_pe_fwd_ema (compat)
+        self._hai_last_diag: dict | None = None
         self._pe_history: deque[float] = deque(maxlen=200)
         self._locomotion_controller = None
         self._motor_state = MotorState()

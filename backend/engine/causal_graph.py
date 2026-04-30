@@ -27,6 +27,11 @@ causal_graph.py — NOTEARS / GNN как nn.Module.
 
   L_total = L_rec + λ_sig*SIGReg(Z) + λ_dag*h(W_free) + λ_l1*|W|₁
 h(W)    = tr(exp(W∘W)) - d
+
+Фаза 2 (JEPA):
+  latent_predictor(concat(h,agg)); h уже содержит A через encode_latent. Лосс: только
+  `_jepa_latent_loss` (cosine по умолчанию, см. RKK_JEPA_LOSS) — не использовать MSE(H_pred,H_tgt) напрямую.
+  resize_to: target_enc копируется со старого ядра (EMA не сбрасывается).
 """
 from __future__ import annotations
 
@@ -36,6 +41,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
+
+
+def _jepa_latent_loss(H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Tensor:
+    """
+    All JEPA latent alignment goes through here (seq + legacy). Default: cosine 1−⟨ĥ,t̂⟩
+    on flattened (node×hidden) — penalizes parallel constant vectors, not only zeros.
+    RKK_JEPA_LOSS=mse → F.mse_loss. Do not call F.mse_loss(H_pred, H_target) elsewhere for l_jepa.
+    """
+    mode = (os.environ.get("RKK_JEPA_LOSS", "cosine") or "cosine").strip().lower()
+    if mode in ("mse", "l2", "euclidean"):
+        return F.mse_loss(H_pred, H_target)
+    hp = H_pred.reshape(-1, H_pred.size(-1))
+    ht = H_target.reshape(-1, H_target.size(-1))
+    hp = F.normalize(hp, dim=-1, eps=1e-8)
+    ht = F.normalize(ht.detach(), dim=-1, eps=1e-8)
+    return (1.0 - (hp * ht).sum(dim=-1)).mean()
 
 from engine.environment_humanoid import HUMANOID_KINEMATIC_EDGE_PRIORS
 from engine.graph_constants import is_read_only_macro_var
@@ -475,17 +496,18 @@ class CausalGraph:
             pred = self._core(x_in)
         return pred[..., :self._d]
 
-    def forward_dynamics_seq(self, X_seq: torch.Tensor, A_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_dynamics_seq(self, X_seq: torch.Tensor, A_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._core is None:
-            return X_seq, torch.zeros(0, device=self.device)
+            return X_seq, torch.zeros(0, device=self.device), torch.zeros(0, device=self.device)
         X_pad = self._pad(X_seq)
         A_pad = self._pad(A_seq)
         if hasattr(self._core, "forward_dynamics_seq"):
-            pred, z = self._core.forward_dynamics_seq(X_pad, A_pad)
+            pred, h_pred, z = self._core.forward_dynamics_seq(X_pad, A_pad)
         else:
             pred = self._core(X_pad + A_pad)
+            h_pred = torch.zeros(0, device=self.device)
             z = torch.zeros(X_seq.shape[0] * X_seq.shape[1], 1, device=self.device)
-        return pred[..., :self._d], z
+        return pred[..., :self._d], h_pred[..., :self._d, :], z
 
     def record_observation(self, obs: dict[str, float]) -> None:
         if not self._node_ids:
@@ -656,29 +678,55 @@ class CausalGraph:
         self._optim.zero_grad()
 
         # ── Parallel forward (LeWM core) ──────────────────────────────────────
-        X_pred, Z_flat = self.forward_dynamics_seq(X_seq, A_seq)
+        X_pred, H_pred, Z_flat = self.forward_dynamics_seq(X_seq, A_seq)
         # X_pred: (B, T-1, d) — predicted next states
+        # H_pred: (B, T-1, d, hidden) — predicted latent next states
         # Z_flat: (B*T, d*hidden) — latent embeddings for SIGReg
 
         # Teacher forcing target: actual observations at t+1
         X_target = X_seq[:, 1:]  # (B, T-1, d)
 
         # ── Losses ────────────────────────────────────────────────────────────
-        l_rec = F.mse_loss(X_pred, X_target)
+        # 1. JEPA latent loss (cosine default — collapse-resistant)
+        if hasattr(self._core, "target_enc"):
+            with torch.no_grad():
+                X_target_pad = self._pad(X_target)
+                H_target = self._core.target_enc(X_target_pad.unsqueeze(-1))
+            l_jepa = _jepa_latent_loss(H_pred, H_target[..., :self._d, :])
+        else:
+            l_jepa = torch.tensor(0.0, device=self.device)
 
-        # SIGReg anti-collapse
+        # 2. Raw reconstruction (scaled; default lower than 0.5 to reduce conflict with JEPA)
+        l_rec = F.mse_loss(X_pred, X_target)
+        try:
+            rec_coeff = float(os.environ.get("RKK_JEPA_SEQ_REC_COEFF", "0.2"))
+        except ValueError:
+            rec_coeff = 0.2
+        rec_coeff = max(0.0, min(1.5, rec_coeff))
+
+        # 3. SIGReg anti-collapse
         l_sig = lambda_sig * self._sigreg(Z_flat)
 
-        # DAG + L1 (shared)
+        # 4. DAG + L1 (shared)
         h_W, l_dag, l_l1 = self._compute_dag_and_l1()
 
-        loss = l_rec + l_sig + l_dag + l_l1
+        loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1
 
         self._finish_train_step(loss)
 
+        # Update EMA target encoder (JEPA)
+        if hasattr(self._core, "update_target_encoder"):
+            try:
+                tau_ema = float(os.environ.get("RKK_JEPA_EMA_TAU", "0.006"))
+            except ValueError:
+                tau_ema = 0.006
+            self._core.update_target_encoder(tau=max(0.0, min(1.0, tau_ema)))
+
         return {
             "loss":    round(loss.item(), 5),
+            "l_jepa":  round(l_jepa.item(), 5),
             "l_rec":   round(l_rec.item(), 5),
+            "rec_coeff": round(rec_coeff, 4),
             "l_sig":   round(l_sig.item(), 5),
             "l_dag":   round(l_dag.item(), 5),
             "l_l1":    round(l_l1.item(), 5),
@@ -751,13 +799,46 @@ class CausalGraph:
         else:
             l_int = torch.tensor(0.0, device=self.device)
 
-        loss = l_rec + l_dag + l_l1 + l_int
+        l_jepa = torch.tensor(0.0, device=self.device)
+        lambda_jepa = 0.0
+        if USE_GNN and hasattr(self._core, "encode_latent") and hasattr(self._core, "target_enc"):
+            try:
+                lambda_jepa = float(os.environ.get("RKK_JEPA_LAMBDA", "0.5"))
+            except ValueError:
+                lambda_jepa = 0.5
+            if lambda_jepa > 0.0:
+                X_pad = self._pad(X_t)
+                a_pad = self._pad(a_t)
+                h = self._core.encode_latent(X_pad, a_pad)
+                _, H_pred = self._core._message_pass(h, return_latent=True)
+                H_pred = H_pred[..., : self._d, :]
+                X_tp1_pad = self._pad(X_tp1)
+                with torch.no_grad():
+                    H_tgt = self._core.target_enc(X_tp1_pad.unsqueeze(-1))[..., : self._d, :]
+                l_jepa = _jepa_latent_loss(H_pred, H_tgt)
+
+        latent_only = os.environ.get("RKK_JEPA_LEGACY_LATENT_ONLY", "1").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if USE_GNN and lambda_jepa > 0.0 and latent_only:
+            loss = lambda_jepa * l_jepa + l_dag + l_l1 + l_int
+        else:
+            loss = l_rec + l_dag + l_l1 + l_int + lambda_jepa * l_jepa
 
         self._finish_train_step(loss)
+
+        if lambda_jepa > 0.0 and hasattr(self._core, "update_target_encoder"):
+            try:
+                tau_ema = float(os.environ.get("RKK_JEPA_EMA_TAU", "0.006"))
+            except ValueError:
+                tau_ema = 0.006
+            self._core.update_target_encoder(tau=max(0.0, min(1.0, tau_ema)))
 
         return {
             "loss":  round(loss.item(), 5),
             "l_rec": round(l_rec.item(), 5),
+            "l_jepa": round(l_jepa.item(), 5),
+            "legacy_latent_only": bool(USE_GNN and lambda_jepa > 0.0 and latent_only),
             "l_dag": round(l_dag.item(), 5),
             "l_int": round(l_int.item(), 5),
             "l_l1":  round(l_l1.item(), 5),
