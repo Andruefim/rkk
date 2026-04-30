@@ -151,6 +151,7 @@ class CausalGraph:
         self.nodes:     dict[str, float] = {}
         self._node_ids: list[str]        = []
         self._d         = 0
+        self.MAX_D      = int(os.environ.get("RKK_GNN_MAX_D", "256"))
         self._core      = None
         self._optim     = None
         self._obs_buffer: list[list[float]] = []
@@ -368,11 +369,17 @@ class CausalGraph:
     def _zero_grad_frozen_W(self) -> None:
         if self._core is None:
             return
-        if not self._frozen_edge_set and not self._forbidden_edge_set:
-            return
         W = self._core.W
         if W.grad is None:
             return
+            
+        if self._d < self.MAX_D:
+            W.grad[self._d:, :] = 0.0
+            W.grad[:, self._d:] = 0.0
+
+        if not self._frozen_edge_set and not self._forbidden_edge_set:
+            return
+            
         for f, t in self._frozen_edge_set:
             if f in self._node_ids and t in self._node_ids:
                 i, j = self._node_ids.index(f), self._node_ids.index(t)
@@ -433,42 +440,52 @@ class CausalGraph:
         return r[:d]
 
     def _rebuild_core(self):
+        if self._core is not None:
+            self._invalidate_cache()
+            self._sync_frozen_W_into_core()
+            return
+
         if USE_GNN:
             from engine.causal_gnn import CausalGNNCore
-            old_W = None
-            if self._core is not None:
-                # GNN resize: мигрируем через resize_to если можем (не через torch.compile обёртку)
-                raw = self._unwrap_gnn_core()
-                if isinstance(raw, CausalGNNCore) and hasattr(raw, "resize_to"):
-                    new_core = raw.resize_to(self._d)
-                    self._core = new_core
-                    self._maybe_compile_gnn_core()
-                    self._optim = torch.optim.Adam(self._core.parameters(), lr=5e-3)
-                    self._invalidate_cache()
-                    self._sync_frozen_W_into_core()
-                    return
-                old_W = self._core.W_masked().detach().clone()
-            self._core = CausalGNNCore(self._d, self.device)
-        else:
-            old_W = None
-            if self._core is not None and self._core.d < self._d:
-                old_W = self._core.W_masked().detach().clone()
-            self._core = NOTEARSCore(self._d, self.device)
-
-        if old_W is not None:
-            old_d = old_W.shape[0]
-            with torch.no_grad():
-                W = self._core.W
-                w = W.detach().clone()
-                w[:old_d, :old_d] = old_W.to(w.device, dtype=w.dtype)
-                W.copy_(w)
-
-        if USE_GNN:
+            self._core = CausalGNNCore(self.MAX_D, self.device)
             self._maybe_compile_gnn_core()
+        else:
+            self._core = NOTEARSCore(self.MAX_D, self.device)
 
         self._optim = torch.optim.Adam(self._core.parameters(), lr=5e-3)
         self._invalidate_cache()
         self._sync_frozen_W_into_core()
+
+    def _pad(self, x: torch.Tensor) -> torch.Tensor:
+        pad_len = self.MAX_D - x.shape[-1]
+        if pad_len > 0:
+            return torch.nn.functional.pad(x, (0, pad_len))
+        return x
+
+    def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        if self._core is None:
+            return X
+        X_pad = self._pad(X)
+        a_pad = self._pad(a)
+        if hasattr(self._core, "forward_dynamics"):
+            pred = self._core.forward_dynamics(X_pad, a_pad)
+        else:
+            m = (torch.abs(a_pad) > 1e-8).float()
+            x_in = X_pad * (1.0 - m) + a_pad * m
+            pred = self._core(x_in)
+        return pred[..., :self._d]
+
+    def forward_dynamics_seq(self, X_seq: torch.Tensor, A_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._core is None:
+            return X_seq, torch.zeros(0, device=self.device)
+        X_pad = self._pad(X_seq)
+        A_pad = self._pad(A_seq)
+        if hasattr(self._core, "forward_dynamics_seq"):
+            pred, z = self._core.forward_dynamics_seq(X_pad, A_pad)
+        else:
+            pred = self._core(X_pad + A_pad)
+            z = torch.zeros(X_seq.shape[0] * X_seq.shape[1], 1, device=self.device)
+        return pred[..., :self._d], z
 
     def record_observation(self, obs: dict[str, float]) -> None:
         if not self._node_ids:
@@ -554,23 +571,29 @@ class CausalGraph:
         dag_mask_frozen = os.environ.get("RKK_DAG_MASK_FROZEN", "1").strip().lower() not in (
             "0", "false", "no", "off",
         )
-        dag_free = torch.ones(self._d, self._d, device=self.device, dtype=torch.float32)
+        dag_free = torch.ones(self.MAX_D, self.MAX_D, device=self.device, dtype=torch.float32)
+        if self._d < self.MAX_D:
+            dag_free[self._d:, :] = 0.0
+            dag_free[:, self._d:] = 0.0
+            
         for f, t in self._frozen_edge_set | self._forbidden_edge_set:
             if f in self._node_ids and t in self._node_ids:
                 i, j = self._node_ids.index(f), self._node_ids.index(t)
                 dag_free[i, j] = 0.0
-        if (
-            dag_mask_frozen
-            and (self._frozen_edge_set or self._forbidden_edge_set)
-            and hasattr(self._core, "dag_constraint_masked")
-        ):
+                
+        if hasattr(self._core, "dag_constraint_masked"):
             h_W = self._core.dag_constraint_masked(dag_free)
         else:
             h_W = self._core.dag_constraint()
+            
         l_dag = self.LAMBDA_DAG * h_W.abs()
 
         wm = self._core.W_masked()
         l1_mask = torch.ones_like(wm)
+        if self._d < self.MAX_D:
+            l1_mask[self._d:, :] = 0.0
+            l1_mask[:, self._d:] = 0.0
+            
         for f, t in self._frozen_edge_set | self._forbidden_edge_set:
             if f in self._node_ids and t in self._node_ids:
                 i, j = self._node_ids.index(f), self._node_ids.index(t)
@@ -633,7 +656,7 @@ class CausalGraph:
         self._optim.zero_grad()
 
         # ── Parallel forward (LeWM core) ──────────────────────────────────────
-        X_pred, Z_flat = self._core.forward_dynamics_seq(X_seq, A_seq)
+        X_pred, Z_flat = self.forward_dynamics_seq(X_seq, A_seq)
         # X_pred: (B, T-1, d) — predicted next states
         # Z_flat: (B*T, d*hidden) — latent embeddings for SIGReg
 
@@ -716,7 +739,7 @@ class CausalGraph:
 
         self._optim.zero_grad()
 
-        X_pred = integrate_world_model_step(self._core, X_t, a_t)
+        X_pred = integrate_world_model_step(self, X_t, a_t)
         l_rec = F.mse_loss(X_pred, X_tp1)
 
         h_W, l_dag, l_l1 = self._compute_dag_and_l1()
@@ -864,7 +887,7 @@ class CausalGraph:
         if variable in self._node_ids:
             a_vec[0, self._node_ids.index(variable)] = float(value)
         with torch.no_grad():
-            pred = integrate_world_model_step(self._core, state_vec, a_vec)
+            pred = integrate_world_model_step(self, state_vec, a_vec)
         result = {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
         return result
 
@@ -881,7 +904,7 @@ class CausalGraph:
         )
         z = torch.zeros_like(state_vec)
         with torch.no_grad():
-            pred = integrate_world_model_step(self._core, state_vec, z)
+            pred = integrate_world_model_step(self, state_vec, z)
         return {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
 
     # ── LeWM: Differentiable propagation + CEM planner ────────────────────────
@@ -907,7 +930,7 @@ class CausalGraph:
         a = torch.zeros(1, self._d, dtype=torch.float32, device=self.device)
         if var in self._node_ids:
             a[0, self._node_ids.index(var)] = float(value)
-        pred = self._core.forward_dynamics(x, a)  # (1, d) — differentiable!
+        pred = self.forward_dynamics(x, a)  # (1, d) — differentiable!
         return pred.squeeze(0)  # (d,)
 
     def propagate_batch(
@@ -937,10 +960,10 @@ class CausalGraph:
             dtype=torch.float32, device=self.device,
         ).unsqueeze(0).expand(N, -1)  # (N, d)
         with torch.no_grad():
-            pred = self._core.forward_dynamics(x0, actions)  # (N, d)
+            pred = self.forward_dynamics(x0, actions)  # (N, d)
             # Multi-step rollout: free dynamics (a=0)
             for _ in range(rollout_steps):
-                pred = self._core.forward_dynamics(pred, torch.zeros_like(pred))
+                pred = self.forward_dynamics(pred, torch.zeros_like(pred))
         return pred
 
     def cem_plan(

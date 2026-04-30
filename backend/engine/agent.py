@@ -284,7 +284,7 @@ class RKKAgent:
         core = self.graph._core
         if core is None or not candidates:
             return []
-        fd = getattr(core, "forward_dynamics", None)
+        fd = getattr(self.graph, "forward_dynamics", None)
         if not callable(fd):
             return []
 

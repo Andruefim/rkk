@@ -141,8 +141,8 @@ class TemporalBlankets:
 
         # Буферы
         self._fast_output_buf: list[torch.Tensor] = []  # для интеграции в slow
-        self._fast_input_buf:  list[torch.Tensor] = []  # для Φ_approx
-        self._slow_output_buf: list[torch.Tensor] = []
+        self._fast_input_buf:  deque[torch.Tensor] = deque(maxlen=10)  # для train_step
+        self._slow_steps_count = 0
 
         self._step_count = 0
 
@@ -189,7 +189,7 @@ class TemporalBlankets:
             integrated    = self.integrator(fast_stack.mean(dim=0))     # (d,)
 
             y_slow, self.h_slow = self.slow.step(integrated, self.h_slow.detach())
-            self._slow_output_buf.append(y_slow.detach())
+            self._slow_steps_count += 1
 
             # Контекст slow → fast
             self.slow_context = self.context_proj(y_slow).detach()
@@ -228,7 +228,7 @@ class TemporalBlankets:
         """Сводка для UI."""
         return {
             "fast_steps":     self._step_count,
-            "slow_steps":     len(self._slow_output_buf),
+            "slow_steps":     self._slow_steps_count,
             "phi":            round(self.phi_approx(), 4),
             "h_fast_norm":    round(self.h_fast.norm().item(), 4),
             "h_slow_norm":    round(self.h_slow.norm().item(), 4),
