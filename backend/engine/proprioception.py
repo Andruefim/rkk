@@ -217,7 +217,7 @@ class EmpowermentEstimator:
                 a[0, idx] = val
                 try:
                     from engine.wm_neural_ode import integrate_world_model_step
-                    x = integrate_world_model_step(graph._core, x, a)
+                    x = integrate_world_model_step(graph, x, a)
                 except Exception:
                     break
             reached.append(x.squeeze(0))

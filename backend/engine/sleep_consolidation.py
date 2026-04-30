@@ -285,14 +285,14 @@ class REMReplay:
                 # Metric-only: no autograd. With RKK_WM_NEURAL_ODE=1, odeint otherwise
                 # materializes a huge graph; we already run a full train forward below.
                 with torch.inference_mode():
-                    X_pred_metric = integrate_world_model_step(core, X_t, a)
+                    X_pred_metric = integrate_world_model_step(graph, X_t, a)
                     loss_before = float(F.mse_loss(X_pred_metric, X_fall).item())
                 losses_before.append(loss_before)
 
                 # Train (single graph per episode)
                 if optim is not None:
                     optim.zero_grad()
-                    X_pred_train = integrate_world_model_step(core, X_t, a)
+                    X_pred_train = integrate_world_model_step(graph, X_t, a)
                     loss = F.mse_loss(X_pred_train, X_fall)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(core.parameters(), 0.5)

@@ -66,6 +66,18 @@ def _t_span(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return torch.linspace(t0, t1, n, device=device, dtype=dtype)
 
 
+def _resolve_wm_forward_dynamics(entity: Any):
+    """
+    CausalGraph.forward_dynamics дополняет активную ширину до MAX_D и обрезает предсказание до _d.
+    Сырой CausalGNNCore / NOTEARSCore ожидает уже (B, MAX_D). Передавать graph._core с (B, _d)
+    даёт matmul (…,256,…) vs (…,214,…) — см. integrate_world_model_step.
+    """
+    fd = getattr(entity, "forward_dynamics", None)
+    if callable(fd) and hasattr(entity, "_pad"):
+        return fd
+    return fd
+
+
 def integrate_world_model_step(
     core: nn.Module,
     y0: torch.Tensor,
@@ -74,9 +86,10 @@ def integrate_world_model_step(
     """
     Одна логическая итерация world model: либо odeint по τ, либо один forward_dynamics.
 
-    y0, a: (B, d); возврат (B, d).
+    Первый аргумент: **CausalGraph** (предпочтительно) или сырой _core.
+    y0, a: (B, graph._d); возврат (B, graph._d).
     """
-    fd: Any = getattr(core, "forward_dynamics", None)
+    fd: Any = _resolve_wm_forward_dynamics(core)
     if not callable(fd):
         return core(y0 + a) if hasattr(core, "__call__") else y0
 

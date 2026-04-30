@@ -22,7 +22,7 @@ class SimulationVisionPredictorMixin:
             ).unsqueeze(0)
             z = torch.zeros_like(full_state)
             pred_full = integrate_world_model_step(
-                self.agent.graph._core, full_state, z
+                self.agent.graph, full_state, z
             ).squeeze(0)
             
             # Выбираем только slot_ переменные, сохраняя градиент (Bug 2 fix)
