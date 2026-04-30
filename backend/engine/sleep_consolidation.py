@@ -350,6 +350,7 @@ class REMReplay:
             env.reset_stance()
             
             # Проигрываем MoCap клип через физику
+            transitions = []
             for t in range(actual_steps):
                 # Извлекаем суставные углы из клипа: 
                 # 0:lhip, 1:rhip, 2:lknee, 3:rknee, 4:lankle, 5:rankle
@@ -368,13 +369,66 @@ class REMReplay:
                 
                 # Читаем настоящую физику (com_z, posture_stability и тд)
                 obs_raw = env.observe()
-                obs = dict(obs_raw)
+                transitions.append(dict(obs_raw))
                 
-                # Добавляем intent, чтобы модель знала ПРИЧИНУ ходьбы
-                obs["intent_stride"] = 0.65
-                obs["intent_stop_recover"] = 0.3
+            # ── Inverse Dynamics (Goal-Conditioned Motor Babbling) ──
+            # Имажинация: подбор intents для минимизации ошибки предсказания World Model
+            core = getattr(graph, "_core", None)
+            intent_indices = [i for i, nid in enumerate(node_ids) if nid.startswith("intent_")]
+            
+            if core is not None and intent_indices and len(transitions) > 1:
+                print(f"[Sleep] 🧠 Solving Inverse Dynamics for {actual_steps} steps...")
+                dev = next(core.parameters()).device
                 
-                # Записываем в буфер снов
+                # Build X_seq: (1, T, d)
+                X_list = []
+                for obs in transitions:
+                    X_list.append([float(obs.get(n, 0.5)) for n in node_ids])
+                    
+                X_seq = torch.tensor([X_list], dtype=torch.float32, device=dev)
+                X_target = X_seq[:, 1:, :] # (1, T-1, d)
+                
+                # A_seq: learnable actions (1, T, d)
+                A_seq = torch.zeros(1, actual_steps, len(node_ids), dtype=torch.float32, device=dev, requires_grad=True)
+                
+                # Freeze core
+                for p in core.parameters():
+                    p.requires_grad = False
+                    
+                optim_a = torch.optim.Adam([A_seq], lr=0.1)
+                
+                # Backprop on intents
+                for _ in range(20):
+                    optim_a.zero_grad()
+                    X_pred, _ = graph.forward_dynamics_seq(X_seq, A_seq)
+                    loss = torch.nn.functional.mse_loss(X_pred, X_target)
+                    loss.backward()
+                    
+                    with torch.no_grad():
+                        mask = torch.zeros_like(A_seq)
+                        for idx in intent_indices:
+                            mask[:, :, idx] = 1.0
+                        A_seq.grad = A_seq.grad * mask
+                        
+                    optim_a.step()
+                    
+                # Unfreeze core
+                for p in core.parameters():
+                    p.requires_grad = True
+                    
+                # Inject inferred intents into observation sequence
+                A_inferred = A_seq.detach().cpu().numpy()[0]
+                for t, obs in enumerate(transitions):
+                    for idx in intent_indices:
+                        obs[node_ids[idx]] = float(A_inferred[t, idx])
+            else:
+                # Fallback if inverse dynamics cannot run
+                for obs in transitions:
+                    obs["intent_stride"] = 0.65
+                    obs["intent_stop_recover"] = 0.3
+                    
+            # Record into memory buffer
+            for obs in transitions:
                 graph.record_observation(obs)
                 
         except Exception as e:
