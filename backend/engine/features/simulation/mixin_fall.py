@@ -43,7 +43,7 @@ class SimulationFallMixin:
         """
         score = self._fall_recovery_score(obs)
         try:
-            max_ticks = int(os.environ.get("RKK_FALL_RECOVERY_TICKS", "40"))
+            max_ticks = int(os.environ.get("RKK_FALL_RECOVERY_TICKS", "200"))
         except ValueError:
             max_ticks = 40
         try:

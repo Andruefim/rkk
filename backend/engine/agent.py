@@ -31,8 +31,13 @@ agent_v4.py — RKKAgent с Value Layer (Шаг А).
 """
 from __future__ import annotations
 
+import json
 import os
+import sys
 import threading
+import time
+import warnings
+from pathlib import Path
 from typing import Any
 import torch
 import numpy as np
@@ -86,6 +91,34 @@ _LOCOMOTION_CPG_LEG_EIG_BLOCK = frozenset(
 # CEM motor vars: intent variables that CEM planner can optimize over.
 _CEM_MOTOR_PREFIXES = ("intent_", "phys_intent_")
 
+# #region agent log
+_DBG_LOG_F7_AGENT = Path(__file__).resolve().parents[2] / "debug-f7a777.log"
+
+
+def _dbg_agent(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
+    try:
+        with _DBG_LOG_F7_AGENT.open("a", encoding="utf-8") as _df:
+            _df.write(
+                json.dumps(
+                    {
+                        "sessionId": "f7a777",
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data or {},
+                        "timestamp": int(time.time() * 1000),
+                        "runId": "pre-fix",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
+
+# #endregion
+
 
 def _is_motor_intent_var(name: str) -> bool:
     return str(name).startswith("intent_") or str(name).startswith("phys_intent_")
@@ -104,6 +137,15 @@ def _eig_chunk_size() -> int:
         return 256
 
 
+def _score_max_candidates() -> int:
+    """Cap intervention pairs before EIG batch (0 = unlimited). RKK_SCORE_MAX_CANDIDATES."""
+    try:
+        v = int(os.environ.get("RKK_SCORE_MAX_CANDIDATES", "512"))
+    except ValueError:
+        return 512
+    return max(0, v)
+
+
 def _score_cache_every() -> int:
     """Пересчёт score_interventions не чаще чем раз в N тиков движка (RKK_SCORE_CACHE_EVERY; 1 = каждый тик)."""
     try:
@@ -112,10 +154,28 @@ def _score_cache_every() -> int:
         return 1
 
 
+_score_async_win_warned = False
+
+
 def _score_async_enabled() -> bool:
     """Фоновый поток для score_interventions; по умолчанию выкл. (лок на весь WM давал рывки UI)."""
+    global _score_async_win_warned
     v = os.environ.get("RKK_SCORE_ASYNC", "0").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    if v not in ("1", "true", "yes", "on"):
+        return False
+    # concurrent score_interventions vs train_step / graph mutation → undefined behavior;
+    # on Windows this showed up as native crash (e.g. 0xC0000005) under WS load.
+    if sys.platform == "win32":
+        if not _score_async_win_warned:
+            warnings.warn(
+                "RKK_SCORE_ASYNC is ignored on Windows (unsafe concurrent CausalGraph access); "
+                "use RKK_SCORE_ASYNC=0.",
+                UserWarning,
+                stacklevel=2,
+            )
+            _score_async_win_warned = True
+        return False
+    return True
 
 
 def _imagination_horizon_from_env() -> int:
@@ -761,7 +821,12 @@ class RKKAgent:
                 if c["variable"] not in _LOCOMOTION_CPG_LEG_EIG_BLOCK
             ]
 
-        if not candidates or not features_batch:
+        cap = _score_max_candidates()
+        if cap > 0 and len(candidates) > cap:
+            candidates.sort(key=lambda c: -float(c.get("uncertainty", 0.0)))
+            candidates = candidates[:cap]
+
+        if not candidates:
             return []
 
         use_eig = _hypothesis_eig_from_env() and W_m is not None and unc_m is not None
@@ -801,7 +866,7 @@ class RKKAgent:
                 use_eig = False
 
         if not use_eig:
-            scores = self.system1.score(features_batch)
+            scores = self.system1.score([c["features"] for c in candidates])
             for i, cand in enumerate(candidates):
                 cand["expected_ig"] = scores[i]
 
@@ -854,12 +919,19 @@ class RKKAgent:
         except Exception:
             pass
         sce = _score_cache_every()
+        # #region agent log
+        _t_score = time.perf_counter()
+        _score_mode = "?"
+        # #endregion
         if (
             sce > 1
             and self._score_cache
             and (engine_tick - self._score_cache_tick) < sce
         ):
             scores = list(self._score_cache)
+            # #region agent log
+            _score_mode = "sce_span_cache"
+            # #endregion
         elif _score_async_enabled():
             if self._score_thread is None or not self._score_thread.is_alive():
                 self._score_thread = threading.Thread(
@@ -872,11 +944,20 @@ class RKKAgent:
                 have = list(self._score_result) if self._score_result else []
             if have:
                 scores = have
+                # #region agent log
+                _score_mode = "async_have"
+                # #endregion
             elif self._score_cache:
                 scores = list(self._score_cache)
+                # #region agent log
+                _score_mode = "async_stale_cache"
+                # #endregion
             else:
                 with torch.no_grad():
                     scores = self.score_interventions()
+                # #region agent log
+                _score_mode = "async_fallback_sync"
+                # #endregion
                 with self._score_lock:
                     self._score_result = list(scores)
             if sce > 1:
@@ -885,9 +966,25 @@ class RKKAgent:
         else:
             with torch.no_grad():
                 scores = self.score_interventions()
+            # #region agent log
+            _score_mode = "sync"
+            # #endregion
             if sce > 1:
                 self._score_cache = list(scores)
                 self._score_cache_tick = engine_tick
+        # #region agent log
+        _dbg_agent(
+            "H1",
+            "RKKAgent.step",
+            "scores_resolved",
+            {
+                "mode": _score_mode,
+                "ms": (time.perf_counter() - _t_score) * 1000,
+                "n_scores": len(scores),
+                "engine_tick": engine_tick,
+            },
+        )
+        # #endregion
         gp = self._maybe_goal_planned_candidate() if enable_l3 else None
         if gp is not None and not (
             symbolic_verifier_enabled() and self._symbolic_prediction_bad
@@ -1002,7 +1099,21 @@ class RKKAgent:
         # NOTEARS train
         notears_result = None
         if self._total_interventions % NOTEARS_EVERY == 0:
+            # #region agent log
+            _t_ts = time.perf_counter()
+            # #endregion
             notears_result = self.graph.train_step()
+            # #region agent log
+            _dbg_agent(
+                "H2",
+                "RKKAgent.step",
+                "graph.train_step",
+                {
+                    "ms": (time.perf_counter() - _t_ts) * 1000,
+                    "interventions": int(self._total_interventions),
+                },
+            )
+            # #endregion
             if notears_result:
                 self._notears_steps += 1
                 self._last_notears_loss = notears_result

@@ -32,6 +32,7 @@ try:
 except ImportError:
     pass
 from contextlib import asynccontextmanager
+import traceback
 from typing import Literal
 from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -291,7 +292,7 @@ def health():
 
 @app.get("/state")
 def state():
-    return get_sim().public_state()
+    return sanitize_for_json(get_sim().public_state())
 
 
 @app.get("/api/snapshot")
@@ -300,7 +301,7 @@ def api_snapshot():
     sim = get_sim()
     ps = sim.public_state()
     ps["world"] = ps.get("current_world", "humanoid")
-    return ps
+    return sanitize_for_json(ps)
 
 
 @app.get("/api/agent/messages")
@@ -356,7 +357,7 @@ async def api_ws_chat(websocket: WebSocket):
 
 @app.post("/step")
 def step():
-    return get_sim().tick_step()
+    return sanitize_for_json(get_sim().tick_step())
 
 
 # ── Camera ────────────────────────────────────────────────────────────────────
@@ -830,6 +831,18 @@ async def causal_stream(websocket: WebSocket):
     print(f"[WS] Humanoid+Vision Singleton connected. d={sim.agent.graph._d}")
 
     try:
+        # Первый JSON сразу после accept — UI ставит ONLINE до тяжёлого tick_step / sanitize.
+        try:
+            loop = asyncio.get_running_loop()
+
+            def _initial_snap():
+                return sanitize_for_json(sim.public_state())
+
+            payload0 = await loop.run_in_executor(None, _initial_snap)
+            await websocket.send_json(payload0)
+        except Exception as e:
+            print(f"[WS] Initial snapshot send failed: {e}")
+
         while True:
             try:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
@@ -875,17 +888,63 @@ async def causal_stream(websocket: WebSocket):
             except Exception:
                 pass
 
-            data = None
-            for _ in range(max(1, speed)):
-                data = sim.tick_step()
+            try:
+                # tick_step() — тяжёлый sync (PyBullet, GNN); в async-цикле он блокирует весь
+                # event loop → WebSocket не шлёт кадры, ping не обрабатывается, UI «мёртв».
+                loop = asyncio.get_running_loop()
 
-            await websocket.send_json(sanitize_for_json(data))
+                def _run_ticks() -> dict:
+                    out: dict | None = None
+                    for _ in range(max(1, speed)):
+                        out = sim.tick_step()
+                    # Санитизация здесь же — иначе огромный dict копируется на главном потоке
+                    # между executor и send_json и снова даёт пики RAM + секундные зависания UI.
+                    return sanitize_for_json(out or {})
+
+                payload = await loop.run_in_executor(None, _run_ticks)
+                await websocket.send_json(payload)
+            except WebSocketDisconnect:
+                raise
+            except RuntimeError as e:
+                # Клиент закрыл сокет — иногда Starlette даёт RuntimeError вместо WebSocketDisconnect.
+                if "send" in str(e).lower() and "close" in str(e).lower():
+                    raise WebSocketDisconnect() from e
+                raise
+            except Exception as e:
+                # Один плохой тик / сериализация не должны ронять весь uvicorn.
+                print(f"[WS] tick/send failed: {e}")
+                traceback.print_exc()
+                try:
+                    await websocket.send_json(
+                        {
+                            "tick": getattr(sim, "tick", 0),
+                            "phase": getattr(sim, "phase", 1),
+                            "entropy": 100.0,
+                            "agents": [],
+                            "events": [
+                                {
+                                    "tick": getattr(sim, "tick", 0),
+                                    "text": f"[WS error] {e!s}"[:200],
+                                    "color": "#ff4444",
+                                    "type": "error",
+                                }
+                            ],
+                            "graph_deltas": {},
+                            "singleton": True,
+                            "_ws_recovery": True,
+                        }
+                    )
+                except Exception as send_exc:
+                    print(f"[WS] recovery send failed: {send_exc}")
+                await asyncio.sleep(0.15)
+
             await asyncio.sleep(0.05)
 
     except WebSocketDisconnect:
         print("[WS] Disconnected")
     except Exception as e:
         print(f"[WS] Error: {e}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

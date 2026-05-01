@@ -46,6 +46,14 @@ if __name__ == "__main__":
     import os
     from pathlib import Path
 
+    # Windows cp1251: Unicode in print() → UnicodeEncodeError → первый WS-тик роняет поток.
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     _backend_dir = Path(__file__).resolve().parent
     _repo_root = _backend_dir.parent
     try:

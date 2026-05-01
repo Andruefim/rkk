@@ -93,7 +93,7 @@ class NOTEARSCore(nn.Module):
         super().__init__()
         self.d      = d
         self.device = device
-        self.W      = nn.Parameter(torch.zeros(d, d, device=device))
+        self.W      = nn.Parameter(torch.randn(d, d, device=device) * 0.02)
         mask = 1.0 - torch.eye(d, device=device)
         self.register_buffer("mask", mask)
 
@@ -483,28 +483,40 @@ class CausalGraph:
             return torch.nn.functional.pad(x, (0, pad_len))
         return x
 
+    def _wm_inputs_for_core(self, X: torch.Tensor, A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        GNN/NOTEARS cores are built at MAX_D×MAX_D — pad observations to MAX_D.
+        RSSMLiteCore uses live graph width (graph._d) — padding to MAX_D breaks Linear layers
+        (e.g. cat(X,a) becomes 512 vs expected 428 when d=214).
+        """
+        if self._core is None:
+            return X, A
+        cd = int(getattr(self._core, "d", self.MAX_D))
+        if cd >= self.MAX_D:
+            return self._pad(X), self._pad(A)
+        d_act = min(cd, self._d, X.shape[-1], A.shape[-1])
+        return X[..., :d_act], A[..., :d_act]
+
     def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         if self._core is None:
             return X
-        X_pad = self._pad(X)
-        a_pad = self._pad(a)
+        X_in, a_in = self._wm_inputs_for_core(X, a)
         if hasattr(self._core, "forward_dynamics"):
-            pred = self._core.forward_dynamics(X_pad, a_pad)
+            pred = self._core.forward_dynamics(X_in, a_in)
         else:
-            m = (torch.abs(a_pad) > 1e-8).float()
-            x_in = X_pad * (1.0 - m) + a_pad * m
+            m = (torch.abs(a_in) > 1e-8).float()
+            x_in = X_in * (1.0 - m) + a_in * m
             pred = self._core(x_in)
         return pred[..., :self._d]
 
     def forward_dynamics_seq(self, X_seq: torch.Tensor, A_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._core is None:
             return X_seq, torch.zeros(0, device=self.device), torch.zeros(0, device=self.device)
-        X_pad = self._pad(X_seq)
-        A_pad = self._pad(A_seq)
+        X_in, A_in = self._wm_inputs_for_core(X_seq, A_seq)
         if hasattr(self._core, "forward_dynamics_seq"):
-            pred, h_pred, z = self._core.forward_dynamics_seq(X_pad, A_pad)
+            pred, h_pred, z = self._core.forward_dynamics_seq(X_in, A_in)
         else:
-            pred = self._core(X_pad + A_pad)
+            pred = self._core(X_in + A_in)
             h_pred = torch.zeros(0, device=self.device)
             z = torch.zeros(X_seq.shape[0] * X_seq.shape[1], 1, device=self.device)
         return pred[..., :self._d], h_pred[..., :self._d, :], z
@@ -710,7 +722,28 @@ class CausalGraph:
         # 4. DAG + L1 (shared)
         h_W, l_dag, l_l1 = self._compute_dag_and_l1()
 
-        loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1
+        # 5. Intervention prediction (same term as legacy — gradient through W when edges active)
+        l_int = torch.tensor(0.0, device=self.device)
+        int_b = self._int_buffer
+        if len(int_b) >= 4:
+            k = min(8, len(int_b))
+            picks = random.sample(int_b, k)
+            rows_X = [self._coerce_row_to_d(it["obs_before"]) for it in picks]
+            rows_Y = [self._coerce_row_to_d(it["obs_after"]) for it in picks]
+            rows_a: list[list[float]] = []
+            for it in picks:
+                ar = [0.0] * self._d
+                idx = int(it.get("idx", -1))
+                if 0 <= idx < self._d:
+                    ar[idx] = float(it.get("val", 0.0))
+                rows_a.append(ar)
+            X_i = torch.tensor(rows_X, dtype=torch.float32, device=self.device)
+            Y_i = torch.tensor(rows_Y, dtype=torch.float32, device=self.device)
+            A_i = torch.tensor(rows_a, dtype=torch.float32, device=self.device)
+            Xp_i = integrate_world_model_step(self, X_i, A_i)
+            l_int = self.LAMBDA_INT * F.mse_loss(Xp_i, Y_i)
+
+        loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1 + l_int
 
         self._finish_train_step(loss)
 
@@ -730,6 +763,7 @@ class CausalGraph:
             "l_sig":   round(l_sig.item(), 5),
             "l_dag":   round(l_dag.item(), 5),
             "l_l1":    round(l_l1.item(), 5),
+            "l_int":   round(l_int.item(), 5),
             "h_W":     round(h_W.item(), 5),
             "mode":    "seq",
             "batch_B": B,

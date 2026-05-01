@@ -194,7 +194,8 @@ class CausalGNNCore(nn.Module):
         self.hidden = hidden
 
         # ── Adjacency matrix (совместимость с NOTEARSCore) ───────────────────
-        self.W = nn.Parameter(torch.zeros(d, d, device=device))
+        # Small random init: all-zeros + sparse inference ⇒ zero agg ⇒ no gradient into W.
+        self.W = nn.Parameter(torch.randn(d, d, device=device) * 0.02)
 
         # ── GNN компоненты ────────────────────────────────────────────────────
         # Node encoder: кодируем скалярное значение переменной

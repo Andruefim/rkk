@@ -39,4 +39,23 @@ def sanitize_for_json(obj: Any) -> Any:
             return sanitize_for_json(obj.item())
     except ImportError:
         pass
+    try:
+        import torch
+
+        if isinstance(obj, torch.Tensor):
+            t = obj.detach().cpu()
+            if t.numel() == 0:
+                return None
+            if t.numel() == 1:
+                return sanitize_for_json(float(t.item()))
+            # Крупные тензоры в JSON не кладём — только сводка (иначе WS гигабайты).
+            if t.numel() <= 64:
+                return [sanitize_for_json(float(x)) for x in t.flatten().tolist()]
+            return {
+                "_tensor": "large",
+                "shape": list(t.shape),
+                "mean": sanitize_for_json(float(t.mean().item())),
+            }
+    except ImportError:
+        pass
     return obj

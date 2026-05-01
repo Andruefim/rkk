@@ -3,7 +3,10 @@ import * as THREE from "three";
 import { useRKKStream } from "../../hooks/useRKKStream";
 import NovaChatWidget from "./NovaChatWidget";
 
-const API = "http://localhost:8000";
+/** Backend REST + WS (override in .env: VITE_RKK_API_URL=http://127.0.0.1:8000) */
+const API = import.meta.env.VITE_RKK_API_URL ?? "http://localhost:8000";
+const WS_CAUSAL_URL =
+  API.replace(/^http/i, "ws").replace(/\/$/, "") + "/ws/causal-stream";
 const CAMERA_PREVIEW_MS = 500;
 const CAM_VIEW = "fp";
 
@@ -150,7 +153,7 @@ const SKELETON_BONES = [
 export default function RKKHumanoid() {
   const mountRef   = useRef(null);
   const rafRef     = useRef(null);
-  const { frame: wsFrame, connected, setSpeed: wsSetSpeed } = useRKKStream();
+  const { frame: wsFrame, connected, setSpeed: wsSetSpeed } = useRKKStream(WS_CAUSAL_URL);
   const wsFrameRef = useRef(wsFrame);
   wsFrameRef.current = wsFrame;
 

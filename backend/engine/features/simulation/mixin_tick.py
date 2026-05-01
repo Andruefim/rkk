@@ -1,22 +1,130 @@
 """Simulation mixin: tick_step, один шаг агента."""
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from engine.features.simulation.mixin_imports import *
+
+# #region agent log
+_DBG_LOG_F7 = Path(__file__).resolve().parents[4] / "debug-f7a777.log"
+
+
+def _dbg_tick(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
+    try:
+        with _DBG_LOG_F7.open("a", encoding="utf-8") as _df:
+            _df.write(
+                json.dumps(
+                    {
+                        "sessionId": "f7a777",
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data or {},
+                        "timestamp": int(time.time() * 1000),
+                        "runId": "pre-fix",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+
+
+# #endregion
 
 
 class SimulationTickMixin:
     # ── Tick ──────────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
         hz = _agent_loop_hz_from_env()
+        # #region agent log
+        _t_tick = time.perf_counter()
+        # #endregion
         if hz > 0.0:
             self._bg.ensure_rkk_agent_loop()
             with self._sim_step_lock:
                 cached = self._agent_step_response
             if cached is not None:
-                return copy.deepcopy(cached)
-            return self.public_state()
+                # Не deepcopy: снимок десятки KB+ — при 15–20 Hz это раздувает RAM на гигабайты
+                # и тормозит event loop; фоновый поток каждый цикл пишет новый dict.
+                # #region agent log
+                _dbg_tick(
+                    "H3",
+                    "mixin_tick.tick_step",
+                    "return_cached",
+                    {"hz": hz, "total_ms": (time.perf_counter() - _t_tick) * 1000},
+                )
+                # #endregion
+                return cached
+            # Не вызываем public_state() сразу: это второй полный snapshot+PyBullet, пока
+            # rkk-agent-loop держит lock на первом тике — минутные зависания и «1 тик / 15 с».
+            try:
+                max_wait = float(os.environ.get("RKK_WS_AGENT_CACHE_WAIT_SEC", "90"))
+            except ValueError:
+                max_wait = 90.0
+            max_wait = max(0.25, min(300.0, max_wait))
+            deadline = time.perf_counter() + max_wait
+            # #region agent log
+            _spin_start = time.perf_counter()
+            _spin_iters = 0
+            # #endregion
+            while time.perf_counter() < deadline:
+                time.sleep(0.04)
+                # #region agent log
+                _spin_iters += 1
+                # #endregion
+                with self._sim_step_lock:
+                    cached = self._agent_step_response
+                if cached is not None:
+                    # #region agent log
+                    _dbg_tick(
+                        "H3",
+                        "mixin_tick.tick_step",
+                        "cache_after_spin",
+                        {
+                            "hz": hz,
+                            "spin_ms": (time.perf_counter() - _spin_start) * 1000,
+                            "spin_iters": _spin_iters,
+                            "total_ms": (time.perf_counter() - _t_tick) * 1000,
+                        },
+                    )
+                    # #endregion
+                    return cached
+            # #region agent log
+            _ps0 = time.perf_counter()
+            # #endregion
+            out = self.public_state()
+            # #region agent log
+            _dbg_tick(
+                "H3",
+                "mixin_tick.tick_step",
+                "public_state_fallback",
+                {
+                    "hz": hz,
+                    "public_state_ms": (time.perf_counter() - _ps0) * 1000,
+                    "spin_ms": (_ps0 - _spin_start) * 1000,
+                    "spin_iters": _spin_iters,
+                    "total_ms": (time.perf_counter() - _t_tick) * 1000,
+                },
+            )
+            # #endregion
+            return out
+        # #region agent log
+        _t_sync = time.perf_counter()
+        # #endregion
         with self._sim_step_lock:
-            return self._run_single_agent_timestep_inner()
+            _inner = self._run_single_agent_timestep_inner()
+        # #region agent log
+        _dbg_tick(
+            "H3",
+            "mixin_tick.tick_step",
+            "sync_path_inner",
+            {"hz": 0.0, "inner_ms": (time.perf_counter() - _t_sync) * 1000},
+        )
+        # #endregion
+        return _inner
 
     def advance_agent_steps(self, n: int) -> None:
         """Синхронно выполнить n логических тиков агента (bootstrap при RKK_AGENT_LOOP_HZ>0)."""
@@ -28,6 +136,9 @@ class SimulationTickMixin:
                 self._agent_step_response = self._run_single_agent_timestep_inner()
 
     def _run_single_agent_timestep_inner(self) -> dict:
+        # #region agent log
+        _t_inner0 = time.perf_counter()
+        # #endregion
         self.tick += 1
         if self.current_world != "humanoid":
             self._hai_prev_com_x = None
@@ -466,6 +577,14 @@ class SimulationTickMixin:
         except Exception:
             pass
 
+        # #region agent log
+        _dbg_tick(
+            "H4",
+            "mixin_tick._run_single_agent_timestep_inner",
+            "timestep_inner_done",
+            {"tick": self.tick, "ms": (time.perf_counter() - _t_inner0) * 1000},
+        )
+        # #endregion
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)
 
     def _apply_topological_self_priors(self) -> None:

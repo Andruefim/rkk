@@ -12,11 +12,13 @@ class SimulationSnapshotShutdownMixin:
         return build_simulation_snapshot(self, snap, graph_deltas, smoothed, scene)
 
     def public_state(self) -> dict:
-        snap     = self._last_snapshot or self.agent.snapshot()
-        smoothed = float(np.mean(self._dr_window)) if self._dr_window else 0.0
-        fn       = getattr(self.agent.env, "get_full_scene", None)
-        scene    = fn() if callable(fn) else {}
-        return self._build_snapshot(snap, {}, smoothed, scene)
+        # PyBullet не потокобезопасен: WS и HTTP должны читать сцену под тем же lock, что и step().
+        with self._sim_step_lock:
+            snap     = self._last_snapshot or self.agent.snapshot()
+            smoothed = float(np.mean(self._dr_window)) if self._dr_window else 0.0
+            fn       = getattr(self.agent.env, "get_full_scene", None)
+            scene    = fn() if callable(fn) else {}
+            return self._build_snapshot(snap, {}, smoothed, scene)
 
     def shutdown(self):
         self._bg.stop_rkk_agent_loop()

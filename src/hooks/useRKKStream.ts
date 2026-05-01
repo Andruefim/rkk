@@ -115,10 +115,13 @@ export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
       ws.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data) as StreamFrame;
+          if (!data || typeof data !== "object") return;
           setFrame(prev => {
-            const agents = data.agents.map((a, i) => ({
+            const raw = Array.isArray(data.agents) ? data.agents : prev.agents;
+            const gd = data.graph_deltas ?? {};
+            const agents = raw.map((a, i) => ({
               ...a,
-              edges: data.graph_deltas[i] ?? prev.agents[i]?.edges ?? a.edges,
+              edges: gd[i as keyof typeof gd] ?? prev.agents[i]?.edges ?? a.edges,
             }));
             return { ...data, agents };
           });

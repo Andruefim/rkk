@@ -94,7 +94,10 @@ class BackgroundLoopService:
                 if not nodes:
                     nodes = dict(s.agent.graph.nodes)
                 try:
-                    obs_live = s.agent.env.observe()
+                    # Same lock as tick_step / agent timestep so CPG observe never races
+                    # physics + graph updates on another thread.
+                    with s._sim_step_lock:
+                        obs_live = s.agent.env.observe()
                     for _k in ("com_x", "com_y", "com_z"):
                         if _k in obs_live:
                             nodes[_k] = float(obs_live[_k])
@@ -132,7 +135,7 @@ class BackgroundLoopService:
         self._agent_loop_thread.start()
         print(
             f"[Simulation] Agent high-level loop ~{_agent_loop_hz_from_env():.1f} Hz "
-            f"(RKK_AGENT_LOOP_HZ; HTTP/WS tick_step → кэш)"
+            f"(RKK_AGENT_LOOP_HZ; HTTP/WS tick_step -> cache)"
         )
 
     def stop_rkk_agent_loop(self) -> None:

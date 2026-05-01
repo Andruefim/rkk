@@ -385,16 +385,97 @@ class EnvironmentHumanoid:
 
     def _apply_upper_body_from_intents(self, *, cpg_sync: dict[str, float] | None = None) -> None:
         """
-        Удалено хардкодное управление руками и спиной.
-        Теперь верхняя часть тала отпущена в свободное плавание для LearnedMotorPrims.
+        Торс и плечи из intent_* — используется при CPG на ногах и в apply_cpg_leg_targets.
+        cpg_sync: опционально подмешивает pitch_add от ритма ног.
         """
-        pass
+        ms = self._motor_state
+        torso = float(ms.get("intent_torso_forward", 0.5))
+        arm_cb = float(ms.get("intent_arm_counterbalance", 0.5))
+        pitch = float(np.clip(0.5 + (torso - 0.5) * 0.55, 0.05, 0.95))
+        if cpg_sync:
+            pitch = float(
+                np.clip(pitch + 0.35 * float(cpg_sync.get("pitch_add", 0.0)), 0.05, 0.95)
+            )
+        self._sim.set_joint("spine_pitch", pitch)
+        self._sim.set_joint(
+            "lshoulder",
+            float(np.clip(0.5 - (arm_cb - 0.5) * 0.65, 0.05, 0.95)),
+        )
+        self._sim.set_joint(
+            "rshoulder",
+            float(np.clip(0.5 + (arm_cb - 0.5) * 0.65, 0.05, 0.95)),
+        )
 
     def _apply_motor_intents(self) -> None:
         """
-        Hardcoded intents mapped to joints removed to allow learned behaviors to emerge.
+        Отображение intent_* на цели суставов (observe всё ещё из фактической физики).
+        При cpg_owns_legs ноги задаёт CPG — здесь только верх тела.
         """
-        self._apply_upper_body_from_intents()
+        if self._intero_control_lost:
+            return
+        ms = self._motor_state
+        sup_l = float(ms.get("intent_support_left", 0.5))
+        sup_r = float(ms.get("intent_support_right", 0.5))
+        recover = float(ms.get("intent_stop_recover", 0.5))
+        stride = float(ms.get("intent_stride", 0.5))
+        torso = float(ms.get("intent_torso_forward", 0.5))
+        arm_cb = float(ms.get("intent_arm_counterbalance", 0.5))
+
+        if self._fixed_root:
+            self._sim.set_joint(
+                "spine_pitch",
+                float(np.clip(0.5 + (torso - 0.5) * 0.5, 0.05, 0.95)),
+            )
+            self._sim.set_joint(
+                "lshoulder",
+                float(np.clip(0.5 - (arm_cb - 0.5) * 0.6, 0.05, 0.95)),
+            )
+            self._sim.set_joint(
+                "rshoulder",
+                float(np.clip(0.5 + (arm_cb - 0.5) * 0.6, 0.05, 0.95)),
+            )
+            return
+
+        if self.cpg_owns_legs:
+            self._apply_upper_body_from_intents(cpg_sync=None)
+            return
+
+        knee = float(
+            np.clip(
+                0.45 - (sup_l + sup_r - 1.0) * 0.20 + (recover - 0.5) * 0.45,
+                0.05,
+                0.95,
+            )
+        )
+        self._sim.set_joint("lknee", knee)
+        self._sim.set_joint("rknee", knee)
+
+        hip_base = float(np.clip(0.5 - (sup_l + sup_r - 1.0) * 0.15, 0.05, 0.95))
+        self._sim.set_joint(
+            "lhip",
+            float(np.clip(hip_base - (stride - 0.5) * 0.3, 0.05, 0.95)),
+        )
+        self._sim.set_joint(
+            "rhip",
+            float(np.clip(hip_base + (stride - 0.5) * 0.3, 0.05, 0.95)),
+        )
+
+        ankle = float(np.clip(0.5 + (sup_l + sup_r - 1.0) * 0.12, 0.05, 0.95))
+        self._sim.set_joint("lankle", ankle)
+        self._sim.set_joint("rankle", ankle)
+
+        self._sim.set_joint(
+            "spine_pitch",
+            float(np.clip(0.5 + (torso - 0.5) * 0.55, 0.05, 0.95)),
+        )
+        self._sim.set_joint(
+            "lshoulder",
+            float(np.clip(0.5 - (arm_cb - 0.5) * 0.65, 0.05, 0.95)),
+        )
+        self._sim.set_joint(
+            "rshoulder",
+            float(np.clip(0.5 + (arm_cb - 0.5) * 0.65, 0.05, 0.95)),
+        )
 
     def apply_motor_intent_residuals(self, residuals: dict[str, float]) -> None:
         """

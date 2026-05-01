@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from engine.json_util import sanitize_for_json
 from engine.core.constants import (
     agent_loop_hz_from_env as _agent_loop_hz_from_env,
     cpg_loop_hz_from_env as _cpg_loop_hz_from_env,
@@ -225,4 +224,6 @@ def build_simulation_snapshot(
             else None
         ),
     }
-    return sanitize_for_json(payload)
+    # Санитизация (nan/inf/torch) — один раз на границе send_json/HTTP, не здесь
+    # (двойной sanitize дублировал весь payload и раздувал RAM на каждый WS-кадр).
+    return payload
