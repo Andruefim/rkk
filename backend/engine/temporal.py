@@ -170,6 +170,15 @@ class TemporalBlankets:
             elif u.numel() < self.d_input:
                 u = torch.nn.functional.pad(u, (0, self.d_input - u.numel()))
 
+        # Keep slow context aligned with d_input (e.g. after graph growth on another path)
+        if self.slow_context.shape[0] != self.d_input:
+            if self.slow_context.shape[0] > self.d_input:
+                self.slow_context = self.slow_context[: self.d_input].detach()
+            else:
+                self.slow_context = torch.nn.functional.pad(
+                    self.slow_context, (0, self.d_input - self.slow_context.shape[0])
+                )
+
         # ── Fast step ──
         # Контекст от slow SSM добавляется как граничное условие
         u_with_context = u + 0.1 * self.slow_context.detach()

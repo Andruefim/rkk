@@ -402,9 +402,13 @@ class RSSMTrainer:
         h = torch.zeros(1, self.rssm.rssm_hidden, device=self.device)
         total_loss = torch.tensor(0.0, device=self.device)
 
+        d_rm = int(self.rssm.d)
         for X_t, a_t, X_tp1 in batch:
-            X_pred, h = self.rssm.forward_dynamics_stateless(X_t, a_t, h)
-            loss_t = F.mse_loss(X_pred, X_tp1.detach())
+            X_s = X_t[..., :d_rm]
+            a_s = a_t[..., :d_rm]
+            tgt = X_tp1[..., :d_rm]
+            X_pred, h = self.rssm.forward_dynamics_stateless(X_s, a_s, h)
+            loss_t = F.mse_loss(X_pred, tgt.detach())
             total_loss = total_loss + loss_t
 
         total_loss = total_loss / self.tbptt

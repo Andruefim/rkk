@@ -36,6 +36,18 @@ def _dbg_tick(hypothesis_id: str, location: str, message: str, data: dict | None
 
 
 class SimulationTickMixin:
+    def _sync_temporal_blankets_to_graph(self) -> None:
+        """Rebuild TemporalBlankets when |graph nodes| changes (inner_voice, concepts, neurogenesis)."""
+        from engine.temporal import TemporalBlankets
+
+        g_d = len(self.agent.graph._node_ids)
+        if g_d <= 0:
+            return
+        tb = self.agent.temporal
+        if tb.d_input == g_d:
+            return
+        self.agent.temporal = TemporalBlankets(d_input=g_d, device=self.device)
+
     # ── Tick ──────────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
         hz = _agent_loop_hz_from_env()
@@ -239,6 +251,7 @@ class SimulationTickMixin:
         self._publish_cpg_node_snapshot()
         self.agent.other_agents_phi = []
         self._maybe_step_hierarchical_l1()
+        self._sync_temporal_blankets_to_graph()
         obs_pre_rssm = dict(self.agent.graph.snapshot_vec_dict())
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
 
@@ -537,15 +550,7 @@ class SimulationTickMixin:
                     "#ff44cc", 
                     "phase"
                 )
-                
-                # Обновляем TemporalBlankets под новую размерность (d = d + 1)
-                from engine.temporal import TemporalBlankets
-                new_d = self.agent.graph._d
-                old_tb = self.agent.temporal
-                new_tb = TemporalBlankets(d_input=new_d, device=self.device)
-                # Копируем состояния TemporalBlankets (насколько возможно)
-                # ... (миграция состояния SSM, аналогично resize_to в GNN)
-                self.agent.temporal = new_tb
+                self._sync_temporal_blankets_to_graph()
 
         # Scene
         scene_fn = getattr(self.agent.env, "get_full_scene", None)
