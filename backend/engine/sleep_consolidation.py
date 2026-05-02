@@ -28,7 +28,7 @@ sleep_consolidation.py — Phase K: Sleep Consolidation.
 RKK_SLEEP_ENABLED=1
 RKK_SLEEP_EVERY_TICKS=10000
 RKK_SLEEP_FALL_THRESHOLD=50
-RKK_SLEEP_DURATION_TICKS=200   — тиков на сон (с fixed_root)
+RKK_SLEEP_DURATION_TICKS=200   — суммарных engine-тиков на сон; фазы REM:LESSON:PRUNE ≈ 30:80:20 от этого числа (раньше были захардкожены 30+80+20=130).
 RKK_SLEEP_REM_LR_MULT=10.0     — множитель lr во время REM
 RKK_SLEEP_PRUNE_THRESHOLD=0.05 — обрезать edges с |w| < threshold
 
@@ -500,6 +500,20 @@ class SleepController:
           result = self._sleep_ctrl.tick(tick, sim)
     """
 
+    @staticmethod
+    def _split_sleep_phase_lengths(total_ticks: int) -> tuple[int, int, int]:
+        """
+        Делит RKK_SLEEP_DURATION_TICKS на три фазы с тем же соотношением,
+        что раньше было захардкожено (REM:LESSON:PRUNE = 30:80:20 при сумме 130).
+        Остаток от округления добавляется к LESSON (ожидание LLM).
+        """
+        total = max(3, int(total_ticks))
+        rem = max(1, round(total * 30 / 130))
+        lesson = max(1, round(total * 80 / 130))
+        prune = max(1, round(total * 20 / 130))
+        lesson += total - (rem + lesson + prune)
+        return rem, lesson, prune
+
     def __init__(self):
         self._phase = SleepPhase.AWAKE
         self._session: SleepSession | None = None
@@ -511,6 +525,9 @@ class SleepController:
         self._every_ticks = _env_int("RKK_SLEEP_EVERY_TICKS", 10000)
         self._fall_threshold = _env_int("RKK_SLEEP_FALL_THRESHOLD", 50)
         self._sleep_duration = _env_int("RKK_SLEEP_DURATION_TICKS", 200)
+        self._rem_ticks, self._lesson_ticks, self._prune_ticks = self._split_sleep_phase_lengths(
+            self._sleep_duration
+        )
 
         # State
         self.last_sleep_tick: int = -self._every_ticks  # allow first sleep
@@ -593,7 +610,11 @@ class SleepController:
 
     def begin_sleep(self, tick: int, reason: str, sim: Any | None = None) -> None:
         """Start a sleep cycle."""
-        print(f"[Sleep] 😴 Beginning sleep at tick={tick} reason={reason}")
+        print(
+            f"[Sleep] 😴 Beginning sleep at tick={tick} reason={reason} "
+            f"(phase ticks REM={self._rem_ticks} LESSON={self._lesson_ticks} PRUNE={self._prune_ticks}; "
+            f"total≈{self._sleep_duration})"
+        )
         if sim is not None:
             _memory_diag_log(sim, f"sleep_begin tick={tick} reason={reason}")
         self._phase = SleepPhase.REM
@@ -655,13 +676,13 @@ class SleepController:
                 # Schedule LLM lesson (async, non-blocking)
                 self._schedule_lesson(tick, sim)
 
-            if ticks_in_phase >= 30:
+            if ticks_in_phase >= self._rem_ticks:
                 self._phase = SleepPhase.LESSON
                 self._phase_start_tick = tick
 
         # ── LESSON phase ────────────────────────────────────────────────────────
         elif self._phase == SleepPhase.LESSON:
-            if ticks_in_phase >= 80:
+            if ticks_in_phase >= self._lesson_ticks:
                 # Apply lesson result if arrived
                 if self._lesson_result is not None:
                     self._apply_lesson(tick, sim, self._lesson_result)
@@ -679,7 +700,7 @@ class SleepController:
                 print(f"[Sleep] Prune: {before}→{after} edges ({before-after} pruned)")
                 _memory_diag_log(sim, "sleep_after_prune")
 
-            if ticks_in_phase >= 20:
+            if ticks_in_phase >= self._prune_ticks:
                 self._end_sleep(tick, sim)
 
         return {
