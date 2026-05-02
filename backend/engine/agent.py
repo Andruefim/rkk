@@ -1390,7 +1390,6 @@ class RKKAgent:
             "alpha_mean":            round(self.graph.alpha_mean, 3),
             "phi":                   round(self.phi_approx(), 4),
             "node_count":            len(self.graph.nodes),
-            "edge_count":            len(self.graph.edges),
             "total_interventions":   self._total_interventions,
             "total_blocked":         self._total_blocked,
             "last_do":               self._last_do,
@@ -1418,8 +1417,10 @@ class RKKAgent:
                 "imagination_horizon": int(self._imagination_horizon),
             },
             "local_reflex_train": self._last_local_reflex_train,
-            "edges": [e.as_dict() for e in self.graph.edges],
         }
+        el_edges = self.graph.edges
+        snap["edge_count"] = len(el_edges)
+        snap["edges"] = [e.as_dict() for e in el_edges]
         if self.env.preset == "pybullet":
             pos_fn = getattr(self.env, "object_positions_world", None)
             if callable(pos_fn):

@@ -160,7 +160,7 @@ class SimulationLlmLoopMixin:
         vl = self.agent.value_layer
         if (
             vl.total_checked >= 128
-            and len(self.agent.graph.edges) >= 6
+            and self.agent.graph.edge_count >= 6
             and self._rolling_block_rate() > 0.72
         ):
             triggers.append("block_rate")

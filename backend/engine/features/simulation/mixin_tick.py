@@ -522,7 +522,7 @@ class SimulationTickMixin:
         smoothed = self._update_phase(snap)
 
         graph_deltas = {}
-        cnt = len(self.agent.graph.edges)
+        cnt = self.agent.graph.edge_count
         if cnt != self._prev_edge_count:
             graph_deltas[0] = [e.as_dict() for e in self.agent.graph.edges]
             self._prev_edge_count = cnt

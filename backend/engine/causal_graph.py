@@ -928,6 +928,17 @@ class CausalGraph:
         self._edge_cache = result
         return result
 
+    @property
+    def edge_count(self) -> int:
+        """Число рёбер с |W|≥EDGE_THRESH; без сборки list[Edge] (дешевле len(edges) при холодном кэше)."""
+        if self._edge_cache is not None:
+            return len(self._edge_cache)
+        if self._core is None:
+            return 0
+        with torch.no_grad():
+            W = self._core.W_masked()
+            return int((W.abs() >= self.EDGE_THRESH).sum().item())
+
     def edge_uncertainty(self, from_: str, to: str) -> float:
         if self._core is None or from_ not in self._node_ids or to not in self._node_ids:
             return 1.0
