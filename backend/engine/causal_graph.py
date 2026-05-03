@@ -40,6 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from collections import Counter
 from dataclasses import dataclass
 
 
@@ -163,7 +164,7 @@ class CausalGraph:
     LAMBDA_DAG  = 0.3
     LAMBDA_INT  = 6.0
     LAMBDA_L1   = 0.001
-    EDGE_THRESH = 0.03
+    EDGE_THRESH = 0.05  # дефолт класса; экземпляр берёт RKK_EDGE_THRESH в __init__
     # Фаза 1: целевой вес замороженных рёбер в W (после каждого optim.step снова clamp).
     FROZEN_EDGE_W = 0.85
 
@@ -196,6 +197,18 @@ class CausalGraph:
         except ValueError:
             self._seq_len = 16
         self._seq_len = max(4, min(64, self._seq_len))
+        try:
+            self.LAMBDA_L1 = float(
+                os.environ.get("RKK_LAMBDA_L1", str(self.__class__.LAMBDA_L1))
+            )
+        except ValueError:
+            self.LAMBDA_L1 = self.__class__.LAMBDA_L1
+        try:
+            self.EDGE_THRESH = float(
+                os.environ.get("RKK_EDGE_THRESH", str(self.__class__.EDGE_THRESH))
+            )
+        except ValueError:
+            self.EDGE_THRESH = self.__class__.EDGE_THRESH
 
     def set_node(self, id_: str, value: float = 0.0) -> None:
         self._invalidate_cache()
@@ -526,8 +539,18 @@ class CausalGraph:
             return
         vec = [obs.get(nid, 0.0) for nid in self._node_ids]
         self._obs_buffer.append(vec)
-        if len(self._obs_buffer) > self.BUFFER_SIZE * 4:
-            self._obs_buffer = self._obs_buffer[-self.BUFFER_SIZE * 2:]
+        try:
+            trim_mult = int(os.environ.get("RKK_OBS_BUFFER_TRIM_MULT", "2"))
+        except ValueError:
+            trim_mult = 2
+        trim_mult = max(2, trim_mult)
+        try:
+            keep_rows = int(os.environ.get("RKK_OBS_BUFFER_KEEP", str(self.BUFFER_SIZE)))
+        except ValueError:
+            keep_rows = self.BUFFER_SIZE
+        keep_rows = max(32, min(4096, keep_rows))
+        if len(self._obs_buffer) > self.BUFFER_SIZE * trim_mult:
+            self._obs_buffer = self._obs_buffer[-keep_rows:]
 
         # LeWM: accumulate contiguous sequences for parallel training
         coerced = self._coerce_row_to_d(vec)
@@ -1211,6 +1234,144 @@ class CausalGraph:
     def _invalidate_cache(self):
         self._edge_cache = None
         self._mdl_cache  = None
+
+    def edge_duplicate_diagnostic(self, tag: str = "") -> None:
+        """
+        Counter по ключам (from_, to) после materialize edges.
+        При типичном графе из матрицы W дубликатов нет — если dup_keys>0, ищи второй источник рёбер.
+
+        Вкл.: RKK_EDGE_DUP_DIAG=1 (дорого: строит полный список edges).
+        """
+        if os.environ.get("RKK_EDGE_DUP_DIAG", "0").strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return
+        edges = self.edges
+        keys = [(e.from_, e.to) for e in edges]
+        c = Counter(keys)
+        dups = {k: v for k, v in c.items() if v > 1}
+        pref = f"[EdgeDup {tag}] " if tag else "[EdgeDup] "
+        print(
+            f"{pref}d={self._d} edge_count_property={len(keys)} unique_pairs={len(c)} "
+            f"dup_keys={len(dups)} (dense W → many edges is normal; duplicates are not)",
+            flush=True,
+        )
+        if dups:
+            print(f"{pref}sample: {list(dups.items())[:10]}", flush=True)
+
+    def deduplicate_edges_keep_strongest(self) -> int:
+        """
+        Если hot-кэш рёбер содержит повторы одной пары — оставить ребро с max |weight|.
+        Не вызывает полную перестройку из W; если кэш пуст — no-op.
+        """
+        if not self._edge_cache:
+            return 0
+        best: dict[tuple[str, str], Edge] = {}
+        for e in self._edge_cache:
+            k = (e.from_, e.to)
+            prev = best.get(k)
+            if prev is None or abs(float(e.weight)) > abs(float(prev.weight)):
+                best[k] = e
+        removed = len(self._edge_cache) - len(best)
+        if removed > 0:
+            self._edge_cache = list(best.values())
+            self._mdl_cache = None
+        return removed
+
+    def log_W_threshold_stats(self, tag: str = "") -> None:
+        """
+        Диагностика плотности |W| на off-diagonal активном блоке d×d.
+        Вкл.: RKK_W_DIAG=1.
+        """
+        if os.environ.get("RKK_W_DIAG", "0").strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return
+        if self._core is None:
+            return
+        d = self._d
+        if d <= 1:
+            return
+        with torch.no_grad():
+            wm = self._core.W_masked()[:d, :d].detach().float().cpu().numpy()
+        w = np.abs(wm).astype(np.float64, copy=False)
+        np.fill_diagonal(w, 0.0)
+        slots = max(1, d * (d - 1))
+        pref = f"[WDiag {tag}] " if tag else "[WDiag] "
+        print(
+            f"{pref}d={d} offdiag |W| mean={float(w.mean()):.4f} max={float(w.max()):.4f}",
+            flush=True,
+        )
+        for t in (0.01, 0.03, 0.05, 0.1, 0.2):
+            n = int((w > t).sum())
+            print(
+                f"{pref}|W|>{t}: {n} ({100.0 * n / slots:.1f}% of off-diagonal slots)",
+                flush=True,
+            )
+
+    def prune_weak_W(self, threshold: float | None = None) -> int:
+        """
+        Обнулить off-diagonal |W_ij| < threshold в активном блоке d×d.
+        Не трогает замороженные и запрещённые рёбра; затем _sync_frozen_W_into_core.
+
+        Порог: аргумент или RKK_POST_SLEEP_PRUNE_THRESHOLD, иначе RKK_SLEEP_PRUNE_THRESHOLD (как фаза PRUNE).
+        """
+        if self._core is None:
+            return 0
+        W = getattr(self._core, "W", None)
+        if W is None:
+            return 0
+        if threshold is None:
+            raw = os.environ.get("RKK_POST_SLEEP_PRUNE_THRESHOLD")
+            if raw is None or raw.strip() == "":
+                raw = os.environ.get("RKK_SLEEP_PRUNE_THRESHOLD", "0.05")
+            try:
+                thr = float(raw)
+            except ValueError:
+                thr = 0.05
+        else:
+            thr = float(threshold)
+        thr = max(0.0, thr)
+
+        d = min(self._d, int(W.shape[0]), int(W.shape[1]))
+        if d <= 1:
+            return 0
+
+        device = W.device
+        protect = torch.zeros(d, d, dtype=torch.bool, device=device)
+        raw_pf = os.environ.get("RKK_PRUNE_PROTECT_PREFIXES")
+        if raw_pf is not None and raw_pf.strip():
+            prot_prefs = tuple(p.strip() for p in raw_pf.split(",") if p.strip())
+        else:
+            # Без phys_: иначе почти весь humanoid-граф «неприкасаемый» и pruned=0.
+            prot_prefs = ("concept_", "proprio_", "mc_", "intent_")
+        for f, t in self._frozen_edge_set | self._forbidden_edge_set:
+            if f in self._node_ids and t in self._node_ids:
+                i, j = self._node_ids.index(f), self._node_ids.index(t)
+                if i < d and j < d:
+                    protect[i, j] = True
+        for i, name in enumerate(self._node_ids):
+            if i >= d:
+                break
+            if any(str(name).startswith(p) for p in prot_prefs):
+                protect[i, :] = True
+                protect[:, i] = True
+            block = W[:d, :d].detach()
+            off_diag = ~torch.eye(d, dtype=torch.bool, device=device)
+            weak = (block.abs() < thr) & off_diag & (~protect)
+            n_pruned = int(weak.sum().item())
+            if n_pruned == 0:
+                self._invalidate_cache()
+                return 0
+            w_full = W.detach().clone()
+            sub = w_full[:d, :d].clone()
+            sub[weak] = 0.0
+            w_full[:d, :d] = sub
+            W.copy_(w_full)
+
+        self._sync_frozen_W_into_core()
+        self._invalidate_cache()
+        return n_pruned
 
     def to_dict(self) -> dict:
         W_data = h_data = core_type = None

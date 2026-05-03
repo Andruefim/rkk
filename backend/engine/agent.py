@@ -79,7 +79,6 @@ from engine.rsi_lite import (
 from engine.local_reflex import local_reflex_train_enabled, train_chains_parallel
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
-NOTEARS_EVERY = 8
 MAX_FALLBACK_TRIES = 5  # больше кандидатов, чтобы пройти Value Layer в начале обучения
 # Вес slot_* в actual_ig для System 1; основной сигнал — не-визуальные узлы (RKK_VISUAL_IG_WEIGHT=0 → только физика).
 VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.1"))
@@ -152,6 +151,15 @@ def _score_cache_every() -> int:
         return max(1, int(os.environ.get("RKK_SCORE_CACHE_EVERY", "1")))
     except ValueError:
         return 1
+
+
+def _notears_every() -> int:
+    """Частота graph.train_step(): RKK_NOTEAR_EVERY или legacy NOTEARS_EVERY в env (дефолт 8)."""
+    try:
+        raw = os.environ.get("RKK_NOTEAR_EVERY") or os.environ.get("NOTEARS_EVERY", "8")
+        return max(1, int(raw))
+    except ValueError:
+        return 8
 
 
 _score_async_win_warned = False
@@ -424,9 +432,6 @@ class RKKAgent:
         """Один вектор признаков System1 для пары (в_from→в_to), как в score_interventions."""
         h_W_norm = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
         disc_rate = self.discovery_rate
-        ic_map: dict[tuple[str, str], int] = {}
-        for e in self.graph.edges:
-            ic_map[(e.from_, e.to)] = e.intervention_count
         nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
         core = self.graph._core
         ii, jj = nid_to_i.get(v_from), nid_to_i.get(v_to)
@@ -440,12 +445,13 @@ class RKKAgent:
             uncertainty = float(unc_t[ii, jj])
             w_ij = float(W_m[ii, jj])
             grad_norm = float(g_m[ii, jj]) if g_m is not None else 0.0
+            ic = 1 if abs(w_ij) >= self.graph.EDGE_THRESH else 0
         else:
             uncertainty, w_ij, grad_norm = 1.0, 0.0, 0.0
+            ic = 0
         alpha = 1.0 - uncertainty
         val_from = self.graph.nodes.get(v_from, 0.5)
         val_to = self.graph.nodes.get(v_to, 0.5)
-        ic = ic_map.get((v_from, v_to), 0)
         return self.system1.build_features(
             w_ij=w_ij, alpha_ij=alpha,
             val_from=val_from, val_to=val_to,
@@ -660,21 +666,368 @@ class RKKAgent:
             "cem_score":    cem_score,
         }
 
+    def _tier1_edge_cap_from_env(self) -> int:
+        try:
+            return max(0, int(os.environ.get("RKK_TIER1_EDGE_CAP", "2048")))
+        except ValueError:
+            return 2048
+
+    def _snapshot_edges_max_from_env(self) -> int:
+        try:
+            return int(os.environ.get("RKK_SNAPSHOT_EDGES_MAX", "512"))
+        except ValueError:
+            return 512
+
+    def _sample_significant_edge_pairs(
+        self, max_pairs: int, rng: np.random.Generator
+    ) -> list[tuple[str, str]]:
+        """Pairs (from,to) with |W_ij|≥EDGE_THRESH without building graph.edges.
+
+        Если значимых ячеек много, полный ``mask.nonzero()`` даёт O(|E|) GPU/CPU — при |E|≈30k это дорого.
+        Тогда включается случайное сэмплирование индексов (батчи), пока не набран max_pairs.
+        """
+        if max_pairs <= 0:
+            return []
+        core = self.graph._core
+        if core is None:
+            return []
+        nids = self.graph._node_ids
+        d = len(nids)
+        if d <= 1:
+            return []
+        thresh = float(self.graph.EDGE_THRESH)
+        try:
+            full_scan_max = int(os.environ.get("RKK_TIER1_FULL_SCAN_MAX_EDGES", "4096"))
+        except ValueError:
+            full_scan_max = 4096
+        full_scan_max = max(256, full_scan_max)
+
+        with torch.no_grad():
+            W = core.W_masked()
+            mask = W.abs() >= thresh
+            n_sig = int(mask.sum().item())
+
+        if n_sig == 0:
+            return []
+
+        if n_sig <= full_scan_max:
+            ij = mask.nonzero(as_tuple=False)
+            n = int(ij.shape[0])
+            ij_np = ij.cpu().numpy()
+            take = min(max_pairs, n)
+            if n > take:
+                sel = rng.choice(n, size=take, replace=False)
+                ij_np = ij_np[sel]
+            out: list[tuple[str, str]] = []
+            for row in ij_np:
+                i, j = int(row[0]), int(row[1])
+                if i < len(nids) and j < len(nids):
+                    out.append((nids[i], nids[j]))
+            return out
+
+        try:
+            probe_factor = int(os.environ.get("RKK_TIER1_PROBE_FACTOR", "64"))
+        except ValueError:
+            probe_factor = 64
+        probe_factor = max(8, probe_factor)
+        max_attempts = min(d * d, max_pairs * probe_factor)
+        batch_cap = 8192
+
+        device = W.device
+        seen: set[tuple[int, int]] = set()
+        out_pairs: list[tuple[str, str]] = []
+        attempts = 0
+        while len(out_pairs) < max_pairs and attempts < max_attempts:
+            batch = min(batch_cap, max_attempts - attempts)
+            if batch <= 0:
+                break
+            ii = torch.randint(0, d, (batch,), device=device)
+            jj = torch.randint(0, d, (batch,), device=device)
+            ok = (ii != jj) & (W[ii, jj].abs() >= thresh)
+            hit_idx = ok.nonzero(as_tuple=False).flatten()
+            attempts += batch
+            for hi in hit_idx.tolist():
+                iik = int(ii[hi])
+                jjk = int(jj[hi])
+                key = (iik, jjk)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out_pairs.append((nids[iik], nids[jjk]))
+                if len(out_pairs) >= max_pairs:
+                    break
+        return out_pairs
+
+    def _gt_discovery_rate_fast(self) -> float:
+        """O(|GT|) vs env.discovery_rate(agent_edges) which is O(|GT|×|E|) when |E|≈d²."""
+        gt_list = getattr(self.env, "_gt", None)
+        if not gt_list:
+            return 0.0
+        core = self.graph._core
+        if core is None:
+            return 0.0
+        nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
+        with torch.no_grad():
+            W_m = core.W_masked().detach().float().cpu().numpy()
+        hits = 0
+        for gt in gt_list:
+            ii, jj = nid_to_i.get(gt.from_), nid_to_i.get(gt.to)
+            if ii is None or jj is None:
+                continue
+            if abs(float(W_m[ii, jj]) - float(gt.weight)) < 0.30:
+                hits += 1
+        return hits / len(gt_list)
+
+    def _snapshot_edges_payload(self) -> tuple[int, list[dict]]:
+        """edge_count + capped edge list for WS/UI without materializing full graph.edges."""
+        rng = np.random.default_rng()
+        lim = self._snapshot_edges_max_from_env()
+        ec = int(self.graph.edge_count)
+        if lim <= 0:
+            return ec, []
+        n_sample = 0 if ec <= 0 else min(lim, ec)
+        pairs = self._sample_significant_edge_pairs(n_sample, rng)
+        core = self.graph._core
+        if core is None or not pairs:
+            return ec, []
+        nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
+        frozen = self.graph._frozen_edge_set
+        out: list[dict] = []
+        with torch.no_grad():
+            W_m = core.W_masked().detach().float().cpu().numpy()
+            A_m = core.alpha_trust_matrix().detach().float().cpu().numpy()
+        for fr, to in pairs:
+            ii, jj = nid_to_i.get(fr), nid_to_i.get(to)
+            if ii is None or jj is None:
+                continue
+            w_ij = float(W_m[ii, jj])
+            a_tr = 1.0 if (fr, to) in frozen else float(A_m[ii, jj])
+            out.append(
+                {
+                    "from_": fr,
+                    "to": to,
+                    "weight": round(w_ij, 4),
+                    "alpha_trust": round(float(a_tr), 4),
+                    "intervention_count": 1,
+                }
+            )
+        return ec, out
+
+    def _first_significant_edge_labels(self, n: int) -> list[str]:
+        """Up to n edge labels from W (no full graph.edges materialization)."""
+        if n <= 0:
+            return []
+        core = self.graph._core
+        if core is None:
+            return []
+        with torch.no_grad():
+            W = core.W_masked()
+            mask = W.abs() >= self.graph.EDGE_THRESH
+            ij = mask.nonzero(as_tuple=False)
+        if ij.numel() == 0:
+            return []
+        nids = self.graph._node_ids
+        out: list[str] = []
+        for row in ij[:n]:
+            i, j = int(row[0]), int(row[1])
+            if i < len(nids) and j < len(nids):
+                out.append(f"{nids[i]}→{nids[j]}")
+            if len(out) >= n:
+                break
+        return out
+
+    _EDGE_FIRST_OBJECTIVE_TARGETS = (
+        "com_z",
+        "phys_com_z",
+        "posture_stability",
+        "phys_posture_stability",
+        "target_dist",
+        "foot_contact_l",
+        "foot_contact_r",
+    )
+
+    def _frontier_sample_k_from_env(self) -> int:
+        try:
+            return max(0, int(os.environ.get("RKK_FRONTIER_SAMPLE", "128")))
+        except ValueError:
+            return 128
+
+    def _build_candidates_edge_first(
+        self,
+        *,
+        var_ids: list[str],
+        nid_to_i: dict[str, int],
+        ic_map: dict[tuple[str, str], int],
+        W_m: np.ndarray | None,
+        unc_m: np.ndarray | None,
+        g_m: np.ndarray | None,
+        h_W_norm: float,
+        disc_rate: float,
+    ) -> list[dict]:
+        """
+        Edge-first candidate generation: Tier1 = sample of significant W_ij (not full graph.edges).
+
+        Tier 1: random sample of |W|≥EDGE_THRESH (RKK_TIER1_EDGE_CAP, default 2048)
+        Tier 2: motor intent × objective targets (fixed small set)
+        Tier 3: random frontier pairs (RKK_FRONTIER_SAMPLE), optional if unc_m available
+        """
+        frontier_k = self._frontier_sample_k_from_env()
+        v2i = {v: i for i, v in enumerate(var_ids)}
+        d = len(var_ids)
+        h_clip = float(np.clip(h_W_norm, 0.0, 1.0))
+        disc_clip = float(np.clip(disc_rate, 0.0, 1.0))
+
+        def _get_edge_features(vf: str, vt: str) -> tuple[list[float], float]:
+            ii = nid_to_i.get(vf)
+            jj = nid_to_i.get(vt)
+            if W_m is not None and ii is not None and jj is not None and unc_m is not None:
+                unc_k = float(unc_m[ii, jj])
+                w_ij = float(W_m[ii, jj])
+                grad_norm = float(g_m[ii, jj]) if g_m is not None else 0.0
+            else:
+                unc_k, w_ij, grad_norm = 1.0, 0.0, 0.0
+            alpha = 1.0 - unc_k
+            ic = ic_map.get((vf, vt), 0)
+            feat = self.system1.build_features(
+                w_ij=w_ij,
+                alpha_ij=alpha,
+                val_from=float(self.graph.nodes.get(vf, 0.5)),
+                val_to=float(self.graph.nodes.get(vt, 0.5)),
+                uncertainty=unc_k,
+                h_W_norm=h_clip,
+                grad_norm_ij=grad_norm,
+                intervention_count=ic,
+                discovery_rate=disc_clip,
+            )
+            return feat, unc_k
+
+        rng = np.random.default_rng()
+        posture_now = float(
+            self.graph.nodes.get(
+                "posture_stability",
+                self.graph.nodes.get("phys_posture_stability", 0.5),
+            )
+        )
+        foot_l = float(
+            self.graph.nodes.get(
+                "foot_contact_l",
+                self.graph.nodes.get("phys_foot_contact_l", 0.5),
+            )
+        )
+        foot_r = float(
+            self.graph.nodes.get(
+                "foot_contact_r",
+                self.graph.nodes.get("phys_foot_contact_r", 0.5),
+            )
+        )
+        stable_stance = posture_now > 0.70 and min(foot_l, foot_r) > 0.56
+
+        try:
+            _sparse_min_unc = float(os.environ.get("RKK_SPARSE_EIG_MIN_UNC", "0.15"))
+        except ValueError:
+            _sparse_min_unc = 0.15
+        _sparse_min_unc = max(0.0, min(0.8, _sparse_min_unc))
+
+        def _make_candidate(vf: str, vt: str) -> dict | None:
+            if vf == vt:
+                return None
+            if vf not in v2i or vt not in v2i:
+                return None
+            feat, unc_k = _get_edge_features(vf, vt)
+            is_motor = _is_motor_intent_var(vf)
+            if _sparse_min_unc > 0 and unc_k < _sparse_min_unc and not is_motor:
+                return None
+            if is_motor:
+                if stable_stance:
+                    lo, hi = 0.30, 0.72
+                else:
+                    lo, hi = 0.35, 0.68
+                if str(vf).endswith("stride"):
+                    hi = min(hi, 0.62 if stable_stance else 0.56)
+                if str(vf).endswith("stop_recover"):
+                    lo, hi = (0.55, 0.80) if not stable_stance else (0.40, 0.65)
+                rand_val = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
+            else:
+                rand_val = float(np.clip(rng.uniform(0.15, 0.85), 0.06, 0.94))
+            return {
+                "variable":    vf,
+                "target":      vt,
+                "value":       rand_val,
+                "uncertainty": unc_k,
+                "features":    feat,
+                "expected_ig": 0.0,
+            }
+
+        seen: set[tuple[str, str]] = set()
+        candidates: list[dict] = []
+
+        tier1_cap = self._tier1_edge_cap_from_env()
+        for vf, vt in self._sample_significant_edge_pairs(tier1_cap, rng):
+            key = (vf, vt)
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._is_locomotion_primary_active() and vf in _LOCOMOTION_CPG_LEG_EIG_BLOCK:
+                continue
+            c = _make_candidate(vf, vt)
+            if c is not None:
+                candidates.append(c)
+
+        motor_vars = [v for v in var_ids if _is_motor_intent_var(v)]
+        for mv in motor_vars:
+            for tv in self._EDGE_FIRST_OBJECTIVE_TARGETS:
+                key = (mv, tv)
+                if key in seen:
+                    continue
+                seen.add(key)
+                c = _make_candidate(mv, tv)
+                if c is not None:
+                    candidates.append(c)
+
+        if frontier_k > 0 and unc_m is not None and d > 1:
+            n_try = min(frontier_k * 4, d * d)
+            fi_s = rng.integers(0, d, size=n_try)
+            fj_s = rng.integers(0, d, size=n_try)
+            added = 0
+            for fi_k, fj_k in zip(fi_s, fj_s):
+                if added >= frontier_k:
+                    break
+                vf = var_ids[int(fi_k)]
+                vt = var_ids[int(fj_k)]
+                if vf == vt:
+                    continue
+                key = (vf, vt)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if self._is_locomotion_primary_active() and vf in _LOCOMOTION_CPG_LEG_EIG_BLOCK:
+                    continue
+                c = _make_candidate(vf, vt)
+                if c is not None:
+                    candidates.append(c)
+                    added += 1
+
+        return candidates
+
     # ── Epistemic scoring ─────────────────────────────────────────────────────
     def score_interventions(self) -> list[dict]:
-        var_ids   = self.env.variable_ids
-        h_W_norm  = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
+        """
+        Векторизованный отбор кандидатов: numpy по всем off-diagonal парам var_ids,
+        build_features только для top-cap пар + Tier2 motor×objectives (без обхода graph.edges).
+        """
+        var_ids = self.env.variable_ids
+        d = len(var_ids)
+        if d <= 1:
+            return []
+
+        h_W_norm = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
+        h_clip = float(np.clip(h_W_norm, 0.0, 1.0))
         disc_rate = self.discovery_rate
+        disc_clip = float(np.clip(disc_rate, 0.0, 1.0))
 
-        # Один проход по рёбрам: счётчики интервенций (раньше — O(pairs×|E|) через next() в цикле)
-        ic_map: dict[tuple[str, str], int] = {}
-        for e in self.graph.edges:
-            ic_map[(e.from_, e.to)] = e.intervention_count
-
-        # Имя узла → индекс без O(d) list.index на каждую пару
         nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
+        v2i = {v: i for i, v in enumerate(var_ids)}
 
-        # Один раз W, α и |grad| на CPU — вместо O(d²) вызовов alpha_trust_matrix / W_masked
         core = self.graph._core
         W_m = unc_m = g_m = None
         if core is not None:
@@ -686,18 +1039,13 @@ class RKKAgent:
             if core.W.grad is not None:
                 g_m = core.W.grad.detach().float().abs().cpu().numpy()
 
-        d = len(var_ids)
-        if d == 0:
-            return []
+        cap = _score_max_candidates()
+        tier1_select = cap if cap > 0 else self._tier1_edge_cap_from_env()
+        tier1_select = max(1, tier1_select)
 
-        # Счётчики интервенций по парам (только известные рёбра — O(|E|))
-        ic_mat = np.zeros((d, d), dtype=np.float64)
-        v2i = {v: i for i, v in enumerate(var_ids)}
-        for (vf, vt), c in ic_map.items():
-            i = v2i.get(vf)
-            j = v2i.get(vt)
-            if i is not None and j is not None and i != j:
-                ic_mat[i, j] = float(c)
+        mask = ~np.eye(d, dtype=bool)
+        fi, fj = np.where(mask)
+        n_pairs = int(fi.shape[0])
 
         ridx = np.zeros(d, dtype=np.int64)
         valid_node = np.zeros(d, dtype=bool)
@@ -707,112 +1055,161 @@ class RKKAgent:
                 ridx[i] = ji
                 valid_node[i] = True
 
-        nodes_arr = np.array(
-            [float(self.graph.nodes.get(v, 0.5)) for v in var_ids],
-            dtype=np.float64,
-        )
-        mask = ~np.eye(d, dtype=bool)
-        fi, fj = np.where(mask)
-        n_pairs = len(fi)
-
-        if W_m is not None:
+        if unc_m is not None and n_pairs > 0:
             ii_n = ridx[fi]
             jj_n = ridx[fj]
             ok = valid_node[fi] & valid_node[fj]
-            w_ij = np.zeros(n_pairs, dtype=np.float64)
-            uncertainty = np.ones(n_pairs, dtype=np.float64)
-            grad_norm = np.zeros(n_pairs, dtype=np.float64)
-            w_ij[ok] = W_m[ii_n[ok], jj_n[ok]]
-            uncertainty[ok] = unc_m[ii_n[ok], jj_n[ok]]
-            if g_m is not None:
-                grad_norm[ok] = g_m[ii_n[ok], jj_n[ok]]
+            unc_pairs = np.ones(n_pairs, dtype=np.float32)
+            unc_pairs[ok] = unc_m[ii_n[ok], jj_n[ok]]
         else:
-            w_ij = np.zeros(n_pairs, dtype=np.float64)
-            uncertainty = np.ones(n_pairs, dtype=np.float64)
-            grad_norm = np.zeros(n_pairs, dtype=np.float64)
+            unc_pairs = np.ones(n_pairs, dtype=np.float32)
 
-        alpha = 1.0 - uncertainty
-        val_from = nodes_arr[fi]
-        val_to = nodes_arr[fj]
-        ic_v = ic_mat[fi, fj]
-        h_clip = float(np.clip(h_W_norm, 0.0, 1.0))
-        disc_v = float(np.clip(disc_rate, 0.0, 1.0))
-
-        feats_arr = np.column_stack(
-            [
-                np.tanh(w_ij),
-                np.clip(alpha, 0.0, 1.0),
-                np.clip(val_from, 0.0, 1.0),
-                np.clip(val_to, 0.0, 1.0),
-                np.clip(uncertainty, 0.0, 1.0),
-                np.full(n_pairs, h_clip, dtype=np.float64),
-                np.tanh(grad_norm),
-                np.clip(ic_v / 100.0, 0.0, 1.0),
-                np.full(n_pairs, disc_v, dtype=np.float64),
-            ]
+        is_motor_var = np.array(
+            [_is_motor_intent_var(v) for v in var_ids],
+            dtype=bool,
         )
-        features_batch = feats_arr.tolist()
+        is_motor_arr = is_motor_var[fi]
+
+        try:
+            sparse_min_unc = float(os.environ.get("RKK_SPARSE_EIG_MIN_UNC", "0.15"))
+        except ValueError:
+            sparse_min_unc = 0.15
+        sparse_min_unc = max(0.0, min(0.8, sparse_min_unc))
+
+        valid_pairs = is_motor_arr | (unc_pairs >= sparse_min_unc)
+
+        if self._is_locomotion_primary_active():
+            blocked = _LOCOMOTION_CPG_LEG_EIG_BLOCK
+            leg_block_var = np.array([v in blocked for v in var_ids], dtype=bool)
+            cpg_block = leg_block_var[fi]
+            valid_pairs &= ~cpg_block
 
         rng = np.random.default_rng()
-        posture_now = float(
+        posture = float(
             self.graph.nodes.get(
                 "posture_stability",
                 self.graph.nodes.get("phys_posture_stability", 0.5),
             )
         )
-        foot_l_now = float(
+        foot_l = float(
             self.graph.nodes.get(
                 "foot_contact_l",
                 self.graph.nodes.get("phys_foot_contact_l", 0.5),
             )
         )
-        foot_r_now = float(
+        foot_r = float(
             self.graph.nodes.get(
                 "foot_contact_r",
                 self.graph.nodes.get("phys_foot_contact_r", 0.5),
             )
         )
-        stable_stance = posture_now > 0.70 and min(foot_l_now, foot_r_now) > 0.56
+        stable_stance = posture > 0.70 and min(foot_l, foot_r) > 0.56
 
-        # ── Sparse EIG: skip low-uncertainty pairs ──────────────────────────
-        try:
-            _sparse_min_unc = float(os.environ.get("RKK_SPARSE_EIG_MIN_UNC", "0.15"))
-        except ValueError:
-            _sparse_min_unc = 0.15
-        _sparse_min_unc = max(0.0, min(0.8, _sparse_min_unc))
+        nodes_arr = np.array(
+            [float(self.graph.nodes.get(v, 0.5)) for v in var_ids],
+            dtype=np.float64,
+        )
 
         candidates: list[dict] = []
-        for k in range(n_pairs):
-            i, j = int(fi[k]), int(fj[k])
-            vf, vt = var_ids[i], var_ids[j]
-            unc_k = float(uncertainty[k])
-            feat_k = features_batch[k]
 
-            # Sparse filter: skip well-known edges (except motor intents)
-            if _sparse_min_unc > 0 and unc_k < _sparse_min_unc:
-                if not _is_motor_intent_var(vf):
-                    continue
-
-            if _is_motor_intent_var(vf):
-                if stable_stance:
-                    lo, hi = 0.30, 0.72
-                else:
-                    lo, hi = 0.35, 0.68
-                if str(vf).endswith("stride"):
-                    hi = min(hi, 0.62 if stable_stance else 0.56)
-                if str(vf).endswith("stop_recover"):
-                    lo, hi = (0.55, 0.80) if not stable_stance else (0.40, 0.65)
-                rand_value = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
+        valid_idx = np.flatnonzero(valid_pairs)
+        if valid_idx.size > 0:
+            if valid_idx.size > tier1_select:
+                scores_sel = unc_pairs[valid_idx]
+                top_k = np.argpartition(scores_sel, -tier1_select)[-tier1_select:]
+                selected = valid_idx[top_k]
             else:
-                rand_value = float(np.clip(rng.uniform(0.15, 0.85), 0.06, 0.94))
-            candidates.append({
-                "variable":    vf,
-                "target":      vt,
-                "value":       rand_value,
-                "uncertainty": unc_k,
-                "features":    feat_k,
-                "expected_ig": 0.0,
-            })
+                selected = valid_idx
+
+            for k in selected:
+                i_v, j_v = int(fi[k]), int(fj[k])
+                vf, vt = var_ids[i_v], var_ids[j_v]
+                unc_k = float(unc_pairs[k])
+                ii, jj = int(ridx[i_v]), int(ridx[j_v])
+                if W_m is not None and valid_node[i_v] and valid_node[j_v]:
+                    w_ij = float(W_m[ii, jj])
+                    grad_n = float(g_m[ii, jj]) if g_m is not None else 0.0
+                else:
+                    w_ij, grad_n = 0.0, 0.0
+                alpha = 1.0 - unc_k
+                feat = self.system1.build_features(
+                    w_ij=w_ij,
+                    alpha_ij=alpha,
+                    val_from=float(nodes_arr[i_v]),
+                    val_to=float(nodes_arr[j_v]),
+                    uncertainty=unc_k,
+                    h_W_norm=h_clip,
+                    grad_norm_ij=grad_n,
+                    intervention_count=0,
+                    discovery_rate=disc_clip,
+                )
+                is_motor = bool(is_motor_arr[k])
+                if is_motor:
+                    lo, hi = (0.30, 0.72) if stable_stance else (0.35, 0.68)
+                    if str(vf).endswith("stride"):
+                        hi = min(hi, 0.62 if stable_stance else 0.56)
+                    if str(vf).endswith("stop_recover"):
+                        lo, hi = (0.55, 0.80) if not stable_stance else (0.40, 0.65)
+                    val = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
+                else:
+                    val = float(np.clip(rng.uniform(0.15, 0.85), 0.06, 0.94))
+                candidates.append(
+                    {
+                        "variable": vf,
+                        "target": vt,
+                        "value": val,
+                        "uncertainty": unc_k,
+                        "features": feat,
+                        "expected_ig": 0.0,
+                    }
+                )
+
+        seen: set[tuple[str, str]] = {(c["variable"], c["target"]) for c in candidates}
+        motor_vars = [v for v in var_ids if _is_motor_intent_var(v)]
+        for mv in motor_vars:
+            for tv in self._EDGE_FIRST_OBJECTIVE_TARGETS:
+                if (mv, tv) in seen:
+                    continue
+                if mv not in v2i or tv not in v2i:
+                    continue
+                i_v, j_v = v2i[mv], v2i[tv]
+                if not valid_node[i_v] or not valid_node[j_v]:
+                    continue
+                ii, jj = int(ridx[i_v]), int(ridx[j_v])
+                if unc_m is not None:
+                    unc_k = float(unc_m[ii, jj])
+                else:
+                    unc_k = 1.0
+                w_ij = float(W_m[ii, jj]) if W_m is not None else 0.0
+                grad_n = float(g_m[ii, jj]) if g_m is not None else 0.0
+                feat = self.system1.build_features(
+                    w_ij=w_ij,
+                    alpha_ij=1.0 - unc_k,
+                    val_from=float(nodes_arr[i_v]),
+                    val_to=float(nodes_arr[j_v]),
+                    uncertainty=unc_k,
+                    h_W_norm=h_clip,
+                    grad_norm_ij=grad_n,
+                    intervention_count=0,
+                    discovery_rate=disc_clip,
+                )
+                lo, hi = (0.30, 0.72) if stable_stance else (0.35, 0.68)
+                if str(mv).endswith("stride"):
+                    hi = min(hi, 0.62 if stable_stance else 0.56)
+                if str(mv).endswith("stop_recover"):
+                    lo, hi = (0.55, 0.80) if not stable_stance else (0.40, 0.65)
+                val = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
+                candidates.append(
+                    {
+                        "variable": mv,
+                        "target": tv,
+                        "value": val,
+                        "uncertainty": unc_k,
+                        "features": feat,
+                        "expected_ig": 0.0,
+                    }
+                )
+                seen.add((mv, tv))
 
         if self._is_locomotion_primary_active():
             candidates = [
@@ -821,7 +1218,6 @@ class RKKAgent:
                 if c["variable"] not in _LOCOMOTION_CPG_LEG_EIG_BLOCK
             ]
 
-        cap = _score_max_candidates()
         if cap > 0 and len(candidates) > cap:
             candidates.sort(key=lambda c: -float(c.get("uncertainty", 0.0)))
             candidates = candidates[:cap]
@@ -829,46 +1225,9 @@ class RKKAgent:
         if not candidates:
             return []
 
-        use_eig = _hypothesis_eig_from_env() and W_m is not None and unc_m is not None
-        if use_eig:
-            # Core W / α_trust live on padded MAX_D×MAX_D; EIG uses one vector per WM dim.
-            # forward_dynamics returns (B, graph._d) — x_vec must match that width even if
-            # len(_node_ids) differs (async race / transient desync); pad missing slots.
-            wm_d = int(self.graph._d)
-            unc_active = unc_m[:wm_d, :wm_d] if unc_m.shape[0] >= wm_d else unc_m
-            nids = list(self.graph._node_ids)
-            x_vals: list[float] = []
-            for i in range(wm_d):
-                if i < len(nids):
-                    x_vals.append(float(self.graph.nodes.get(nids[i], 0.0)))
-                else:
-                    x_vals.append(0.5)
-            x_vec = np.array(x_vals, dtype=np.float64)
-            u_node = self._marginal_node_uncertainty(unc_active)
-            eigs = self._batch_hypothesis_eig(
-                candidates, x_vec, u_node, nid_to_i, unc_active,
-                list(self.graph._node_ids), self.env,
-            )
-            if len(eigs) == len(candidates):
-                # Учитываем гипотезу «это ребро неизвестно»: масштаб EIG по unc(v_from→v_to).
-                for i, cand in enumerate(candidates):
-                    eigs[i] *= 1.0 + float(cand["uncertainty"])
-                arr = np.array(eigs, dtype=np.float64)
-                lo, hi = float(arr.min()), float(arr.max())
-                if hi > lo + 1e-12:
-                    normed = (arr - lo) / (hi - lo)
-                else:
-                    normed = np.full_like(arr, 0.5)
-                for i, cand in enumerate(candidates):
-                    cand["eig_raw"] = float(eigs[i])
-                    cand["expected_ig"] = float(normed[i])
-            else:
-                use_eig = False
-
-        if not use_eig:
-            scores = self.system1.score([c["features"] for c in candidates])
-            for i, cand in enumerate(candidates):
-                cand["expected_ig"] = scores[i]
+        scores = self.system1.score([c["features"] for c in candidates])
+        for i, cand in enumerate(candidates):
+            cand["expected_ig"] = float(scores[i])
 
         if symbolic_verifier_enabled() and self._symbolic_prediction_bad:
             a, b = exploration_blend_from_uncertainty()
@@ -913,12 +1272,45 @@ class RKKAgent:
 
     # ── Один шаг с Value Layer ────────────────────────────────────────────────
     def step(self, engine_tick: int = 0, *, enable_l3: bool = True) -> dict:
+        _slow_t = {
+            "observe": 0.0,
+            "score_interventions": 0.0,
+            "train_step": 0.0,
+            "cem": 0.0,
+            "discovery_rate": 0.0,
+        }
+
+        def _report_if_slow_tick() -> None:
+            total = sum(_slow_t.values())
+            if total <= 1.0:
+                return
+            extra = ""
+            try:
+                g = self.graph
+                extra = (
+                    f" | BUFFER_SIZE={g.BUFFER_SIZE} d={g._d} "
+                    f"buffer_fill={len(g._obs_buffer)}"
+                )
+            except Exception:
+                pass
+            parts = " | ".join(
+                f"{k}={v:.3f}s"
+                for k, v in sorted(_slow_t.items(), key=lambda x: -x[1])
+            )
+            print(
+                f"[SLOW TICK {engine_tick}] total={total:.2f}s{extra} | {parts}",
+                flush=True,
+            )
+
         self._last_engine_tick = engine_tick
+        _t0 = time.perf_counter()
         try:
             self.graph.apply_env_observation(dict(self.env.observe()))
         except Exception:
             pass
+        _slow_t["observe"] = time.perf_counter() - _t0
         sce = _score_cache_every()
+        _t0_si = time.perf_counter()
         # #region agent log
         _t_score = time.perf_counter()
         _score_mode = "?"
@@ -972,6 +1364,7 @@ class RKKAgent:
             if sce > 1:
                 self._score_cache = list(scores)
                 self._score_cache_tick = engine_tick
+        _slow_t["score_interventions"] = time.perf_counter() - _t0_si
         # #region agent log
         _dbg_agent(
             "H1",
@@ -992,11 +1385,14 @@ class RKKAgent:
             scores.insert(0, gp)
 
         # ── CEM planning: use world model for model-based action selection ────
+        _t0_cem = time.perf_counter()
         cem_cand = self._maybe_cem_candidate(engine_tick) if enable_l3 else None
+        _slow_t["cem"] = time.perf_counter() - _t0_cem
         if cem_cand is not None:
             scores.insert(0, cem_cand)
 
         if not scores:
+            _report_if_slow_tick()
             return {
                 "blocked": False, "skipped": True, "prediction_error": 0.0,
                 "cf_predicted": {}, "cf_observed": {}, "goal_planned": False,
@@ -1039,6 +1435,7 @@ class RKKAgent:
 
         # Все кандидаты заблокированы — возвращаем событие
         if chosen is None:
+            _report_if_slow_tick()
             return {
                 "blocked":       True,
                 "blocked_count": blocked_count,
@@ -1058,6 +1455,7 @@ class RKKAgent:
         value = chosen["value"]
 
         if is_read_only_macro_var(var):
+            _report_if_slow_tick()
             return {
                 "blocked": True,
                 "blocked_count": blocked_count + 1,
@@ -1098,18 +1496,19 @@ class RKKAgent:
 
         # NOTEARS train
         notears_result = None
-        if self._total_interventions % NOTEARS_EVERY == 0:
+        if self._total_interventions % _notears_every() == 0:
             # #region agent log
             _t_ts = time.perf_counter()
             # #endregion
             notears_result = self.graph.train_step()
+            _slow_t["train_step"] = time.perf_counter() - _t_ts
             # #region agent log
             _dbg_agent(
                 "H2",
                 "RKKAgent.step",
                 "graph.train_step",
                 {
-                    "ms": (time.perf_counter() - _t_ts) * 1000,
+                    "ms": _slow_t["train_step"] * 1000,
                     "interventions": int(self._total_interventions),
                 },
             )
@@ -1192,7 +1591,9 @@ class RKKAgent:
         self._last_do = f"do({var}={_v_do:.2f})"
         self._last_blocked_reason = ""
 
+        _t0_dr = time.perf_counter()
         cur_dr = self.discovery_rate
+        _slow_t["discovery_rate"] = time.perf_counter() - _t0_dr
         if cur_dr > self._peak_discovery_rate:
             self._peak_discovery_rate = cur_dr
 
@@ -1205,7 +1606,7 @@ class RKKAgent:
             "variable":          var,
             "value":             value,
             "compression_delta": compression_delta,
-            "updated_edges":     [f"{e.from_}→{e.to}" for e in self.graph.edges[:4]],
+            "updated_edges":     self._first_significant_edge_labels(4),
             "pruned_edges":      [],
             "prediction_error":  float(np.mean([
                 abs(predicted.get(k, 0) - v) for k, v in observed_env.items()
@@ -1219,6 +1620,7 @@ class RKKAgent:
             "rsi_lite": rsi_event,
             "notears":           notears_result,
         }
+        _report_if_slow_tick()
         return self._last_result
 
     # ── Demon ─────────────────────────────────────────────────────────────────
@@ -1255,11 +1657,7 @@ class RKKAgent:
         Blend of GT-based and self-supervised discovery rate.
         As the agent matures, self-supervised metric gets more weight.
         """
-        gt_dr = self.env.discovery_rate([
-            {"from_": e.from_, "to": e.to, "weight": e.weight}
-            for e in self.graph.edges
-        ])
-        # Self-supervised: compression discoveries / total computations
+        gt_dr = self._gt_discovery_rate_fast()
         ss_dr = self.self_supervised_discovery_rate
         # Blend: GT dominates early (calibration), self-supervised dominates later
         if self._total_interventions < 200:
@@ -1418,9 +1816,9 @@ class RKKAgent:
             },
             "local_reflex_train": self._last_local_reflex_train,
         }
-        el_edges = self.graph.edges
-        snap["edge_count"] = len(el_edges)
-        snap["edges"] = [e.as_dict() for e in el_edges]
+        el_ec, el_list = self._snapshot_edges_payload()
+        snap["edge_count"] = el_ec
+        snap["edges"] = el_list
         if self.env.preset == "pybullet":
             pos_fn = getattr(self.env, "object_positions_world", None)
             if callable(pos_fn):

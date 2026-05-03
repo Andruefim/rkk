@@ -537,7 +537,9 @@ class SimulationTickMixin:
         graph_deltas = {}
         cnt = self.agent.graph.edge_count
         if cnt != self._prev_edge_count:
-            graph_deltas[0] = [e.as_dict() for e in self.agent.graph.edges]
+            # Не материализовать десятки тысяч Edge — тот же capped payload, что и в agent.snapshot (WS/UI).
+            _, el_list = self.agent._snapshot_edges_payload()
+            graph_deltas[0] = el_list
             self._prev_edge_count = cnt
 
         # Neurogenesis

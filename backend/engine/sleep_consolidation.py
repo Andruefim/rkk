@@ -162,43 +162,25 @@ class SynapticPruner:
         threshold: float | None = None,
     ) -> tuple[int, int]:
         """
-        Prune weak edges from GNN weight matrix W.
-        Returns (edges_before, edges_after).
+        Обнуляет слабые веса через CausalGraph.prune_weak_W (frozen / forbidden / префиксы узлов).
+        Возвращает (edge_count до, edge_count после) по текущему graph.EDGE_THRESH.
         """
-        threshold = threshold or _env_float("RKK_SLEEP_PRUNE_THRESHOLD", 0.05)
+        thr = threshold if threshold is not None else _env_float("RKK_SLEEP_PRUNE_THRESHOLD", 0.05)
         core = getattr(graph, "_core", None)
         if core is None:
             return 0, 0
-
-        W = getattr(core, "W", None)
-        if W is None:
-            return 0, 0
-
-        node_ids = list(graph._node_ids)
-        n = W.shape[0]
-
-        with torch.no_grad():
-            W_abs = W.data.abs()
-            # Count non-zero before
-            before = int((W_abs > 0.005).sum().item())
-
-            # Build mask: don't prune protected nodes
-            prune_mask = torch.ones(n, n, dtype=torch.bool, device=W.device)
-            for i, name in enumerate(node_ids):
-                if any(name.startswith(p) for p in self.PROTECTED_PREFIXES):
-                    prune_mask[i, :] = False
-                    prune_mask[:, i] = False
-
-            # Zero out small weights on non-protected edges
-            weak = (W_abs < threshold) & prune_mask
-            W.data[weak] = 0.0
-
-            after = int((W.data.abs() > 0.005).sum().item())
-            pruned = before - after
-
-        if pruned > 0:
-            graph._invalidate_cache()
-
+        try:
+            before = int(graph.edge_count)
+        except Exception:
+            before = 0
+        try:
+            graph.prune_weak_W(thr)
+        except Exception:
+            pass
+        try:
+            after = int(graph.edge_count)
+        except Exception:
+            after = before
         return before, after
 
 
@@ -828,6 +810,30 @@ class SleepController:
         self.last_sleep_tick = tick
         self._falls_since_sleep = 0
         self.sleep_count += 1
+
+        try:
+            g = sim.agent.graph
+            g.deduplicate_edges_keep_strongest()
+            g.edge_duplicate_diagnostic("wake")
+            _wd = os.environ.get("RKK_W_DIAG", "0").strip().lower()
+            if _wd in ("1", "true", "yes", "on"):
+                g.log_W_threshold_stats("wake_before_prune")
+            if os.environ.get("RKK_POST_SLEEP_W_PRUNE", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            ):
+                nz = g.prune_weak_W()
+                ec = int(g.edge_count)
+                print(
+                    f"[Sleep] post-wake W prune: zeroed_weak_slots={nz} edge_count≥thresh={ec}",
+                    flush=True,
+                )
+            if _wd in ("1", "true", "yes", "on"):
+                g.log_W_threshold_stats("wake_after_prune")
+        except Exception:
+            pass
 
         # Post-sleep: advance curriculum if possible
         self._post_sleep_curriculum(tick, sim)
