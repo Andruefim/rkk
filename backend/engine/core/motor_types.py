@@ -31,6 +31,12 @@ class MotorState:
             "intent_gait_coupling": 0.88,
             "intent_arm_counterbalance": 0.5,
             "intent_stop_recover": 0.5,
+            "intent_reach_right": 0.5,
+            "intent_reach_left": 0.5,
+            "intent_grasp": 0.5,
+            "intent_look_at": 0.5,
+            "intent_lean_forward": 0.5,
+            "intent_wave": 0.5,
         }
     )
     joint_targets: dict[str, float] = field(default_factory=dict)

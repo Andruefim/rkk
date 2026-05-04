@@ -1,27 +1,11 @@
 """
-motor_cortex.py — Специализированные моторные субграфы (Phase D: Motor Cortex RSI).
+motor_cortex.py — Motor Cortex library + CPG annealing.
 
-Архитектура «пирамиды управления»:
-  L4 (High): Causal GNN (goals, objects, self_*)
-  L3 (Mid):  MotorCortexLibrary (learned motor programs)
-  L2 (Low):  CPG (rhythmic oscillators — scaffold, fades out)
-  L1 (Phys): PyBullet joints
+По умолчанию **нет** захардкоженных MLP-программ поведения: включение
+`RKK_MOTOR_CORTEX_LEGACY_SPECS=1` подгружает старые walk/balance/… MLP.
+Исполнение intent→joint из открытого GNN: `engine.causal_motor_executor` (RKK_CAUSAL_MOTOR_EXECUTOR=1).
 
-Каждый MotorProgram — маленький MLP (d_in≈8, hidden=32, d_out=6):
-  WalkProgram:    (intent_stride, posture, foot_l, foot_r, com_x, com_z, gait_l, gait_r) → leg joints
-  BalanceProgram: (torso_roll, torso_pitch, support_bias, com_z, com_x) → corrective joints
-  RecoveryProgram:(com_z, posture, foot_l, foot_r) → recovery joint sequence
-
-CPG Annealing:
-  cpg_weight ∈ [0, 1]. Final joint = cpg_weight * CPG_out + (1-cpg_weight) * cortex_out
-  Снижается плавно по мере роста posture_stability и foot_contact.
-  Минимум RKK_CPG_MIN_WEIGHT (дефолт 0.08) — CPG остаётся слабым scaffold.
-
-RSI Integration:
-  RSIController вызывает cortex.maybe_spawn_program() при детектировании плато.
-  Каждый новый program добавляет абстрактные узлы в основной GNN:
-    walk_drive_l, walk_drive_r, balance_signal, recovery_signal
-  Это отвязывает высокоуровневый GNN от нейронного шума суставов.
+Пирамида: L4 GNN → (causal executor | legacy MLP) + L2 CPG scaffold → PyBullet.
 """
 from __future__ import annotations
 
@@ -170,6 +154,78 @@ class MotorProgram:
         }
 
 
+
+_LEGACY_PROGRAM_SPECS = {
+    "walk": {
+        "input_keys": [
+            "intent_stride", "intent_support_left", "intent_support_right",
+            "intent_torso_forward", "posture_stability", "foot_contact_l",
+            "foot_contact_r", "gait_phase_l",
+        ],
+        "output_keys": ["lhip", "rhip", "lknee", "rknee", "lankle", "rankle"],
+        "hidden": 48,
+    },
+    "balance": {
+        "input_keys": [
+            "com_z", "torso_roll", "torso_pitch", "support_bias",
+            "posture_stability", "foot_contact_l", "foot_contact_r", "com_x",
+        ],
+        "output_keys": ["lhip", "rhip", "lankle", "rankle", "spine_pitch", "spine_yaw"],
+        "hidden": 32,
+    },
+    "recovery": {
+        "input_keys": [
+            "com_z", "posture_stability", "foot_contact_l", "foot_contact_r",
+            "intent_stop_recover", "torso_roll", "torso_pitch", "intent_stride",
+        ],
+        "output_keys": ["lhip", "rhip", "lknee", "rknee", "lshoulder", "rshoulder"],
+        "hidden": 32,
+    },
+    "reach_right": {
+        "input_keys": [
+            "intent_reach_right", "intent_grasp",
+            "rshoulder", "relbow",
+            "neck_yaw", "neck_pitch",
+            "posture_stability", "com_z", "target_dist",
+        ],
+        "output_keys": ["rshoulder", "relbow", "neck_yaw", "neck_pitch"],
+        "hidden": 32,
+    },
+    "reach_left": {
+        "input_keys": [
+            "intent_reach_left", "intent_grasp",
+            "lshoulder", "lelbow",
+            "neck_yaw", "neck_pitch",
+            "posture_stability", "com_z", "target_dist",
+        ],
+        "output_keys": ["lshoulder", "lelbow", "neck_yaw", "neck_pitch"],
+        "hidden": 32,
+    },
+    "head_gaze": {
+        "input_keys": [
+            "intent_look_at",
+            "neck_yaw", "neck_pitch",
+            "target_dist", "com_z", "posture_stability",
+        ],
+        "output_keys": ["neck_yaw", "neck_pitch"],
+        "hidden": 16,
+    },
+    "spine_posture": {
+        "input_keys": [
+            "posture_stability", "com_z", "torso_roll", "torso_pitch",
+            "intent_stride", "intent_stop_recover", "intent_lean_forward",
+        ],
+        "output_keys": ["spine_pitch", "spine_yaw", "torso_pitch"],
+        "hidden": 24,
+    },
+}
+
+def motor_program_specs() -> dict[str, Any]:
+    """Захардкоженные MLP-программы только при RKK_MOTOR_CORTEX_LEGACY_SPECS=1."""
+    if not _env_bool("RKK_MOTOR_CORTEX_LEGACY_SPECS", False):
+        return {}
+    return dict(_LEGACY_PROGRAM_SPECS)
+
 # ── Motor Cortex Library ──────────────────────────────────────────────────────
 class MotorCortexLibrary:
     """
@@ -186,33 +242,6 @@ class MotorCortexLibrary:
     """
 
     # Описания встроенных программ
-    _PROGRAM_SPECS = {
-        "walk": {
-            "input_keys": [
-                "intent_stride", "intent_support_left", "intent_support_right",
-                "intent_torso_forward", "posture_stability", "foot_contact_l",
-                "foot_contact_r", "gait_phase_l",
-            ],
-            "output_keys": ["lhip", "rhip", "lknee", "rknee", "lankle", "rankle"],
-            "hidden": 48,
-        },
-        "balance": {
-            "input_keys": [
-                "com_z", "torso_roll", "torso_pitch", "support_bias",
-                "posture_stability", "foot_contact_l", "foot_contact_r", "com_x",
-            ],
-            "output_keys": ["lhip", "rhip", "lankle", "rankle", "spine_pitch", "spine_yaw"],
-            "hidden": 32,
-        },
-        "recovery": {
-            "input_keys": [
-                "com_z", "posture_stability", "foot_contact_l", "foot_contact_r",
-                "intent_stop_recover", "torso_roll", "torso_pitch", "intent_stride",
-            ],
-            "output_keys": ["lhip", "rhip", "lknee", "rknee", "lshoulder", "rshoulder"],
-            "hidden": 32,
-        },
-    }
 
     def __init__(self, device: torch.device):
         self.device = device
@@ -244,7 +273,7 @@ class MotorCortexLibrary:
         with self._lock:
             if name in self.programs:
                 return self.programs[name]
-            spec = self._PROGRAM_SPECS.get(name)
+            spec = motor_program_specs().get(name)
             if spec is None:
                 raise ValueError(f"Unknown motor program: {name!r}")
             d_in = len(spec["input_keys"])
@@ -269,7 +298,7 @@ class MotorCortexLibrary:
         """RSI hook: создаём программу при плато."""
         if name in self.programs:
             return False
-        if name not in self._PROGRAM_SPECS:
+        if name not in motor_program_specs():
             return False
         self.ensure_program(name)
         print(f"[MotorCortex] RSI spawned '{name}': {reason}")
@@ -380,10 +409,12 @@ class MotorCortexLibrary:
         rate = _env_float("RKK_CPG_ANNEAL_RATE", 5e-5)
         min_w = _env_float("RKK_CPG_MIN_WEIGHT", 0.08)
 
-        if self._quality_ema > threshold and len(self.programs) > 0:
-            # Check that cortex programs have enough training
-            min_steps = _env_int("RKK_CPG_ANNEAL_MIN_TRAIN", 200)
-            ready = any(p.train_steps >= min_steps for p in self.programs.values())
+        if self._quality_ema > threshold:
+            if len(self.programs) > 0:
+                min_steps = _env_int("RKK_CPG_ANNEAL_MIN_TRAIN", 200)
+                ready = any(p.train_steps >= min_steps for p in self.programs.values())
+            else:
+                ready = _env_bool("RKK_CPG_ANNEAL_WITHOUT_MC_PROGRAMS", True)
             if ready:
                 self.cpg_weight = max(min_w, self.cpg_weight - rate)
 
@@ -422,6 +453,18 @@ class MotorCortexLibrary:
         Эти узлы позволяют высокоуровневому графу планировать
         без прямого управления суставами.
         """
+        udrv = 0.5
+        try:
+            for _k, _v in (nodes or {}).items():
+                if not str(_k).startswith("intent_"):
+                    continue
+                udrv = max(
+                    udrv,
+                    0.5 + abs(float(_v) - 0.5),
+                )
+        except (TypeError, ValueError):
+            udrv = 0.5
+        udrv = float(np.clip(udrv, 0.05, 0.95))
         self.abstract_nodes = {
             "mc_walk_drive": float(np.clip(self._quality_ema, 0.05, 0.95)),
             "mc_balance_signal": float(np.clip(posture, 0.05, 0.95)),
@@ -432,6 +475,7 @@ class MotorCortexLibrary:
                     0.05, 0.95,
                 )
             ),
+            "mc_upper_drive": float(np.clip(udrv, 0.05, 0.95)),
         }
 
     def inject_abstract_nodes_into_graph(self, graph) -> int:
@@ -474,35 +518,71 @@ class MotorCortexLibrary:
         if tick < min_ticks:
             return spawned
 
-        # Phase 1: ensure walk program exists
-        if "walk" not in self.programs and posture_mean > 0.30:
-            if self.maybe_spawn_program("walk", f"posture={posture_mean:.3f}"):
-                spawned.append("walk")
+        specs = motor_program_specs()
 
-        # Phase 2: balance program when walk exists but instability persists
-        if (
-            "walk" in self.programs
-            and "balance" not in self.programs
-            and posture_mean > 0.45
-            and fallen_rate > 0.05
-        ):
-            if self.maybe_spawn_program("balance", f"fallen_rate={fallen_rate:.3f}"):
-                spawned.append("balance")
+        if specs:
+            # Phase 1: ensure walk program exists
+            if "walk" not in self.programs and posture_mean > 0.30:
+                if self.maybe_spawn_program("walk", f"posture={posture_mean:.3f}"):
+                    spawned.append("walk")
 
-        # Phase 3: recovery program when balance exists
-        if (
-            "balance" in self.programs
-            and "recovery" not in self.programs
-            and fallen_rate > 0.02
-        ):
-            if self.maybe_spawn_program("recovery", f"loco_r={loco_reward_mean:.3f}"):
-                spawned.append("recovery")
+            # Phase 2: balance program when walk exists but instability persists
+            if (
+                "walk" in self.programs
+                and "balance" not in self.programs
+                and posture_mean > 0.45
+                and fallen_rate > 0.05
+            ):
+                if self.maybe_spawn_program("balance", f"fallen_rate={fallen_rate:.3f}"):
+                    spawned.append("balance")
 
-        # Enable annealing once walk program has enough training
-        if not self._annealing_enabled and "walk" in self.programs:
-            walk_prog = self.programs["walk"]
-            annealing_start = _env_int("RKK_CPG_ANNEAL_START_STEPS", 300)
-            if walk_prog.train_steps >= annealing_start:
+            # Phase 3: recovery program when balance exists
+            if (
+                "balance" in self.programs
+                and "recovery" not in self.programs
+                and fallen_rate > 0.02
+            ):
+                if self.maybe_spawn_program("recovery", f"loco_r={loco_reward_mean:.3f}"):
+                    spawned.append("recovery")
+
+            # Phase 4: upper body when locomotion stable (legacy programmes only)
+            if (
+                "balance" in self.programs
+                and posture_mean > 0.55
+                and fallen_rate < 0.10
+            ):
+                if "reach_right" not in self.programs and self.maybe_spawn_program(
+                    "reach_right", "locomotion_stable"
+                ):
+                    spawned.append("reach_right")
+                if "reach_left" not in self.programs and self.maybe_spawn_program(
+                    "reach_left", "locomotion_stable"
+                ):
+                    spawned.append("reach_left")
+
+            if (
+                ("reach_right" in self.programs or "reach_left" in self.programs)
+                and "spine_posture" not in self.programs
+            ):
+                if self.maybe_spawn_program("spine_posture", "upper_body_active"):
+                    spawned.append("spine_posture")
+
+            if (
+                "spine_posture" in self.programs
+                and "head_gaze" not in self.programs
+                and posture_mean > 0.50
+            ):
+                if self.maybe_spawn_program("head_gaze", "torso_stabilized"):
+                    spawned.append("head_gaze")
+
+        # Enable annealing once walk has trained (legacy) or quality high (GNN-only)
+        if not self._annealing_enabled:
+            if "walk" in self.programs:
+                walk_prog = self.programs["walk"]
+                annealing_start = _env_int("RKK_CPG_ANNEAL_START_STEPS", 300)
+                if walk_prog.train_steps >= annealing_start:
+                    self.enable_annealing()
+            elif not specs and posture_mean > _env_float("RKK_CPG_ANNEAL_THRESHOLD", 0.58):
                 self.enable_annealing()
 
         return spawned

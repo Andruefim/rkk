@@ -175,6 +175,14 @@ class Simulation(
         self._hai_last_diag: dict | None = None
         self._pe_history: deque[float] = deque(maxlen=200)
         self._locomotion_controller = None
+        self._reflex_stabilizer = None
+        self._reflex_posture_prev = 0.5
+        self._reflex_stabilizer_logged = False
+        self._cerebellum = None
+        self._cerebellum_obs_prev = None
+        self._cerebellum_logged = False
+        self._causal_motor_executor = None
+        self._last_joint_cmd_applied: dict[str, float] = {}
         self._motor_state = MotorState()
         self._motor_state_lock = threading.Lock()
         self._bg = BackgroundLoopService(self)

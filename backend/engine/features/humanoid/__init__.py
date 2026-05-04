@@ -20,6 +20,7 @@ from engine.features.humanoid.constants import (
     SPINE_VARS,
     TORSO_VARS,
     URDF_FROZEN_EDGES,
+    UPPER_BODY_INTENT_VARS,
     VESTIBULAR_VARS,
     VAR_NAMES,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "SPINE_VARS",
     "TORSO_VARS",
     "URDF_FROZEN_EDGES",
+    "UPPER_BODY_INTENT_VARS",
     "VESTIBULAR_VARS",
     "VAR_NAMES",
     "fixed_root_seeds",

@@ -25,6 +25,14 @@ SANDBOX_VARS = [
     "stack_height",
     "stability_score",
 ]
+UPPER_BODY_INTENT_VARS: tuple[str, ...] = (
+    "intent_reach_right",
+    "intent_reach_left",
+    "intent_grasp",
+    "intent_look_at",
+    "intent_lean_forward",
+    "intent_wave",
+)
 MOTOR_INTENT_VARS: tuple[str, ...] = (
     "intent_stride",
     "intent_support_left",
@@ -33,7 +41,7 @@ MOTOR_INTENT_VARS: tuple[str, ...] = (
     "intent_gait_coupling",
     "intent_arm_counterbalance",
     "intent_stop_recover",
-)
+) + UPPER_BODY_INTENT_VARS
 MOTOR_INTENT_DEFAULTS: dict[str, float] = {
     "intent_gait_coupling": 0.88,
 }

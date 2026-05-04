@@ -304,7 +304,7 @@ class ValueLayer:
                 BlockReason.READ_ONLY_MACRO,
                 current_nodes,
                 current_phi,
-                "concept_* — read-only macro (aggregate); do() disabled",
+                "read-only / outcome node (concept_*, intero_*, motor observables) — do() disabled",
                 variable,
                 value,
             )

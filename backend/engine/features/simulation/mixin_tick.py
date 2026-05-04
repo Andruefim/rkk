@@ -270,6 +270,105 @@ class SimulationTickMixin:
             )
         )
 
+        rs = getattr(self, "_reflex_stabilizer", None)
+        if rs is None:
+            try:
+                from engine.reflex_stabilizer import reflex_stabilizer_enabled
+
+                if reflex_stabilizer_enabled():
+                    rs = self._ensure_reflex_stabilizer()
+            except Exception:
+                rs = None
+        if rs is not None and self.current_world == "humanoid" and not self._fixed_root_active:
+            try:
+                train_every = int(os.environ.get("RKK_REFLEX_TRAIN_EVERY", "3"))
+            except ValueError:
+                train_every = 3
+            train_every = max(1, train_every)
+            if self.tick % train_every == 0:
+                rs.train_on_outcome(self._reflex_posture_prev, _posture_now)
+            self._reflex_posture_prev = _posture_now
+
+        cb_cereb = getattr(self, "_cerebellum", None)
+        if cb_cereb is None:
+            try:
+                from engine.cerebellum import cerebellum_enabled
+
+                if cerebellum_enabled():
+                    cb_cereb = self._ensure_cerebellum()
+            except Exception:
+                cb_cereb = None
+        if cb_cereb is not None and self.current_world == "humanoid" and not self._fixed_root_active:
+            if self._cerebellum_obs_prev is not None and self._last_joint_cmd_applied:
+                cb_cereb.record_transition(
+                    self._cerebellum_obs_prev,
+                    self._last_joint_cmd_applied,
+                    _obs_for_d_e,
+                )
+            try:
+                train_every_cb = int(os.environ.get("RKK_CEREBELLUM_TRAIN_EVERY", "5"))
+            except ValueError:
+                train_every_cb = 5
+            train_every_cb = max(1, train_every_cb)
+            if self.tick % train_every_cb == 0:
+                cb_cereb.train_step()
+            intents = {}
+            for k, v in self.agent.graph.nodes.items():
+                sk = str(k)
+                if not sk.startswith("intent_"):
+                    continue
+                try:
+                    intents[sk] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            cb_cereb.set_desired_from_graph(dict(self.agent.graph.nodes), intents)
+            self._cerebellum_obs_prev = dict(_obs_for_d_e)
+
+        if (
+            _MOTOR_CORTEX_AVAILABLE
+            and self.current_world == "humanoid"
+            and not self._fixed_root_active
+        ):
+            mc_fb = self._ensure_motor_cortex()
+            if mc_fb is not None and len(mc_fb.programs) > 0:
+                fl_mc = float(
+                    _obs_for_d_e.get(
+                        "foot_contact_l",
+                        _obs_for_d_e.get("phys_foot_contact_l", 0.5),
+                    )
+                )
+                fr_mc = float(
+                    _obs_for_d_e.get(
+                        "foot_contact_r",
+                        _obs_for_d_e.get("phys_foot_contact_r", 0.5),
+                    )
+                )
+                loco_r = self._locomotion_reward_ema()
+                cpg_cmd: dict = {}
+                if self._locomotion_controller is not None:
+                    cpg_cmd = dict(
+                        getattr(self._locomotion_controller, "_last_command", {}) or {}
+                    )
+                mc_fb.push_and_train(
+                    nodes=dict(self.agent.graph.nodes),
+                    cpg_targets=cpg_cmd,
+                    reward=loco_r,
+                    posture=_posture_now,
+                    foot_l=fl_mc,
+                    foot_r=fr_mc,
+                )
+                mc_fb.anneal_step(_posture_now, fl_mc, fr_mc, fallen, self.tick)
+                if not self._mc_abstract_nodes_injected:
+                    added = mc_fb.inject_abstract_nodes_into_graph(self.agent.graph)
+                    if added > 0:
+                        self._mc_abstract_nodes_injected = True
+                        self._add_event(
+                            "🧠 MotorCortex: +mc_* feedback nodes for GNN",
+                            "#ff88ff",
+                            "phase",
+                        )
+                mc_fb.sync_abstract_nodes_to_graph(self.agent.graph)
+
         # Level 3-I: Multi-scale time tick (first consumer of post-step obs)
         if _TIMESCALE_AVAILABLE and self._timescale is not None:
             self._timescale.tick(self.tick, _obs_for_d_e)

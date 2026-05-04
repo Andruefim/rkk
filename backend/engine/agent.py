@@ -83,6 +83,46 @@ MAX_FALLBACK_TRIES = 5  # больше кандидатов, чтобы прой
 # Вес slot_* в actual_ig для System 1; основной сигнал — не-визуальные узлы (RKK_VISUAL_IG_WEIGHT=0 → только физика).
 VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.1"))
 _SELF_VAR_SET = frozenset(SELF_VARS)
+
+
+def _intervention_bootstrap_ticks() -> int:
+    try:
+        return max(0, int(os.environ.get("RKK_INTERVENTION_BOOTSTRAP_TICKS", "500")))
+    except ValueError:
+        return 500
+
+
+def _homeostatic_ig_enabled() -> bool:
+    return os.environ.get("RKK_HOMEOSTATIC_IG", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _homeostatic_abs_delta(before: dict, after: dict) -> float | None:
+    """Среднее |Δ| по homeostatic-осям среды (нормированные [0,1])."""
+    rows = (
+        ("posture_stability", "phys_posture_stability"),
+        ("com_z", "phys_com_z"),
+        ("foot_contact_l", "phys_foot_contact_l"),
+        ("foot_contact_r", "phys_foot_contact_r"),
+    )
+    deltas: list[float] = []
+    for p, alt in rows:
+        b = before.get(p)
+        if b is None:
+            b = before.get(alt)
+        a = after.get(p)
+        if a is None:
+            a = after.get(alt)
+        if b is None or a is None:
+            continue
+        try:
+            deltas.append(abs(float(a) - float(b)))
+        except (TypeError, ValueError):
+            continue
+    if not deltas:
+        return None
+    return float(np.clip(np.mean(deltas), 0.0, 1.0))
 # RKK_LOCOMOTION_CPG=1: CPG ведёт ноги; EIG не выбирает прямые do() по этим узлам.
 _LOCOMOTION_CPG_LEG_EIG_BLOCK = frozenset(
     {"lhip", "lknee", "lankle", "rhip", "rknee", "rankle"}
@@ -1020,6 +1060,8 @@ class RKKAgent:
         if d <= 1:
             return []
 
+        bticks = _intervention_bootstrap_ticks()
+
         h_W_norm = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
         h_clip = float(np.clip(h_W_norm, 0.0, 1.0))
         disc_rate = self.discovery_rate
@@ -1077,6 +1119,12 @@ class RKKAgent:
         sparse_min_unc = max(0.0, min(0.8, sparse_min_unc))
 
         valid_pairs = is_motor_arr | (unc_pairs >= sparse_min_unc)
+
+        src_controllable = np.array(
+            [not is_read_only_macro_var(v) for v in var_ids],
+            dtype=bool,
+        )
+        valid_pairs &= src_controllable[fi]
 
         if self._is_locomotion_primary_active():
             blocked = _LOCOMOTION_CPG_LEG_EIG_BLOCK
@@ -1228,6 +1276,12 @@ class RKKAgent:
         scores = self.system1.score([c["features"] for c in candidates])
         for i, cand in enumerate(candidates):
             cand["expected_ig"] = float(scores[i])
+
+        if bticks > 0 and self._total_interventions < bticks:
+            floor = 0.88
+            for cand in candidates:
+                if _is_motor_intent_var(str(cand.get("variable", ""))):
+                    cand["expected_ig"] = max(float(cand["expected_ig"]), floor)
 
         if symbolic_verifier_enabled() and self._symbolic_prediction_bad:
             a, b = exploration_blend_from_uncertainty()
@@ -1560,7 +1614,14 @@ class RKKAgent:
             self.graph.refresh_concept_aggregates()
         pe_slot = _mean_abs_err(slot_ids)
         w_vis = min(0.45, max(0.0, VISUAL_IG_WEIGHT))
-        if slot_ids and phys_ids:
+        ig_home = (
+            _homeostatic_abs_delta(obs_before_env, observed_env)
+            if _homeostatic_ig_enabled()
+            else None
+        )
+        if ig_home is not None:
+            actual_ig = ig_home
+        elif slot_ids and phys_ids:
             actual_ig = (1.0 - w_vis) * pe_phys + w_vis * pe_slot
         elif phys_ids:
             actual_ig = pe_phys

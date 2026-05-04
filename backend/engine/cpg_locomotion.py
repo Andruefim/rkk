@@ -170,6 +170,24 @@ class LocomotionController:
         torso_forward = float(np.clip(torso_forward, 0.38, 0.96))
         self._last_motor_state["intent_torso_forward"] = float(torso_forward)
 
+        from engine.features.humanoid.constants import UPPER_BODY_INTENT_VARS
+
+        for _uk in UPPER_BODY_INTENT_VARS:
+            self._last_motor_state[str(_uk)] = float(self._node(agent_nodes, str(_uk)))
+
+        intent_agg = 0.0
+        try:
+            for key in agent_nodes:
+                sk = str(key)
+                if not sk.startswith("intent_"):
+                    continue
+                if sk == "intent_gait_coupling":
+                    continue
+                intent_agg += abs(float(self._node(agent_nodes, sk)) - 0.5)
+        except Exception:
+            intent_agg = 0.0
+        drive_damp = float(np.clip(1.0 - 0.06 * intent_agg, 0.72, 1.0))
+
         # CPG команды для ног
         cmd = torch.zeros(6, dtype=torch.float32, device=self.device)
         cmd[0] =  0.19 * stride - 0.08 * sup_r - 0.05 * recover   # lhip
@@ -179,7 +197,10 @@ class LocomotionController:
         cmd[4] =  0.08 * sup_l - 0.04 * stride + 0.05 * recover    # lankle
         cmd[5] =  0.08 * sup_r + 0.04 * stride + 0.05 * recover    # rankle
 
-        cpg_out = self.cpg.step(dt=dt, external_command=cmd * (0.7 + 0.3 * energy))
+        cpg_out = self.cpg.step(
+            dt=dt,
+            external_command=cmd * (0.7 + 0.3 * energy) * drive_damp,
+        )
 
         # Торс синхронизация с CPG: pitch_add > 0 = наклон вперёд
         gscale = float(np.clip(stride_n * 1.8, 0.0, 1.0))

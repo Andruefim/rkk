@@ -391,19 +391,64 @@ class EnvironmentHumanoid:
         ms = self._motor_state
         torso = float(ms.get("intent_torso_forward", 0.5))
         arm_cb = float(ms.get("intent_arm_counterbalance", 0.5))
-        pitch = float(np.clip(0.5 + (torso - 0.5) * 0.55, 0.05, 0.95))
+        rr = float(ms.get("intent_reach_right", 0.5))
+        rl = float(ms.get("intent_reach_left", 0.5))
+        grasp = float(ms.get("intent_grasp", 0.5))
+        look = float(ms.get("intent_look_at", 0.5))
+        lean = float(ms.get("intent_lean_forward", 0.5))
+        wave = float(ms.get("intent_wave", 0.5))
+
+        pitch = float(np.clip(0.5 + (torso - 0.5) * 0.55 + (lean - 0.5) * 0.28, 0.05, 0.95))
         if cpg_sync:
             pitch = float(
                 np.clip(pitch + 0.35 * float(cpg_sync.get("pitch_add", 0.0)), 0.05, 0.95)
             )
         self._sim.set_joint("spine_pitch", pitch)
+
+        l_sh = float(
+            np.clip(
+                0.5
+                - (arm_cb - 0.5) * 0.65
+                + (rl - 0.5) * 0.88
+                - (wave - 0.5) * 0.12,
+                0.05,
+                0.95,
+            )
+        )
+        r_sh = float(
+            np.clip(
+                0.5
+                + (arm_cb - 0.5) * 0.65
+                + (rr - 0.5) * 0.88
+                + (wave - 0.5) * 0.12,
+                0.05,
+                0.95,
+            )
+        )
+        self._sim.set_joint("lshoulder", l_sh)
+        self._sim.set_joint("rshoulder", r_sh)
+
+        g = float(np.clip((grasp - 0.5) * 1.1, -0.35, 0.35))
+        self._sim.set_joint("lelbow", float(np.clip(0.5 - g, 0.05, 0.95)))
+        self._sim.set_joint("relbow", float(np.clip(0.5 - g, 0.05, 0.95)))
+
         self._sim.set_joint(
-            "lshoulder",
-            float(np.clip(0.5 - (arm_cb - 0.5) * 0.65, 0.05, 0.95)),
+            "neck_yaw",
+            float(np.clip(0.5 + (look - 0.5) * 0.75 + (rr - 0.5) * 0.15 - (rl - 0.5) * 0.15, 0.05, 0.95)),
         )
         self._sim.set_joint(
-            "rshoulder",
-            float(np.clip(0.5 + (arm_cb - 0.5) * 0.65, 0.05, 0.95)),
+            "neck_pitch",
+            float(
+                np.clip(
+                    0.5
+                    + abs(look - 0.5) * 0.22
+                    + (lean - 0.5) * 0.2
+                    - 0.08 * max(0.0, rr - 0.5)
+                    - 0.08 * max(0.0, rl - 0.5),
+                    0.05,
+                    0.95,
+                )
+            ),
         )
 
     def _apply_motor_intents(self) -> None:
@@ -534,6 +579,9 @@ class EnvironmentHumanoid:
             self._apply_upper_body_from_intents(cpg_sync=cpg_sync)
             for name, val in targets.items():
                 if name in LEG_VARS:
+                    self._sim.set_joint(name, float(np.clip(val, 0.05, 0.95)))
+            for name, val in targets.items():
+                if name in (ARM_VARS + SPINE_VARS + HEAD_VARS):
                     self._sim.set_joint(name, float(np.clip(val, 0.05, 0.95)))
         self._sim.step(n_sub)
         self._update_interoception()

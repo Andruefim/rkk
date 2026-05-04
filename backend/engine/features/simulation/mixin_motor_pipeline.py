@@ -1,6 +1,7 @@
 """Simulation mixin: L1 motor queue, burst causal."""
 from __future__ import annotations
 
+from engine.features.humanoid.constants import LEG_VARS
 from engine.features.simulation.mixin_imports import *
 
 
@@ -70,6 +71,10 @@ class SimulationMotorPipelineMixin:
             payload["cpg_sync"] = {k: float(v) for k, v in cpg_sync.items()}
         self._l1_motor_q.put(payload)
         self._l1_last_cmd_tick = self.tick
+        jt = payload.get("joint_targets") or {}
+        self._last_joint_cmd_applied = {
+            k: float(jt[k]) for k in LEG_VARS if k in jt
+        }
 
     def _record_motor_burst_causal(
         self,

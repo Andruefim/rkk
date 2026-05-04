@@ -93,17 +93,62 @@ class BackgroundLoopService:
                     nodes = dict(self._cpg_node_snapshot)
                 if not nodes:
                     nodes = dict(s.agent.graph.nodes)
+                obs_reflex = dict(nodes)
                 try:
-                    # Same lock as tick_step / agent timestep so CPG observe never races
-                    # physics + graph updates on another thread.
-                    with s._sim_step_lock:
-                        obs_live = s.agent.env.observe()
+                    # Не брать _sim_step_lock: иначе CPG ждёт 1–2 с пока агент считает score/train.
+                    # get_state() внутри observe() сериализуется через humanoid._physics_lock.
+                    obs_live = s.agent.env.observe()
+                    obs_reflex = {**nodes}
+                    for k, v in obs_live.items():
+                        try:
+                            obs_reflex[k] = float(v)
+                        except (TypeError, ValueError):
+                            pass
                     for _k in ("com_x", "com_y", "com_z"):
                         if _k in obs_live:
                             nodes[_k] = float(obs_live[_k])
                 except Exception:
-                    pass
+                    obs_reflex = dict(nodes)
                 targets = s._locomotion_controller.get_joint_targets(nodes, dt=dt)
+                cb = getattr(s, "_cerebellum", None)
+                if cb is None:
+                    try:
+                        from engine.cerebellum import cerebellum_enabled
+
+                        if cerebellum_enabled():
+                            cb = s._ensure_cerebellum()
+                    except Exception:
+                        cb = None
+                use_cb = cb is not None and cb.ready_for_control()
+                if use_cb:
+                    try:
+                        from engine.features.humanoid.constants import LEG_VARS
+
+                        leg = cb.get_joint_commands(obs_reflex)
+                        for k in LEG_VARS:
+                            if k in leg:
+                                targets[k] = leg[k]
+                    except Exception:
+                        pass
+                else:
+                    rs = getattr(s, "_reflex_stabilizer", None)
+                    if rs is None:
+                        try:
+                            from engine.reflex_stabilizer import reflex_stabilizer_enabled
+
+                            if reflex_stabilizer_enabled():
+                                rs = s._ensure_reflex_stabilizer()
+                        except Exception:
+                            rs = None
+                    if rs is not None:
+                        try:
+                            targets = rs.step(obs_reflex, targets)
+                        except Exception:
+                            pass
+                try:
+                    targets = s._blend_causal_executor_targets(nodes, targets)
+                except Exception:
+                    pass
                 cpg_sync = s._locomotion_controller.upper_body_cpg_sync()
                 s._enqueue_l1_motor_command(
                     source="cpg",
@@ -156,8 +201,10 @@ class BackgroundLoopService:
         while not self._agent_stop.is_set():
             t0 = time.perf_counter()
             try:
+                result = None
                 with s._sim_step_lock:
-                    s._agent_step_response = s._run_single_agent_timestep_inner()
+                    result = s._run_single_agent_timestep_inner()
+                s._agent_step_response = result
             except Exception as e:
                 print(f"[Simulation] Agent loop: {e}")
             elapsed = time.perf_counter() - t0
