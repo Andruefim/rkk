@@ -167,13 +167,19 @@ class SimulationTickMixin:
         except ValueError:
             auto_fr_ticks = 0
         if auto_fr_ticks > 0 and self.current_world == "humanoid":
-            if self.tick == 1 and not self._fixed_root_active:
-                self.enable_fixed_root()
-                self._add_event(
-                    "📌 Curriculum: fixed_root ON (phase 1, arms→cubes)",
-                    "#66ccaa",
-                    "phase",
-                )
+            try:
+                fr_retry_max = int(os.environ.get("RKK_CURRICULUM_FIXED_ROOT_RETRY_MAX", "16"))
+            except ValueError:
+                fr_retry_max = 16
+            fr_retry_max = max(1, fr_retry_max)
+            if self.tick <= fr_retry_max and not self._fixed_root_active:
+                r = self.enable_fixed_root()
+                if r.get("fixed_root") and not r.get("error") and self._fixed_root_active:
+                    self._add_event(
+                        "📌 Curriculum: fixed_root ON (phase 1, arms→cubes)",
+                        "#66ccaa",
+                        "phase",
+                    )
             if (
                 self._fixed_root_active
                 and self.tick >= auto_fr_ticks

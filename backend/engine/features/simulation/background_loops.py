@@ -4,8 +4,10 @@
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
+import traceback
 from typing import TYPE_CHECKING
 
 from engine.core.constants import cpg_loop_hz_from_env as _cpg_loop_hz_from_env
@@ -16,6 +18,8 @@ if TYPE_CHECKING:
 
 class BackgroundLoopService:
     """Управление rkk-cpg-loop и rkk-agent-loop."""
+
+    _agent_loop_traceback_once = True
 
     __slots__ = ("_sim", "_cpg_loop_thread", "_cpg_stop", "_cpg_snapshot_lock", "_cpg_node_snapshot", "_agent_loop_thread", "_agent_stop")
 
@@ -207,5 +211,12 @@ class BackgroundLoopService:
                 s._agent_step_response = result
             except Exception as e:
                 print(f"[Simulation] Agent loop: {e}")
+                if (
+                    BackgroundLoopService._agent_loop_traceback_once
+                    and os.environ.get("RKK_AGENT_LOOP_TRACEBACK", "").strip().lower()
+                    in ("1", "true", "yes", "on")
+                ):
+                    traceback.print_exc()
+                    BackgroundLoopService._agent_loop_traceback_once = False
             elapsed = time.perf_counter() - t0
             self._agent_stop.wait(timeout=max(0.0, dt - elapsed))

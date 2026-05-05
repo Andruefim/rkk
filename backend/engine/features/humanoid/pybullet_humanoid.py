@@ -37,6 +37,39 @@ from engine.features.humanoid.kinematics import (
 from engine.features.humanoid.sandbox import InstrumentalSandbox
 from engine.features.humanoid.vestibular import gravity_dir_in_link_frame
 
+
+def _humanoid_motor_torque_scale() -> float:
+    """Множитель к соразмерным человеку лимитам момента (1.0 ≈ взрослый, ~1.1 — чуть сильнее)."""
+    try:
+        return max(0.05, float(os.environ.get("RKK_HUMANOID_MOTOR_TORQUE_SCALE", "1.12")))
+    except ValueError:
+        return 1.12
+
+
+def _humanoid_motor_torque_table() -> dict:
+    """
+    Лимиты моментов (Н·м) для POSITION_CONTROL: порядок величин как у человека ~70 kg,
+    чуть выше за счёт RKK_HUMANOID_MOTOR_TORQUE_SCALE (по умолчанию 1.12).
+    """
+    s = _humanoid_motor_torque_scale()
+    leg_sph = 340.0 * s
+    arm_sph = 128.0 * s
+    return {
+        "root_constraint": 1250.0 * s,
+        "relax_sph": [52.0 * s, 52.0 * s, 52.0 * s],
+        "relax_rev": 40.0 * s,
+        # Короткий «поджим» при reset_stance — чуть выше рабочих, без аркадных 8000+
+        "stabilize_sph": [410.0 * s, 410.0 * s, 410.0 * s],
+        "stabilize_rev": 385.0 * s,
+        "neck_sph": [92.0 * s, 92.0 * s, 92.0 * s],
+        "spine_sph": [275.0 * s, 275.0 * s, 275.0 * s],
+        "leg_sph": [leg_sph, leg_sph, leg_sph],
+        "arm_sph": [arm_sph, arm_sph, arm_sph],
+        "leg_rev": 275.0 * s,
+        "arm_rev": 120.0 * s,
+    }
+
+
 class _PyBulletHumanoid(InstrumentalSandbox):
 
     _JOINT_MAP = {
@@ -58,6 +91,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self._bg_running = False
         self._bg_thread: threading.Thread | None = None
         self._bg_hz = 0.0
+        self._mt = _humanoid_motor_torque_table()
 
         self.client = pb.connect(pb.DIRECT)
         pb.setGravity(0, 0, -9.81, physicsClientId=self.client)
@@ -241,7 +275,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             # Снижаем максимальную силу constraint чтобы не было артефактов
             pb.changeConstraint(
                 self._root_constraint,
-                maxForce=5000.0,
+                maxForce=float(self._mt["root_constraint"]),
                 physicsClientId=self.client,
             )
             print(f"[HumanoidEnv] Fixed root constraint #{self._root_constraint} at z={pos[2]:.3f}")
@@ -714,7 +748,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, pb.POSITION_CONTROL,
                     targetPosition=quat_id,
                     positionGain=1.0, velocityGain=0.35,
-                    maxVelocity=8.0, force=[220.0, 220.0, 220.0],
+                    maxVelocity=8.0, force=list(self._mt["relax_sph"]),
                     physicsClientId=cid,
                 )
             else:
@@ -722,7 +756,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, controlMode=pb.POSITION_CONTROL,
                     targetPosition=0.0,
                     positionGain=0.55, velocityGain=0.12,
-                    force=100.0, physicsClientId=cid,
+                    force=float(self._mt["relax_rev"]), physicsClientId=cid,
                 )
 
     def _motor_stabilize_neutral_pose(self) -> None:
@@ -738,7 +772,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, pb.POSITION_CONTROL,
                     targetPosition=quat_id,
                     positionGain=1.2, velocityGain=0.40,
-                    maxVelocity=6.0, force=[12000.0, 12000.0, 12000.0],
+                    maxVelocity=6.0, force=list(self._mt["stabilize_sph"]),
                     physicsClientId=cid,
                 )
             else:
@@ -746,7 +780,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     rid, i, controlMode=pb.POSITION_CONTROL,
                     targetPosition=0.0,
                     positionGain=0.90, velocityGain=0.25,
-                    force=8000.0, physicsClientId=cid,
+                    force=float(self._mt["stabilize_rev"]), physicsClientId=cid,
                 )
 
     def _snap_base_spine_vertical(self) -> None:
@@ -852,7 +886,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 physicsClientId=cid,
             )
             pb.changeConstraint(
-                self._root_constraint, maxForce=5000.0, physicsClientId=cid,
+                self._root_constraint,
+                maxForce=float(self._mt["root_constraint"]),
+                physicsClientId=cid,
             )
 
         if getattr(self, "ball_id", None) is not None:
@@ -897,7 +933,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                         positionGain=0.62, velocityGain=0.18, maxVelocity=4.0,
-                        force=[4000.0, 4000.0, 4000.0], physicsClientId=cid)
+                        force=list(self._mt["neck_sph"]), physicsClientId=cid)
                 return
 
             if var_name in ("spine_yaw", "spine_pitch"):
@@ -911,7 +947,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                         positionGain=0.85, velocityGain=0.25, maxVelocity=3.5,
-                        force=[10000.0, 10000.0, 10000.0], physicsClientId=cid)
+                        force=list(self._mt["spine_sph"]), physicsClientId=cid)
                 return
 
             is_leg = var_name in ("lhip", "rhip", "lknee", "rknee", "lankle", "rankle")
@@ -933,23 +969,25 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if is_leg:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                             positionGain=0.85, velocityGain=0.25, maxVelocity=4.0,
-                            force=[12000.0, 12000.0, 12000.0], physicsClientId=cid)
+                            force=list(self._mt["leg_sph"]), physicsClientId=cid)
                 else:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                             positionGain=0.52, velocityGain=0.15, maxVelocity=5.5,
-                            force=[3000.0, 3000.0, 3000.0], physicsClientId=cid)
+                            force=list(self._mt["arm_sph"]), physicsClientId=cid)
             else:
                 if is_leg:
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
-                        positionGain=0.80, velocityGain=0.20, force=8000.0, physicsClientId=cid,
+                        positionGain=0.80, velocityGain=0.20,
+                        force=float(self._mt["leg_rev"]), physicsClientId=cid,
                     )
                 else:
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
-                        positionGain=0.5, velocityGain=0.1, force=2000.0, physicsClientId=cid,
+                        positionGain=0.5, velocityGain=0.1,
+                        force=float(self._mt["arm_rev"]), physicsClientId=cid,
                     )
 
     def get_com(self) -> tuple[np.ndarray, np.ndarray]:

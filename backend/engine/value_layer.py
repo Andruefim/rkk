@@ -282,6 +282,7 @@ class ValueLayer:
         other_agents_phi: list[float] | None = None,
         engine_tick:      int = 0,
         imagination_horizon: int = 0,
+        post_fr_loco_relax: float = 0.0,
     ) -> CheckResult:
         self.total_checked += 1
         if imagination_horizon > 0:
@@ -342,6 +343,10 @@ class ValueLayer:
             intent_key = variable[5:] if variable.startswith("phys_") else variable
             shift = abs(float(value) - 0.5)
             loco_relax = _loco_warmup_relax(engine_tick)
+            if post_fr_loco_relax > 0.0:
+                loco_relax = float(
+                    np.clip(loco_relax + post_fr_loco_relax, 0.0, 1.0)
+                )
             if intent_key == "intent_stop_recover":
                 loco_relax = max(loco_relax, 0.65)
             if posture < 0.52:

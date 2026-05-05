@@ -54,6 +54,9 @@ class ExperienceBuffer:
     def __len__(self):
         return len(self._buf)
 
+    def clear(self) -> None:
+        self._buf.clear()
+
 
 # ─── System 1 Network ─────────────────────────────────────────────────────────
 class System1Net(nn.Module):

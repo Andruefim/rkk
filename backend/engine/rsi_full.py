@@ -153,6 +153,7 @@ class RSIController:
         self._snapshots: deque[dict[str, float]] = deque(maxlen=maxlen)
         self._rsi_events: list[dict[str, Any]] = []
         self._last_structural_tick = -10**9
+        self._last_vl_extend_tick = -10**9
         self._vl_backup: tuple[float, float] | None = None
         self._vl_relax_remaining = 0
 
@@ -171,6 +172,7 @@ class RSIController:
         self._snapshots.clear()
         self._rsi_events.clear()
         self._last_structural_tick = -10**9
+        self._last_vl_extend_tick = -10**9
         self._vl_backup = None
         self._vl_relax_remaining = 0
 
@@ -223,11 +225,15 @@ class RSIController:
         if not _env_bool("RKK_RSI_FULL_VL_RELAX", True):
             return None
         b = self.agent.value_layer.bounds
+        extend_cd = max(1, _env_int("RKK_RSI_FULL_VL_EXTEND_COOLDOWN", 500))
         if self._vl_backup is None:
             self._vl_backup = (float(b.phi_min), float(b.phi_min_steady))
         elif self._vl_relax_remaining > 0:
+            if (tick - self._last_vl_extend_tick) < extend_cd:
+                return None
             ttl = _env_int("RKK_RSI_FULL_VL_RELAX_TICKS", 400)
             self._vl_relax_remaining = max(self._vl_relax_remaining, ttl)
+            self._last_vl_extend_tick = tick
             return {"type": "vl_relax_extend", "tick": tick}
         fac = _env_float("RKK_RSI_FULL_VL_RELAX_FACTOR", 0.90)
         b.phi_min = max(0.005, float(b.phi_min) * fac)
@@ -236,6 +242,7 @@ class RSIController:
             self._vl_relax_remaining,
             _env_int("RKK_RSI_FULL_VL_RELAX_TICKS", 400),
         )
+        self._last_vl_extend_tick = tick
         ev = {"type": "vl_relax_phi", "phi_min": b.phi_min, "tick": tick}
         self._rsi_events.append(ev)
         self._last_structural_tick = tick

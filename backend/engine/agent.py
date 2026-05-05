@@ -123,6 +123,105 @@ def _homeostatic_abs_delta(before: dict, after: dict) -> float | None:
     if not deltas:
         return None
     return float(np.clip(np.mean(deltas), 0.0, 1.0))
+
+
+def _joint_keys_for_ig(nids: list[str]) -> list[str]:
+    """Суставы графа для IG при падении (short name или phys_* зеркало)."""
+    from engine.features.humanoid.constants import ARM_VARS, HEAD_VARS, LEG_VARS, SPINE_VARS
+
+    allowed = set(LEG_VARS) | set(ARM_VARS) | set(SPINE_VARS) | set(HEAD_VARS)
+    out: list[str] = []
+    for k in nids:
+        sk = str(k)
+        if sk in allowed:
+            out.append(sk)
+        elif sk.startswith("phys_") and sk[5:] in allowed:
+            out.append(sk)
+    return out
+
+
+def _ig_fallen_posture_th() -> float:
+    try:
+        return float(os.environ.get("RKK_IG_FALLEN_POSTURE_TH", "0.25"))
+    except ValueError:
+        return 0.25
+
+
+def _ig_fallen_gain() -> float:
+    try:
+        return max(0.1, float(os.environ.get("RKK_IG_FALLEN_GAIN", "3.0")))
+    except ValueError:
+        return 3.0
+
+
+def _ig_joint_fallback_eps() -> float:
+    try:
+        return max(0.0, float(os.environ.get("RKK_IG_JOINT_FALLBACK_EPS", "1e-4")))
+    except ValueError:
+        return 1e-4
+
+
+def _ig_free_joint_coef() -> float:
+    """Вес joint PE в свободном режиме (homeostatic + joint), RKK_IG_FREE_JOINT_COEF."""
+    try:
+        return max(0.0, float(os.environ.get("RKK_IG_FREE_JOINT_COEF", "0.3")))
+    except ValueError:
+        return 0.3
+
+
+def _homeostatic_graph_keys(nids: list[str]) -> list[str]:
+    """Ключи графа для PE по оси homeostatic (posture/com/feet), по одному на группу."""
+    ns = set(nids)
+    pairs = (
+        ("posture_stability", "phys_posture_stability"),
+        ("com_z", "phys_com_z"),
+        ("foot_contact_l", "phys_foot_contact_l"),
+        ("foot_contact_r", "phys_foot_contact_r"),
+    )
+    out: list[str] = []
+    for a, b in pairs:
+        if a in ns:
+            out.append(a)
+        elif b in ns:
+            out.append(b)
+    return out
+
+
+def _env_fixed_root_flag(env: object) -> bool:
+    """True если humanoid (или base_env под Visual) в режиме fixed_root."""
+    if env is None:
+        return False
+    for ref in (env, getattr(env, "base_env", None)):
+        if ref is None:
+            continue
+        try:
+            fr = getattr(ref, "fixed_root", False)
+        except Exception:
+            continue
+        if isinstance(fr, bool) and fr:
+            return True
+    return False
+
+
+def _graph_fixed_root_flag(nodes: object) -> bool:
+    """Узлы графа (если есть): self_fixed_root / fixed_root > 0.5."""
+    if not isinstance(nodes, dict):
+        return False
+    for key in ("self_fixed_root", "fixed_root"):
+        if key not in nodes:
+            continue
+        try:
+            if float(nodes[key]) > 0.5:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _ig_diag_enabled() -> bool:
+    return os.environ.get("RKK_IG_DIAG", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
 # RKK_LOCOMOTION_CPG=1: CPG ведёт ноги; EIG не выбирает прямые do() по этим узлам.
 _LOCOMOTION_CPG_LEG_EIG_BLOCK = frozenset(
     {"lhip", "lknee", "lankle", "rhip", "rknee", "rankle"}
@@ -287,6 +386,10 @@ class RKKAgent:
         # Фаза 3: LLM-учитель (IG-бонус затухает с числом интервенций)
         self._teacher_rules: list[TeacherIGRule] = []
         self._teacher_weight: float = 0.0
+
+        # Curriculum: после снятия fixed_root (см. Simulation.disable_fixed_root)
+        self._post_fr_explore_until: int = 0
+        self._post_fr_vl_relax_until: int = 0
 
         self._bootstrap()
 
@@ -482,10 +585,27 @@ class RKKAgent:
                 g_m = None
                 if core.W.grad is not None:
                     g_m = core.W.grad.detach().float().abs().cpu().numpy()
-            uncertainty = float(unc_t[ii, jj])
-            w_ij = float(W_m[ii, jj])
-            grad_norm = float(g_m[ii, jj]) if g_m is not None else 0.0
-            ic = 1 if abs(w_ij) >= self.graph.EDGE_THRESH else 0
+            in_unc = (
+                0 <= ii < unc_t.shape[0]
+                and 0 <= jj < unc_t.shape[1]
+                and 0 <= ii < W_m.shape[0]
+                and 0 <= jj < W_m.shape[1]
+            )
+            if in_unc:
+                uncertainty = float(unc_t[ii, jj])
+                w_ij = float(W_m[ii, jj])
+                if (
+                    g_m is not None
+                    and 0 <= ii < g_m.shape[0]
+                    and 0 <= jj < g_m.shape[1]
+                ):
+                    grad_norm = float(g_m[ii, jj])
+                else:
+                    grad_norm = 0.0
+                ic = 1 if abs(w_ij) >= self.graph.EDGE_THRESH else 0
+            else:
+                uncertainty, w_ij, grad_norm = 1.0, 0.0, 0.0
+                ic = 0
         else:
             uncertainty, w_ij, grad_norm = 1.0, 0.0, 0.0
             ic = 0
@@ -732,20 +852,25 @@ class RKKAgent:
         if core is None:
             return []
         nids = self.graph._node_ids
-        d = len(nids)
-        if d <= 1:
+        d_graph = len(nids)
+        if d_graph <= 1:
             return []
-        thresh = float(self.graph.EDGE_THRESH)
         try:
             full_scan_max = int(os.environ.get("RKK_TIER1_FULL_SCAN_MAX_EDGES", "4096"))
         except ValueError:
             full_scan_max = 4096
         full_scan_max = max(256, full_scan_max)
 
+        thresh = float(self.graph.EDGE_THRESH)
         with torch.no_grad():
             W = core.W_masked()
             mask = W.abs() >= thresh
             n_sig = int(mask.sum().item())
+
+        dW = int(W.shape[0])
+        d = min(d_graph, dW, int(W.shape[1]))
+        if d <= 1:
+            return []
 
         if n_sig == 0:
             return []
@@ -814,6 +939,11 @@ class RKKAgent:
             ii, jj = nid_to_i.get(gt.from_), nid_to_i.get(gt.to)
             if ii is None or jj is None:
                 continue
+            if not (
+                0 <= ii < W_m.shape[0]
+                and 0 <= jj < W_m.shape[1]
+            ):
+                continue
             if abs(float(W_m[ii, jj]) - float(gt.weight)) < 0.30:
                 hits += 1
         return hits / len(gt_list)
@@ -839,6 +969,13 @@ class RKKAgent:
         for fr, to in pairs:
             ii, jj = nid_to_i.get(fr), nid_to_i.get(to)
             if ii is None or jj is None:
+                continue
+            if not (
+                0 <= ii < W_m.shape[0]
+                and 0 <= jj < W_m.shape[1]
+                and 0 <= ii < A_m.shape[0]
+                and 0 <= jj < A_m.shape[1]
+            ):
                 continue
             w_ij = float(W_m[ii, jj])
             a_tr = 1.0 if (fr, to) in frozen else float(A_m[ii, jj])
@@ -920,10 +1057,26 @@ class RKKAgent:
         def _get_edge_features(vf: str, vt: str) -> tuple[list[float], float]:
             ii = nid_to_i.get(vf)
             jj = nid_to_i.get(vt)
-            if W_m is not None and ii is not None and jj is not None and unc_m is not None:
+            if (
+                W_m is not None
+                and unc_m is not None
+                and ii is not None
+                and jj is not None
+                and 0 <= ii < W_m.shape[0]
+                and 0 <= jj < W_m.shape[1]
+                and 0 <= ii < unc_m.shape[0]
+                and 0 <= jj < unc_m.shape[1]
+            ):
                 unc_k = float(unc_m[ii, jj])
                 w_ij = float(W_m[ii, jj])
-                grad_norm = float(g_m[ii, jj]) if g_m is not None else 0.0
+                if (
+                    g_m is not None
+                    and 0 <= ii < g_m.shape[0]
+                    and 0 <= jj < g_m.shape[1]
+                ):
+                    grad_norm = float(g_m[ii, jj])
+                else:
+                    grad_norm = 0.0
             else:
                 unc_k, w_ij, grad_norm = 1.0, 0.0, 0.0
             alpha = 1.0 - unc_k
@@ -1072,12 +1225,15 @@ class RKKAgent:
 
         core = self.graph._core
         W_m = unc_m = g_m = None
+        wm_cap = len(self.graph._node_ids)
         if core is not None:
             with torch.no_grad():
                 W_t = core.W_masked().detach().float()
                 A_t = core.alpha_trust_matrix().detach().float()
                 W_m = W_t.cpu().numpy()
                 unc_m = (1.0 - A_t).cpu().numpy()
+            if W_m is not None and W_m.ndim == 2:
+                wm_cap = min(wm_cap, int(W_m.shape[0]), int(W_m.shape[1]))
             if core.W.grad is not None:
                 g_m = core.W.grad.detach().float().abs().cpu().numpy()
 
@@ -1093,14 +1249,16 @@ class RKKAgent:
         valid_node = np.zeros(d, dtype=bool)
         for i, v in enumerate(var_ids):
             ji = nid_to_i.get(v)
-            if ji is not None:
-                ridx[i] = ji
+            if ji is not None and int(ji) < wm_cap:
+                ridx[i] = int(ji)
                 valid_node[i] = True
 
         if unc_m is not None and n_pairs > 0:
             ii_n = ridx[fi]
             jj_n = ridx[fj]
             ok = valid_node[fi] & valid_node[fj]
+            if unc_m.ndim == 2:
+                ok = ok & (ii_n < unc_m.shape[0]) & (jj_n < unc_m.shape[1])
             unc_pairs = np.ones(n_pairs, dtype=np.float32)
             unc_pairs[ok] = unc_m[ii_n[ok], jj_n[ok]]
         else:
@@ -1174,9 +1332,22 @@ class RKKAgent:
                 vf, vt = var_ids[i_v], var_ids[j_v]
                 unc_k = float(unc_pairs[k])
                 ii, jj = int(ridx[i_v]), int(ridx[j_v])
-                if W_m is not None and valid_node[i_v] and valid_node[j_v]:
+                if (
+                    W_m is not None
+                    and valid_node[i_v]
+                    and valid_node[j_v]
+                    and 0 <= ii < W_m.shape[0]
+                    and 0 <= jj < W_m.shape[1]
+                ):
                     w_ij = float(W_m[ii, jj])
-                    grad_n = float(g_m[ii, jj]) if g_m is not None else 0.0
+                    if (
+                        g_m is not None
+                        and 0 <= ii < g_m.shape[0]
+                        and 0 <= jj < g_m.shape[1]
+                    ):
+                        grad_n = float(g_m[ii, jj])
+                    else:
+                        grad_n = 0.0
                 else:
                     w_ij, grad_n = 0.0, 0.0
                 alpha = 1.0 - unc_k
@@ -1224,12 +1395,22 @@ class RKKAgent:
                 if not valid_node[i_v] or not valid_node[j_v]:
                     continue
                 ii, jj = int(ridx[i_v]), int(ridx[j_v])
-                if unc_m is not None:
+                if unc_m is not None and 0 <= ii < unc_m.shape[0] and 0 <= jj < unc_m.shape[1]:
                     unc_k = float(unc_m[ii, jj])
                 else:
                     unc_k = 1.0
-                w_ij = float(W_m[ii, jj]) if W_m is not None else 0.0
-                grad_n = float(g_m[ii, jj]) if g_m is not None else 0.0
+                if W_m is not None and 0 <= ii < W_m.shape[0] and 0 <= jj < W_m.shape[1]:
+                    w_ij = float(W_m[ii, jj])
+                else:
+                    w_ij = 0.0
+                if (
+                    g_m is not None
+                    and 0 <= ii < g_m.shape[0]
+                    and 0 <= jj < g_m.shape[1]
+                ):
+                    grad_n = float(g_m[ii, jj])
+                else:
+                    grad_n = 0.0
                 feat = self.system1.build_features(
                     w_ij=w_ij,
                     alpha_ij=1.0 - unc_k,
@@ -1288,6 +1469,28 @@ class RKKAgent:
             for cand in candidates:
                 unc = float(cand.get("uncertainty", 0.5))
                 cand["expected_ig"] = a * float(cand["expected_ig"]) + b * unc
+
+        try:
+            dr_stuck = float(os.environ.get("RKK_SCORE_STUCK_DR_MAX", "0.02"))
+        except ValueError:
+            dr_stuck = 0.02
+        try:
+            min_iv_stuck = int(os.environ.get("RKK_SCORE_STUCK_MIN_INTERVENTIONS", "800"))
+        except ValueError:
+            min_iv_stuck = 800
+        try:
+            noise_scale = float(os.environ.get("RKK_SCORE_STUCK_NOISE", "0.3"))
+        except ValueError:
+            noise_scale = 0.3
+        if (
+            noise_scale > 0.0
+            and float(disc_rate) < dr_stuck
+            and self._total_interventions >= min_iv_stuck
+        ):
+            for cand in candidates:
+                cand["expected_ig"] = float(cand["expected_ig"]) + float(
+                    rng.uniform(0.0, noise_scale)
+                )
 
         return sorted(candidates, key=lambda x: -x["expected_ig"])
 
@@ -1445,6 +1648,12 @@ class RKKAgent:
         if cem_cand is not None:
             scores.insert(0, cem_cand)
 
+        post_to = int(getattr(self, "_post_fr_explore_until", 0))
+        if post_to > engine_tick and len(scores) >= 10:
+            head = scores[:10]
+            np.random.default_rng().shuffle(head)
+            scores = head + scores[10:]
+
         if not scores:
             _report_if_slow_tick()
             return {
@@ -1456,6 +1665,14 @@ class RKKAgent:
         chosen      = None
         check_result = None
         blocked_count = 0
+
+        _pfr_vl = 0.0
+        if engine_tick < int(getattr(self, "_post_fr_vl_relax_until", 0)):
+            try:
+                _pfr_vl = float(os.environ.get("RKK_POST_FR_VL_LOCO_BLEND", "0.3"))
+            except ValueError:
+                _pfr_vl = 0.3
+            _pfr_vl = float(np.clip(_pfr_vl, 0.0, 1.0))
 
         # Перебираем кандидатов пока не найдём допустимое действие
         for candidate in scores[:MAX_FALLBACK_TRIES]:
@@ -1472,6 +1689,7 @@ class RKKAgent:
                 other_agents_phi=self.other_agents_phi,
                 engine_tick=engine_tick,
                 imagination_horizon=(self._imagination_horizon if enable_l3 else 0),
+                post_fr_loco_relax=_pfr_vl,
             )
 
             if check_result.allowed:
@@ -1592,6 +1810,14 @@ class RKKAgent:
                 for k in keys
             ]))
 
+        def _joint_ig_value() -> float | None:
+            jkeys = _joint_keys_for_ig(list(self.graph._node_ids))
+            if not jkeys:
+                return None
+            return float(
+                np.clip(_mean_abs_err(jkeys) * _ig_fallen_gain(), 0.0, 1.0)
+            )
+
         pe_phys = _mean_abs_err(phys_ids)
 
         # Этап Г: петля «намерение ↔ исход» + ошибка модели → self_* (только среды с методом).
@@ -1619,14 +1845,59 @@ class RKKAgent:
             if _homeostatic_ig_enabled()
             else None
         )
-        if ig_home is not None:
-            actual_ig = ig_home
+
+        posture_now = float(
+            self.graph.nodes.get(
+                "posture_stability",
+                self.graph.nodes.get("phys_posture_stability", 1.0),
+            )
+        )
+        is_fallen = posture_now < _ig_fallen_posture_th()
+
+        is_fixed_root = bool(
+            getattr(self.value_layer.bounds, "fixed_root_mode", False)
+            or _env_fixed_root_flag(self.env)
+            or _graph_fixed_root_flag(self.graph.nodes)
+        )
+
+        # Падение и fixed_root: homeostatic (posture/com/foot) часто константы → joint PE×gain.
+        use_joint_ig = is_fallen or is_fixed_root
+        if use_joint_ig:
+            jv = _joint_ig_value()
+            if jv is not None:
+                actual_ig = jv
+            elif ig_home is not None:
+                actual_ig = ig_home
+            elif slot_ids and phys_ids:
+                actual_ig = (1.0 - w_vis) * pe_phys + w_vis * pe_slot
+            elif phys_ids:
+                actual_ig = pe_phys
+            else:
+                actual_ig = pe_slot
+        elif ig_home is not None:
+            # Свободное стояние: |Δobserve| по homeostatic часто ≈0 — добавляем PE по тем же осям + суставам.
+            hk = _homeostatic_graph_keys(list(nids))
+            jk = _joint_keys_for_ig(list(nids))
+            jc = _ig_free_joint_coef()
+            homeo_pe = _mean_abs_err(hk) if hk else 0.0
+            joint_pe = float(_mean_abs_err(jk) * jc) if jk else 0.0
+            if hk or jk:
+                actual_ig = float(np.clip(homeo_pe + joint_pe, 0.0, 1.0))
+            else:
+                actual_ig = float(ig_home)
         elif slot_ids and phys_ids:
             actual_ig = (1.0 - w_vis) * pe_phys + w_vis * pe_slot
         elif phys_ids:
             actual_ig = pe_phys
         else:
             actual_ig = pe_slot
+
+        # Любое состояние без homeostatic сигнала (не падение): запасной joint IG.
+        _jf = _ig_joint_fallback_eps()
+        if not is_fallen and float(actual_ig) <= _jf:
+            jv2 = _joint_ig_value()
+            if jv2 is not None and float(jv2) > _jf:
+                actual_ig = float(jv2)
 
         t_bonus = self._teacher_ig_bonus(var, dict(self.graph.nodes))
         actual_ig = float(np.clip(actual_ig + t_bonus, 0.0, 1.0))
@@ -1651,6 +1922,21 @@ class RKKAgent:
             _v_do = 0.5
         self._last_do = f"do({var}={_v_do:.2f})"
         self._last_blocked_reason = ""
+
+        if _ig_diag_enabled() and self._total_interventions % 50 == 0:
+            try:
+                am = float(self.graph.alpha_mean)
+            except Exception:
+                am = float("nan")
+            print(
+                f"[IGDiag] iv={self._total_interventions} "
+                f"actual_ig={actual_ig:.4f} "
+                f"is_fallen={is_fallen} "
+                f"is_fixed_root={is_fixed_root} "
+                f"alpha_mean={am:.3f} "
+                f"var={var}",
+                flush=True,
+            )
 
         _t0_dr = time.perf_counter()
         cur_dr = self.discovery_rate

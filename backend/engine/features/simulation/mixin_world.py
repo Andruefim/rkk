@@ -5,6 +5,26 @@ from engine.features.simulation.mixin_imports import *
 
 
 class SimulationWorldMixin:
+    def _humanoid_base_env(self):
+        """
+        Реальный EnvironmentHumanoid под agent.env (слоты / EnvironmentVisual).
+        Без этого isinstance(agent.env, Humanoid) ломается и curriculum fixed_root не включается.
+        """
+        try:
+            from engine.environment_humanoid import EnvironmentHumanoid
+        except ImportError:
+            return None
+        ref = getattr(self, "_base_env_ref", None)
+        if isinstance(ref, EnvironmentHumanoid):
+            return ref
+        env = getattr(self.agent, "env", None)
+        if isinstance(env, EnvironmentHumanoid):
+            return env
+        inner = getattr(env, "base_env", None)
+        if isinstance(inner, EnvironmentHumanoid):
+            return inner
+        return None
+
     def switch_world(self, new_world: str) -> dict:
         """Только humanoid; переключение сцен отключено."""
         if new_world not in WORLDS:
@@ -130,24 +150,24 @@ class SimulationWorldMixin:
           4. HomeostaticBounds → for_fixed_root()
           5. inject fixed_root_seeds() (для slot-графа большинство рёбер может быть skipped)
         """
-        from engine.environment_humanoid import EnvironmentHumanoid, fixed_root_seeds
+        from engine.environment_humanoid import fixed_root_seeds
 
-        base_env = (
-            self._base_env_ref
-            if (self._visual_mode and getattr(self, "_base_env_ref", None) is not None)
-            else self.agent.env
-        )
-        if not isinstance(base_env, EnvironmentHumanoid):
+        humanoid = self._humanoid_base_env()
+        if humanoid is None:
             return {"error": "fixed_root требует humanoid world"}
 
-        if base_env.fixed_root:
+        if humanoid.fixed_root and self._fixed_root_active:
             return {"fixed_root": True, "already_enabled": True}
 
         with self._sim_step_lock:
             if self._visual_mode and self._visual_env is not None:
                 self._visual_env.set_fixed_root(True)
             else:
-                base_env.set_fixed_root(True)
+                fn = getattr(self.agent.env, "set_fixed_root", None)
+                if callable(fn) and self.agent.env is not humanoid:
+                    fn(True)
+                else:
+                    humanoid.set_fixed_root(True)
 
             env = self.agent.env
             new_vars = list(env.variable_ids)
@@ -170,6 +190,8 @@ class SimulationWorldMixin:
             self._fixed_root_active = True
             self._fall_count = 0
             self._stop_cpg_background_loop()
+            self.agent._post_fr_explore_until = 0
+            self.agent._post_fr_vl_relax_until = 0
 
             self._add_event(
                 f"📌 FIXED ROOT ON: d={self.agent.graph._d}, "
@@ -195,24 +217,24 @@ class SimulationWorldMixin:
           3. GNN rebind; при visual — через EnvironmentVisual.set_fixed_root(False)
           4. HomeostaticBounds → default (строгие, но с warmup)
         """
-        from engine.environment_humanoid import EnvironmentHumanoid, humanoid_hardcoded_seeds
+        from engine.environment_humanoid import humanoid_hardcoded_seeds
 
-        base_env = (
-            self._base_env_ref
-            if (self._visual_mode and getattr(self, "_base_env_ref", None) is not None)
-            else self.agent.env
-        )
-        if not isinstance(base_env, EnvironmentHumanoid):
+        humanoid = self._humanoid_base_env()
+        if humanoid is None:
             return {"error": "не humanoid world"}
 
-        if not base_env.fixed_root:
+        if not self._fixed_root_active and not humanoid.fixed_root:
             return {"fixed_root": False, "was_enabled": False}
 
         with self._sim_step_lock:
             if self._visual_mode and self._visual_env is not None:
                 self._visual_env.set_fixed_root(False)
             else:
-                base_env.set_fixed_root(False)
+                fn = getattr(self.agent.env, "set_fixed_root", None)
+                if callable(fn) and self.agent.env is not humanoid:
+                    fn(False)
+                else:
+                    humanoid.set_fixed_root(False)
 
             env = self.agent.env
             new_vars = list(env.variable_ids)
@@ -245,6 +267,29 @@ class SimulationWorldMixin:
             result = self.agent.inject_text_priors(humanoid_hardcoded_seeds())
 
             self._fixed_root_active = False
+
+            try:
+                n_exp = int(os.environ.get("RKK_POST_FR_EXPLORE_TICKS", "300"))
+            except ValueError:
+                n_exp = 300
+            try:
+                n_vl = int(os.environ.get("RKK_POST_FR_VL_RELAX_TICKS", "300"))
+            except ValueError:
+                n_vl = 300
+            tcur = int(getattr(self, "tick", 0))
+            self.agent._post_fr_explore_until = tcur + max(0, n_exp)
+            self.agent._post_fr_vl_relax_until = tcur + max(0, n_vl)
+            try:
+                self.agent.system1.buffer.clear()
+            except Exception:
+                pass
+            print(
+                f"[Curriculum] System1 buffer cleared on fixed_root release "
+                f"(tick={tcur}, explore_until={self.agent._post_fr_explore_until}, "
+                f"vl_relax_until={self.agent._post_fr_vl_relax_until})",
+                flush=True,
+            )
+
             self._add_event(
                 f"📌 FIXED ROOT OFF: d={self.agent.graph._d}, {len(new_vars)} vars",
                 "#cc44ff", "phase"
