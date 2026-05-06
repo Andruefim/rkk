@@ -77,6 +77,8 @@ from engine.rsi_lite import (
     rsi_plateau_interventions,
 )
 from engine.local_reflex import local_reflex_train_enabled, train_chains_parallel
+from engine.trajectory_contrastive import TrajectoryCollector, trajectory_enabled
+from engine.progressive_scope import ProgressiveScope, progressive_scope_enabled
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
 MAX_FALLBACK_TRIES = 5  # больше кандидатов, чтобы пройти Value Layer в начале обучения
@@ -390,6 +392,11 @@ class RKKAgent:
         # Curriculum: после снятия fixed_root (см. Simulation.disable_fixed_root)
         self._post_fr_explore_until: int = 0
         self._post_fr_vl_relax_until: int = 0
+
+        # Phase T: Trajectory contrastive learning
+        self._traj_collector = TrajectoryCollector()
+        # Phase T: Progressive variable scope
+        self._prog_scope = ProgressiveScope()
 
         self._bootstrap()
 
@@ -1284,6 +1291,14 @@ class RKKAgent:
         )
         valid_pairs &= src_controllable[fi]
 
+        # Phase T: progressive scope — restrict interventions to current phase
+        if progressive_scope_enabled():
+            scope_allowed = self._prog_scope.get_intervention_filter(var_ids)
+            scope_mask = np.array(
+                [v in scope_allowed for v in var_ids], dtype=bool,
+            )
+            valid_pairs &= scope_mask[fi]
+
         if self._is_locomotion_primary_active():
             blocked = _LOCOMOTION_CPG_LEG_EIG_BLOCK
             leg_block_var = np.array([v in blocked for v in var_ids], dtype=bool)
@@ -1922,6 +1937,37 @@ class RKKAgent:
             _v_do = 0.5
         self._last_do = f"do({var}={_v_do:.2f})"
         self._last_blocked_reason = ""
+
+        # Phase T: feed trajectory collector + progressive scope
+        if trajectory_enabled():
+            is_env_fallen = False
+            try:
+                fn_fallen = getattr(self.env, 'is_fallen', None)
+                if callable(fn_fallen):
+                    is_env_fallen = fn_fallen()
+                else:
+                    is_env_fallen = is_fallen
+            except Exception:
+                is_env_fallen = is_fallen
+            completed_seg = self._traj_collector.tick(
+                obs=observed_env,
+                action=(var, float(value)),
+                is_fallen=is_env_fallen,
+                node_ids=list(self.graph._node_ids),
+                engine_tick=engine_tick,
+            )
+            if completed_seg is not None:
+                # Feed completed segment to GNN for trajectory-level training
+                self.graph._traj_segments.append(completed_seg)
+                if len(self.graph._traj_segments) > self.graph._traj_max_segments:
+                    self.graph._traj_segments = self.graph._traj_segments[-self.graph._traj_max_segments:]
+        if progressive_scope_enabled():
+            tq = self._traj_collector.recent_quality() if trajectory_enabled() else None
+            self._prog_scope.tick(
+                is_fallen=is_fallen,
+                posture=posture_now,
+                quality=tq,
+            )
 
         if _ig_diag_enabled() and self._total_interventions % 50 == 0:
             try:

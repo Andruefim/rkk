@@ -43,6 +43,13 @@ import numpy as np
 from collections import Counter
 from dataclasses import dataclass
 
+from engine.trajectory_contrastive import (
+    trajectory_enabled,
+    trajectory_contrastive_loss,
+    TrajectoryHead,
+    TrajectorySegment,
+)
+
 
 def _jepa_latent_loss(H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Tensor:
     """
@@ -209,6 +216,10 @@ class CausalGraph:
             )
         except ValueError:
             self.EDGE_THRESH = self.__class__.EDGE_THRESH
+        # Trajectory contrastive learning (Phase T)
+        self._traj_segments: list[TrajectorySegment] = []
+        self._traj_head: TrajectoryHead | None = None
+        self._traj_max_segments = 100
 
     def set_node(self, id_: str, value: float = 0.0) -> None:
         self._invalidate_cache()
@@ -766,7 +777,27 @@ class CausalGraph:
             Xp_i = integrate_world_model_step(self, X_i, A_i)
             l_int = self.LAMBDA_INT * F.mse_loss(Xp_i, Y_i)
 
-        loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1 + l_int
+        # 6. Trajectory contrastive loss (Phase T)
+        l_traj = torch.tensor(0.0, device=self.device)
+        if trajectory_enabled() and self._traj_segments:
+            try:
+                lw = float(os.environ.get("RKK_TRAJECTORY_LOSS_WEIGHT", "0.25"))
+            except ValueError:
+                lw = 0.25
+            if self._traj_head is None:
+                embed_dim = self._d * (self._core.hidden if hasattr(self._core, 'hidden') else 24)
+                self._traj_head = TrajectoryHead(embed_dim, self.device)
+            else:
+                embed_dim = self._d * (self._core.hidden if hasattr(self._core, 'hidden') else 24)
+                if self._traj_head.net[0].in_features != embed_dim:
+                    self._traj_head = TrajectoryHead(embed_dim, self.device)
+            l_traj = lw * trajectory_contrastive_loss(
+                self._core, self._traj_segments,
+                self._node_ids, self._d, self.MAX_D,
+                self._traj_head, self.device,
+            )
+
+        loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1 + l_int + l_traj
 
         self._finish_train_step(loss)
 
@@ -787,6 +818,7 @@ class CausalGraph:
             "l_dag":   round(l_dag.item(), 5),
             "l_l1":    round(l_l1.item(), 5),
             "l_int":   round(l_int.item(), 5),
+            "l_traj":  round(l_traj.item(), 5),
             "h_W":     round(h_W.item(), 5),
             "mode":    "seq",
             "batch_B": B,
@@ -877,10 +909,30 @@ class CausalGraph:
         latent_only = os.environ.get("RKK_JEPA_LEGACY_LATENT_ONLY", "1").strip().lower() in (
             "1", "true", "yes", "on",
         )
+        # Trajectory contrastive loss (Phase T)
+        l_traj = torch.tensor(0.0, device=self.device)
+        if trajectory_enabled() and self._traj_segments:
+            try:
+                lw = float(os.environ.get("RKK_TRAJECTORY_LOSS_WEIGHT", "0.25"))
+            except ValueError:
+                lw = 0.25
+            if self._traj_head is None:
+                embed_dim = self._d * (self._core.hidden if hasattr(self._core, 'hidden') else 24)
+                self._traj_head = TrajectoryHead(embed_dim, self.device)
+            else:
+                embed_dim = self._d * (self._core.hidden if hasattr(self._core, 'hidden') else 24)
+                if self._traj_head.net[0].in_features != embed_dim:
+                    self._traj_head = TrajectoryHead(embed_dim, self.device)
+            l_traj = lw * trajectory_contrastive_loss(
+                self._core, self._traj_segments,
+                self._node_ids, self._d, self.MAX_D,
+                self._traj_head, self.device,
+            )
+
         if USE_GNN and lambda_jepa > 0.0 and latent_only:
-            loss = lambda_jepa * l_jepa + l_dag + l_l1 + l_int
+            loss = lambda_jepa * l_jepa + l_dag + l_l1 + l_int + l_traj
         else:
-            loss = l_rec + l_dag + l_l1 + l_int + lambda_jepa * l_jepa
+            loss = l_rec + l_dag + l_l1 + l_int + lambda_jepa * l_jepa + l_traj
 
         self._finish_train_step(loss)
 
@@ -899,6 +951,7 @@ class CausalGraph:
             "l_dag": round(l_dag.item(), 5),
             "l_int": round(l_int.item(), 5),
             "l_l1":  round(l_l1.item(), 5),
+            "l_traj": round(l_traj.item(), 5),
             "h_W":   round(h_W.item(), 5),
             "mode":  "legacy",
             "batch_int": n_i,
