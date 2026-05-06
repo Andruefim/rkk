@@ -70,6 +70,53 @@ def _humanoid_motor_torque_table() -> dict:
     }
 
 
+def _joint_smooth_alpha() -> float:
+    """LPF for target commands: 0.0=freeze, 1.0=no smoothing."""
+    try:
+        return float(np.clip(float(os.environ.get("RKK_HUMANOID_JOINT_SMOOTH_ALPHA", "0.28")), 0.0, 1.0))
+    except ValueError:
+        return 0.28
+
+
+def _joint_slew_max_step() -> float:
+    """Max normalized target step per set_joint call."""
+    try:
+        return float(np.clip(float(os.environ.get("RKK_HUMANOID_JOINT_MAX_STEP", "0.09")), 0.0, 1.0))
+    except ValueError:
+        return 0.09
+
+
+def _ctrl_profile_from_delta(delta_norm: float) -> tuple[float, float]:
+    """
+    Convert command delta [0..1] into (velocity_scale, force_scale).
+    Small deltas stay soft/slow; large deltas can use full authority.
+    """
+    d = float(np.clip(delta_norm, 0.0, 1.0))
+    try:
+        v_min = float(os.environ.get("RKK_HUMANOID_CTRL_VEL_MIN", "0.40"))
+    except ValueError:
+        v_min = 0.40
+    try:
+        v_max = float(os.environ.get("RKK_HUMANOID_CTRL_VEL_MAX", "1.00"))
+    except ValueError:
+        v_max = 1.00
+    try:
+        f_min = float(os.environ.get("RKK_HUMANOID_CTRL_FORCE_MIN", "0.50"))
+    except ValueError:
+        f_min = 0.50
+    try:
+        f_max = float(os.environ.get("RKK_HUMANOID_CTRL_FORCE_MAX", "1.00"))
+    except ValueError:
+        f_max = 1.00
+    v_min = float(np.clip(v_min, 0.05, 1.2))
+    v_max = float(np.clip(v_max, v_min, 2.0))
+    f_min = float(np.clip(f_min, 0.05, 1.2))
+    f_max = float(np.clip(f_max, f_min, 2.0))
+    v = float(v_min + (v_max - v_min) * d)
+    f = float(f_min + (f_max - f_min) * d)
+    return v, f
+
+
 class _PyBulletHumanoid(InstrumentalSandbox):
 
     _JOINT_MAP = {
@@ -92,6 +139,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self._bg_thread: threading.Thread | None = None
         self._bg_hz = 0.0
         self._mt = _humanoid_motor_torque_table()
+        self._joint_target_norm: dict[str, float] = {}
 
         self.client = pb.connect(pb.DIRECT)
         pb.setGravity(0, 0, -9.81, physicsClientId=self.client)
@@ -833,6 +881,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
 
         self._neck_euler[:] = 0.0
         self._spine_euler[:] = 0.0
+        self._joint_target_norm.clear()
         rid = self.robot_id
         cid = self.client
         pb.resetBasePositionAndOrientation(
@@ -916,7 +965,16 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 return
             jid = self.joint_by_var[var_name]
             lo, hi = _RANGES.get(var_name, (-2.0, 2.0))
-            real_pos = float(np.clip(target_pos * (hi - lo) + lo, lo, hi))
+            tgt_norm = float(np.clip(target_pos, 0.0, 1.0))
+            prev_norm = float(self._joint_target_norm.get(var_name, tgt_norm))
+            alpha = _joint_smooth_alpha()
+            slew = _joint_slew_max_step()
+            desired = prev_norm + (tgt_norm - prev_norm) * alpha
+            step = float(np.clip(desired - prev_norm, -slew, slew))
+            cmd_norm = float(np.clip(prev_norm + step, 0.0, 1.0))
+            self._joint_target_norm[var_name] = cmd_norm
+            vel_scale, force_scale = _ctrl_profile_from_delta(abs(cmd_norm - prev_norm))
+            real_pos = float(np.clip(cmd_norm * (hi - lo) + lo, lo, hi))
             rid, cid = self.robot_id, self.client
             jt = self._joint_types[jid]
             motor_m = getattr(pb, "setJointMotorControlMultiDof", None)
@@ -932,8 +990,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 ex, ey, ez = float(self._neck_euler[0]), float(self._neck_euler[1]), float(self._neck_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                        positionGain=0.62, velocityGain=0.18, maxVelocity=4.0,
-                        force=list(self._mt["neck_sph"]), physicsClientId=cid)
+                        positionGain=0.62, velocityGain=0.18, maxVelocity=4.0 * vel_scale,
+                        force=[f * force_scale for f in self._mt["neck_sph"]], physicsClientId=cid)
                 return
 
             if var_name in ("spine_yaw", "spine_pitch"):
@@ -946,8 +1004,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                        positionGain=0.85, velocityGain=0.25, maxVelocity=3.5,
-                        force=list(self._mt["spine_sph"]), physicsClientId=cid)
+                        positionGain=0.85, velocityGain=0.25, maxVelocity=3.5 * vel_scale,
+                        force=[f * force_scale for f in self._mt["spine_sph"]], physicsClientId=cid)
                 return
 
             is_leg = var_name in ("lhip", "rhip", "lknee", "rknee", "lankle", "rankle")
@@ -968,26 +1026,28 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     q = [0.0, 0.0, 0.0, 1.0]
                 if is_leg:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                            positionGain=0.85, velocityGain=0.25, maxVelocity=4.0,
-                            force=list(self._mt["leg_sph"]), physicsClientId=cid)
+                            positionGain=0.85, velocityGain=0.25, maxVelocity=4.0 * vel_scale,
+                            force=[f * force_scale for f in self._mt["leg_sph"]], physicsClientId=cid)
                 else:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                            positionGain=0.52, velocityGain=0.15, maxVelocity=5.5,
-                            force=list(self._mt["arm_sph"]), physicsClientId=cid)
+                            positionGain=0.52, velocityGain=0.15, maxVelocity=5.5 * vel_scale,
+                            force=[f * force_scale for f in self._mt["arm_sph"]], physicsClientId=cid)
             else:
                 if is_leg:
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
                         positionGain=0.80, velocityGain=0.20,
-                        force=float(self._mt["leg_rev"]), physicsClientId=cid,
+                        maxVelocity=4.0 * vel_scale,
+                        force=float(self._mt["leg_rev"]) * force_scale, physicsClientId=cid,
                     )
                 else:
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
                         positionGain=0.5, velocityGain=0.1,
-                        force=float(self._mt["arm_rev"]), physicsClientId=cid,
+                        maxVelocity=5.5 * vel_scale,
+                        force=float(self._mt["arm_rev"]) * force_scale, physicsClientId=cid,
                     )
 
     def get_com(self) -> tuple[np.ndarray, np.ndarray]:
