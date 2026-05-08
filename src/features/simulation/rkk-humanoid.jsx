@@ -117,6 +117,7 @@ function normAgent(a) {
     discoveryRate:a.discovery_rate??0, hW:a.h_W??0,
     notears:a.notears??null, valueLayer:a.value_layer??null, edges:a.edges??[],
     fallen:a.fallen??false, fallCount:a.fall_count??0,
+    progressiveScope:a.progressive_scope??null, trajectory:a.trajectory??null,
   };
 }
 
@@ -1222,6 +1223,15 @@ export default function RKKHumanoid() {
               <tr key={k}><td style={{color:"#2a4466",paddingRight:8,paddingBottom:2}}>{l}</td><td style={{color:"#aabbcc",textAlign:"right"}}>{v}</td></tr>
             ))}
           </tbody></table>
+
+          {a.progressiveScope&&<div style={{...sep,fontSize:8,color:"#44aaff",display:"flex",justifyContent:"space-between"}}>
+            <span>Scope Phase: {a.progressiveScope.phase}</span>
+            <span style={{color:"#00ff99"}}>Q: {a.progressiveScope.mastery_quality?.toFixed(2)}</span>
+          </div>}
+          {a.trajectory&&a.trajectory.segments>0&&<div style={{fontSize:8,color:"#aa55ff",display:"flex",justifyContent:"space-between"}}>
+            <span>Traj. Segments:</span>
+            <span style={{color:"#bb88ff"}}>{a.trajectory.segments}</span>
+          </div>}
 
           {a.valueLayer&&<div style={{...sep,fontSize:8}}>
             <div style={{display:"flex",justifyContent:"space-between"}}>

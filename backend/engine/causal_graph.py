@@ -533,17 +533,25 @@ class CausalGraph:
             pred = self._core(x_in)
         return pred[..., :self._d]
 
-    def forward_dynamics_seq(self, X_seq: torch.Tensor, A_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward_dynamics_seq(self, X_seq: torch.Tensor, A_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if self._core is None:
-            return X_seq, torch.zeros(0, device=self.device), torch.zeros(0, device=self.device)
+            return X_seq, torch.zeros(0, device=self.device), torch.zeros(0, device=self.device), None, None
         X_in, A_in = self._wm_inputs_for_core(X_seq, A_seq)
         if hasattr(self._core, "forward_dynamics_seq"):
-            pred, h_pred, z = self._core.forward_dynamics_seq(X_in, A_in)
+            out = self._core.forward_dynamics_seq(X_in, A_in)
+            if len(out) == 5:
+                pred, h_pred, z, p5, p20 = out
+            else:
+                pred, h_pred, z = out
+                p5, p20 = None, None
         else:
             pred = self._core(X_in + A_in)
             h_pred = torch.zeros(0, device=self.device)
             z = torch.zeros(X_seq.shape[0] * X_seq.shape[1], 1, device=self.device)
-        return pred[..., :self._d], h_pred[..., :self._d, :], z
+            p5, p20 = None, None
+        p5_out = p5[..., :self._d] if p5 is not None else None
+        p20_out = p20[..., :self._d] if p20 is not None else None
+        return pred[..., :self._d], h_pred[..., :self._d, :], z, p5_out, p20_out
 
     def record_observation(self, obs: dict[str, float]) -> None:
         if not self._node_ids:
@@ -724,7 +732,7 @@ class CausalGraph:
         self._optim.zero_grad()
 
         # ── Parallel forward (LeWM core) ──────────────────────────────────────
-        X_pred, H_pred, Z_flat = self.forward_dynamics_seq(X_seq, A_seq)
+        X_pred, H_pred, Z_flat, X_pred_5, X_pred_20 = self.forward_dynamics_seq(X_seq, A_seq)
         # X_pred: (B, T-1, d) — predicted next states
         # H_pred: (B, T-1, d, hidden) — predicted latent next states
         # Z_flat: (B*T, d*hidden) — latent embeddings for SIGReg
@@ -744,6 +752,15 @@ class CausalGraph:
 
         # 2. Raw reconstruction (scaled; default lower than 0.5 to reduce conflict with JEPA)
         l_rec = F.mse_loss(X_pred, X_target)
+        
+        # 2.5 Multi-scale reconstruction
+        if X_pred_5 is not None and T > 5:
+            X_target_5 = X_seq[:, 5:]
+            l_rec = l_rec + 0.5 * F.mse_loss(X_pred_5[:, :-5], X_target_5)
+        if X_pred_20 is not None and T > 20:
+            X_target_20 = X_seq[:, 20:]
+            l_rec = l_rec + 0.25 * F.mse_loss(X_pred_20[:, :-20], X_target_20)
+
         try:
             rec_coeff = float(os.environ.get("RKK_JEPA_SEQ_REC_COEFF", "0.2"))
         except ValueError:

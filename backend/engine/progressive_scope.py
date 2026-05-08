@@ -175,6 +175,7 @@ class ProgressiveScope:
         is_fallen: bool,
         posture: float,
         quality: float | None = None,
+        is_fixed_root: bool = False,
     ) -> bool:
         """
         Update mastery estimate. Returns True if phase advanced.
@@ -183,6 +184,7 @@ class ProgressiveScope:
             is_fallen: whether the agent is in a catastrophic state
             posture: current posture stability [0,1]
             quality: optional trajectory quality from TrajectoryCollector
+            is_fixed_root: whether the agent is externally supported
         """
         if not progressive_scope_enabled():
             return False
@@ -214,6 +216,8 @@ class ProgressiveScope:
         fallen_rate = sum(1 for f in self._fallen_window if f) / len(self._fallen_window)
 
         # Advance if quality is high AND fall rate is low
+        if is_fixed_root:
+            return False
         if mastery >= threshold and fallen_rate < 0.3:
             return self._advance_phase(mastery, fallen_rate)
         return False

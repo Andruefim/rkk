@@ -100,6 +100,10 @@ class EnvironmentHumanoid:
         else:
             self._sim.fixed_root = enabled
 
+    def apply_random_perturbation(self, max_force: float = 80.0) -> None:
+        if isinstance(self._sim, _PyBulletHumanoid):
+            self._sim.apply_random_perturbation(max_force)
+
     # ── Нормализация ──────────────────────────────────────────────────────────
     def _norm(self, key: str, val: float) -> float:
         lo, hi = _RANGES.get(key, (-1.0, 1.0))

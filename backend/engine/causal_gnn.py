@@ -219,6 +219,10 @@ class CausalGNNCore(nn.Module):
         # Output decoder: предсказываем x_i из h_i + агрегированных сообщений
         self.out_dec = _mlp(hidden * 2, hidden, 1, nn.ReLU)
         
+        # Multi-scale decoders (t+5, t+20)
+        self.out_dec_5 = _mlp(hidden * 2, hidden, 1, nn.ReLU)
+        self.out_dec_20 = _mlp(hidden * 2, hidden, 1, nn.ReLU)
+        
         # JEPA Target Encoder (EMA from node_enc after each train step)
         self.target_enc = nn.Sequential(
             nn.Linear(1, hidden),
@@ -226,7 +230,7 @@ class CausalGNNCore(nn.Module):
         )
 
         # Xavier initialization
-        for m in [self.node_enc, self.action_enc, self.msg_fn, self.latent_predictor, self.out_dec]:
+        for m in [self.node_enc, self.action_enc, self.msg_fn, self.latent_predictor, self.out_dec, self.out_dec_5, self.out_dec_20]:
             for layer in m:
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight, gain=0.5)
@@ -258,7 +262,8 @@ class CausalGNNCore(nn.Module):
         self,
         h: torch.Tensor,
         return_latent: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return_multiscale: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """h: (B, d, hidden) → (B, d) scalars; latent head uses concat(h, agg) only."""
         B, d, _hd = h.shape
         A = self.W_masked()
@@ -292,6 +297,14 @@ class CausalGNNCore(nn.Module):
 
         h_next = torch.cat([h, agg], dim=-1)
         out = self.out_dec(h_next).squeeze(-1)
+
+        if return_multiscale:
+            out_5 = self.out_dec_5(h_next).squeeze(-1)
+            out_20 = self.out_dec_20(h_next).squeeze(-1)
+            if return_latent:
+                h_pred = self.latent_predictor(h_next)
+                return out, h_pred, out_5, out_20
+            return out, out_5, out_20
 
         if return_latent:
             h_pred = self.latent_predictor(h_next)
@@ -331,7 +344,7 @@ class CausalGNNCore(nn.Module):
 
     def forward_dynamics_seq(
         self, X_seq: torch.Tensor, A_seq: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parallel teacher-forcing prediction over sequences (LeWM-style).
 
@@ -347,6 +360,8 @@ class CausalGNNCore(nn.Module):
             X_pred: (B, T-1, d)  — predicted next states (teacher forcing)
             H_pred: (B, T-1, d, hidden) — predicted next latent states (JEPA)
             Z_flat: (B*T, d*hidden) — flattened latent embeddings for SIGReg
+            X_pred_5: (B, T, d) — raw predicted t+5 states
+            X_pred_20: (B, T, d) — raw predicted t+20 states
         """
         B, T, d = X_seq.shape
 
@@ -358,11 +373,15 @@ class CausalGNNCore(nn.Module):
         H_flat = self.encode_latent(X_flat, A_flat)  # (B*T, d, hidden)
 
         # 3. Message pass → predicted next-state scalars and latents for all timesteps
-        X_pred_flat, H_pred_flat = self._message_pass(H_flat, return_latent=True)
+        X_pred_flat, H_pred_flat, X_pred_5_flat, X_pred_20_flat = self._message_pass(
+            H_flat, return_latent=True, return_multiscale=True
+        )
 
         # 4. Reshape back
         X_pred_all = X_pred_flat.reshape(B, T, d)    # (B, T, d)
         H_pred_all = H_pred_flat.reshape(B, T, d, self.hidden)
+        X_pred_5_all = X_pred_5_flat.reshape(B, T, d)
+        X_pred_20_all = X_pred_20_flat.reshape(B, T, d)
 
         # 5. Teacher forcing: X_pred[t] predicts X[t+1]
         X_pred = X_pred_all[:, :-1, :]  # (B, T-1, d)
@@ -371,7 +390,7 @@ class CausalGNNCore(nn.Module):
         # 6. Flatten latents for SIGReg (anti-collapse on full batch)
         Z_flat = H_flat.reshape(B * T, d * self.hidden)
 
-        return X_pred, H_pred, Z_flat
+        return X_pred, H_pred, Z_flat, X_pred_5_all, X_pred_20_all
 
     def dag_constraint(self) -> torch.Tensor:
         """

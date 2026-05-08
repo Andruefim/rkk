@@ -258,6 +258,16 @@ class SimulationTickMixin:
         self.agent.other_agents_phi = []
         self._maybe_step_hierarchical_l1()
         self._sync_temporal_blankets_to_graph()
+        
+        # Controlled perturbations during fixed_root to teach active balance
+        if self.current_world == "humanoid" and self._fixed_root_active:
+            if self.tick % 40 == 0:
+                fn_perturb = getattr(self.agent.env, "apply_random_perturbation", None)
+                if callable(fn_perturb):
+                    # Start gentle, increase force
+                    force = 60.0 + min(100.0, self.tick * 0.2)
+                    fn_perturb(max_force=force)
+
         obs_pre_rssm = dict(self.agent.graph.snapshot_vec_dict())
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
 

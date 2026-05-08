@@ -344,6 +344,26 @@ class _PyBulletHumanoid(InstrumentalSandbox):
     def fixed_root(self) -> bool:
         return self._root_constraint is not None
 
+    def apply_random_perturbation(self, max_force: float = 80.0) -> None:
+        """Применить случайный импульс к торсу (базовому звену) для обучения балансу."""
+        with self._physics_lock:
+            # Случайное направление в XY плоскости
+            angle = np.random.uniform(0, 2 * np.pi)
+            force_mag = np.random.uniform(max_force * 0.5, max_force)
+            force = [np.cos(angle) * force_mag, np.sin(angle) * force_mag, 0.0]
+            
+            # Точка приложения - центр масс базового звена
+            pos, _ = pb.getBasePositionAndOrientation(self.robot_id, physicsClientId=self.client)
+            pb.applyExternalForce(
+                self.robot_id,
+                -1,  # base link
+                force,
+                list(pos),
+                pb.WORLD_FRAME,
+                physicsClientId=self.client,
+            )
+            print(f"[HumanoidEnv] Applied perturbation: {force_mag:.1f}N at angle {angle:.2f}")
+
     # ─────────────────────────────────────────────────────────────────────────
     def _static_box_three(
         self,

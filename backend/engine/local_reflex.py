@@ -104,8 +104,8 @@ def train_chains_parallel(
         xs: list[list[float]] = []
         ys: list[list[float]] = []
         for k in range(len(obs_b) - 1):
-            xs.append([float(obs_b[k][ii]) for ii in idx])
-            ys.append([float(obs_b[k + 1][ii]) for ii in idx])
+            xs.append([float(obs_b[k][ii]) if ii < len(obs_b[k]) else 0.0 for ii in idx])
+            ys.append([float(obs_b[k + 1][ii]) if ii < len(obs_b[k + 1]) else 0.0 for ii in idx])
         if len(xs) < 3:
             continue
         X = torch.tensor(xs, dtype=torch.float32, device=device)

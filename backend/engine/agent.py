@@ -1967,6 +1967,7 @@ class RKKAgent:
                 is_fallen=is_fallen,
                 posture=posture_now,
                 quality=tq,
+                is_fixed_root=is_fixed_root,
             )
 
         if _ig_diag_enabled() and self._total_interventions % 50 == 0:
@@ -2208,6 +2209,16 @@ class RKKAgent:
                 "imagination_horizon": int(self._imagination_horizon),
             },
             "local_reflex_train": self._last_local_reflex_train,
+            "progressive_scope": {
+                "enabled": True,
+                "phase": self._prog_scope.phase,
+                "ticks_in_phase": getattr(self._prog_scope, "_phase_ticks", 0),
+                "mastery_quality": round(self._prog_scope.mastery_quality, 3) if getattr(self._prog_scope, "mastery_quality", None) is not None else 0.0,
+            } if getattr(self, "_prog_scope", None) else None,
+            "trajectory": {
+                "enabled": True,
+                "segments": len(self.graph._traj_segments) if hasattr(self.graph, "_traj_segments") else 0,
+            },
         }
         el_ec, el_list = self._snapshot_edges_payload()
         snap["edge_count"] = el_ec
