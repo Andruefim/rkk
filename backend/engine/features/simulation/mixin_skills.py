@@ -418,12 +418,7 @@ class SimulationSkillsMixin:
         }
 
     def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
-        """Заменяем логику скиллов на Active Inference (Гомеостатический контроль)."""
-        # В humanoid окружении мы всегда используем Active Inference для микро-контроля
-        if self.current_world == "humanoid":
-            return self._run_active_inference_step(engine_tick)
-            
-        # Для других сред оставляем стандартный агент (Curiosity-driven)
+        """Curiosity-driven exploration for all environments including humanoid."""
         return self.agent.step(
             engine_tick=engine_tick,
             enable_l3=self._l3_planning_due(),
