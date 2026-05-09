@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Any
 
 
@@ -24,8 +25,12 @@ def sanitize_for_json(obj: Any) -> Any:
         return obj
     if isinstance(obj, dict):
         return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, deque):
+        return [sanitize_for_json(v) for v in obj]
     if isinstance(obj, (list, tuple)):
         return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, set):
+        return [sanitize_for_json(v) for v in sorted(obj, key=lambda x: str(x))]
     try:
         import numpy as np
 
@@ -58,4 +63,7 @@ def sanitize_for_json(obj: Any) -> Any:
             }
     except ImportError:
         pass
-    return obj
+    try:
+        return str(obj)
+    except Exception:
+        return None

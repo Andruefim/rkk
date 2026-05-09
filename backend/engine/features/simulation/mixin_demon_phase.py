@@ -5,7 +5,25 @@ from engine.features.simulation.mixin_imports import *
 
 
 class SimulationDemonPhaseMixin:
+    def _demon_should_pause(self, snap: dict) -> bool:
+        """
+        В кризисе эмбодимента не искажать W — иначе WM не сходится и «интеллект»
+        (предсказание, compression, vision grounding) не растёт.
+        """
+        if os.environ.get("RKK_DEMON_PAUSE_WHEN_UNSTABLE", "1").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return False
+        if snap.get("fallen"):
+            return True
+        return False
+
     def _step_demon(self, snap: dict):
+        if self._demon_should_pause(snap):
+            return
         try:
             action = self.demon.step([snap], 1 - snap.get("peak_discovery_rate", 0))
         except RuntimeError as e:

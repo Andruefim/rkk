@@ -97,20 +97,34 @@ export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
   }, []);
 
   useEffect(() => {
-    let ws: WebSocket;
-    let reconnectTimer: ReturnType<typeof setTimeout>;
+    let cancelled = false;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let attempt = 0;
 
     function connect() {
+      if (cancelled) return;
       ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
-      ws.onopen  = () => { setConnected(true);  console.log("[RKK] WS connected"); };
+      ws.onopen = () => {
+        attempt = 0;
+        if (!cancelled) {
+          setConnected(true);
+          console.log("[RKK] WS connected");
+        }
+      };
       ws.onclose = () => {
         setConnected(false);
-        console.log("[RKK] WS closed, reconnecting…");
-        reconnectTimer = setTimeout(connect, 2000);
+        if (cancelled) return;
+        attempt += 1;
+        const delay = Math.min(8000, 1000 + attempt * 800);
+        console.log(`[RKK] WS closed, reconnect in ${delay}ms`);
+        reconnectTimer = setTimeout(connect, delay);
       };
-      ws.onerror = () => ws.close();
+      ws.onerror = () => {
+        console.warn("[RKK] WS error (waiting for close/reconnect)");
+      };
 
       ws.onmessage = (ev) => {
         try {
@@ -132,7 +146,12 @@ export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
     }
 
     connect();
-    return () => { clearTimeout(reconnectTimer); ws?.close(); };
+    return () => {
+      cancelled = true;
+      clearTimeout(reconnectTimer);
+      ws?.close();
+      wsRef.current = null;
+    };
   }, [wsUrl]);
 
   return { frame, connected, speed, setSpeed, reset };

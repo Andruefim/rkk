@@ -5,6 +5,13 @@ from engine.features.simulation.mixin_imports import *
 
 
 class SimulationLocomotionMixin:
+    """
+    AGI/embodied stack: низкий уровень (CPG, рефлексы, cerebellum) — «тело»;
+    высокий уровень (Active Inference intents в mixin_skills) — коррекция намерений.
+    RKK_AGI_SUBSTRATE_BLEND=1 (default): не отключать CPG/MC перед agent.step — иначе агент
+    не живёт достаточно долго для обучения WM / vision / LLM.
+    """
+
     @staticmethod
     def _unwrap_base_env(env):
         e = env
@@ -18,6 +25,11 @@ class SimulationLocomotionMixin:
 
     def _cpg_decoupled_enabled(self) -> bool:
         return self._locomotion_cpg_enabled() and _cpg_loop_hz_from_env() > 0.0
+
+    def _agi_substrate_blend_enabled(self) -> bool:
+        """CPG(+MC) как базовый ритм ног; Active Inference остаётся слоем намерений."""
+        v = os.environ.get("RKK_AGI_SUBSTRATE_BLEND", "1").strip().lower()
+        return v not in ("0", "false", "no", "off")
 
     def _stop_cpg_background_loop(self) -> None:
         self._bg.stop_cpg_loop()
@@ -37,6 +49,23 @@ class SimulationLocomotionMixin:
             return
         if self.current_world != "humanoid" or self._fixed_root_active:
             return
+
+        if not self._agi_substrate_blend_enabled():
+            # Только intent из WM (без ритма ног): хрупко для долгого обучения.
+            return
+
+        if not getattr(self, "_logged_agi_substrate_blend", False):
+            self._logged_agi_substrate_blend = True
+            try:
+                self._add_event(
+                    "🜔 AGI substrate: CPG/MC legs + Active Inference intents "
+                    "(RKK_AGI_SUBSTRATE_BLEND=1)",
+                    "#66ddaa",
+                    "phase",
+                )
+            except Exception:
+                pass
+
         base = self._unwrap_base_env(self.agent.env)
         fn = getattr(base, "apply_cpg_leg_targets", None)
         if not callable(fn):

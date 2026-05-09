@@ -76,7 +76,6 @@ from engine.rsi_lite import (
     rsi_min_interventions,
     rsi_plateau_interventions,
 )
-from engine.local_reflex import local_reflex_train_enabled, train_chains_parallel
 from engine.trajectory_contrastive import TrajectoryCollector, trajectory_enabled
 from engine.progressive_scope import ProgressiveScope, progressive_scope_enabled
 
@@ -373,9 +372,6 @@ class RKKAgent:
         self._rsi_adjustment_count: int = 0
         self._notears_steps  = 0
         self._last_notears_loss: dict | None = None
-        self._local_reflex_cores: dict[tuple[str, ...], Any] = {}
-        self._last_local_reflex_train: dict | None = None
-
         # Φ других агентов (заполняется Simulation-ом перед step())
         self.other_agents_phi: list[float] = []
         self._last_engine_tick = 0
@@ -1803,7 +1799,6 @@ class RKKAgent:
             if notears_result:
                 self._notears_steps += 1
                 self._last_notears_loss = notears_result
-            self._maybe_train_local_reflex()
 
         mdl_after         = self.graph.mdl_size
         compression_delta = mdl_before - mdl_after
@@ -2125,15 +2120,6 @@ class RKKAgent:
         self._rsi_ref_discovery = float(cur_dr)
         return self._apply_rsi_lite()
 
-    def _maybe_train_local_reflex(self) -> None:
-        if not local_reflex_train_enabled():
-            return
-        self._last_local_reflex_train = train_chains_parallel(
-            graph=self.graph,
-            device=self.graph.device,
-            cores=self._local_reflex_cores,
-        )
-
     def phi_approx(self) -> float:
         return self.temporal.phi_approx()
 
@@ -2208,7 +2194,6 @@ class RKKAgent:
                 "graph_BUFFER_SIZE": int(self.graph.BUFFER_SIZE),
                 "imagination_horizon": int(self._imagination_horizon),
             },
-            "local_reflex_train": self._last_local_reflex_train,
             "progressive_scope": {
                 "enabled": True,
                 "phase": self._prog_scope.phase,

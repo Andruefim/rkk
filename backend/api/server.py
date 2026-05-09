@@ -840,8 +840,36 @@ async def causal_stream(websocket: WebSocket):
 
             payload0 = await loop.run_in_executor(None, _initial_snap)
             await websocket.send_json(payload0)
+        except WebSocketDisconnect:
+            raise
         except Exception as e:
-            print(f"[WS] Initial snapshot send failed: {e}")
+            print(
+                f"[WS] Initial snapshot send failed: {type(e).__name__}: {e!s}",
+                flush=True,
+            )
+            traceback.print_exc()
+            try:
+                await websocket.send_json(
+                    sanitize_for_json(
+                        {
+                            "tick": int(getattr(sim, "tick", 0)),
+                            "phase": int(getattr(sim, "phase", 1)),
+                            "entropy": 100.0,
+                            "singleton": True,
+                            "events": [
+                                {
+                                    "tick": int(getattr(sim, "tick", 0)),
+                                    "text": f"[WS] Initial snapshot fallback ({type(e).__name__})",
+                                    "color": "#ff8844",
+                                    "type": "error",
+                                }
+                            ],
+                            "_ws_recovery": True,
+                        }
+                    )
+                )
+            except (WebSocketDisconnect, RuntimeError):
+                raise
 
         while True:
             try:

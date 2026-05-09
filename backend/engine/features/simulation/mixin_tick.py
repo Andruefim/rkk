@@ -388,13 +388,14 @@ class SimulationTickMixin:
         # Level 3-I: Multi-scale time tick (first consumer of post-step obs)
         if _TIMESCALE_AVAILABLE and self._timescale is not None:
             self._timescale.tick(self.tick, _obs_for_d_e)
-            motor_intents = self._timescale.get_intents(LEVEL_MOTOR)
-            for var, val in motor_intents.items():
-                if var.startswith("intent_"):
-                    try:
-                        self.agent.env.intervene(var, float(val), count_intervention=False)
-                    except Exception:
-                        pass
+            if self.current_world != "humanoid":
+                motor_intents = self._timescale.get_intents(LEVEL_MOTOR)
+                for var, val in motor_intents.items():
+                    if var.startswith("intent_"):
+                        try:
+                            self.agent.env.intervene(var, float(val), count_intervention=False)
+                        except Exception:
+                            pass
 
         # Phase J: Inner Voice (τ2, fast, no LLM)
         self._tick_inner_voice(self.tick)

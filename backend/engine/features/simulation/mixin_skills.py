@@ -255,50 +255,175 @@ class SimulationSkillsMixin:
             "goal_planned": False,
         }
 
-    def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
-        """L3 внутри agent.step; L2 skill — один шаг последовательности за тик."""
-        if (
-            self.current_world == "humanoid"
-            and not self._fixed_root_active
-            and self._curriculum_stabilize_until > 0
-            and engine_tick <= self._curriculum_stabilize_until
-        ):
-            if self._skill_exec is not None:
-                return self._execute_skill_frame()
-            if self._skill_library_enabled():
-                lib = self._ensure_skill_library()
-                obs = self.agent.env.observe()
-                obs_st = self._skill_state_dict(obs)
-                sk = lib.select_skill(obs_st, "stand")
-                if sk is not None:
-                    self._skill_exec = {
-                        "skill": sk,
-                        "index": 0,
-                        "obs_before": dict(obs_st),
-                    }
-                    return self._execute_skill_frame()
-            return self.agent.step(engine_tick=engine_tick, enable_l3=False)
+    def _ensure_homeostatic_ctrl(self):
+        if not hasattr(self, "_homeostatic_ctrl"):
+            from engine.active_inference import HomeostaticController
+            import torch
+            device = getattr(self.agent.graph._core, "device", torch.device("cpu"))
+            self._homeostatic_ctrl = HomeostaticController(device=device, learning_rate=0.1, max_iters=10)
+        return self._homeostatic_ctrl
 
-        # Removed hardcoded skill lock. The agent will rely on its causal EIG for learning.
-        if (
-            self._skill_library_enabled()
-            and self.current_world == "humanoid"
-            and not self._fixed_root_active
-        ):
-            if self._skill_exec is not None:
-                return self._execute_skill_frame()
-            if self._skill_start_prob() > 0.0 and np.random.random() < self._skill_start_prob():
-                obs = self.agent.env.observe()
-                st = self._skill_state_dict(obs)
-                goal = self._skill_goal_hint(st)
-                sk = self._ensure_skill_library().select_skill(st, goal)
-                if sk is not None:
-                    self._skill_exec = {
-                        "skill": sk,
-                        "index": 0,
-                        "obs_before": dict(st),
-                    }
-                    return self._execute_skill_frame()
+    @staticmethod
+    def _graph_intent_to_env_var(nid: str) -> str | None:
+        """Имя узла графа → переменная motor intent в HumanoidEnvironment (или None)."""
+        from engine.features.humanoid.constants import MOTOR_INTENT_VARS
+
+        s = str(nid)
+        if s in MOTOR_INTENT_VARS:
+            return s
+        if s.startswith("phys_intent_"):
+            suf = s[len("phys_intent_") :]
+            if suf in MOTOR_INTENT_VARS:
+                return suf
+        return None
+
+    def _intent_pairs_for_env(self, actions: dict[str, float]) -> list[tuple[str, float]]:
+        out: list[tuple[str, float]] = []
+        for gid, val in actions.items():
+            ev = self._graph_intent_to_env_var(gid)
+            if ev is not None:
+                out.append((ev, float(val)))
+        return out
+
+    def _run_active_inference_step(self, engine_tick: int) -> dict:
+        """Один шаг Active Inference: минимизация Free Energy (дивергенции с target_priors)."""
+        ctrl = self._ensure_homeostatic_ctrl()
+        
+        obs_before_env = dict(self.agent.env.observe())
+        self.agent.graph.apply_env_observation(obs_before_env)
+        obs_before_full = self.agent.graph.snapshot_vec_dict()
+        
+        # 1. Применение возмущений (Perturbations) в режиме fixed_root
+        if self._fixed_root_active and engine_tick % 50 == 0:
+            import random
+            from engine.graph_constants import is_read_only_macro_var
+
+            perturb_val = random.uniform(0.1, 0.9)
+            candidates = [
+                n
+                for n in self.agent.graph._node_ids
+                if not is_read_only_macro_var(n) and self._graph_intent_to_env_var(n)
+            ]
+            if candidates:
+                ev = self._graph_intent_to_env_var(random.choice(candidates))
+                if ev:
+                    self._sim_env_intervene(ev, perturb_val, count_intervention=False)
+            obs_before_env = dict(self.agent.env.observe())
+            self.agent.graph.apply_env_observation(obs_before_env)
+            obs_before_full = self.agent.graph.snapshot_vec_dict()
+
+        # 2. Вычисляем компенсирующие действия через Active Inference
+        goal = self._skill_goal_hint(obs_before_full)
+        if goal == "walk":
+            # Если мы стабильны, добавляем приор на движение вперед (com_x_vel)
+            target_priors = {
+                "phys_posture_stability": 1.0, 
+                "phys_com_z": 0.82,
+                "phys_com_x_vel": 0.35  # Целевая скорость вперед
+            }
+        else:
+            # Если мы падаем или нестабильны, фокусируемся только на балансе
+            target_priors = {
+                "phys_posture_stability": 1.0, 
+                "phys_com_z": 0.82
+            }
+        
+        # Добавляем интринсик (любопытство) если включено
+        if getattr(self, "_intrinsic", None) and hasattr(self._intrinsic, "get_target_priors"):
+            intrinsic_priors = self._intrinsic.get_target_priors(obs_before_full)
+            target_priors.update(intrinsic_priors)
+        
+        # Инверсия модели: какие действия приведут к target_priors?
+        actions = ctrl.optimize_action(obs_before_full, self.agent.graph, target_priors)
+        
+        if not actions:
+            # Motor Babbling: если модель еще не обучена (градиенты нулевые),
+            # добавляем случайные микродвижения по motor intent (имена как в среде).
+            import random
+
+            for nid in self.agent.graph._node_ids:
+                ev = self._graph_intent_to_env_var(nid)
+                if ev and random.random() < 0.35:
+                    actions[nid] = random.uniform(0.15, 0.85)
+
+        pairs_graph = list(actions.items())
+        pairs = self._intent_pairs_for_env(actions)
+        if actions:
+            ranked = sorted(
+                pairs,
+                key=lambda kv: abs(kv[1] - 0.5),
+                reverse=True,
+            )
+            top = ranked[0] if ranked else None
+            print(
+                f"[ACTIVE INFERENCE] Tick {engine_tick}: Generated {len(actions)} graph intents, "
+                f"{len(pairs)} env intents. Top delta: {top}"
+            )
+
+        var0, val0 = (pairs[0] if pairs else ("", 0.5))
+        
+        # 3. Применяем действия (только имена, понятные HumanoidEnvironment)
+        if not pairs:
+            obs_after = dict(self.agent.env.observe())
+        else:
+            burst_fn = getattr(self.agent.env, "intervene_burst", None)
+            if callable(burst_fn):
+                obs_after = dict(burst_fn(pairs, count_intervention=True))
+            else:
+                for var, val in pairs:
+                    obs_after = self._sim_env_intervene(var, val, count_intervention=False)
+                if not obs_after:
+                    obs_after = dict(self.agent.env.observe())
+                    
+        # 4. Логирование и обучение графа
+        if not obs_after:
+            obs_after = dict(self.agent.env.observe())
+            
+        self._sync_motor_state(obs_after, source="active_inference", tick=self.tick)
+        self._log_motor_command(
+            source="active_inference",
+            intents=actions,
+            obs=self._motor_obs_payload(obs_after),
+        )
+        
+        self.agent.graph.apply_env_observation(obs_after)
+        obs_after_full = self.agent.graph.snapshot_vec_dict()
+        
+        self.agent.graph.record_observation(obs_before_full)
+        self.agent.graph.record_observation(obs_after_full)
+        
+        for var, val in pairs_graph:
+            if var in self.agent.graph.nodes:
+                self.agent.graph.record_intervention(
+                    var, float(val), obs_before_full, obs_after_full
+                )
+                
+        self.agent.temporal.step(obs_after)
+        
+        return {
+            "blocked": False,
+            "skipped": False,
+            "hierarchy": "active_inference",
+            "skill": "homeostasis",
+            "skill_step": 0,
+            "skill_done": True,
+            "variable": var0,
+            "value": float(val0),
+            "updated_edges": [],
+            "compression_delta": 0.0,
+            "prediction_error": 0.0,
+            "cf_predicted": {},
+            "cf_observed": {},
+            "goal_planned": False,
+        }
+
+    def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
+        """Заменяем логику скиллов на Active Inference (Гомеостатический контроль)."""
+        # В humanoid окружении мы всегда используем Active Inference для микро-контроля
+        if self.current_world == "humanoid":
+            return self._run_active_inference_step(engine_tick)
+            
+        # Для других сред оставляем стандартный агент (Curiosity-driven)
         return self.agent.step(
             engine_tick=engine_tick,
             enable_l3=self._l3_planning_due(),

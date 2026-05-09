@@ -267,110 +267,10 @@ class GoalImagination:
     ) -> dict[str, Any] | None:
         """
         Генерирует следующую цель через GNN imagination rollout.
-        Возвращает {"variable": str, "value": float, "expected_gain": float}.
+        Отключено: базовый контроль идёт через Active Inference + гомеостаз;
+        Система 2 (curiosity) будет включаться после стабилизации (см. implementation_plan).
         """
-        if not intrinsic_enabled():
-            return None
-
-        core = graph._core
-        if core is None:
-            return None
-
-        node_ids = list(graph._node_ids)
-        d = len(node_ids)
-        if d == 0:
-            return None
-
-        # Исключаем read-only и self_* из кандидатов
-        from engine.graph_constants import is_read_only_macro_var
-        candidates_vars = [
-            nid for nid in node_ids
-            if not is_read_only_macro_var(nid)
-            and not nid.startswith("concept_")
-            and not nid.startswith("proprio_")
-        ]
-        if not candidates_vars:
-            return None
-
-        # Сэмплируем K интервенций
-        k = min(self._k_candidates, len(candidates_vars) * 3)
-        rng = np.random.default_rng()
-
-        # Адаптивный диапазон: если стагнация — исследуем агрессивнее
-        if causal_surprise.compression_is_stagnant():
-            lo, hi = 0.1, 0.9
-        elif causal_surprise.surprise_is_high():
-            lo, hi = 0.3, 0.7  # осторожнее когда много сюрпризов
-        else:
-            lo, hi = 0.2, 0.8
-
-        sampled = [
-            (rng.choice(candidates_vars), float(rng.uniform(lo, hi)))
-            for _ in range(k)
-        ]
-
-        # Текущее состояние
-        current_state = dict(graph.nodes)
-        current_mdl = float(graph.mdl_size)
-
-        best_var, best_val, best_expected = None, 0.5, -np.inf
-
-        with torch.no_grad():
-            for var, val in sampled:
-                try:
-                    # GNN rollout
-                    state = graph.propagate_from(current_state, var, val)
-
-                    # Многошаговый rollout
-                    for _ in range(min(3, self._horizon)):
-                        state = graph.rollout_step_free(state)
-
-                    # Оцениваем ожидаемый Δcompression через proxy:
-                    # "насколько состояние после отличается от текущего?"
-                    delta = float(np.mean([
-                        abs(float(state.get(nid, 0.5)) - float(current_state.get(nid, 0.5)))
-                        for nid in node_ids
-                    ]))
-
-                    # Неопределённость по этому узлу (чем выше — тем ценнее)
-                    if core is not None:
-                        A = core.alpha_trust_matrix()
-                        idx = node_ids.index(var) if var in node_ids else -1
-                        if idx >= 0:
-                            uncertainty = float(1.0 - A[idx].mean().item())
-                        else:
-                            uncertainty = 0.5
-                    else:
-                        uncertainty = 0.5
-
-                    # Ожидаемый выигрыш = delta * uncertainty
-                    # (большое изменение в неизведанной области = ценно)
-                    expected_gain = delta * (1.0 + uncertainty)
-
-                    if expected_gain > best_expected:
-                        best_expected = expected_gain
-                        best_var = var
-                        best_val = val
-
-                except Exception:
-                    continue
-
-        if best_var is None:
-            return None
-
-        goal = {
-            "variable": best_var,
-            "value": best_val,
-            "expected_gain": float(best_expected),
-            "generated_at": n_interventions,
-            "horizon": self._horizon,
-        }
-
-        self._current_goal = goal
-        self._goal_age = 0
-        self._goal_history.append(dict(goal))
-        self.total_goals_generated += 1
-        return goal
+        return None
 
     def tick_goal(self, actual_compression: float) -> dict[str, Any] | None:
         """
@@ -603,6 +503,41 @@ class IntrinsicObjective:
         # История наград
         self._reward_history: deque[float] = deque(maxlen=500)
         self.total_steps: int = 0
+        self._posture_hist: deque[float] = deque(maxlen=100)
+
+    def get_target_priors(self, snapshot_vec: dict[str, float]) -> dict[str, float]:
+        """
+        Дополнительные цели для HomeostaticController (Система 2 → приоры).
+        Пока любопытство отключено в GoalImagination, возвращаем пустой словарь;
+        история осанки используется для будущего гейтинга навигационных приоров.
+        """
+        if not intrinsic_enabled():
+            return {}
+        ps = float(
+            snapshot_vec.get(
+                "phys_posture_stability",
+                snapshot_vec.get("posture_stability", 0.5),
+            )
+        )
+        self._posture_hist.append(ps)
+        if os.environ.get("RKK_INTRINSIC_NAV_PRIORS", "0").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return {}
+        if len(self._posture_hist) < 25:
+            return {}
+        if float(np.mean(list(self._posture_hist)[-40:])) < 0.72:
+            return {}
+        try:
+            vx = float(os.environ.get("RKK_NAV_PRIOR_COM_X_VEL", "0.18"))
+        except ValueError:
+            vx = 0.18
+        if any(k.endswith("com_x_vel") for k in snapshot_vec):
+            return {"phys_com_x_vel": vx}
+        return {}
 
     def step(
         self,
@@ -662,6 +597,23 @@ class IntrinsicObjective:
             graph_mdl_after=mdl_after,
             n_interventions=int(agent._total_interventions),
         )
+
+        # Гомеостаз: при низкой осанке подавляем EIG (implementation_plan Phase 3).
+        if os.environ.get("RKK_INTRINSIC_HOMEOSTASIS_GATE", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            try:
+                obs_h = dict(agent.env.observe())
+                posture = float(
+                    obs_h.get("posture_stability", obs_h.get("phys_posture_stability", 0.5))
+                )
+                hf = float(np.clip((posture - 0.30) / 0.62, 0.05, 1.0))
+                r *= hf
+            except Exception:
+                pass
 
         # Интегрируем AMP бонус (Уровень 2)
         try:

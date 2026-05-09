@@ -317,7 +317,8 @@ class CausalGNNCore(nn.Module):
         X_t, a_t: (B, d) в масштабе наблюдений; a_t разрежен (do(var)=val по индексу).
         Где |a_i|≈0, вклад action_enc не добавляется (чтобы f(X,0) не сдвигал bias’ом).
         """
-        am = (torch.abs(a).unsqueeze(-1) > 1e-8).float()
+        # Differentiable soft mask to allow backpropagation to `a`
+        am = torch.sigmoid(torch.abs(a) * 1000.0).unsqueeze(-1)
         h_a = self.action_enc(a.unsqueeze(-1))
         h = self.node_enc(X.unsqueeze(-1)) + am * h_a
         return self._message_pass(h)
@@ -337,7 +338,8 @@ class CausalGNNCore(nn.Module):
         X, a: (B, d) or (B*T, d)
         Returns: (B, d, hidden) — latent embedding per node.
         """
-        am = (torch.abs(a).unsqueeze(-1) > 1e-8).float()
+        # Differentiable soft mask
+        am = torch.sigmoid(torch.abs(a) * 1000.0).unsqueeze(-1)
         h_a = self.action_enc(a.unsqueeze(-1))
         h = self.node_enc(X.unsqueeze(-1)) + am * h_a
         return h

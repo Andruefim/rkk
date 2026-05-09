@@ -44,7 +44,7 @@ def build_simulation_snapshot(
         "smoothed_dr": round(smoothed, 3),
         "agents": [snap],
         "n_agents": 1,
-        "demon": sim.demon.snapshot,
+        "demon": sim.demon.snapshot,  # @property → dict (не ())
         "tom_links": [],
         "events": list(sim.events),
         "graph_deltas": graph_deltas,

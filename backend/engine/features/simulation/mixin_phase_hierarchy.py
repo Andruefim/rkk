@@ -19,7 +19,6 @@ class SimulationPhaseHierarchyMixin:
         self._last_dr_snapshot = float(dr)
 
     def _phase1_snapshot_meta(self) -> dict:
-        from engine.local_reflex import snapshot_chains_metadata
 
         try:
             dpt = int(os.environ.get("RKK_CONCEPT_DISCOVERY_PLATEAU_TICKS", "0"))
@@ -44,8 +43,7 @@ class SimulationPhaseHierarchyMixin:
                 getattr(self.agent.graph, "_frozen_edge_set", set()) or set()
             ),
             "dag_mask_frozen": dag_mask_frozen,
-            "local_reflex": snapshot_chains_metadata(list(self.agent.graph._node_ids)),
-            "local_reflex_train": getattr(self.agent, "_last_local_reflex_train", None),
+            "dag_mask_frozen": dag_mask_frozen,
         }
 
     def _phase2_snapshot_meta(self) -> dict:

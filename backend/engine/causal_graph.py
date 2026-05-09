@@ -502,24 +502,23 @@ class CausalGraph:
         self._sync_frozen_W_into_core()
 
     def _pad(self, x: torch.Tensor) -> torch.Tensor:
-        pad_len = self.MAX_D - x.shape[-1]
+        return self._pad_to(x, self.MAX_D)
+
+    def _pad_to(self, x: torch.Tensor, target_d: int) -> torch.Tensor:
+        pad_len = target_d - x.shape[-1]
         if pad_len > 0:
             return torch.nn.functional.pad(x, (0, pad_len))
         return x
 
     def _wm_inputs_for_core(self, X: torch.Tensor, A: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        GNN/NOTEARS cores are built at MAX_D×MAX_D — pad observations to MAX_D.
-        RSSMLiteCore uses live graph width (graph._d) — padding to MAX_D breaks Linear layers
-        (e.g. cat(X,a) becomes 512 vs expected 428 when d=214).
-        """
         if self._core is None:
             return X, A
         cd = int(getattr(self._core, "d", self.MAX_D))
-        if cd >= self.MAX_D:
-            return self._pad(X), self._pad(A)
-        d_act = min(cd, self._d, X.shape[-1], A.shape[-1])
-        return X[..., :d_act], A[..., :d_act]
+        if cd > X.shape[-1]:
+            return self._pad_to(X, cd), self._pad_to(A, cd)
+        elif cd < X.shape[-1]:
+            return X[..., :cd], A[..., :cd]
+        return X, A
 
     def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         if self._core is None:
@@ -578,7 +577,21 @@ class CausalGraph:
         if len(self._seq_obs_run) >= T:
             # slice last T observations as one complete sequence
             seq = self._seq_obs_run[-T:]
-            self._seq_buffer.append(seq)
+            
+            # Calculate homeostasis score (average posture_stability)
+            ps_idx = -1
+            if "posture_stability" in self._node_ids:
+                ps_idx = self._node_ids.index("posture_stability")
+            elif "phys_posture_stability" in self._node_ids:
+                ps_idx = self._node_ids.index("phys_posture_stability")
+            
+            if ps_idx >= 0:
+                score = float(np.mean([row[ps_idx] for row in seq]))
+            else:
+                score = 1.0 # Default if no posture variable
+                
+            self._seq_buffer.append((seq, score))
+            
             # keep overlap of T//2 for next sequence
             self._seq_obs_run = self._seq_obs_run[-(T // 2):]
             # cap buffer
@@ -709,7 +722,16 @@ class CausalGraph:
         buf = self._seq_buffer
         batch_size = min(4, len(buf))
         indices = random.sample(range(len(buf)), batch_size)
-        seqs = [buf[i] for i in indices]
+        
+        batch_items = [buf[i] for i in indices]
+        seqs = [item[0] for item in batch_items]
+        scores = [item[1] for item in batch_items]
+        
+        # Stability weights for Reward-Weighted Regression
+        # Give more weight to sequences where homeostasis was maintained
+        weights = torch.tensor(scores, dtype=torch.float32, device=self.device).view(batch_size, 1, 1)
+        # Normalize weights to avoid exploding gradients, but keep them relative
+        weights = weights / (weights.mean() + 1e-6)
 
         T = len(seqs[0])
         B = batch_size
@@ -750,8 +772,11 @@ class CausalGraph:
         else:
             l_jepa = torch.tensor(0.0, device=self.device)
 
-        # 2. Raw reconstruction (scaled; default lower than 0.5 to reduce conflict with JEPA)
-        l_rec = F.mse_loss(X_pred, X_target)
+        # 2. Raw reconstruction (weighted by homeostasis score)
+        # We want the model to prioritize learning dynamics of stable states
+        # Unstable states (falling) are noisy and less useful for control discovery
+        l_rec_elementwise = F.mse_loss(X_pred, X_target, reduction='none')
+        l_rec = (l_rec_elementwise * weights).mean()
         
         # 2.5 Multi-scale reconstruction
         if X_pred_5 is not None and T > 5:
