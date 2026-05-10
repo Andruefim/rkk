@@ -43,13 +43,13 @@ class SimulationFallMixin:
         """
         score = self._fall_recovery_score(obs)
         try:
-            max_ticks = int(os.environ.get("RKK_FALL_RECOVERY_TICKS", "200"))
+            max_ticks = int(os.environ.get("RKK_FALL_RECOVERY_TICKS", "60"))
         except ValueError:
-            max_ticks = 40
+            max_ticks = 60
         try:
-            stall_ticks = int(os.environ.get("RKK_FALL_RECOVERY_STALL_TICKS", "12"))
+            stall_ticks = int(os.environ.get("RKK_FALL_RECOVERY_STALL_TICKS", "50"))
         except ValueError:
-            stall_ticks = 12
+            stall_ticks = 50
         try:
             min_gain = float(os.environ.get("RKK_FALL_RECOVERY_MIN_GAIN", "0.02"))
         except ValueError:
