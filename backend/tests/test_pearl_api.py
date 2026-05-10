@@ -70,3 +70,27 @@ def test_value_critical_veto_injected_state():
     )
     assert res.reason.value == "critical_veto"
     os.environ.pop("RKK_VALUE_VETO", None)
+
+
+def test_acceptance_pearl_facade_l3_not_alias_l2_when_wm_moves_exogenous():
+    """Phase A: L3 restores U; L2 may differ when propagate shifts exogenous under do()."""
+    from engine.pearl_api import PearlCausalFacade
+
+    class FakeGraph:
+        def rollout_step_free(self, base):
+            return dict(base)
+
+        def propagate_from(self, base, variable, value):
+            out = dict(base)
+            out[variable] = float(value)
+            out["com_x"] = float(out.get("com_x", 0.5)) + 0.05
+            out["floor_friction"] = 0.99
+            return out
+
+    fac = PearlCausalFacade(FakeGraph())
+    base = {"com_x": 0.5, "intent_stride": 0.5, "floor_friction": 0.42}
+    iv = fac.intervene_predict(base, "intent_stride", 0.8)
+    cf = fac.counterfactual(base, "intent_stride", 0.8)
+    assert iv["floor_friction"] != base["floor_friction"]
+    assert cf["floor_friction"] == base["floor_friction"]
+    assert abs(cf["intent_stride"] - 0.8) < 1e-6 or cf["intent_stride"] != base["intent_stride"]

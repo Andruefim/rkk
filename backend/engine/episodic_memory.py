@@ -151,7 +151,6 @@ class SuccessEpisode:
     mean_posture: float
     mean_com_z: float
     physics_context: dict[str, float] = field(default_factory=dict)
-    physics_context: dict[str, float] = field(default_factory=dict)
 
     def to_llm_lines(self, idx: int) -> list[str]:
         intent_str = ", ".join(

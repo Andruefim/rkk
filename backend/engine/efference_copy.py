@@ -68,7 +68,7 @@ def split_obs_vectors(
         if modality_of_node(k) == "vision":
             v_e.append(xe)
             v_a.append(xa)
-        elif modality_of_node(k) in ("proprio", "motor_intent", "default"):
+        elif modality_of_node(k) in ("proprio", "motor_intent"):
             p_e.append(xe)
             p_a.append(xa)
     return (

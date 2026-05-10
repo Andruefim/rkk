@@ -36,6 +36,23 @@ class RollingObservationPosterior:
         self._buf: deque[np.ndarray] = deque(maxlen=self._k)
         self._last_physics: dict[str, float] = {}
 
+    def remap_node_ids(self, new_ids: list[str]) -> None:
+        """Pad/truncate history when the graph grows (neurogenesis) instead of wiping the buffer."""
+        if new_ids == self._ids:
+            return
+        oid_to_j = {n: j for j, n in enumerate(self._ids)}
+        new_buf: deque[np.ndarray] = deque(maxlen=self._k)
+        for v in self._buf:
+            nv = np.zeros(len(new_ids), dtype=np.float64)
+            for i, nid in enumerate(new_ids):
+                if nid in oid_to_j:
+                    j = oid_to_j[nid]
+                    if j < len(v):
+                        nv[i] = float(v[j])
+            new_buf.append(nv)
+        self._ids = list(new_ids)
+        self._buf = new_buf
+
     def push(
         self,
         obs_dict: dict[str, float],
@@ -72,3 +89,15 @@ class RollingObservationPosterior:
         pad = min(8, vals.size)
         tail = vals[-pad:] / (np.abs(vals[-pad:]).max() + 1e-6)
         return np.concatenate([z[: max(1, len(z) - pad)], tail])
+
+
+def physics_task_label(physics_context: dict[str, float]) -> str:
+    """Coarse string label for dynamics regime (Phase D/I episodic clustering)."""
+    gz = float(physics_context.get("gravity_z", -9.81))
+    ff = float(
+        physics_context.get(
+            "floor_lateral_friction",
+            physics_context.get("base_lateral_friction", 1.0),
+        )
+    )
+    return f"g_z={gz:.3f}|μ_floor={ff:.3f}"

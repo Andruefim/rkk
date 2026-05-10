@@ -519,9 +519,11 @@ class SimulationTickMixin:
             if pearl_context_enabled() and self.current_world == "humanoid":
                 nids = list(self.agent.graph._node_ids)
                 d_g = len(nids)
-                if self._context_posterior is None or self._context_posterior_d != d_g:
+                if self._context_posterior is None:
                     self._context_posterior = RollingObservationPosterior(nids)
-                    self._context_posterior_d = d_g
+                else:
+                    self._context_posterior.remap_node_ids(nids)
+                self._context_posterior_d = d_g
                 _phy_ctx: dict[str, float] = {}
                 try:
                     _gdp = getattr(self.agent.env, "get_dynamics_params", None)

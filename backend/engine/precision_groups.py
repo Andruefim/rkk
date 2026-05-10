@@ -46,16 +46,66 @@ def temporal_precision_routing_enabled() -> bool:
 
 
 def modality_group_for_var(name: str) -> str:
-    """Route graph variable names into coarse modality buckets."""
-    s = str(name).lower()
+    """
+    Single canonical routing key for precision / efference / HAI (Phase B, C₂).
+
+    Must match how ``weighted_squared_error_sum`` and ``default_precision_vector`` index weights.
+    """
+    s0 = str(name).strip()
+    s = s0.lower()
+    if s in ("vision", "proprio", "motor_intent", "sandbox", "vestibular", "other"):
+        return s
     if s.startswith("slot_") or "vision" in s or s.startswith("pixel"):
         return "vision"
     if s.startswith("vestibular") or "floor_friction" in s:
         return "vestibular"
     if s.startswith("intent_") or s.startswith("phys_intent"):
         return "motor_intent"
+    if any(
+        s.startswith(p)
+        for p in (
+            "cube",
+            "ball_",
+            "lever_",
+            "target_dist",
+            "stack_",
+            "stability_score",
+        )
+    ):
+        return "sandbox"
     if s.startswith("proprio") or any(
-        x in s for x in ("com_", "torso_", "foot_", "posture", "joint", "hip", "knee", "ankle")
+        x in s
+        for x in (
+            "com_",
+            "torso_",
+            "foot_",
+            "posture",
+            "joint",
+            "hip",
+            "knee",
+            "ankle",
+        )
+    ):
+        return "proprio"
+    if any(
+        s.startswith(p)
+        for p in (
+            "spine_",
+            "neck_",
+            "lhip",
+            "rhip",
+            "lknee",
+            "rknee",
+            "lankle",
+            "rankle",
+            "lshoulder",
+            "rshoulder",
+            "lelbow",
+            "relbow",
+            "gait_",
+            "support_",
+            "motor_drive",
+        )
     ):
         return "proprio"
     return "other"
@@ -69,6 +119,7 @@ class PrecisionGroupState:
     vision: float = 1.0
     vestibular: float = 1.0
     motor_intent: float = 1.0
+    sandbox: float = 1.0
     other: float = 1.0
     calib_steps: int = 0
     noise_events: deque[tuple[float, str]] = field(
@@ -81,6 +132,7 @@ class PrecisionGroupState:
             vision=self.vision,
             vestibular=self.vestibular,
             motor_intent=self.motor_intent,
+            sandbox=self.sandbox,
             other=self.other,
             calib_steps=self.calib_steps,
             noise_events=deque(self.noise_events, maxlen=self.noise_events.maxlen or 50),

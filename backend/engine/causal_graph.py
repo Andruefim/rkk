@@ -903,7 +903,9 @@ class CausalGraph:
                 lz_w = float(os.environ.get("RKK_SZ_LOSS_WEIGHT", "0.05"))
             except ValueError:
                 lz_w = 0.05
-            l_sz = lz_w * z_hat.pow(2).mean()
+            # Phase E: anti-collapse — reward variance across batch/dim, do not L2-shrink z→0
+            z_var = z_hat.var(dim=0).mean().clamp_min(1e-10)
+            l_sz = -lz_w * z_var
 
         loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1 + l_int + l_traj + l_sz
 
