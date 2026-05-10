@@ -103,10 +103,8 @@ class SimulationLocomotionMixin:
                         final_targets[k] = leg_cmd[k]
                 motor_src = "cerebellum+cpg_sync"
             else:
-                # Legacy MLP programmes (RKK_MOTOR_CORTEX_LEGACY_SPECS=1) — иначе только CPG+рефлекс
                 if (
-                    self._motor_cortex_legacy_specs_enabled()
-                    and mc is not None
+                    mc is not None
                     and len(mc.programs) > 0
                 ):
                     obs_now = dict(self.agent.env.observe())
@@ -197,6 +195,11 @@ class SimulationLocomotionMixin:
             return None
         if self._motor_cortex is None:
             self._motor_cortex = _MotorCortexLibrary(self.device)
+            for name in motor_program_specs():
+                try:
+                    self._motor_cortex.ensure_program(name)
+                except Exception:
+                    pass
         return self._motor_cortex
 
     def _ensure_reflex_stabilizer(self):

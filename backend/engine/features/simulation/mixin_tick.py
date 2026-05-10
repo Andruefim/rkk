@@ -415,6 +415,12 @@ class SimulationTickMixin:
             )
             _proprio_anomaly = self._proprio.anomaly_score
             _proprio_emp_reward = self._proprio.get_empowerment_reward()
+            # Feed empowerment reward into CPG so it's incentivized to create
+            # diverse, high-influence actions (not just stand still)
+            if self._locomotion_controller is not None and _proprio_emp_reward > 0:
+                self._locomotion_controller._reward_history.append(
+                    float(_proprio_emp_reward) * 0.3
+                )
 
             if _TIMESCALE_AVAILABLE and self._timescale is not None:
                 if self._timescale.should_run(LEVEL_REFLEX, self.tick):

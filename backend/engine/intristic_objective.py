@@ -178,6 +178,16 @@ class CausalSurprise:
             exploration_bonus = 0.3 * (1.0 - n_interventions / 500.0)
             reward += exploration_bonus
 
+        # Anti-stagnation: when rewards have been near zero, add growing
+        # exploration pressure so the agent tries new things instead of
+        # staying in a "couch potato" local optimum (standing still).
+        if len(self._reward_history) >= 100:
+            recent = list(self._reward_history)[-100:]
+            recent_abs_mean = float(np.mean([abs(r) for r in recent]))
+            if recent_abs_mean < 0.02:
+                stagnation_bonus = 0.15 * (1.0 - recent_abs_mean / 0.02)
+                reward += stagnation_bonus
+
         if comp_norm > 0:
             self.total_discoveries += 1
 

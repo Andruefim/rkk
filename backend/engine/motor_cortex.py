@@ -221,9 +221,7 @@ _LEGACY_PROGRAM_SPECS = {
 }
 
 def motor_program_specs() -> dict[str, Any]:
-    """Захардкоженные MLP-программы только при RKK_MOTOR_CORTEX_LEGACY_SPECS=1."""
-    if not _env_bool("RKK_MOTOR_CORTEX_LEGACY_SPECS", False):
-        return {}
+    """Motor program specs are always available for learning from CPG."""
     return dict(_LEGACY_PROGRAM_SPECS)
 
 # ── Motor Cortex Library ──────────────────────────────────────────────────────

@@ -142,6 +142,7 @@ except ImportError:
 # Motor Cortex import (lazy — инициализируется при первом вызове)
 try:
     from engine.motor_cortex import MotorCortexLibrary as _MotorCortexLibrary
+    from engine.motor_cortex import motor_program_specs
 
     _MOTOR_CORTEX_AVAILABLE = True
 except ImportError:
