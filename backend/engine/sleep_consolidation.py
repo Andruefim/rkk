@@ -806,6 +806,13 @@ class SleepController:
             self._sessions.append(session)
             print(f"[Sleep] ✅ {session.summary()}")
 
+        em = getattr(sim, "_episodic_memory", None)
+        if em is not None and session:
+            try:
+                em.on_sleep_complete(tick, session)
+            except Exception:
+                pass
+
         self._phase = SleepPhase.AWAKE
         self.last_sleep_tick = tick
         self._falls_since_sleep = 0

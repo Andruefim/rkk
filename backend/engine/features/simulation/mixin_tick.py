@@ -503,6 +503,18 @@ class SimulationTickMixin:
         # Level 2-D: Episodic Memory
         self._update_episodic_memory(self.tick, _obs_for_d_e, fallen, _posture_now)
 
+        # Living Memory: непрерывная временная шкала (humanoid), до curriculum-тика
+        if self.current_world == "humanoid" and self._episodic_memory is not None:
+            _cn = None
+            if self._curriculum is not None:
+                try:
+                    _cn = self._curriculum.current_stage.name
+                except Exception:
+                    _cn = None
+            self._episodic_memory.append_timeline_tick(
+                self.tick, _obs_for_d_e, fallen, _posture_now, _cn
+            )
+
         # Level 2-E: Curriculum
         self._tick_curriculum(self.tick, _obs_for_d_e, fallen)
 

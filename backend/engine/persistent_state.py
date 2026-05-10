@@ -98,6 +98,9 @@ class PersistentMeta:
     fall_patterns: list[dict] = field(default_factory=list)
     skill_success_rates: dict[str, float] = field(default_factory=dict)
 
+    # Living Memory — семантические буллеты (автобиография между сессиями)
+    semantic_narrative: list[str] = field(default_factory=list)
+
     # Physical curriculum
     mastered_skills: list[str] = field(default_factory=list)
     failed_skills: list[str] = field(default_factory=list)
@@ -242,6 +245,7 @@ def collect_meta_from_simulation(sim) -> PersistentMeta:
             {"desc": p.description[:100], "conf": round(p.confidence, 3)}
             for p in sim._episodic_memory._patterns[:5]
         ]
+        meta.semantic_narrative = sim._episodic_memory.semantic_narrative_list()[-48:]
 
     # Sleep
     if sim._sleep_ctrl is not None:
@@ -311,6 +315,8 @@ def restore_meta_to_simulation(sim, meta: PersistentMeta) -> None:
     if sim._episodic_memory is not None:
         sim._episodic_memory.total_falls_recorded = meta.total_falls
         sim._episodic_memory.total_successes_recorded = meta.total_successes
+        if getattr(meta, "semantic_narrative", None):
+            sim._episodic_memory.restore_semantic_narrative(list(meta.semantic_narrative))
 
     # Sleep
     if sim._sleep_ctrl is not None:

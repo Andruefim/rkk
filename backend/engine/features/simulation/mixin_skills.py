@@ -332,6 +332,16 @@ class SimulationSkillsMixin:
         if getattr(self, "_intrinsic", None) and hasattr(self._intrinsic, "get_target_priors"):
             intrinsic_priors = self._intrinsic.get_target_priors(obs_before_full)
             target_priors.update(intrinsic_priors)
+
+        # Living Memory: поправки приоров из эпизодической памяти (паттерны падений / окна)
+        em = getattr(self, "_episodic_memory", None)
+        if em is not None:
+            try:
+                mem_adj = em.retrieve_prior_adjustments(obs_before_full)
+                for k, v in mem_adj.items():
+                    target_priors[k] = float(v)
+            except Exception:
+                pass
         
         # Инверсия модели: какие действия приведут к target_priors?
         actions = ctrl.optimize_action(obs_before_full, self.agent.graph, target_priors)

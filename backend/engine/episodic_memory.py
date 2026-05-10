@@ -1,8 +1,14 @@
 """
-episodic_memory.py — Level 2-D: Episodic Fall Memory.
+episodic_memory.py — Level 2-D: Episodic Fall Memory + Living Memory thread.
 
 Агент запоминает эпизоды падений с полным контекстом и использует
 эту память для улучшения LLM L2 консультаций и собственного обучения.
+
+Living Memory (человекоподобная нить опыта):
+  - timeline: компактная шкала времени (posture, fall, curriculum) каждый тик humanoid
+  - semantic_narrative: короткие «буллеты» из консолидации окон и фазы сна
+  - retrieve_prior_adjustments(obs): мягкие поправки к гомеостатическим приорам Active Inference
+  - сохранение narrative в autosave.meta (persistent_state)
 
 Архитектура:
   EpisodicFallMemory — хранит deque(maxlen=50) эпизодов падений:
@@ -31,6 +37,10 @@ RKK_EPISODE_FALL_MAXLEN=50     — размер буфера падений
 RKK_EPISODE_SUCCESS_MAXLEN=30  — размер буфера успехов
 RKK_EPISODE_PRETRIGGER=8       — тиков истории до падения
 RKK_EPISODE_PATTERN_MIN=3      — min повторений для паттерна
+
+Living Memory:
+  RKK_LIVING_MEMORY_TRACE=1      — шкала времени (timeline) для humanoid
+  RKK_LIVING_MEMORY_CONSOLIDATE_EVERY=400 — тиков между свёрткой в semantic bullets
 """
 from __future__ import annotations
 
@@ -65,7 +75,26 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def living_memory_trace_enabled() -> bool:
+    return os.environ.get("RKK_LIVING_MEMORY_TRACE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 # ── Dataclasses ────────────────────────────────────────────────────────────────
+@dataclass
+class TimelineEntry:
+    tick: int
+    posture: float
+    fallen: bool
+    curriculum: str | None
+    com_z: float
+    summary: str
+
+
 @dataclass
 class FallEpisode:
     tick: int
@@ -264,6 +293,115 @@ class EpisodicMemory:
         self.total_falls_recorded: int = 0
         self.total_successes_recorded: int = 0
 
+        # Living Memory — непрерывная «жизнь» в симуляции (humanoid)
+        self._timeline: deque[TimelineEntry] = deque(maxlen=_env_int("RKK_LIVING_TIMELINE_MAX", 1024))
+        self._semantic_narrative: deque[str] = deque(
+            maxlen=_env_int("RKK_LIVING_SEMANTIC_MAX", 48)
+        )
+        self._consolidate_every: int = _env_int("RKK_LIVING_MEMORY_CONSOLIDATE_EVERY", 400)
+        self._last_consolidate_tick: int = -999999
+
+    def restore_semantic_narrative(self, bullets: list[str]) -> None:
+        """После загрузки autosave.meta."""
+        self._semantic_narrative.clear()
+        for b in bullets[: self._semantic_narrative.maxlen or 48]:
+            if isinstance(b, str) and b.strip():
+                self._semantic_narrative.append(b.strip()[:240])
+
+    def semantic_narrative_list(self) -> list[str]:
+        return list(self._semantic_narrative)
+
+    def append_timeline_tick(
+        self,
+        tick: int,
+        obs: dict[str, float],
+        fallen: bool,
+        posture: float,
+        curriculum_name: str | None = None,
+    ) -> None:
+        """Вызывать каждый тик на humanoid (включая fixed_root если trace включён)."""
+        if not living_memory_trace_enabled():
+            return
+        cz = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
+        cn = (curriculum_name or "").strip()[:40] or None
+        summ = f"t={tick} ps={posture:.2f} cz={cz:.2f} fall={int(fallen)} cur={cn or '-'}"
+
+        self._timeline.append(
+            TimelineEntry(
+                tick=tick,
+                posture=float(posture),
+                fallen=bool(fallen),
+                curriculum=cn,
+                com_z=cz,
+                summary=summ,
+            )
+        )
+        if tick - self._last_consolidate_tick >= self._consolidate_every:
+            self._consolidate_timeline_to_semantic(tick)
+            self._last_consolidate_tick = tick
+
+    def _consolidate_timeline_to_semantic(self, tick: int) -> None:
+        if len(self._timeline) < 40:
+            return
+        chunk = list(self._timeline)[-min(120, len(self._timeline)) :]
+        mean_ps = float(np.mean([e.posture for e in chunk]))
+        falls_n = sum(1 for e in chunk if e.fallen)
+        rng = f"{chunk[0].tick}–{chunk[-1].tick}"
+        bullet = (
+            f"[window {rng}] mean_posture={mean_ps:.2f}, falls_window={falls_n}/{len(chunk)}"
+        )
+        if self._semantic_narrative and self._semantic_narrative[-1] == bullet:
+            return
+        # Не засорять память «пустыми» плато
+        if falls_n == 0 and 0.58 <= mean_ps <= 0.74:
+            return
+        self._semantic_narrative.append(bullet[:240])
+
+    def on_sleep_complete(self, tick: int, session: Any) -> None:
+        """После фазы сна — закрепить эпизод консолидации в семантической памяти."""
+        if not living_memory_trace_enabled() and not episode_memory_enabled():
+            return
+        rem = int(getattr(session, "rem_episodes_replayed", 0) or 0)
+        pruned = int(getattr(session, "edges_pruned", 0) or 0)
+        verbal = str(getattr(session, "lesson_verbal", "") or "")[:120].replace("\n", " ")
+        self._semantic_narrative.append(
+            f"sleep_consolidation@{tick}: REM_ep={rem}, pruned_edges={pruned}, lesson='{verbal}'"
+        )
+
+    def retrieve_prior_adjustments(self, obs: dict[str, float]) -> dict[str, float]:
+        """
+        Мягкие поправки к ключам phys_* для Active Inference (узкий диапазон).
+        Основаны на выученных паттернах падений и недавней средней стабильности.
+        """
+        out: dict[str, float] = {}
+        posture = float(
+            obs.get("posture_stability", obs.get("phys_posture_stability", 0.5))
+        )
+
+        if episode_memory_enabled():
+            for p in self._patterns:
+                desc = p.description.lower()
+                conf = float(p.confidence)
+                if conf < 0.28:
+                    continue
+                if "overstride" in desc:
+                    out["phys_com_x_vel"] = min(out.get("phys_com_x_vel", 0.40), 0.22)
+                if "backward" in desc and "stride" in desc:
+                    out["phys_com_z"] = max(out.get("phys_com_z", 0.80), 0.84)
+                if "uneven" in desc or "support" in desc:
+                    out["phys_posture_stability"] = max(
+                        out.get("phys_posture_stability", 0.97), 1.0
+                    )
+
+        if len(self._timeline) >= 24:
+            tail = list(self._timeline)[-24:]
+            mps = float(np.mean([e.posture for e in tail]))
+            if mps < 0.52 and posture < 0.58:
+                out["phys_posture_stability"] = 1.0
+                out["phys_com_z"] = max(out.get("phys_com_z", 0.78), 0.83)
+
+        return out
+
     def tick_update(
         self,
         tick: int,
@@ -410,38 +548,44 @@ class EpisodicMemory:
         """
         Returns formatted memory context for LLM L2 / embodied reward prompts.
         """
-        if not episode_memory_enabled():
-            return ""
-
         lines: list[str] = []
 
-        # Recent falls
-        recent_falls = list(self.falls)[-max_falls:]
-        if recent_falls:
-            lines.append(f"FALL HISTORY (last {len(recent_falls)} of {len(self.falls)} total):")
-            for i, ep in enumerate(recent_falls):
-                lines.extend(ep.to_llm_lines(i + 1))
+        if episode_memory_enabled():
+            # Recent falls
+            recent_falls = list(self.falls)[-max_falls:]
+            if recent_falls:
+                lines.append(f"FALL HISTORY (last {len(recent_falls)} of {len(self.falls)} total):")
+                for i, ep in enumerate(recent_falls):
+                    lines.extend(ep.to_llm_lines(i + 1))
+                    lines.append("")
+
+            # Patterns
+            if self._patterns:
+                lines.append("DETECTED PATTERNS:")
+                for p in self._patterns[:3]:
+                    lines.append(f"  [conf={p.confidence:.2f}] {p.description}")
                 lines.append("")
 
-        # Patterns
-        if self._patterns:
-            lines.append("DETECTED PATTERNS:")
-            for p in self._patterns[:3]:
-                lines.append(f"  [conf={p.confidence:.2f}] {p.description}")
+            # Recent successes
+            recent_success = list(self.successes)[-max_successes:]
+            if recent_success:
+                lines.append(f"STABLE WALKING EPISODES (last {len(recent_success)}):")
+                for i, ep in enumerate(recent_success):
+                    lines.extend(ep.to_llm_lines(i + 1))
+                lines.append("")
+
+            lines.append(f"STATISTICS: {self.total_falls_recorded} total falls, "
+                         f"{self.total_successes_recorded} stable walk episodes recorded.")
+
+        # Autobiographical semantic narrative (works even when fall buffers are sparse)
+        if self._semantic_narrative:
             lines.append("")
+            lines.append("AUTOBIOGRAPHY (consolidated lived experience):")
+            for b in list(self._semantic_narrative)[-12:]:
+                lines.append(f"  • {b}")
 
-        # Recent successes
-        recent_success = list(self.successes)[-max_successes:]
-        if recent_success:
-            lines.append(f"STABLE WALKING EPISODES (last {len(recent_success)}):")
-            for i, ep in enumerate(recent_success):
-                lines.extend(ep.to_llm_lines(i + 1))
-            lines.append("")
-
-        # Summary stats
-        lines.append(f"STATISTICS: {self.total_falls_recorded} total falls, "
-                     f"{self.total_successes_recorded} stable walk episodes recorded.")
-
+        if not lines:
+            return ""
         return "\n".join(lines)
 
     def get_seeds_from_patterns(self, valid_vars: set[str]) -> list[dict]:
@@ -465,6 +609,7 @@ class EpisodicMemory:
     def snapshot(self) -> dict[str, Any]:
         return {
             "enabled": episode_memory_enabled(),
+            "living_trace": living_memory_trace_enabled(),
             "total_falls": self.total_falls_recorded,
             "total_successes": self.total_successes_recorded,
             "buffered_falls": len(self.falls),
@@ -476,4 +621,6 @@ class EpisodicMemory:
                 for p in self._patterns
             ],
             "recent_fall_causes": [ep.cause for ep in list(self.falls)[-5:]],
+            "timeline_len": len(self._timeline),
+            "semantic_narrative_preview": list(self._semantic_narrative)[-6:],
         }
