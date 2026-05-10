@@ -469,11 +469,20 @@ class EnvironmentHumanoid:
         stride = float(ms.get("intent_stride", 0.5))
         torso = float(ms.get("intent_torso_forward", 0.5))
         arm_cb = float(ms.get("intent_arm_counterbalance", 0.5))
+        lean = float(ms.get("intent_lean_forward", 0.5))
 
         if self._fixed_root:
             self._sim.set_joint(
                 "spine_pitch",
-                float(np.clip(0.5 + (torso - 0.5) * 0.5, 0.05, 0.95)),
+                float(
+                    np.clip(
+                        0.5
+                        + (torso - 0.5) * 0.5
+                        + (lean - 0.5) * 0.25,
+                        0.05,
+                        0.95,
+                    )
+                ),
             )
             self._sim.set_joint(
                 "lshoulder",
@@ -513,9 +522,18 @@ class EnvironmentHumanoid:
         self._sim.set_joint("lankle", ankle)
         self._sim.set_joint("rankle", ankle)
 
+        # Как _apply_upper_body_from_intents: torso + lean → spine_pitch
         self._sim.set_joint(
             "spine_pitch",
-            float(np.clip(0.5 + (torso - 0.5) * 0.55, 0.05, 0.95)),
+            float(
+                np.clip(
+                    0.5
+                    + (torso - 0.5) * 0.55
+                    + (lean - 0.5) * 0.28,
+                    0.05,
+                    0.95,
+                )
+            ),
         )
         self._sim.set_joint(
             "lshoulder",

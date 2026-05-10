@@ -1077,9 +1077,11 @@ class _PyBulletHumanoid(InstrumentalSandbox):
 
     def get_joint_angle(self, var_name: str) -> float:
         if var_name == "neck_yaw":   return float(self._neck_euler[2])
-        if var_name == "neck_pitch": return float(self._neck_euler[0])
+        # Должно совпадать с set_joint: neck_pitch пишет в _neck_euler[1]
+        if var_name == "neck_pitch": return float(self._neck_euler[1])
         if var_name == "spine_yaw":  return float(self._spine_euler[2])
-        if var_name == "spine_pitch":return float(self._spine_euler[0])
+        # Должно совпадать с set_joint: spine_pitch пишет в _spine_euler[1]
+        if var_name == "spine_pitch": return float(self._spine_euler[1])
         if var_name not in self.joint_by_var:
             return 0.0
         jid = self.joint_by_var[var_name]
