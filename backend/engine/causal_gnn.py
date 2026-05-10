@@ -44,6 +44,7 @@ LeWM integration (Фаза N):
 from __future__ import annotations
 
 import math
+import os
 import warnings
 import torch
 import torch.nn as nn
@@ -244,6 +245,14 @@ class CausalGNNCore(nn.Module):
         self.target_enc.load_state_dict(self.node_enc.state_dict())
         for p in self.target_enc.parameters():
             p.requires_grad = False
+
+        try:
+            self._sz_dim = max(4, min(128, int(os.environ.get("RKK_SZ_DIM", "16"))))
+        except ValueError:
+            self._sz_dim = 16
+        self.sz_head_z = nn.Linear(d * hidden, self._sz_dim)
+        nn.init.xavier_uniform_(self.sz_head_z.weight, gain=0.12)
+        nn.init.zeros_(self.sz_head_z.bias)
 
         # No-self-loop mask
         mask = 1.0 - torch.eye(d, device=device)

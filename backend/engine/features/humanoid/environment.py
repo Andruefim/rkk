@@ -100,6 +100,17 @@ class EnvironmentHumanoid:
         else:
             self._sim.fixed_root = enabled
 
+    def get_dynamics_params(self) -> dict[str, float]:
+        """Physics regime snapshot for episodic ``physics_context`` (mass, friction, gravity, …)."""
+        fn = getattr(self._sim, "get_dynamics_params", None)
+        if callable(fn):
+            return dict(fn())
+        return {
+            "schema_version": 1.0,
+            "backend": 0.0 if self._backend == "fallback" else 1.0,
+            "fixed_root": 1.0 if self._fixed_root else 0.0,
+        }
+
     def apply_random_perturbation(self, max_force: float = 80.0) -> None:
         if isinstance(self._sim, _PyBulletHumanoid):
             self._sim.apply_random_perturbation(max_force)

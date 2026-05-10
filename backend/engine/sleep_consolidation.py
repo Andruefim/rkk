@@ -207,7 +207,18 @@ class REMReplay:
         if episodic_memory is None or not episodic_memory.falls:
             return 0, 0.0, 0.0
 
-        episodes = list(episodic_memory.falls)
+        try:
+            kk = max(1, int(os.environ.get("RKK_SLEEP_REM_TOP_K", "32")))
+        except ValueError:
+            kk = 32
+        sort_surprise = os.environ.get(
+            "RKK_SLEEP_REM_SURPRISE_SORT", "1"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if sort_surprise and hasattr(episodic_memory, "get_top_k_by_surprise"):
+            episodes = episodic_memory.get_top_k_by_surprise(kk)
+        else:
+            episodes = list(episodic_memory.falls)[-min(20, len(episodic_memory.falls)) :]
+
         if not episodes:
             return 0, 0.0, 0.0
 
@@ -234,7 +245,7 @@ class REMReplay:
         losses_after = []
 
         n_replayed = 0
-        for ep in episodes[-20:]:  # last 20 fall episodes
+        for ep in episodes:
             # X_before: state before fall
             obs_before = ep.obs_before
             obs_fall = ep.obs_at_fall
@@ -300,6 +311,58 @@ class REMReplay:
             torch.cuda.empty_cache()
 
         return n_replayed, l_before, l_after
+
+    def replay_top_surprise_wm_train(
+        self,
+        episodic_memory,
+        graph,
+        k: int = 8,
+    ) -> int:
+        """
+        REM → WM: ``train_step`` on top-k fall episodes by surprise (Phase D).
+        Requires episodic ``physics_context`` / ranking from EpisodeMemory.
+        """
+        if episodic_memory is None:
+            return 0
+        if os.environ.get("RKK_REM_WM_TRAIN", "0").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return 0
+        core = getattr(graph, "_core", None)
+        optim = getattr(graph, "_optim", None)
+        if core is None or optim is None:
+            return 0
+        try:
+            k = max(1, int(os.environ.get("RKK_REM_WM_TOP_K", str(k))))
+        except ValueError:
+            k = 8
+        eps = episodic_memory.get_top_k_by_surprise(k)
+        if not eps:
+            return 0
+        node_ids = list(graph._node_ids)
+        n_ok = 0
+
+        def _row(obs: dict[str, float]) -> list[float]:
+            return [float(obs.get(n, graph.nodes.get(n, 0.5))) for n in node_ids]
+
+        for ep in eps:
+            try:
+                v0 = _row(ep.obs_before)
+                v1 = _row(ep.obs_at_fall)
+                graph.record_observation({node_ids[i]: v0[i] for i in range(len(node_ids))})
+                graph.record_observation({node_ids[i]: v1[i] for i in range(len(node_ids))})
+                tr = graph.train_step()
+                if tr is not None:
+                    n_ok += 1
+            except Exception:
+                continue
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return n_ok
 
     def inject_mocap_dreams(self, graph, n_steps: int = 150, sim: Any | None = None) -> int:
         """
@@ -634,7 +697,14 @@ class SleepController:
                 session.rem_loss_before = l_before
                 session.rem_loss_after = l_after
                 print(f"[Sleep] REM: replayed {n} episodes, loss {l_before:.4f}→{l_after:.4f}")
-                
+
+                n_wm = self._rem_replayer.replay_top_surprise_wm_train(
+                    getattr(sim, "_episodic_memory", None),
+                    sim.agent.graph,
+                )
+                if n_wm > 0:
+                    print(f"[Sleep] REM: WM train_step on top-surprise batches (ok={n_wm})")
+
                 # ИНЪЕКЦИЯ СНОВ О ХОДЬБЕ (Physical Priors)
                 n_mocap = self._rem_replayer.inject_mocap_dreams(sim.agent.graph, n_steps=150)
                 print(f"[Sleep] REM: injected {n_mocap} steps of MoCap dreams (Walking manifold learned)")

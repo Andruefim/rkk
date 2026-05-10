@@ -68,6 +68,23 @@ def _jepa_latent_loss(H_pred: torch.Tensor, H_target: torch.Tensor) -> torch.Ten
 
 from engine.environment_humanoid import HUMANOID_KINEMATIC_EDGE_PRIORS
 from engine.graph_constants import is_read_only_macro_var
+from engine.pearl_constants import (
+    default_exogenous_node_ids,
+    exogenous_ids_for_graph,
+    pearl_api_enabled,
+)
+
+
+def sz_split_enabled() -> bool:
+    """Phase E: dual heads s (transition latent) / z (task context) over shared embeddings."""
+    return os.environ.get("RKK_SZ_SPLIT", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 from engine.wm_neural_ode import integrate_world_model_step
 
 # ── Переключение ядра ─────────────────────────────────────────────────────────
@@ -691,6 +708,36 @@ class CausalGraph:
 
         return h_W, l_dag, l_l1
 
+    def _apply_sz_split_param_requires_grad(self) -> None:
+        """Phase E: first N train steps train only ``sz_head_z`` (z), freeze s-path modules."""
+        core = self._unwrap_gnn_core()
+        if core is None or not hasattr(core, "sz_head_z"):
+            return
+        if not sz_split_enabled():
+            for p in core.parameters():
+                p.requires_grad = True
+            return
+        try:
+            lim = int(os.environ.get("RKK_SZ_FREEZE_S_STEPS", "1000"))
+        except ValueError:
+            lim = 1000
+        freeze_s = len(self.train_losses) < lim
+        if not freeze_s:
+            for p in core.parameters():
+                p.requires_grad = True
+            return
+        for p in core.parameters():
+            p.requires_grad = False
+        for p in core.sz_head_z.parameters():
+            p.requires_grad = True
+
+    def _reset_all_core_requires_grad(self) -> None:
+        core = self._unwrap_gnn_core()
+        if core is None:
+            return
+        for p in core.parameters():
+            p.requires_grad = True
+
     def _finish_train_step(self, loss: torch.Tensor) -> None:
         """Shared backward + optimizer step for both training modes."""
         loss.backward()
@@ -702,6 +749,7 @@ class CausalGraph:
         self.train_losses.append(loss.item())
         if len(self.train_losses) > 100:
             self.train_losses.pop(0)
+        self._reset_all_core_requires_grad()
 
     def _train_step_seq(self) -> dict[str, float] | None:
         """
@@ -752,6 +800,7 @@ class CausalGraph:
                 A_seq[:, :, i] = X_seq[:, :, i]
 
         self._optim.zero_grad()
+        self._apply_sz_split_param_requires_grad()
 
         # ── Parallel forward (LeWM core) ──────────────────────────────────────
         X_pred, H_pred, Z_flat, X_pred_5, X_pred_20 = self.forward_dynamics_seq(X_seq, A_seq)
@@ -839,7 +888,24 @@ class CausalGraph:
                 self._traj_head, self.device,
             )
 
-        loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1 + l_int + l_traj
+        l_sz = torch.tensor(0.0, device=self.device)
+        core_um = self._unwrap_gnn_core()
+        if (
+            sz_split_enabled()
+            and core_um is not None
+            and hasattr(core_um, "sz_head_z")
+            and H_pred.numel() > 0
+        ):
+            bp, tp, dp_, hp = H_pred.shape
+            flat_h = H_pred.reshape(bp * tp, dp_ * hp)
+            z_hat = core_um.sz_head_z(flat_h)
+            try:
+                lz_w = float(os.environ.get("RKK_SZ_LOSS_WEIGHT", "0.05"))
+            except ValueError:
+                lz_w = 0.05
+            l_sz = lz_w * z_hat.pow(2).mean()
+
+        loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1 + l_int + l_traj + l_sz
 
         self._finish_train_step(loss)
 
@@ -861,6 +927,7 @@ class CausalGraph:
             "l_l1":    round(l_l1.item(), 5),
             "l_int":   round(l_int.item(), 5),
             "l_traj":  round(l_traj.item(), 5),
+            "l_sz":    round(l_sz.item(), 5),
             "h_W":     round(h_W.item(), 5),
             "mode":    "seq",
             "batch_B": B,
@@ -1150,6 +1217,80 @@ class CausalGraph:
         with torch.no_grad():
             pred = integrate_world_model_step(self, state_vec, z)
         return {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
+
+    # ── Pearl-style API (Phase A): L1/L2/L3 ───────────────────────────────────
+    def observe_predict(self, base: dict[str, float] | None = None) -> dict[str, float]:
+        """
+        Pearl **L1** (associational / observational one-step): passive dynamics Ẋ = f(X, 0).
+        Same as ``rollout_step_free``: no intervention; differs from conditional rollout that
+        mutates multiple latent mechanisms — here only the WM transition map applies once.
+        """
+        src = base if base is not None else self.nodes
+        return self.rollout_step_free(dict(src))
+
+    def intervene_predict(
+        self,
+        base: dict[str, float],
+        variable: str,
+        value: float,
+    ) -> dict[str, float]:
+        """
+        Pearl **L2** / ``do()`` prediction: one-step effect of hard intervention on ``variable``.
+        Wraps ``propagate_from`` → ``forward_dynamics`` / Neural ODE integrator.
+        """
+        return self.propagate_from(dict(base), variable, float(value))
+
+    def predict_after_do(
+        self,
+        base: dict[str, float],
+        variable: str,
+        value: float,
+    ) -> dict[str, float]:
+        """Alias for ``intervene_predict`` (backward-compatible name)."""
+        return self.intervene_predict(base, variable, value)
+
+    def counterfactual_predict(
+        self,
+        base: dict[str, float],
+        variable: str,
+        value: float,
+        exogenous_ids: frozenset[str] | None = None,
+    ) -> dict[str, float]:
+        """
+        Pearl **L3**-style atomic counterfactual (explicit U):
+
+        1. Compute post-intervention prediction via the structural WM (same as L2).
+        2. **Clamp** every coordinate in **U** (exogenous / environmental noise slots listed in
+           ``RKK_EXOGENOUS_NODE_IDS`` + defaults in ``pearl_constants``) back to its **factual**
+           value from ``base``.
+
+        This avoids pseudo-L3 where the entire state vector is frozen; only exogenous channels
+        are held to the factual world, while endogenous predictions respond to ``do(variable)``.
+        Full Pearl counterfactuals additionally require abduction over U from evidence — not
+        implemented here; **U must be explicitly labeled**.
+        """
+        pred = self.intervene_predict(base, variable, value)
+        if exogenous_ids is not None:
+            u_set = frozenset(exogenous_ids)
+        else:
+            u_set = exogenous_ids_for_graph(self._node_ids)
+            if not u_set:
+                u_base = default_exogenous_node_ids()
+                u_set = frozenset(n for n in self._node_ids if n in u_base)
+        out = dict(pred)
+        for uid in u_set:
+            if uid in base:
+                out[uid] = float(base[uid])
+        return out
+
+    def pearl_snapshot(self) -> dict:
+        """Diagnostics when ``RKK_PEARL_API`` enabled."""
+        u = sorted(exogenous_ids_for_graph(self._node_ids))
+        return {
+            "pearl_api": pearl_api_enabled(),
+            "exogenous_U": u,
+            "d": self._d,
+        }
 
     # ── LeWM: Differentiable propagation + CEM planner ────────────────────────
 

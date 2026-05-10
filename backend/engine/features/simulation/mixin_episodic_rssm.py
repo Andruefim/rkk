@@ -24,12 +24,21 @@ class SimulationEpisodicRssmMixin:
         if self.current_world != "humanoid" or self._fixed_root_active:
             return
 
+        physics_ctx: dict[str, float] = {}
+        try:
+            fn = getattr(self.agent.env, "get_dynamics_params", None)
+            if callable(fn):
+                physics_ctx = dict(fn())
+        except Exception:
+            physics_ctx = {}
+
         self._episodic_memory.tick_update(
             tick=tick,
             obs=obs,
             last_action=self._last_action_for_memory,
             fallen=fallen,
             posture=posture,
+            physics_context=physics_ctx,
         )
 
         if fallen and (tick - self._last_fall_memory_tick) > 5:
@@ -52,7 +61,7 @@ class SimulationEpisodicRssmMixin:
                 }
             except Exception:
                 pass
-            ep = self._episodic_memory.on_fall(tick, obs, intents)
+            ep = self._episodic_memory.on_fall(tick, obs, intents, physics_context=physics_ctx)
             if ep is not None:
                 self._last_fall_memory_tick = tick
                 seeds = self._episodic_memory.get_seeds_from_patterns(

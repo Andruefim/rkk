@@ -48,7 +48,12 @@ from engine.graph_constants import is_read_only_macro_var
 from engine.environment  import Environment
 from engine.system1      import System1
 from engine.temporal     import TemporalBlankets
-from engine.value_layer  import ValueLayer, HomeostaticBounds, BlockReason
+from engine.value_layer  import (
+    ValueLayer,
+    HomeostaticBounds,
+    BlockReason,
+    efference_predicted_veto,
+)
 from engine.phase3_teacher import TeacherIGRule
 from engine.environment_humanoid import SELF_VARS
 from engine.goal_planning import (
@@ -84,6 +89,42 @@ MAX_FALLBACK_TRIES = 5  # больше кандидатов, чтобы прой
 # Вес slot_* в actual_ig для System 1; основной сигнал — не-визуальные узлы (RKK_VISUAL_IG_WEIGHT=0 → только физика).
 VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.1"))
 _SELF_VAR_SET = frozenset(SELF_VARS)
+
+
+def _efference_copy_enabled() -> bool:
+    return os.environ.get("RKK_EFFERENCE_COPY", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _scalar_prediction_error(
+    observed_env: dict[str, Any],
+    predicted: dict[str, Any],
+) -> float:
+    """Mean |pred−obs| over env keys, or √(weighted mean precision×err²) when ``RKK_PRECISION_GROUPS``."""
+    from engine.precision_channels import (
+        default_precision_vector,
+        precision_groups_enabled,
+        weighted_squared_error_sum,
+    )
+
+    err_dict: dict[str, float] = {}
+    for k, v in observed_env.items():
+        try:
+            err_dict[str(k)] = abs(float(predicted.get(k, 0.0)) - float(v))
+        except (TypeError, ValueError):
+            continue
+    if not err_dict:
+        return 0.0
+    if precision_groups_enabled():
+        ws = weighted_squared_error_sum(
+            err_dict.keys(), err_dict, precisions=default_precision_vector()
+        )
+        return float(np.clip(np.sqrt(ws / len(err_dict)), 0.0, 1.5))
+    return float(np.mean(list(err_dict.values())))
 
 
 def _intervention_bootstrap_ticks() -> int:
@@ -1758,6 +1799,32 @@ class RKKAgent:
         self.graph.apply_env_observation(obs_before_env)
         obs_before_full = self.graph.snapshot_vec_dict()
         predicted  = self.graph.propagate(var, value)
+        _fixed_root_now = bool(
+            getattr(self.value_layer.bounds, "fixed_root_mode", False)
+            or _env_fixed_root_flag(self.env)
+            or _graph_fixed_root_flag(self.graph.nodes)
+        )
+        _ev_block, _ev_msg = efference_predicted_veto(
+            var, dict(predicted), fixed_root=_fixed_root_now
+        )
+        if _ev_block:
+            _report_if_slow_tick()
+            self._total_blocked += 1
+            self._last_blocked_reason = "efference_predicted_veto"
+            return {
+                "blocked": True,
+                "blocked_count": blocked_count + 1,
+                "reason": "efference_predicted_veto",
+                "message": _ev_msg,
+                "variable": var,
+                "value": float(value),
+                "updated_edges": [],
+                "compression_delta": 0.0,
+                "prediction_error": 0.0,
+                "cf_predicted": {},
+                "cf_observed": {},
+                "goal_planned": False,
+            }
         sym_ok, sym_fail = True, []
         if symbolic_verifier_enabled():
             sym_ok, sym_fail = verify_normalized_prediction(dict(predicted), self.env)
@@ -1864,11 +1931,7 @@ class RKKAgent:
         )
         is_fallen = posture_now < _ig_fallen_posture_th()
 
-        is_fixed_root = bool(
-            getattr(self.value_layer.bounds, "fixed_root_mode", False)
-            or _env_fixed_root_flag(self.env)
-            or _graph_fixed_root_flag(self.graph.nodes)
-        )
+        is_fixed_root = _fixed_root_now
 
         # Падение и fixed_root: homeostatic (posture/com/foot) часто константы → joint PE×gain.
         use_joint_ig = is_fallen or is_fixed_root
@@ -1989,6 +2052,28 @@ class RKKAgent:
         rsi_event = self._tick_rsi_lite_discovery(cur_dr)
 
         _cf_keys = list(self.graph._node_ids)[:48]
+        _eff = None
+        if _efference_copy_enabled():
+            try:
+                from engine.efference_copy import efference_correlation_report
+
+                _eff = efference_correlation_report(
+                    dict(predicted), dict(observed_full)
+                )
+            except Exception:
+                _eff = None
+        if (
+            _eff is not None
+            and not _eff.get("ok", True)
+            and os.environ.get("RKK_PRECISION_DOWN_ON_EFFERENCE", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            try:
+                from engine.precision_groups import get_precision_state
+
+                get_precision_state().decay_vision(0.85)
+            except Exception:
+                pass
         self._last_result = {
             "blocked":           False,
             "blocked_count":     blocked_count,
@@ -1997,9 +2082,7 @@ class RKKAgent:
             "compression_delta": compression_delta,
             "updated_edges":     self._first_significant_edge_labels(4),
             "pruned_edges":      [],
-            "prediction_error":  float(np.mean([
-                abs(predicted.get(k, 0) - v) for k, v in observed_env.items()
-            ])),
+            "prediction_error":  _scalar_prediction_error(observed_env, predicted),
             "cf_predicted": {k: float(round(float(predicted.get(k, 0.0)), 4)) for k in _cf_keys},
             "cf_observed":  {k: float(round(float(observed_full.get(k, 0.0)), 4)) for k in _cf_keys},
             "goal_planned":  bool(chosen.get("from_goal_plan")),
@@ -2008,6 +2091,7 @@ class RKKAgent:
             "symbolic_violations": sym_fail,
             "rsi_lite": rsi_event,
             "notears":           notears_result,
+            "efference": _eff,
         }
         _report_if_slow_tick()
         return self._last_result

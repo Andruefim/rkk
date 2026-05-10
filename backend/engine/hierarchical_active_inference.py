@@ -23,6 +23,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from engine.precision_groups import routing_weights_for_hai, temporal_precision_routing_enabled
+
 
 def hierarchical_pe_enabled() -> bool:
     return os.environ.get("RKK_HIERARCHICAL_AI", "1").strip().lower() not in (
@@ -178,12 +180,16 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
     pe_lat_ema = (1.0 - beta) * pe_lat_prev + beta * float(cy - 0.5)
     sim._hai_pe_lat_ema = pe_lat_ema
 
+    w_plan, w_prop = 1.0, 1.0
+    if temporal_precision_routing_enabled():
+        w_plan, w_prop = routing_weights_for_hai()
+
     dead_fwd = _env_f("RKK_HAI_PE_DEAD", 0.004)
     dead_vert = _env_f("RKK_HAI_PE_VERT_DEAD", 0.03)
     dead_lat = _env_f("RKK_HAI_PE_LAT_DEAD", 0.04)
 
-    kp = _env_f("RKK_HAI_PE_GAIN", 0.055)
-    kp_vert = _env_f("RKK_HAI_SUPPORT_GAIN", 0.045)
+    kp = _env_f("RKK_HAI_PE_GAIN", 0.055) * w_plan
+    kp_vert = _env_f("RKK_HAI_SUPPORT_GAIN", 0.045) * w_prop
     kp_lat = _env_f("RKK_HAI_LAT_GAIN", 0.04)
     lat_sign = _env_f("RKK_HAI_LAT_SIGN", 1.0)
 
@@ -241,4 +247,7 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
         "pe_lat_ema": round(pe_lat_ema, 5),
         "applied": applied,
         "residual_keys": list(residuals.keys()),
+        "precision_routing": temporal_precision_routing_enabled(),
+        "w_plan": round(w_plan, 4),
+        "w_prop": round(w_prop, 4),
     }

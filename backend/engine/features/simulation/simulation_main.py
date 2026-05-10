@@ -173,6 +173,8 @@ class Simulation(
         self._hai_pe_lat_ema: float = 0.0
         self._hai_pe_ema: float = 0.0  # mirror of _hai_pe_fwd_ema (compat)
         self._hai_last_diag: dict | None = None
+        self._context_posterior = None
+        self._context_posterior_d = 0
         self._pe_history: deque[float] = deque(maxlen=200)
         self._locomotion_controller = None
         self._reflex_stabilizer = None

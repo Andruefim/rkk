@@ -36,6 +36,14 @@ def _dbg_tick(hypothesis_id: str, location: str, message: str, data: dict | None
 
 
 class SimulationTickMixin:
+    """Humanoid tick orchestration.
+
+    Phase C₁ (temporal contracts): reflex / CPG / stabilizers run without invoking imagination,
+    LLM loops, or L3 goal-planning; those live in ``_run_agent_or_skill_step`` and async teachers.
+    Leg commands owned by CPG must not receive conflicting high-rate ``do()`` on the same joints
+    (enforced in locomotion / EIG paths — see ``mixin_locomotion``).
+    """
+
     def _sync_temporal_blankets_to_graph(self) -> None:
         """Rebuild TemporalBlankets when |graph nodes| changes (inner_voice, concepts, neurogenesis)."""
         from engine.temporal import TemporalBlankets
@@ -246,6 +254,7 @@ class SimulationTickMixin:
         else:
             self.agent.value_layer.set_teacher_vl_overlay(None)
 
+        # Phase C₁: reflex path (CPG + reflex stabilizer) stays fast and LLM-free; τ2/τ3 run later.
         # CPG runs BEFORE agent step so legs are stabilized before high-level exploration
         self._ensure_cpg_background_loop()
         self._drain_l1_motor_commands()
@@ -503,6 +512,30 @@ class SimulationTickMixin:
         # Level 2-D: Episodic Memory
         self._update_episodic_memory(self.tick, _obs_for_d_e, fallen, _posture_now)
 
+        # Phase I: PEARL-style rolling observation posterior (flag ``RKK_PEARL_CONTEXT``)
+        try:
+            from engine.context_posterior import RollingObservationPosterior, pearl_context_enabled
+
+            if pearl_context_enabled() and self.current_world == "humanoid":
+                nids = list(self.agent.graph._node_ids)
+                d_g = len(nids)
+                if self._context_posterior is None or self._context_posterior_d != d_g:
+                    self._context_posterior = RollingObservationPosterior(nids)
+                    self._context_posterior_d = d_g
+                _phy_ctx: dict[str, float] = {}
+                try:
+                    _gdp = getattr(self.agent.env, "get_dynamics_params", None)
+                    if callable(_gdp):
+                        _phy_ctx = dict(_gdp())
+                except Exception:
+                    _phy_ctx = {}
+                self._context_posterior.push(
+                    dict(self.agent.graph.snapshot_vec_dict()),
+                    _phy_ctx,
+                )
+        except Exception:
+            pass
+
         # Living Memory: непрерывная временная шкала (humanoid), до curriculum-тика
         if self.current_world == "humanoid" and self._episodic_memory is not None:
             _cn = None
@@ -570,6 +603,18 @@ class SimulationTickMixin:
         snap = self.agent.snapshot()
         snap["fallen"]     = fallen
         snap["fall_count"] = self._fall_count
+        cp = getattr(self, "_context_posterior", None)
+        if cp is not None:
+            try:
+                zm = cp.mean_z()
+                snap["pearl_context_z_dim"] = int(zm.size)
+                snap["pearl_context_z_head"] = [float(x) for x in zm[:16]]
+                te = cp.task_embedding()
+                snap["pearl_context_task_dim"] = int(te.size)
+                snap["pearl_context_task_head"] = [float(x) for x in te[:16]]
+                snap["physics_context_keys"] = list(cp.last_physics_context().keys())[:24]
+            except Exception:
+                pass
         self._last_snapshot = snap
 
         if self._rsi_full_enabled():

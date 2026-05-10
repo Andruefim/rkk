@@ -18,12 +18,99 @@ value_layer.py — Value Layer (РКК v5, Проблема 10) + fixed_root mod
 from __future__ import annotations
 
 import os
+
 import torch
 import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
 
 from engine.graph_constants import is_read_only_macro_var
+
+
+def value_veto_enabled() -> bool:
+    """Lexicographic physical veto + energy prognosis (Phase G)."""
+    return os.environ.get("RKK_VALUE_VETO", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _veto_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, str(default)))
+    except ValueError:
+        return default
+
+
+def critical_body_diag(nodes: dict[str, float]) -> dict[str, float]:
+    cz = float(nodes.get("com_z", nodes.get("phys_com_z", 0.5)))
+    ps = float(
+        nodes.get("posture_stability", nodes.get("phys_posture_stability", 0.5))
+    )
+    ie = float(nodes.get("intero_energy", nodes.get("phys_intero_energy", 1.0)))
+    fall_imminent = cz < _veto_float("RKK_VETO_COM_Z_CRITICAL", 0.28) or ps < _veto_float(
+        "RKK_VETO_POSTURE_CRITICAL", 0.22
+    )
+    energy_low = ie < _veto_float("RKK_VETO_ENERGY_CRITICAL", 0.18)
+    return {
+        "com_z": cz,
+        "posture_stability": ps,
+        "intero_energy": ie,
+        "fall_imminent": float(fall_imminent),
+        "energy_low": float(energy_low),
+    }
+
+
+def predicted_body_critical(predicted: dict[str, float]) -> bool:
+    """
+    Phase F+G: WM one-step prediction implies imminent balance loss (normalized coords).
+    Thresholds are separate from instantaneous ``critical_body_diag`` so efference can gate execution.
+    """
+    cz = float(predicted.get("com_z", predicted.get("phys_com_z", 0.5)))
+    ps = float(
+        predicted.get(
+            "posture_stability", predicted.get("phys_posture_stability", 0.5)
+        )
+    )
+    cz_thr = _veto_float("RKK_VETO_PRED_COM_Z_MAX", 0.24)
+    ps_thr = _veto_float("RKK_VETO_PRED_POSTURE_MIN", 0.22)
+    return bool(cz < cz_thr or ps < ps_thr)
+
+
+def efference_predicted_veto(
+    variable: str,
+    predicted: dict[str, float],
+    *,
+    fixed_root: bool,
+) -> tuple[bool, str]:
+    """
+    After ``graph.propagate``: veto dangerous predicted posture/com_z before ``env.intervene``.
+    Requires ``RKK_VALUE_VETO=1`` (same gate as lexicographic veto).
+    """
+    if not value_veto_enabled() or fixed_root:
+        return False, ""
+    if is_recovery_or_stabilize_action(variable):
+        return False, ""
+    if predicted_body_critical(predicted):
+        cz = float(predicted.get("com_z", predicted.get("phys_com_z", 0.5)))
+        ps = float(
+            predicted.get(
+                "posture_stability", predicted.get("phys_posture_stability", 0.5)
+            )
+        )
+        return True, f"efference veto: predicted com_z={cz:.3f} posture={ps:.3f}"
+    return False, ""
+
+
+def is_recovery_or_stabilize_action(variable: str) -> bool:
+    v = str(variable).lower()
+    if "stop_recover" in v or "recover" in v:
+        return True
+    if "support_left" in v or "support_right" in v:
+        return True
+    return False
 
 
 class BlockReason(Enum):
@@ -34,6 +121,7 @@ class BlockReason(Enum):
     AUTONOMY_HARM    = "autonomy_harm"
     REPEATED_FAIL    = "repeated_fail"
     READ_ONLY_MACRO  = "read_only_macro"
+    CRITICAL_VETO    = "critical_veto"
 
 
 @dataclass
@@ -231,6 +319,9 @@ class ValueLayer:
         self.block_reasons: dict[str, int] = {r.value: 0 for r in BlockReason}
         self.imagination_checks = 0
         self.imagination_blocks = 0
+        # Phase G allostasis: smoothed interoceptive energy derivative (charge urgency)
+        self._intero_energy_prev: float | None = None
+        self._energy_delta_ema: float = 0.0
 
     def set_teacher_vl_overlay(self, overlay: TeacherVLOverlay | None) -> None:
         self._teacher_vl_overlay = overlay
@@ -238,6 +329,26 @@ class ValueLayer:
     @staticmethod
     def _clip_state_val(v: float) -> float:
         return float(np.clip(np.nan_to_num(v, nan=0.5, posinf=1.0, neginf=0.0), 0.0, 1.0))
+
+    def _tick_energy_allostasis(self, current_nodes: dict[str, float]) -> None:
+        ie = float(
+            current_nodes.get(
+                "intero_energy", current_nodes.get("phys_intero_energy", 1.0)
+            )
+        )
+        if self._intero_energy_prev is not None:
+            delta = ie - self._intero_energy_prev
+            try:
+                beta = float(os.environ.get("RKK_ALLOSTASIS_ENERGY_EMA", "0.12"))
+            except ValueError:
+                beta = 0.12
+            beta = float(np.clip(beta, 0.02, 0.5))
+            self._energy_delta_ema = (1.0 - beta) * self._energy_delta_ema + beta * delta
+        self._intero_energy_prev = ie
+
+    def energy_expenditure_ema(self) -> float:
+        """Negative → draining faster (need recharge / reduce locomotor spend)."""
+        return float(self._energy_delta_ema)
 
     def _graph_constraints(
         self,
@@ -292,6 +403,9 @@ class ValueLayer:
         eff = merge_teacher_vl(eff, self._teacher_vl_overlay, engine_tick)
         fixed_root = self.bounds.fixed_root_mode
 
+        if value_veto_enabled() and not fixed_root:
+            self._tick_energy_allostasis(current_nodes)
+
         # §1 Переменная в диапазоне
         if value < self.bounds.var_min or value > self.bounds.var_max:
             return self._block(
@@ -309,6 +423,64 @@ class ValueLayer:
                 variable,
                 value,
             )
+
+        if value_veto_enabled() and not fixed_root:
+            diag = critical_body_diag(current_nodes)
+            drain_fast = self._energy_delta_ema < _veto_float(
+                "RKK_VETO_ENERGY_DRAIN_EMA", -0.004
+            ) and diag["intero_energy"] < _veto_float(
+                "RKK_VETO_ENERGY_DRAIN_IE_MAX", 0.42
+            )
+            critical = diag["fall_imminent"] > 0.5 or (
+                diag["energy_low"] > 0.5 and diag["posture_stability"] < 0.36
+            )
+            if drain_fast and not is_recovery_or_stabilize_action(variable):
+                intent_key_v = (
+                    variable[5:] if variable.startswith("phys_") else variable
+                )
+                if intent_key_v == "intent_stride":
+                    return self._block(
+                        BlockReason.CRITICAL_VETO,
+                        current_nodes,
+                        current_phi,
+                        f"allostasis: fast energy drain ema={self._energy_delta_ema:.5f} "
+                        f"ie={diag['intero_energy']:.3f}",
+                        variable,
+                        value,
+                    )
+            if critical and not is_recovery_or_stabilize_action(variable):
+                return self._block(
+                    BlockReason.CRITICAL_VETO,
+                    current_nodes,
+                    current_phi,
+                    f"critical veto: posture={diag['posture_stability']:.3f} "
+                    f"com_z={diag['com_z']:.3f} energy={diag['intero_energy']:.3f}",
+                    variable,
+                    value,
+                )
+            cz = float(
+                current_nodes.get("com_z", current_nodes.get("phys_com_z", 0.5))
+            )
+            try:
+                cz_th = float(os.environ.get("RKK_VETO_COM_Z_NORM_MAX", "0.16"))
+            except ValueError:
+                cz_th = 0.16
+            intent_key_v = (
+                variable[5:] if variable.startswith("phys_") else variable
+            )
+            try:
+                stride_cap = float(os.environ.get("RKK_VETO_STRIDE_MAX_WHEN_LOW_COM", "0.58"))
+            except ValueError:
+                stride_cap = 0.58
+            if cz < cz_th and intent_key_v == "intent_stride" and float(value) > stride_cap:
+                return self._block(
+                    BlockReason.CRITICAL_VETO,
+                    current_nodes,
+                    current_phi,
+                    f"critical veto: com_z={cz:.3f} < {cz_th}, stride blocked",
+                    variable,
+                    value,
+                )
 
         # slot_*, self_* и intent_* — «внутренние» оси; не жмём узкий predict_band как у физики.
         slot_action = (

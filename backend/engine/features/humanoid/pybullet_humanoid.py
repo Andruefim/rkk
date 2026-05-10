@@ -1187,6 +1187,34 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         x, y, z, w = float(orn[0]), float(orn[1]), float(orn[2]), float(orn[3])
         return gravity_dir_in_link_frame((x, y, z, w))
 
+    def get_dynamics_params(self) -> dict[str, float]:
+        """
+        Serializable physics regime for episodic physics_context (Phase D / I).
+        Values use simulator-native units; schema_version tracks dictionary layout.
+        """
+        out: dict[str, float] = {
+            "schema_version": 1.0,
+            "backend": 1.0,
+            "fixed_root": 1.0 if getattr(self, "fixed_root", False) else 0.0,
+            "urdf_global_scale": float(HUMANOID_URDF_GLOBAL_SCALING),
+        }
+        with self._physics_lock:
+            gx, gy, gz = pb.getGravity(physicsClientId=self.client)
+            out["gravity_x"] = float(gx)
+            out["gravity_y"] = float(gy)
+            out["gravity_z"] = float(gz)
+            try:
+                out["timestep"] = float(pb.getTimeStep(physicsClientId=self.client))
+            except Exception:
+                out["timestep"] = 1.0 / 240.0
+            di = pb.getDynamicsInfo(self.robot_id, -1, physicsClientId=self.client)
+            out["base_mass"] = float(di[0])
+            out["base_lateral_friction"] = float(di[1])
+            if getattr(self, "floor_id", None) is not None:
+                fd = pb.getDynamicsInfo(self.floor_id, -1, physicsClientId=self.client)
+                out["floor_lateral_friction"] = float(fd[1])
+        return out
+
     def get_state(self) -> dict:
         with self._physics_lock:
             com, euler = self.get_com()

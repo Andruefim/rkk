@@ -37,6 +37,7 @@ RKK_EPISODE_FALL_MAXLEN=50     — размер буфера падений
 RKK_EPISODE_SUCCESS_MAXLEN=30  — размер буфера успехов
 RKK_EPISODE_PRETRIGGER=8       — тиков истории до падения
 RKK_EPISODE_PATTERN_MIN=3      — min повторений для паттерна
+RKK_REM_WM_TRAIN=0             — REM фаза: дополнительный wm.train_step по top-k surprise (Phase D)
 
 Living Memory:
   RKK_LIVING_MEMORY_TRACE=1      — шкала времени (timeline) для humanoid
@@ -105,6 +106,8 @@ class FallEpisode:
     cause: str                         # автоматическая классификация
     recovery_ticks: int = 0            # сколько тиков восстановления
     recovered: bool = False
+    physics_context: dict[str, float] = field(default_factory=dict)
+    surprise_score: float = 0.0
 
     def to_llm_lines(self, idx: int) -> list[str]:
         cz_b = _safe_float(self.obs_before.get("com_z", self.obs_before.get("phys_com_z")))
@@ -147,6 +150,8 @@ class SuccessEpisode:
     duration_ticks: int
     mean_posture: float
     mean_com_z: float
+    physics_context: dict[str, float] = field(default_factory=dict)
+    physics_context: dict[str, float] = field(default_factory=dict)
 
     def to_llm_lines(self, idx: int) -> list[str]:
         intent_str = ", ".join(
@@ -292,6 +297,7 @@ class EpisodicMemory:
 
         self.total_falls_recorded: int = 0
         self.total_successes_recorded: int = 0
+        self._last_physics_context: dict[str, float] = {}
 
         # Living Memory — непрерывная «жизнь» в симуляции (humanoid)
         self._timeline: deque[TimelineEntry] = deque(maxlen=_env_int("RKK_LIVING_TIMELINE_MAX", 1024))
@@ -409,12 +415,15 @@ class EpisodicMemory:
         last_action: tuple[str, float] | None,
         fallen: bool,
         posture: float,
+        *,
+        physics_context: dict[str, float] | None = None,
     ) -> None:
         """Call every tick to maintain rolling buffers."""
         if not episode_memory_enabled():
             return
 
-        # Maintain rolling obs buffer
+        if physics_context:
+            self._last_physics_context = dict(physics_context)
         self._obs_history.append(dict(obs))
         if last_action is not None:
             self._action_history.append(last_action)
@@ -462,6 +471,7 @@ class EpisodicMemory:
         tick: int,
         obs_at_fall: dict[str, float],
         intents: dict[str, float],
+        physics_context: dict[str, float] | None = None,
     ) -> FallEpisode | None:
         """Record a fall episode. Returns the episode object."""
         if not episode_memory_enabled():
@@ -478,6 +488,14 @@ class EpisodicMemory:
         # Classify cause
         cause = self._classify_fall_cause(obs_at_fall, intents, last_action)
 
+        pc = dict(physics_context or self._last_physics_context or {})
+        ps_a = _safe_float(
+            obs_at_fall.get(
+                "posture_stability", obs_at_fall.get("phys_posture_stability", 0.5)
+            )
+        )
+        surprise = float(max(0.0, min(1.0, 0.82 - ps_a)))
+
         episode = FallEpisode(
             tick=tick,
             obs_before=obs_before,
@@ -485,6 +503,8 @@ class EpisodicMemory:
             trigger_action=last_action,
             intents_at_fall={k: v for k, v in intents.items()},
             cause=cause,
+            physics_context=pc,
+            surprise_score=surprise,
         )
         self.falls.append(episode)
         self.total_falls_recorded += 1
@@ -539,6 +559,7 @@ class EpisodicMemory:
             duration_ticks=duration,
             mean_posture=float(np.mean(self._posture_buf)) if self._posture_buf else 0.5,
             mean_com_z=float(np.mean(self._com_z_buf)) if self._com_z_buf else 0.5,
+            physics_context=dict(self._last_physics_context or {}),
         )
         self.successes.append(ep)
         self.total_successes_recorded += 1
@@ -605,6 +626,14 @@ class EpisodicMemory:
             if "overstride" in p.description and "posture_stability" in valid_vars and "intent_stride" in valid_vars:
                 seeds.append({"from_": "posture_stability", "to": "intent_stride", "weight": 0.30, "alpha": 0.05})
         return seeds
+
+    def get_top_k_by_surprise(self, k: int) -> list[FallEpisode]:
+        """Episodes ranked by ``surprise_score`` (proxy PE from posture instability)."""
+        if not self.falls:
+            return []
+        k = max(1, int(k))
+        ranked = sorted(self.falls, key=lambda e: float(e.surprise_score), reverse=True)
+        return ranked[:k]
 
     def snapshot(self) -> dict[str, Any]:
         return {

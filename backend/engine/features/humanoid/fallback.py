@@ -177,3 +177,19 @@ class _FallbackHumanoid(InstrumentalSandbox):
 
     def disable_fixed_root(self) -> None:
         self.fixed_root = False
+
+    def get_dynamics_params(self) -> dict[str, float]:
+        """Fallback stub — aligns keys with PyBullet ``get_dynamics_params``."""
+        return {
+            "schema_version": 1.0,
+            "backend": 0.0,
+            "fixed_root": 1.0 if self.fixed_root else 0.0,
+            "gravity_x": 0.0,
+            "gravity_y": 0.0,
+            "gravity_z": -9.81,
+            "timestep": float(self._dt),
+            "base_mass": 70.0,
+            "base_lateral_friction": 0.8,
+            "floor_lateral_friction": 1.0,
+            "urdf_global_scale": 1.0,
+        }
