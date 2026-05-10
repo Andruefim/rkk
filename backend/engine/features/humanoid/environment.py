@@ -308,6 +308,30 @@ class EnvironmentHumanoid:
         # Убраны жесткие лимиты _JOINT_COMFORT_RANGE для открытого обучения моторике.
         return 0.05, 0.95
 
+    def _balance_spine_pitch_nudge(self, raw: dict[str, float]) -> float:
+        """
+        Постуральный рефлекс по физике: слегка поднимает цель spine_pitch [0..1],
+        если CoM уходит назад относительно опоры или высота ЦМ падает.
+        Не заменяет политику агента; помогает опоре и делает наклон туловища заметнее.
+        Отключение: RKK_SPINE_BALANCE_REFLEX=0. Сила: RKK_SPINE_BALANCE_GAIN (по умолч. 0.14).
+        """
+        if self._fixed_root:
+            return 0.0
+        off = os.environ.get("RKK_SPINE_BALANCE_REFLEX", "1").strip().lower()
+        if off in ("0", "false", "no", "off"):
+            return 0.0
+        try:
+            gain = float(os.environ.get("RKK_SPINE_BALANCE_GAIN", "0.14"))
+        except ValueError:
+            gain = 0.14
+        gain = float(np.clip(gain, 0.0, 0.35))
+        cx = float(raw.get("com_x", 0.41))
+        cz = float(raw.get("com_z", STAND_Z))
+        neutral_x = 0.41
+        behind = float(np.clip((neutral_x - cx) / 0.22, 0.0, 1.0))
+        low_h = float(np.clip((0.52 - cz) / 0.35, 0.0, 1.0))
+        return float(np.clip(gain * (0.55 * behind + 0.45 * low_h), 0.0, 0.20))
+
     def intervene(self, variable: str, value: float, *, count_intervention: bool = True) -> dict[str, float]:
         if count_intervention:
             self.n_interventions += 1
@@ -402,7 +426,15 @@ class EnvironmentHumanoid:
         lean = float(ms.get("intent_lean_forward", 0.5))
         wave = float(ms.get("intent_wave", 0.5))
 
-        pitch = float(np.clip(0.5 + (torso - 0.5) * 0.55 + (lean - 0.5) * 0.28, 0.05, 0.95))
+        raw_phys = self._sim.get_state()
+        bal = self._balance_spine_pitch_nudge(raw_phys)
+        pitch = float(
+            np.clip(
+                0.5 + (torso - 0.5) * 0.55 + (lean - 0.5) * 0.28 + bal,
+                0.05,
+                0.95,
+            )
+        )
         if cpg_sync:
             pitch = float(
                 np.clip(pitch + 0.35 * float(cpg_sync.get("pitch_add", 0.0)), 0.05, 0.95)
@@ -470,6 +502,8 @@ class EnvironmentHumanoid:
         torso = float(ms.get("intent_torso_forward", 0.5))
         arm_cb = float(ms.get("intent_arm_counterbalance", 0.5))
         lean = float(ms.get("intent_lean_forward", 0.5))
+        raw_phys = self._sim.get_state()
+        bal = self._balance_spine_pitch_nudge(raw_phys)
 
         if self._fixed_root:
             self._sim.set_joint(
@@ -478,7 +512,8 @@ class EnvironmentHumanoid:
                     np.clip(
                         0.5
                         + (torso - 0.5) * 0.5
-                        + (lean - 0.5) * 0.25,
+                        + (lean - 0.5) * 0.25
+                        + bal,
                         0.05,
                         0.95,
                     )
@@ -522,14 +557,15 @@ class EnvironmentHumanoid:
         self._sim.set_joint("lankle", ankle)
         self._sim.set_joint("rankle", ankle)
 
-        # Как _apply_upper_body_from_intents: torso + lean → spine_pitch
+        # Как _apply_upper_body_from_intents: torso + lean → spine_pitch (+ постуральный bal)
         self._sim.set_joint(
             "spine_pitch",
             float(
                 np.clip(
                     0.5
                     + (torso - 0.5) * 0.55
-                    + (lean - 0.5) * 0.28,
+                    + (lean - 0.5) * 0.28
+                    + bal,
                     0.05,
                     0.95,
                 )

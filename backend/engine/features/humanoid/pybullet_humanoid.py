@@ -86,6 +86,16 @@ def _joint_slew_max_step() -> float:
         return 0.09
 
 
+def _spine_pitch_euler_coeff() -> float:
+    """Масштаб Эйлер-компоненты наклона таза (около оси pitch URDF); см. RKK_SPINE_PITCH_EULER_COEFF."""
+    try:
+        return float(
+            np.clip(float(os.environ.get("RKK_SPINE_PITCH_EULER_COEFF", "0.92")), 0.35, 1.35)
+        )
+    except ValueError:
+        return 0.92
+
+
 def _ctrl_profile_from_delta(delta_norm: float) -> tuple[float, float]:
     """
     Convert command delta [0..1] into (velocity_scale, force_scale).
@@ -1020,7 +1030,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if var_name == "spine_yaw":
                     self._spine_euler[2] = 0.65 * real_pos
                 else:
-                    self._spine_euler[1] = 0.85 * real_pos  # Увеличена гибкость для подъема торса
+                    self._spine_euler[1] = _spine_pitch_euler_coeff() * real_pos
                 ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
