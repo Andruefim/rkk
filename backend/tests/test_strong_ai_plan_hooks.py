@@ -76,6 +76,11 @@ class PlanHookTests(unittest.TestCase):
         )
         self.assertEqual(modality_group_for_var("vestibular_gz"), "vestibular")
 
+    def test_floor_friction_is_sandbox_not_vestibular(self) -> None:
+        from engine.precision_groups import modality_group_for_var
+
+        self.assertEqual(modality_group_for_var("floor_friction"), "sandbox")
+
 
 if __name__ == "__main__":
     unittest.main()

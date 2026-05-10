@@ -319,8 +319,10 @@ class REMReplay:
         k: int = 8,
     ) -> int:
         """
-        REM → WM: ``train_step`` on top-k fall episodes by surprise (Phase D).
-        Requires episodic ``physics_context`` / ranking from EpisodeMemory.
+        REM → WM: вызывает ``CausalGraph.train_step()`` после записи пар наблюдений
+        из top-k эпизодов по surprise (Phase D). Это и есть WM training entry point
+        в RKK (LeWM / GNN world model), не отдельный ``temporal_world_model.train_step``.
+        Включение: ``RKK_REM_WM_TRAIN=1``.
         """
         if episodic_memory is None:
             return 0

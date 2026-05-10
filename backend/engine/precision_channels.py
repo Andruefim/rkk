@@ -19,6 +19,10 @@ from engine.precision_groups import (
     precision_groups_enabled,
 )
 
+_PRECISION_SCALAR_FIELDS = frozenset(
+    {"proprio", "vestibular", "motor_intent", "sandbox", "other"}
+)
+
 
 def precision_calib_window() -> int:
     """Backward-compat wrapper; delegates to ``precision_groups``."""
@@ -39,17 +43,20 @@ def default_precision_vector() -> dict[str, float]:
         "sandbox": 1.5,
         "vestibular": 2.0,
         "other": 1.0,
-        "default": 1.0,
     }
     for k in list(out.keys()):
         env_key = f"RKK_PRECISION_{k.upper()}"
-        if k == "default":
-            env_key = "RKK_PRECISION_DEFAULT"
         try:
             if os.environ.get(env_key) is not None:
                 out[k] = float(os.environ.get(env_key, str(out[k])))
         except ValueError:
             pass
+    # Legacy env RKK_PRECISION_DEFAULT → applies to fallback bucket "other"
+    try:
+        if os.environ.get("RKK_PRECISION_DEFAULT") is not None:
+            out["other"] = float(os.environ.get("RKK_PRECISION_DEFAULT", str(out["other"])))
+    except ValueError:
+        pass
     return out
 
 
@@ -66,7 +73,7 @@ def weighted_squared_error_sum(
         if nid not in errors:
             continue
         g = modality_group_for_var(str(nid))
-        pg = float(prec.get(g, prec.get("default", 1.0)))
+        pg = float(prec.get(g, prec.get("other", 1.0)))
         e = float(errors[nid])
         total += pg * (e * e)
     return total
@@ -83,6 +90,6 @@ def precision_down_scale(group: str, factor: float = 0.5) -> None:
     if g == "vision":
         st.decay_vision(f)
         return
-    if hasattr(st, g):
+    if g in _PRECISION_SCALAR_FIELDS:
         cur = float(getattr(st, g))
         setattr(st, g, float(max(0.05, min(4.0, cur * f))))

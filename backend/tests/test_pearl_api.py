@@ -93,4 +93,4 @@ def test_acceptance_pearl_facade_l3_not_alias_l2_when_wm_moves_exogenous():
     cf = fac.counterfactual(base, "intent_stride", 0.8)
     assert iv["floor_friction"] != base["floor_friction"]
     assert cf["floor_friction"] == base["floor_friction"]
-    assert abs(cf["intent_stride"] - 0.8) < 1e-6 or cf["intent_stride"] != base["intent_stride"]
+    assert abs(cf["intent_stride"] - 0.8) < 1e-6

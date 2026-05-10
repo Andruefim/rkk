@@ -57,20 +57,24 @@ def modality_group_for_var(name: str) -> str:
         return s
     if s.startswith("slot_") or "vision" in s or s.startswith("pixel"):
         return "vision"
-    if s.startswith("vestibular") or "floor_friction" in s:
+    if s.startswith("vestibular"):
         return "vestibular"
     if s.startswith("intent_") or s.startswith("phys_intent"):
         return "motor_intent"
-    if any(
-        s.startswith(p)
-        for p in (
-            "cube",
-            "ball_",
-            "lever_",
-            "target_dist",
-            "stack_",
-            "stability_score",
+    if (
+        any(
+            s.startswith(p)
+            for p in (
+                "cube",
+                "ball_",
+                "lever_",
+                "target_dist",
+                "stack_",
+                "stability_score",
+                "floor_friction",
+            )
         )
+        or "floor_friction" in s
     ):
         return "sandbox"
     if s.startswith("proprio") or any(
