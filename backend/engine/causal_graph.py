@@ -1553,6 +1553,10 @@ class CausalGraph:
         Не трогает замороженные и запрещённые рёбра; затем _sync_frozen_W_into_core.
 
         Порог: аргумент или RKK_POST_SLEEP_PRUNE_THRESHOLD, иначе RKK_SLEEP_PRUNE_THRESHOLD (как фаза PRUNE).
+
+        RKK_PRUNE_PROTECT_PREFIXES: список префиксов узлов через запятую; для каждого совпадения
+        защищается вся строка и столбец этого узла. Не задано — по умолчанию concept_, proprio_, mc_, intent_.
+        Пустая строка (переменная задана, но без символов) — без префиксной защиты, только frozen/forbidden.
         """
         if self._core is None:
             return 0
@@ -1578,11 +1582,13 @@ class CausalGraph:
         device = W.device
         protect = torch.zeros(d, d, dtype=torch.bool, device=device)
         raw_pf = os.environ.get("RKK_PRUNE_PROTECT_PREFIXES")
-        if raw_pf is not None and raw_pf.strip():
-            prot_prefs = tuple(p.strip() for p in raw_pf.split(",") if p.strip())
-        else:
+        if raw_pf is None:
             # Без phys_: иначе почти весь humanoid-граф «неприкасаемый» и pruned=0.
             prot_prefs = ("concept_", "proprio_", "mc_", "intent_")
+        elif not raw_pf.strip():
+            prot_prefs = ()
+        else:
+            prot_prefs = tuple(p.strip() for p in raw_pf.split(",") if p.strip())
         for f, t in self._frozen_edge_set | self._forbidden_edge_set:
             if f in self._node_ids and t in self._node_ids:
                 i, j = self._node_ids.index(f), self._node_ids.index(t)
@@ -1594,18 +1600,19 @@ class CausalGraph:
             if any(str(name).startswith(p) for p in prot_prefs):
                 protect[i, :] = True
                 protect[:, i] = True
-            block = W[:d, :d].detach()
-            off_diag = ~torch.eye(d, dtype=torch.bool, device=device)
-            weak = (block.abs() < thr) & off_diag & (~protect)
-            n_pruned = int(weak.sum().item())
-            if n_pruned == 0:
-                self._invalidate_cache()
-                return 0
-            w_full = W.detach().clone()
-            sub = w_full[:d, :d].clone()
-            sub[weak] = 0.0
-            w_full[:d, :d] = sub
-            W.copy_(w_full)
+
+        block = W[:d, :d].detach()
+        off_diag = ~torch.eye(d, dtype=torch.bool, device=device)
+        weak = (block.abs() < thr) & off_diag & (~protect)
+        n_pruned = int(weak.sum().item())
+        if n_pruned == 0:
+            self._invalidate_cache()
+            return 0
+        w_full = W.detach().clone()
+        sub = w_full[:d, :d].clone()
+        sub[weak] = 0.0
+        w_full[:d, :d] = sub
+        W.copy_(w_full)
 
         self._sync_frozen_W_into_core()
         self._invalidate_cache()

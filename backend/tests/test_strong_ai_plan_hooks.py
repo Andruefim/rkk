@@ -81,6 +81,22 @@ class PlanHookTests(unittest.TestCase):
 
         self.assertEqual(modality_group_for_var("floor_friction"), "sandbox")
 
+    def test_sleep_mocap_dreams_env_toggle(self) -> None:
+        from engine import sleep_consolidation as sc
+
+        key = "RKK_SLEEP_MOCAP_DREAMS"
+        prev = os.environ.get(key)
+        try:
+            os.environ[key] = "0"
+            self.assertFalse(sc.mocap_dreams_enabled())
+            os.environ[key] = "1"
+            self.assertTrue(sc.mocap_dreams_enabled())
+        finally:
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,7 @@ RKK_SLEEP_REM_LR_MULT=10.0     — множитель lr во время REM
 RKK_SLEEP_PRUNE_THRESHOLD=0.05 — обрезать edges с |w| < threshold
 
 MoCap inverse (inject_mocap_dreams):
+  RKK_SLEEP_MOCAP_DREAMS — 1 (default): проигрывать MoCap-клипы в REM и учить WM на них; 0/off — пропустить (сон и replay эпизодов без изменений).
   RKK_SLEEP_QUALITY_THRESH — если MSE(forward_seq, X|A=0) > порога, инверсию не делаем (negative transfer).
   RKK_SLEEP_INVERSE_INNER — Adam-шагов на каждый одношаговый переход (дефолт 72).
   RKK_SLEEP_INVERSE_LR — lr для пошагового Adam.
@@ -61,6 +62,16 @@ import torch
 def sleep_enabled() -> bool:
     return os.environ.get("RKK_SLEEP_ENABLED", "1").strip().lower() not in (
         "0", "false", "no", "off"
+    )
+
+
+def mocap_dreams_enabled() -> bool:
+    """REM MoCap replay + inverse dynamics; disable to save CPU/GPU while keeping sleep."""
+    return os.environ.get("RKK_SLEEP_MOCAP_DREAMS", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
     )
 
 
@@ -707,9 +718,20 @@ class SleepController:
                 if n_wm > 0:
                     print(f"[Sleep] REM: WM train_step on top-surprise batches (ok={n_wm})")
 
-                # ИНЪЕКЦИЯ СНОВ О ХОДЬБЕ (Physical Priors)
-                n_mocap = self._rem_replayer.inject_mocap_dreams(sim.agent.graph, n_steps=150)
-                print(f"[Sleep] REM: injected {n_mocap} steps of MoCap dreams (Walking manifold learned)")
+                # ИНЪЕКЦИЯ СНОВ О ХОДЬБЕ (Physical Priors; опционально — RKK_SLEEP_MOCAP_DREAMS=0)
+                if mocap_dreams_enabled():
+                    n_mocap = self._rem_replayer.inject_mocap_dreams(
+                        sim.agent.graph, n_steps=150
+                    )
+                    print(
+                        f"[Sleep] REM: injected {n_mocap} steps of MoCap dreams "
+                        "(Walking manifold learned)"
+                    )
+                else:
+                    print(
+                        "[Sleep] REM: MoCap dreams skipped "
+                        "(RKK_SLEEP_MOCAP_DREAMS=0)"
+                    )
                 _memory_diag_log(sim, "sleep_after_REM_replay")
 
                 try:
