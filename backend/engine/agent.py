@@ -411,6 +411,33 @@ def _max_fallback_tries_from_env() -> int:
     return max(1, min(12, n))
 
 
+def _vl_fast_fixed_root_intents_enabled() -> bool:
+    return os.environ.get("RKK_VL_FAST_FIXED_ROOT", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _cheap_vl_s1_intent_batch(
+    current_nodes: dict[str, float],
+    vl_batch: list[dict],
+) -> list[dict] | None:
+    """
+    Без WM: S1 = текущие узлы с одной подстановкой intent/phys_intent.
+    Только если все кандидаты — high-level intents (pelvis fixed).
+    """
+    if not vl_batch:
+        return None
+    out: list[dict] = []
+    for c in vl_batch:
+        var = str(c.get("variable", ""))
+        if not (var.startswith("intent_") or var.startswith("phys_intent_")):
+            return None
+        s1 = dict(current_nodes)
+        s1[var] = float(c.get("value", 0.5))
+        out.append(s1)
+    return out
+
+
 def _imagination_horizon_from_env() -> int:
     """Фаза 13: RKK_IMAGINATION_STEPS — число шагов core(X) после мысленного do(); 0 = как раньше."""
     raw = os.environ.get("RKK_IMAGINATION_STEPS", "1")
@@ -479,6 +506,11 @@ class RKKAgent:
         # Curriculum: после снятия fixed_root (см. Simulation.disable_fixed_root)
         self._post_fr_explore_until: int = 0
         self._post_fr_vl_relax_until: int = 0
+        # SleepConsolidation._end_sleep: реже полный score_interventions (см. _effective_score_cache_every)
+        self._post_sleep_score_cache_relax_until: int = 0
+        # fixed_root: если кэш scoring снова ставит тот же top-1 что и последний do — ротируем список (см. step)
+        self._last_applied_do_key: tuple[str, float] | None = None
+        self._repeat_same_top_scores: int = 0
 
         # Phase T: Trajectory contrastive learning
         self._traj_collector = TrajectoryCollector()
@@ -1369,7 +1401,7 @@ class RKKAgent:
         bticks = _intervention_bootstrap_ticks()
 
         # Cache dag_constraint (4× d×d matmuls) — reuse across score cache window
-        sce = _score_cache_every()
+        sce = self._effective_score_cache_every(self._last_engine_tick)
         if abs(self._last_engine_tick - self._h_W_cache_tick) >= max(1, sce):
             self._h_W_cache = float(abs(self._get_h_W()))
             self._h_W_cache_tick = self._last_engine_tick
@@ -1675,6 +1707,27 @@ class RKKAgent:
 
         return sorted(candidates, key=lambda x: -x["expected_ig"])
 
+    def _effective_score_cache_every(self, engine_tick: int) -> int:
+        """
+        После сна REM/урок уплотняют W — score_interventions тяжелее; на окне тиков
+        держим минимальный интервал не ниже RKK_POST_SLEEP_SCORE_CACHE_EVERY_FLOOR.
+        """
+        sce = _score_cache_every()
+        try:
+            until = int(getattr(self, "_post_sleep_score_cache_relax_until", 0) or 0)
+        except (TypeError, ValueError):
+            until = 0
+        if until > 0 and engine_tick <= until:
+            try:
+                floor = max(
+                    1,
+                    int(os.environ.get("RKK_POST_SLEEP_SCORE_CACHE_EVERY_FLOOR", "32")),
+                )
+            except ValueError:
+                floor = 32
+            return max(sce, floor)
+        return sce
+
     def _score_async_worker(self) -> None:
         try:
             with torch.no_grad():
@@ -1701,7 +1754,9 @@ class RKKAgent:
             return
         if self._score_thread is not None and self._score_thread.is_alive():
             return
-        if engine_tick - self._score_refresh_tick < max(1, _score_cache_every()):
+        if engine_tick - self._score_refresh_tick < max(
+            1, self._effective_score_cache_every(engine_tick)
+        ):
             return
         self._score_refresh_tick = engine_tick
         self._score_thread = threading.Thread(
@@ -1780,7 +1835,7 @@ class RKKAgent:
         except Exception:
             pass
         _slow_t["observe"] = time.perf_counter() - _t0
-        sce = _score_cache_every()
+        sce = self._effective_score_cache_every(engine_tick)
         stale_mult = _score_stale_mult()
         cache_age = engine_tick - self._score_cache_tick
         cache_fresh = bool(self._score_cache) and cache_age < sce
@@ -1879,6 +1934,44 @@ class RKKAgent:
             np.random.default_rng().shuffle(head)
             scores = head + scores[10:]
 
+        # Pelvis fixed: при застое «тот же кандидат #0 == последний do» VL каждый раз одобряет одно и то же.
+        # RKK_FIXED_ROOT_SCORE_ROTATE_TICKS: после стольких тиков подряд — сдвинуть #0 в конец очереди.
+        if enable_l3:
+            try:
+                fr_now = _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(
+                    self.graph.nodes
+                )
+            except Exception:
+                fr_now = False
+            if fr_now and scores:
+                k_top = (
+                    str(scores[0].get("variable", "")),
+                    round(float(scores[0].get("value", 0.5)), 4),
+                )
+                le = getattr(self, "_last_applied_do_key", None)
+                if le is not None and k_top == le:
+                    self._repeat_same_top_scores += 1
+                else:
+                    self._repeat_same_top_scores = 0
+                try:
+                    rlim = max(
+                        4, int(os.environ.get("RKK_FIXED_ROOT_SCORE_ROTATE_TICKS", "24"))
+                    )
+                except ValueError:
+                    rlim = 24
+                if self._repeat_same_top_scores >= rlim and len(scores) >= 2:
+                    scores = scores[1:] + scores[:1]
+                    self._repeat_same_top_scores = 0
+                    try:
+                        sce_rot = self._effective_score_cache_every(engine_tick)
+                    except Exception:
+                        sce_rot = _score_cache_every()
+                    if sce_rot > 1:
+                        self._score_cache = list(scores)
+                        self._score_cache_tick = engine_tick
+            elif not fr_now:
+                self._repeat_same_top_scores = 0
+
         if not scores:
             _report_if_slow_tick()
             return {
@@ -1904,10 +1997,23 @@ class RKKAgent:
         vl_batch = scores[:vl_tries]
         current_nodes = dict(self.graph.nodes)
         _t0_vl = time.perf_counter()
-        s1_batch = self.graph.propagate_from_batch(
-            current_nodes,
-            [(c["variable"], c["value"]) for c in vl_batch],
-        )
+        cheap: list[dict] | None = None
+        if (
+            _vl_fast_fixed_root_intents_enabled()
+            and vl_horizon == 0
+            and (
+                _env_fixed_root_flag(self.env)
+                or _graph_fixed_root_flag(self.graph.nodes)
+            )
+        ):
+            cheap = _cheap_vl_s1_intent_batch(current_nodes, vl_batch)
+        if cheap is not None:
+            s1_batch = cheap
+        else:
+            s1_batch = self.graph.propagate_from_batch(
+                current_nodes,
+                [(c["variable"], c["value"]) for c in vl_batch],
+            )
 
         # Перебираем кандидатов пока не найдём допустимое действие
         for i, candidate in enumerate(vl_batch):
@@ -2098,7 +2204,24 @@ class RKKAgent:
                 )
             except Exception:
                 pass
-            obs_self = dict(self.env.observe())
+            try:
+                fr_ob = _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(
+                    self.graph.nodes
+                )
+            except Exception:
+                fr_ob = False
+            if fr_ob and str(var).startswith("intent_"):
+                obs_self = dict(observed_env)
+                st_src = getattr(self.env, "base_env", self.env)
+                st = getattr(st_src, "_self_state", None)
+                if isinstance(st, dict):
+                    for sk in _SELF_VAR_SET:
+                        if sk in st:
+                            obs_self[sk] = float(np.clip(float(st[sk]), 0.05, 0.95))
+                else:
+                    obs_self = dict(self.env.observe())
+            else:
+                obs_self = dict(self.env.observe())
             for sk in _SELF_VAR_SET:
                 if sk in self.graph.nodes and sk in obs_self:
                     self.graph.nodes[sk] = float(obs_self[sk])
@@ -2177,6 +2300,7 @@ class RKKAgent:
         self.temporal.train_step(u_next)
 
         self._total_interventions += 1
+        self._last_applied_do_key = (str(var), round(float(value), 4))
         try:
             _v_do = float(value)
         except (TypeError, ValueError):

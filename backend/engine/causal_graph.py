@@ -694,6 +694,8 @@ class CausalGraph:
         if self._core is None:
             return None
 
+        self._wm_train_calls = int(getattr(self, "_wm_train_calls", 0)) + 1
+
         # ── Try LeWM parallel sequence training first ─────────────────────────
         has_seq = (
             USE_GNN
@@ -937,9 +939,17 @@ class CausalGraph:
             Xp_i = integrate_world_model_step(self, X_i, A_i)
             l_int = self.LAMBDA_INT * int_scale * F.mse_loss(Xp_i, Y_i)
 
-        # 6. Trajectory contrastive loss (Phase T)
+        # 6. Trajectory contrastive loss (Phase T) — дорого; реже при RKK_TRAJECTORY_EVERY>1
         l_traj = torch.tensor(0.0, device=self.device)
-        if trajectory_enabled() and self._traj_segments:
+        try:
+            traj_every = max(1, int(os.environ.get("RKK_TRAJECTORY_EVERY", "1")))
+        except ValueError:
+            traj_every = 1
+        if (
+            trajectory_enabled()
+            and self._traj_segments
+            and (self._wm_train_calls % traj_every == 0)
+        ):
             try:
                 lw = float(os.environ.get("RKK_TRAJECTORY_LOSS_WEIGHT", "0.25"))
             except ValueError:
@@ -1097,7 +1107,15 @@ class CausalGraph:
         )
         # Trajectory contrastive loss (Phase T)
         l_traj = torch.tensor(0.0, device=self.device)
-        if trajectory_enabled() and self._traj_segments:
+        try:
+            traj_every = max(1, int(os.environ.get("RKK_TRAJECTORY_EVERY", "1")))
+        except ValueError:
+            traj_every = 1
+        if (
+            trajectory_enabled()
+            and self._traj_segments
+            and (self._wm_train_calls % traj_every == 0)
+        ):
             try:
                 lw = float(os.environ.get("RKK_TRAJECTORY_LOSS_WEIGHT", "0.25"))
             except ValueError:
@@ -1610,10 +1628,16 @@ class CausalGraph:
         При типичном графе из матрицы W дубликатов нет — если dup_keys>0, ищи второй источник рёбер.
 
         Вкл.: RKK_EDGE_DUP_DIAG=1 (дорого: строит полный список edges).
+        На post-sleep wake вызывается с tag «wake» — дополнительно нужен
+        RKK_EDGE_DUP_DIAG_WAKE=1, иначе no-op (избежать материализации рёбер на каждом пробуждении).
         """
         if os.environ.get("RKK_EDGE_DUP_DIAG", "0").strip().lower() not in (
             "1", "true", "yes", "on",
         ):
+            return
+        if (tag or "").lower() == "wake" and os.environ.get(
+            "RKK_EDGE_DUP_DIAG_WAKE", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
             return
         edges = self.edges
         keys = [(e.from_, e.to) for e in edges]

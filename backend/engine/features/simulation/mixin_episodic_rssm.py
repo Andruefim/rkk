@@ -210,9 +210,10 @@ class SimulationEpisodicRssmMixin:
             self._rssm_upgraded = True
             self._rssm_upgrade_tick = tick
             try:
-                h = int(os.environ.get("RKK_WM_RSSM_IMAGINATION", "12"))
+                h = int(os.environ.get("RKK_WM_RSSM_IMAGINATION", "6"))
             except ValueError:
-                h = 12
+                h = 6
+            h = max(1, min(24, h))
             self.agent._imagination_horizon = h
             self._add_event(
                 f"🔮 RSSM-lite activated at tick={tick} "
@@ -237,7 +238,11 @@ class SimulationEpisodicRssmMixin:
             a_t = [float(action_val) if n == action_var else 0.0 for n in node_ids]
             X_tp1 = [float(obs_after.get(n, 0.0)) for n in node_ids]
             self._rssm_trainer.push(X_t, a_t, X_tp1)
-            if self.tick % 8 == 0:
+            try:
+                rssm_every = max(1, int(os.environ.get("RKK_RSSM_TRAIN_EVERY", "16")))
+            except ValueError:
+                rssm_every = 16
+            if self.tick % rssm_every == 0:
                 self._rssm_trainer.maybe_train()
         except Exception:
             pass

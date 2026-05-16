@@ -24,6 +24,10 @@ sleep_consolidation.py — Phase K: Sleep Consolidation.
   - fixed_root=False
   - Curriculum advance check (возможно переход к следующему навыку)
   - PhysicalCurriculum.inject_into_scheduler() если нужны новые навыки
+  - RKK_POST_SLEEP_SCORE_RELAX_TICKS (default 480): N тиков после пробуждения реже
+    полный пересчёт score_interventions (мин. интервал = max(RKK_SCORE_CACHE_EVERY,
+    RKK_POST_SLEEP_SCORE_CACHE_EVERY_FLOOR)); 0 — выключить.
+  - RKK_POST_SLEEP_SCORE_CACHE_EVERY_FLOOR (default 32): нижняя граница интервала в этом окне.
 
 RKK_SLEEP_ENABLED=1
 RKK_SLEEP_EVERY_TICKS=10000
@@ -867,24 +871,33 @@ class SleepController:
 
         _memory_diag_log(sim, "sleep_after_REM_replay")
 
-        try:
-            from engine.world_state_bridge import grounded_sleep_consolidate
+        if os.environ.get("RKK_SLEEP_GROUNDED", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            try:
+                from engine.world_state_bridge import grounded_sleep_consolidate
 
-            gsn = grounded_sleep_consolidate(sim)
-            if session is not None and gsn.get("ok"):
-                session.grounded_samples = int(gsn.get("samples_pushed", 0))
-                session.grounded_loss_last = float(gsn.get("loss_last") or 0.0)
-                print(
-                    f"[Sleep] Grounded: samples={session.grounded_samples} "
-                    f"loss={session.grounded_loss_last}"
-                )
-        except Exception as e:
-            print(f"[Sleep] Grounded consolidate: {e}")
-        _memory_diag_log(sim, "sleep_after_grounded_inner_voice")
+                gsn = grounded_sleep_consolidate(sim)
+                if session is not None and gsn.get("ok"):
+                    session.grounded_samples = int(gsn.get("samples_pushed", 0))
+                    session.grounded_loss_last = float(gsn.get("loss_last") or 0.0)
+                    print(
+                        f"[Sleep] Grounded: samples={session.grounded_samples} "
+                        f"loss={session.grounded_loss_last}"
+                    )
+            except Exception as e:
+                print(f"[Sleep] Grounded consolidate: {e}")
+            _memory_diag_log(sim, "sleep_after_grounded_inner_voice")
+        else:
+            print("[Sleep] Grounded consolidate skipped (RKK_SLEEP_GROUNDED=0)")
+
         self._schedule_lesson(tick, sim)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if os.environ.get("RKK_SLEEP_REM_GC", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def tick(self, tick: int, sim) -> dict[str, Any]:
         """
@@ -1086,6 +1099,20 @@ class SleepController:
                 )
             if _wd in ("1", "true", "yes", "on"):
                 g.log_W_threshold_stats("wake_after_prune")
+        except Exception:
+            pass
+
+        # После REM граф плотнее — score_interventions дороже; окно с более редким sync refresh.
+        try:
+            ag = getattr(sim, "agent", None)
+            if ag is not None:
+                try:
+                    rel = int(os.environ.get("RKK_POST_SLEEP_SCORE_RELAX_TICKS", "480"))
+                except ValueError:
+                    rel = 480
+                rel = max(0, rel)
+                if rel > 0:
+                    setattr(ag, "_post_sleep_score_cache_relax_until", int(tick) + rel)
         except Exception:
             pass
 

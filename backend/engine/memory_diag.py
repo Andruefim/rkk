@@ -4,7 +4,10 @@
 Включение:
   RKK_MEMORY_DIAG=1          — логи в консоль
   RKK_MEMORY_DIAG_INTERVAL=0 — если >0, каждые N тиков симуляции (см. mixin_tick)
-  RKK_MEMORY_TRACE=1         — tracemalloc: дифф топ-N аллокаций между снапшотами сна
+  RKK_MEMORY_TRACE=1         — tracemalloc: дифф топ-N аллокаций между снапшотами
+  RKK_MEMORY_TRACE_SLEEP=1   — если RKK_MEMORY_TRACE=1: делать compare_to и на тегах
+                               sleep*/wake (по умолчанию выкл.: compare_to после сна
+                               на большом куче может занимать десятки секунд)
 
 Без psutil на Windows пробуем короткий ctypes-вызов к Working Set.
 """
@@ -24,6 +27,13 @@ def memory_diag_enabled() -> bool:
 
 def memory_trace_enabled() -> bool:
     return os.environ.get("RKK_MEMORY_TRACE", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def memory_trace_sleep_compare_enabled() -> bool:
+    """Разрешить tracemalloc compare_to на sleep/wake-хуках (дорого)."""
+    return os.environ.get("RKK_MEMORY_TRACE_SLEEP", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -215,6 +225,13 @@ def trace_snapshot(tag: str) -> None:
     trace_start_if_needed()
     snap = tracemalloc.take_snapshot()
     top_n = _env_int("RKK_MEMORY_TRACE_TOP", 12)
+    tl = (tag or "").lower()
+    sleepish = "sleep" in tl or tl.startswith("sleep")
+    if sleepish and not memory_trace_sleep_compare_enabled():
+        # Обновляем baseline без compare_to: после REM/графа куча огромна —
+        # compare_to может блокировать главный поток на многие секунды.
+        _last_snapshot = snap
+        return
     if _last_snapshot is not None:
         stats = snap.compare_to(_last_snapshot, "lineno")
         lines = [f"[MemDiag] tracemalloc diff → {tag} (top {top_n})"]

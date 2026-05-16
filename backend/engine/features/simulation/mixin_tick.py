@@ -678,24 +678,29 @@ class SimulationTickMixin:
             from engine.context_posterior import RollingObservationPosterior, pearl_context_enabled
 
             if pearl_context_enabled() and self.current_world == "humanoid":
-                nids = list(self.agent.graph._node_ids)
-                d_g = len(nids)
-                if self._context_posterior is None:
-                    self._context_posterior = RollingObservationPosterior(nids)
-                else:
-                    self._context_posterior.remap_node_ids(nids)
-                self._context_posterior_d = d_g
-                _phy_ctx: dict[str, float] = {}
                 try:
-                    _gdp = getattr(self.agent.env, "get_dynamics_params", None)
-                    if callable(_gdp):
-                        _phy_ctx = dict(_gdp())
-                except Exception:
-                    _phy_ctx = {}
-                self._context_posterior.push(
-                    dict(self.agent.graph.snapshot_vec_dict()),
-                    _phy_ctx,
-                )
+                    pearl_every = max(1, int(os.environ.get("RKK_PEARL_PUSH_EVERY", "4")))
+                except ValueError:
+                    pearl_every = 4
+                if self.tick % pearl_every == 0:
+                    nids = list(self.agent.graph._node_ids)
+                    d_g = len(nids)
+                    if self._context_posterior is None:
+                        self._context_posterior = RollingObservationPosterior(nids)
+                    else:
+                        self._context_posterior.remap_node_ids(nids)
+                    self._context_posterior_d = d_g
+                    _phy_ctx: dict[str, float] = {}
+                    try:
+                        _gdp = getattr(self.agent.env, "get_dynamics_params", None)
+                        if callable(_gdp):
+                            _phy_ctx = dict(_gdp())
+                    except Exception:
+                        _phy_ctx = {}
+                    self._context_posterior.push(
+                        dict(self.agent.graph.snapshot_vec_dict()),
+                        _phy_ctx,
+                    )
         except Exception:
             pass
 

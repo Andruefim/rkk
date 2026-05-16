@@ -570,8 +570,25 @@ class ValueLayer:
                     )
 
         # §2–4 Виртуальный do() + imagination rollout
-        S = dict(current_nodes)
-        S1 = precomputed_s1 if precomputed_s1 is not None else graph.propagate_from(S, variable, value)
+        # Perf: при fixed_root + horizon=0 виртуальный WM для intent_* не нужен —
+        # один шаг = локальная подстановка вектора узлов (избегаем integrate_world_model_step).
+        _fast_fr = os.environ.get("RKK_VL_FAST_FIXED_ROOT", "1").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if (
+            _fast_fr
+            and fixed_root
+            and imagination_horizon == 0
+            and is_intent_action
+            and precomputed_s1 is None
+        ):
+            S1 = dict(current_nodes)
+            S1[variable] = float(value)
+        else:
+            S = dict(current_nodes)
+            S1 = precomputed_s1 if precomputed_s1 is not None else graph.propagate_from(
+                S, variable, value
+            )
         br_msg = self._graph_constraints(
             S1, S, eff, slot_action, raw_prev_entropy=True,
             skip_entropy=fixed_root,  # в fixed_root пропускаем entropy_spike
