@@ -161,6 +161,32 @@ class System1:
             float(np.clip(discovery_rate, 0, 1)),
         ]
 
+    def build_features_batch(
+        self,
+        w_ij: np.ndarray,
+        alpha_ij: np.ndarray,
+        val_from: np.ndarray,
+        val_to: np.ndarray,
+        uncertainty: np.ndarray,
+        h_W_norm: float,
+        grad_norm_ij: np.ndarray,
+        intervention_count: np.ndarray,
+        discovery_rate: float,
+    ) -> np.ndarray:
+        """Vectorized feature construction for N candidates at once. Returns (N, 9) array."""
+        n = len(w_ij)
+        out = np.empty((n, 9), dtype=np.float32)
+        out[:, 0] = np.tanh(w_ij)
+        out[:, 1] = np.clip(alpha_ij, 0, 1)
+        out[:, 2] = np.clip(val_from, 0, 1)
+        out[:, 3] = np.clip(val_to, 0, 1)
+        out[:, 4] = np.clip(uncertainty, 0, 1)
+        out[:, 5] = float(np.clip(h_W_norm, 0, 1))
+        out[:, 6] = np.tanh(grad_norm_ij)
+        out[:, 7] = np.clip(intervention_count / 100.0, 0, 1)
+        out[:, 8] = float(np.clip(discovery_rate, 0, 1))
+        return out
+
     def score(self, features_batch: list[list[float]]) -> list[float]:
         """
         Предсказываем E[IG] для батча пар (from_var, to_var).
@@ -173,6 +199,16 @@ class System1:
         with torch.no_grad():
             scores = self.net(x).squeeze(-1)
         return scores.cpu().tolist()
+
+    def score_np(self, features_np: np.ndarray) -> np.ndarray:
+        """Score from numpy array directly (avoids list→tensor conversion). Returns (N,) numpy."""
+        if features_np.shape[0] == 0:
+            return np.array([], dtype=np.float32)
+        self.net.eval()
+        x = torch.from_numpy(features_np).to(self.device)
+        with torch.no_grad():
+            scores = self.net(x).squeeze(-1)
+        return scores.cpu().numpy()
 
     def push_experience(self, features: list[float], actual_ig: float):
         """Записываем опыт и запускаем обучение по расписанию."""

@@ -209,6 +209,12 @@ class SimulationWorldMixin:
                 "seeds_injected": result.get("injected", 0),
             }
 
+    def set_fixed_root_force(self, force_ratio: float) -> None:
+        """Плавно меняем силу фиксации в PyBullet."""
+        humanoid = self._humanoid_base_env()
+        if humanoid is not None and hasattr(humanoid, "set_fixed_root_force"):
+            humanoid.set_fixed_root_force(force_ratio)
+
     def disable_fixed_root(self) -> dict:
         """
         Отключаем fixed_root mode:

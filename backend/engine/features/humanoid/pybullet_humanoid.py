@@ -350,6 +350,21 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             self._root_constraint = None
             print("[HumanoidEnv] Fixed root constraint removed")
 
+    def set_fixed_root_force(self, force_ratio: float) -> None:
+        """Плавно меняем силу фиксации (от 1.0 до 0.0) перед полным снятием."""
+        with self._physics_lock:
+            if self._root_constraint is None:
+                return
+            force = float(self._mt["root_constraint"]) * np.clip(force_ratio, 0.0, 1.0)
+            try:
+                pb.changeConstraint(
+                    self._root_constraint,
+                    maxForce=force,
+                    physicsClientId=self.client,
+                )
+            except Exception as e:
+                pass
+
     @property
     def fixed_root(self) -> bool:
         return self._root_constraint is not None

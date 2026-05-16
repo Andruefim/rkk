@@ -732,6 +732,15 @@ class SleepController:
                         "[Sleep] REM: MoCap dreams skipped "
                         "(RKK_SLEEP_MOCAP_DREAMS=0)"
                     )
+                # Normalize W after REM to prevent densification (the LR boost causes weight explosion)
+                core = getattr(sim.agent.graph, "_core", None)
+                if core is not None:
+                    with torch.no_grad():
+                        w_max = core.W.abs().max()
+                        if w_max > 1.5:
+                            core.W.data.div_(w_max / 1.5)
+                            print(f"[Sleep] REM: Normalized W max {w_max:.2f} → 1.5 to prevent densification")
+
                 _memory_diag_log(sim, "sleep_after_REM_replay")
 
                 try:

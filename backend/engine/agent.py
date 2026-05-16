@@ -421,6 +421,9 @@ class RKKAgent:
         self._score_thread: threading.Thread | None = None
         self._score_result: list[dict] = []
         self._score_lock = threading.Lock()
+        # Cache for dag_constraint (4× d×d matmuls) — recompute at most once per score_cache window
+        self._h_W_cache: float = 0.0
+        self._h_W_cache_tick: int = -9_999_999
 
         # Фаза 3: LLM-учитель (IG-бонус затухает с числом интервенций)
         self._teacher_rules: list[TeacherIGRule] = []
@@ -1259,7 +1262,12 @@ class RKKAgent:
 
         bticks = _intervention_bootstrap_ticks()
 
-        h_W_norm = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
+        # Cache dag_constraint (4× d×d matmuls) — reuse across score cache window
+        sce = _score_cache_every()
+        if abs(self._last_engine_tick - self._h_W_cache_tick) >= max(1, sce):
+            self._h_W_cache = float(abs(self._get_h_W()))
+            self._h_W_cache_tick = self._last_engine_tick
+        h_W_norm = min(self._h_W_cache / max(self.graph._d, 1), 1.0)
         h_clip = float(np.clip(h_W_norm, 0.0, 1.0))
         disc_rate = self.discovery_rate
         disc_clip = float(np.clip(disc_rate, 0.0, 1.0))
@@ -1379,58 +1387,71 @@ class RKKAgent:
             else:
                 selected = valid_idx
 
-            for k in selected:
-                i_v, j_v = int(fi[k]), int(fj[k])
+            # ── Vectorized feature construction for all selected candidates ──
+            sel_fi = fi[selected]
+            sel_fj = fj[selected]
+            sel_iv = sel_fi.astype(np.intp)
+            sel_jv = sel_fj.astype(np.intp)
+            sel_ii = ridx[sel_iv]
+            sel_jj = ridx[sel_jv]
+            sel_unc = unc_pairs[selected].astype(np.float32)
+            sel_motor = is_motor_arr[selected]
+
+            # Gather W and grad values vectorized
+            n_sel = len(selected)
+            w_arr = np.zeros(n_sel, dtype=np.float32)
+            g_arr = np.zeros(n_sel, dtype=np.float32)
+            ok_wm = valid_node[sel_iv] & valid_node[sel_jv]
+            if W_m is not None:
+                ok_wm &= (sel_ii < W_m.shape[0]) & (sel_jj < W_m.shape[1])
+                w_arr[ok_wm] = W_m[sel_ii[ok_wm], sel_jj[ok_wm]]
+                if g_m is not None:
+                    ok_gm = ok_wm & (sel_ii < g_m.shape[0]) & (sel_jj < g_m.shape[1])
+                    g_arr[ok_gm] = g_m[sel_ii[ok_gm], sel_jj[ok_gm]]
+
+            # Build all features in one vectorized call
+            feats_np = self.system1.build_features_batch(
+                w_ij=w_arr,
+                alpha_ij=1.0 - sel_unc,
+                val_from=nodes_arr[sel_iv].astype(np.float32),
+                val_to=nodes_arr[sel_jv].astype(np.float32),
+                uncertainty=sel_unc,
+                h_W_norm=h_clip,
+                grad_norm_ij=g_arr,
+                intervention_count=np.zeros(n_sel, dtype=np.float32),
+                discovery_rate=disc_clip,
+            )
+
+            # Generate random values vectorized
+            vals_non_motor = rng.uniform(0.15, 0.85, size=n_sel).astype(np.float64)
+            if stable_stance:
+                vals_motor = rng.uniform(0.30, 0.72, size=n_sel).astype(np.float64)
+            else:
+                vals_motor = rng.uniform(0.35, 0.68, size=n_sel).astype(np.float64)
+            vals = np.where(sel_motor, vals_motor, vals_non_motor)
+            vals = np.clip(vals, 0.06, 0.94)
+
+            # Build candidates list
+            for idx_k in range(n_sel):
+                k = int(selected[idx_k])
+                i_v, j_v = int(sel_iv[idx_k]), int(sel_jv[idx_k])
                 vf, vt = var_ids[i_v], var_ids[j_v]
-                unc_k = float(unc_pairs[k])
-                ii, jj = int(ridx[i_v]), int(ridx[j_v])
-                if (
-                    W_m is not None
-                    and valid_node[i_v]
-                    and valid_node[j_v]
-                    and 0 <= ii < W_m.shape[0]
-                    and 0 <= jj < W_m.shape[1]
-                ):
-                    w_ij = float(W_m[ii, jj])
-                    if (
-                        g_m is not None
-                        and 0 <= ii < g_m.shape[0]
-                        and 0 <= jj < g_m.shape[1]
-                    ):
-                        grad_n = float(g_m[ii, jj])
-                    else:
-                        grad_n = 0.0
-                else:
-                    w_ij, grad_n = 0.0, 0.0
-                alpha = 1.0 - unc_k
-                feat = self.system1.build_features(
-                    w_ij=w_ij,
-                    alpha_ij=alpha,
-                    val_from=float(nodes_arr[i_v]),
-                    val_to=float(nodes_arr[j_v]),
-                    uncertainty=unc_k,
-                    h_W_norm=h_clip,
-                    grad_norm_ij=grad_n,
-                    intervention_count=0,
-                    discovery_rate=disc_clip,
-                )
-                is_motor = bool(is_motor_arr[k])
-                if is_motor:
-                    lo, hi = (0.30, 0.72) if stable_stance else (0.35, 0.68)
-                    if str(vf).endswith("stride"):
-                        hi = min(hi, 0.62 if stable_stance else 0.56)
-                    if str(vf).endswith("stop_recover"):
+                # Per-motor adjustments for stride/stop_recover
+                if sel_motor[idx_k]:
+                    vf_s = str(vf)
+                    if vf_s.endswith("stride"):
+                        hi_lim = 0.62 if stable_stance else 0.56
+                        vals[idx_k] = min(vals[idx_k], hi_lim)
+                    if vf_s.endswith("stop_recover"):
                         lo, hi = (0.55, 0.80) if not stable_stance else (0.40, 0.65)
-                    val = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
-                else:
-                    val = float(np.clip(rng.uniform(0.15, 0.85), 0.06, 0.94))
+                        vals[idx_k] = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
                 candidates.append(
                     {
                         "variable": vf,
                         "target": vt,
-                        "value": val,
-                        "uncertainty": unc_k,
-                        "features": feat,
+                        "value": float(vals[idx_k]),
+                        "uncertainty": float(sel_unc[idx_k]),
+                        "features": feats_np[idx_k].tolist(),
                         "expected_ig": 0.0,
                     }
                 )
@@ -1506,7 +1527,9 @@ class RKKAgent:
         if not candidates:
             return []
 
-        scores = self.system1.score([c["features"] for c in candidates])
+        # Extract features as numpy array for fast scoring (avoids list→tensor conversion)
+        feats_all = np.array([c["features"] for c in candidates], dtype=np.float32)
+        scores = self.system1.score_np(feats_all)
         for i, cand in enumerate(candidates):
             cand["expected_ig"] = float(scores[i])
 

@@ -190,21 +190,27 @@ class SimulationTickMixin:
                     )
             if (
                 self._fixed_root_active
-                and self.tick >= auto_fr_ticks
                 and not self._curriculum_auto_fr_released
             ):
-                self._curriculum_auto_fr_released = True
-                self.disable_fixed_root()
-                try:
-                    stab = int(os.environ.get("RKK_POST_FR_STABILIZE_TICKS", "80"))
-                except ValueError:
-                    stab = 80
-                self._curriculum_stabilize_until = self.tick + max(0, stab)
-                self._add_event(
-                    f"📌 Auto fixed_root OFF at tick {self.tick}, stabilize until {self._curriculum_stabilize_until}",
-                    "#66ccaa",
-                    "phase",
-                )
+                # Gradual soft-release over 200 ticks
+                release_window = 200
+                if self.tick >= auto_fr_ticks - release_window:
+                    ratio = max(0.0, float(auto_fr_ticks - self.tick) / float(release_window))
+                    self.set_fixed_root_force(ratio)
+                    
+                if self.tick >= auto_fr_ticks:
+                    self._curriculum_auto_fr_released = True
+                    self.disable_fixed_root()
+                    try:
+                        stab = int(os.environ.get("RKK_POST_FR_STABILIZE_TICKS", "80"))
+                    except ValueError:
+                        stab = 80
+                    self._curriculum_stabilize_until = self.tick + max(0, stab)
+                    self._add_event(
+                        f"📌 Auto fixed_root OFF at tick {self.tick}, stabilize until {self._curriculum_stabilize_until}",
+                        "#66ccaa",
+                        "phase",
+                    )
 
         # Fallen check + автосброс физики (иначе VL и block_rate залипают)
         fallen = False
