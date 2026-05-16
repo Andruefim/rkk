@@ -434,6 +434,9 @@ class EnvironmentVisual:
                 step_fn = getattr(self.base_env, "_sim", None)
                 if step_fn is not None:
                     step_fn.step(8)
+        elif variable.startswith("phys_intent_"):
+            # Раньше общего phys_*: иначе phys_intent_* попадёт в hybrid как variable[5:]==intent_*…
+            _base_iv(variable, value)
         elif variable.startswith("phys_"):
             # Hybrid mode: прямое воздействие только на управляемые моторные phys_*.
             # Наблюдаемые sandbox-переменные остаются read-only.

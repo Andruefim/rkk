@@ -766,13 +766,28 @@ class SimulationTickMixin:
             pass
 
         # #region agent log
+        _inner_ms = (time.perf_counter() - _t_inner0) * 1000.0
         _dbg_tick(
             "H4",
             "mixin_tick._run_single_agent_timestep_inner",
             "timestep_inner_done",
-            {"tick": self.tick, "ms": (time.perf_counter() - _t_inner0) * 1000},
+            {"tick": self.tick, "ms": _inner_ms},
         )
         # #endregion
+        try:
+            from engine.tick_run_logger import record_sim_tick
+
+            record_sim_tick(
+                self,
+                result=result,
+                snap=snap,
+                inner_ms=_inner_ms,
+                obs=_obs_for_d_e if _obs_for_d_e else None,
+                fallen=fallen,
+                posture=_posture_now,
+            )
+        except Exception as e:
+            print(f"[TickRunLog] hook: {e}")
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)
 
     def _apply_topological_self_priors(self) -> None:

@@ -21,6 +21,12 @@ class SimulationSnapshotShutdownMixin:
             return self._build_snapshot(snap, {}, smoothed, scene)
 
     def shutdown(self):
+        try:
+            from engine.tick_run_logger import finalize_tick_run_log
+
+            finalize_tick_run_log(self)
+        except Exception:
+            pass
         self._bg.stop_rkk_agent_loop()
         self._stop_cpg_background_loop()
         try:

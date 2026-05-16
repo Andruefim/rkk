@@ -26,6 +26,24 @@ from engine.features.humanoid.deps import PYBULLET_AVAILABLE
 from engine.features.humanoid.fallback import _FallbackHumanoid
 from engine.features.humanoid.pybullet_humanoid import _PyBulletHumanoid
 
+_PHYS_INTENT_PREFIX = "phys_intent_"
+
+
+def canonical_motor_intent_variable(variable: str) -> str:
+    """
+    Узлы графа часто называются phys_intent_*; в среде ключи _motor_state — intent_* из MOTOR_INTENT_VARS.
+    phys_intent_lean_forward → intent_lean_forward. Неизвестный суффикс возвращается без изменений.
+    """
+    v = str(variable)
+    if not v.startswith(_PHYS_INTENT_PREFIX):
+        return v
+    rest = v[len(_PHYS_INTENT_PREFIX) :]
+    if not rest:
+        return v
+    cand = f"intent_{rest}"
+    return cand if cand in MOTOR_INTENT_VARS else v
+
+
 # ─── EnvironmentHumanoid ─────────────────────────────────────────────────────
 class EnvironmentHumanoid:
     """
@@ -347,6 +365,8 @@ class EnvironmentHumanoid:
         if count_intervention:
             self.n_interventions += 1
 
+        variable = canonical_motor_intent_variable(variable)
+
         if variable in INTERO_VARS:
             # Intero vars are read-only sensors; ignore external writes.
             self._sim.step(self.steps_per_do)
@@ -402,6 +422,7 @@ class EnvironmentHumanoid:
         touched_intent = False
         joints_after: list[tuple[str, float]] = []
         for variable, value in pairs:
+            variable = canonical_motor_intent_variable(variable)
             v = float(np.clip(value, 0.05, 0.95))
             if variable in INTERO_VARS:
                 continue  # read-only sensors
@@ -599,10 +620,11 @@ class EnvironmentHumanoid:
         if self._intero_control_lost:
             return
         for k, delta in (residuals or {}).items():
-            if k not in MOTOR_INTENT_VARS:
+            ck = canonical_motor_intent_variable(k)
+            if ck not in MOTOR_INTENT_VARS:
                 continue
-            prev = float(self._motor_state.get(k, 0.5))
-            self._motor_state[k] = float(
+            prev = float(self._motor_state.get(ck, 0.5))
+            self._motor_state[ck] = float(
                 np.clip(prev + float(delta), 0.05, 0.95)
             )
 

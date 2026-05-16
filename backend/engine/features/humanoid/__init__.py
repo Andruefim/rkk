@@ -25,7 +25,7 @@ from engine.features.humanoid.constants import (
     VAR_NAMES,
 )
 from engine.features.humanoid.deps import PIL_AVAILABLE, PYBULLET_AVAILABLE
-from engine.features.humanoid.environment import EnvironmentHumanoid
+from engine.features.humanoid.environment import EnvironmentHumanoid, canonical_motor_intent_variable
 from engine.features.humanoid.seeds import (
     fixed_root_seeds,
     humanoid_hardcoded_seeds,
@@ -36,6 +36,7 @@ __all__ = [
     "ARM_VARS",
     "CUBE_VARS",
     "EnvironmentHumanoid",
+    "canonical_motor_intent_variable",
     "FIXED_BASE_VARS",
     "FOOT_VARS",
     "HEAD_VARS",

@@ -1581,6 +1581,7 @@ class RKKAgent:
 
     # ── Один шаг с Value Layer ────────────────────────────────────────────────
     def step(self, engine_tick: int = 0, *, enable_l3: bool = True) -> dict:
+        _step_t0 = time.perf_counter()
         _slow_t = {
             "observe": 0.0,
             "score_interventions": 0.0,
@@ -2094,6 +2095,12 @@ class RKKAgent:
             "efference": _eff,
         }
         _report_if_slow_tick()
+        self._last_step_timings = {
+            k: round(float(v) * 1000.0, 2) for k, v in _slow_t.items()
+        }
+        self._last_step_timings["total_ms"] = round(
+            (time.perf_counter() - _step_t0) * 1000.0, 2
+        )
         return self._last_result
 
     # ── Demon ─────────────────────────────────────────────────────────────────
