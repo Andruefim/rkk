@@ -56,6 +56,118 @@ class SimulationTickMixin:
             return
         self.agent.temporal = TemporalBlankets(d_input=g_d, device=self.device)
 
+    def _fr_posture_and_bias_from_graph(self) -> tuple[float, float]:
+        g = self.agent.graph.nodes
+        posture = float(
+            g.get("posture_stability", g.get("phys_posture_stability", 0.5))
+        )
+        bias = float(g.get("support_bias", g.get("phys_support_bias", 0.5)))
+        return posture, bias
+
+    def _fr_update_release_tracking(self) -> None:
+        if not self._fixed_root_active:
+            return
+        try:
+            posture_min = float(os.environ.get("RKK_FR_RELEASE_POSTURE_MIN", "0.85"))
+        except ValueError:
+            posture_min = 0.85
+        posture, bias = self._fr_posture_and_bias_from_graph()
+        self._fr_support_bias_hist.append(bias)
+        if posture >= posture_min:
+            self._fr_posture_streak += 1
+        else:
+            self._fr_posture_streak = 0
+
+    def _fr_early_release_ready(self) -> tuple[bool, str]:
+        try:
+            rel_mq = float(os.environ.get("RKK_FIXED_ROOT_RELEASE_MASTERY", "0.72"))
+            rel_min = max(
+                1, int(os.environ.get("RKK_FIXED_ROOT_RELEASE_MIN_TICKS", "400"))
+            )
+            streak_need = max(
+                10, int(os.environ.get("RKK_FR_RELEASE_POSTURE_STREAK", "40"))
+            )
+            bias_need = float(os.environ.get("RKK_FR_RELEASE_BIAS_RANGE", "0.15"))
+            hist_min = max(20, int(os.environ.get("RKK_FR_RELEASE_BIAS_WINDOW", "30")))
+        except ValueError:
+            rel_mq, rel_min, streak_need, bias_need, hist_min = (
+                0.72,
+                400,
+                40,
+                0.15,
+                30,
+            )
+        if self.tick < rel_min or self.tick < self._fr_release_blocked_until:
+            return False, ""
+        if not hasattr(self.agent, "_prog_scope"):
+            return False, ""
+        if float(self.agent._prog_scope.mastery_quality) < rel_mq:
+            return False, ""
+        if self._fr_posture_streak < streak_need:
+            return False, ""
+        hist = list(self._fr_support_bias_hist)
+        if len(hist) < hist_min:
+            return False, ""
+        if (max(hist) - min(hist)) < bias_need:
+            return False, ""
+        return True, "mastery+posture+bias"
+
+    def _fr_try_reattach_after_fall(self, obs: dict) -> None:
+        if not self._curriculum_auto_fr_released or self._fixed_root_active:
+            return
+        if self._fr_reattach_active:
+            return
+        try:
+            max_n = max(1, int(os.environ.get("RKK_POST_FR_REATTACH_MAX", "3")))
+            dur = max(40, int(os.environ.get("RKK_POST_FR_REATTACH_TICKS", "150")))
+        except ValueError:
+            max_n, dur = 3, 150
+        if self._fr_reattach_count >= max_n:
+            return
+        self._fr_reattach_count += 1
+        self._fr_reattach_active = True
+        self._fr_reattach_until = self.tick + dur
+        self._fr_release_blocked_until = self._fr_reattach_until + dur
+        self._fr_posture_streak = 0
+        r = self.enable_fixed_root()
+        if not r.get("error"):
+            fn = getattr(self.agent.env, "reset_stance", None)
+            if callable(fn):
+                fn()
+            self.agent.graph._obs_buffer.clear()
+            self.agent.graph._int_buffer.clear()
+            self._add_event(
+                f"📌 fixed_root RE-ATTACH ({dur} ticks, "
+                f"fall #{self._fr_reattach_count}/{max_n})",
+                "#ffaa66",
+                "phase",
+            )
+
+    def _fr_maybe_end_reattach(self) -> None:
+        if not self._fr_reattach_active or self.tick < self._fr_reattach_until:
+            return
+        is_fn = getattr(self.agent.env, "is_fallen", None)
+        fallen = is_fn() if callable(is_fn) else False
+        posture, _ = self._fr_posture_and_bias_from_graph()
+        try:
+            posture_ok = float(os.environ.get("RKK_FR_REATTACH_POSTURE_MIN", "0.82"))
+        except ValueError:
+            posture_ok = 0.82
+        if fallen or posture < posture_ok:
+            return
+        self._fr_reattach_active = False
+        self.disable_fixed_root()
+        try:
+            stab = int(os.environ.get("RKK_POST_FR_STABILIZE_TICKS", "120"))
+        except ValueError:
+            stab = 120
+        self._curriculum_stabilize_until = self.tick + max(0, stab)
+        self._add_event(
+            f"📌 fixed_root re-release after reattach (tick {self.tick})",
+            "#66ccaa",
+            "phase",
+        )
+
     # ── Tick ──────────────────────────────────────────────────────────────────
     def tick_step(self) -> dict:
         hz = _agent_loop_hz_from_env()
@@ -188,26 +300,40 @@ class SimulationTickMixin:
                         "#66ccaa",
                         "phase",
                     )
+            self._fr_maybe_end_reattach()
+
             if (
                 self._fixed_root_active
                 and not self._curriculum_auto_fr_released
             ):
-                # Gradual soft-release over 200 ticks
+                self._fr_update_release_tracking()
                 release_window = 200
                 if self.tick >= auto_fr_ticks - release_window:
-                    ratio = max(0.0, float(auto_fr_ticks - self.tick) / float(release_window))
+                    ratio = max(
+                        0.0, float(auto_fr_ticks - self.tick) / float(release_window)
+                    )
                     self.set_fixed_root_force(ratio)
-                    
-                if self.tick >= auto_fr_ticks:
+
+                early_release, rel_reason = self._fr_early_release_ready()
+                time_release = self.tick >= auto_fr_ticks
+
+                if time_release or early_release:
                     self._curriculum_auto_fr_released = True
                     self.disable_fixed_root()
                     try:
-                        stab = int(os.environ.get("RKK_POST_FR_STABILIZE_TICKS", "80"))
+                        stab = int(os.environ.get("RKK_POST_FR_STABILIZE_TICKS", "120"))
                     except ValueError:
-                        stab = 80
+                        stab = 120
                     self._curriculum_stabilize_until = self.tick + max(0, stab)
+                    if early_release and not time_release:
+                        reason = rel_reason
+                    elif time_release and not early_release:
+                        reason = f"tick≥{auto_fr_ticks}"
+                    else:
+                        reason = f"{rel_reason}+tick≥{auto_fr_ticks}"
                     self._add_event(
-                        f"📌 Auto fixed_root OFF at tick {self.tick}, stabilize until {self._curriculum_stabilize_until}",
+                        f"📌 fixed_root OFF ({reason}) tick {self.tick}, "
+                        f"stabilize until {self._curriculum_stabilize_until}",
                         "#66ccaa",
                         "phase",
                     )
@@ -222,6 +348,11 @@ class SimulationTickMixin:
             if fallen:
                 self._fall_count += 1
                 obs_fall = dict(self.agent.env.observe())
+                if (
+                    self._curriculum_auto_fr_released
+                    and self.tick > self._curriculum_stabilize_until
+                ):
+                    self._fr_try_reattach_after_fall(obs_fall)
                 if self._maybe_recover_or_reset_after_fall(obs_fall):
                     obs = self.agent.env.observe()
                     self._sync_motor_state(obs, source="reset", tick=self.tick)
@@ -270,6 +401,19 @@ class SimulationTickMixin:
             fallen_pre = is_fn_pre()
         self._maybe_apply_cpg_locomotion(fallen_pre)
         self._publish_cpg_node_snapshot()
+        if self.current_world == "humanoid":
+            base_env = self._unwrap_base_env(self.agent.env)
+            cpg_on = bool(getattr(base_env, "cpg_owns_legs", False))
+            loco_r = (
+                self._locomotion_reward_ema()
+                if self._locomotion_controller is not None
+                else 0.0
+            )
+            self.agent.graph.set_locomotion_train_context(
+                reward_ema=loco_r,
+                cpg_active=cpg_on,
+                fallen=bool(fallen_pre),
+            )
         self.agent.other_agents_phi = []
         self._maybe_step_hierarchical_l1()
         self._sync_temporal_blankets_to_graph()
@@ -284,14 +428,17 @@ class SimulationTickMixin:
                     fn_perturb(max_force=force)
 
         obs_pre_rssm = dict(self.agent.graph.snapshot_vec_dict())
+        _t_phase = time.perf_counter()
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
+        self._inner_phase_ms = getattr(self, "_inner_phase_ms", {})
+        self._inner_phase_ms["agent"] = round((time.perf_counter() - _t_phase) * 1000.0, 2)
 
         # Track action for episodic memory
         self._record_last_action(result)
 
         _obs_for_d_e: dict = {}
         try:
-            _obs_for_d_e = dict(self.agent.env.observe())
+            _obs_for_d_e = dict(self.agent.graph.snapshot_vec_dict())
         except Exception:
             pass
         _posture_now = float(
@@ -460,6 +607,7 @@ class SimulationTickMixin:
                 self._hai_pe_ema = 0.0
 
         # Phase K: Sleep Controller
+        _t_sleep = time.perf_counter()
         if (
             _PHASE_K_AVAILABLE
             and self._sleep_ctrl is not None
@@ -495,15 +643,22 @@ class SimulationTickMixin:
                         "#ffff88",
                         "sleep",
                     )
+        self._inner_phase_ms["sleep"] = round((time.perf_counter() - _t_sleep) * 1000.0, 2)
 
         # Phase K: Physical curriculum when scheduler runs low on stages ahead
         if (
             _PHASE_K_AVAILABLE
             and self._physical_curriculum is not None
             and self._curriculum is not None
-            and self.tick % 1000 == 0
         ):
-            self._physical_curriculum.inject_into_scheduler(self._curriculum)
+            try:
+                phys_every = max(
+                    1, int(os.environ.get("RKK_PHYS_CURRICULUM_INJECT_EVERY", "50"))
+                )
+            except ValueError:
+                phys_every = 50
+            if self.tick % phys_every == 0:
+                self._physical_curriculum.inject_into_scheduler(self._curriculum)
 
         # Phase L: Verbal Action (async in background thread)
         if _VERBAL_AVAILABLE and self._verbal is not None:
@@ -608,7 +763,9 @@ class SimulationTickMixin:
         self._log_step(result, fallen)
         self._rolling_block_bits.append(1 if result.get("blocked") else 0)
 
+        _t_snap = time.perf_counter()
         snap = self.agent.snapshot()
+        self._inner_phase_ms["snapshot"] = round((time.perf_counter() - _t_snap) * 1000.0, 2)
         snap["fallen"]     = fallen
         snap["fall_count"] = self._fall_count
         cp = getattr(self, "_context_posterior", None)
@@ -684,7 +841,12 @@ class SimulationTickMixin:
 
         # Phase M: slot labels + attention → visual concepts / verbal context
         if _PHASE_M_AVAILABLE:
-            self._phase_m_sync_from_vision()
+            try:
+                _pm_every = max(1, int(os.environ.get("RKK_PHASE_M_EVERY", "5")))
+            except ValueError:
+                _pm_every = 5
+            if self.tick % _pm_every == 0:
+                self._phase_m_sync_from_vision()
 
         if _WORLD_BRIDGE_AVAILABLE and self._world_bridge is not None:
             try:

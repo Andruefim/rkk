@@ -143,6 +143,12 @@ class Simulation(
         self._fixed_root_active = False
         self._curriculum_auto_fr_released = False
         self._curriculum_stabilize_until: int = 0
+        self._fr_posture_streak: int = 0
+        self._fr_support_bias_hist: deque[float] = deque(maxlen=48)
+        self._fr_reattach_active: bool = False
+        self._fr_reattach_until: int = 0
+        self._fr_reattach_count: int = 0
+        self._fr_release_blocked_until: int = 0
         self._stand_ticks = 0
         self._last_fall_reset_tick: int = -999
         self._fall_recovery_active = False

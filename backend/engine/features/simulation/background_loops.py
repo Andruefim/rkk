@@ -10,6 +10,7 @@ import time
 import traceback
 from typing import TYPE_CHECKING
 
+from engine.core.constants import cpg_during_fixed_root_enabled
 from engine.core.constants import cpg_loop_hz_from_env as _cpg_loop_hz_from_env
 
 if TYPE_CHECKING:
@@ -45,7 +46,9 @@ class BackgroundLoopService:
         s = self._sim
         if not s._cpg_decoupled_enabled():
             return
-        if s.current_world != "humanoid" or s._fixed_root_active:
+        if s.current_world != "humanoid":
+            return
+        if s._fixed_root_active and not cpg_during_fixed_root_enabled():
             return
         base = s._unwrap_base_env(s.agent.env)
         if not callable(getattr(base, "apply_cpg_leg_targets", None)):
@@ -83,7 +86,10 @@ class BackgroundLoopService:
                 if not s._locomotion_cpg_enabled():
                     time.sleep(0.05)
                     continue
-                if s.current_world != "humanoid" or s._fixed_root_active:
+                if s.current_world != "humanoid":
+                    time.sleep(0.05)
+                    continue
+                if s._fixed_root_active and not cpg_during_fixed_root_enabled():
                     time.sleep(0.05)
                     continue
                 base = s._unwrap_base_env(s.agent.env)

@@ -85,6 +85,7 @@ def sz_split_enabled() -> bool:
     )
 
 
+from engine.wm_locomotion_gating import locomotion_wm_scales
 from engine.wm_neural_ode import integrate_world_model_step
 
 # ── Переключение ядра ─────────────────────────────────────────────────────────
@@ -221,6 +222,9 @@ class CausalGraph:
         except ValueError:
             self._seq_len = 16
         self._seq_len = max(4, min(64, self._seq_len))
+        self._loco_reward_ema: float = 0.0
+        self._loco_cpg_active: bool = False
+        self._loco_fallen: bool = False
         try:
             self.LAMBDA_L1 = float(
                 os.environ.get("RKK_LAMBDA_L1", str(self.__class__.LAMBDA_L1))
@@ -326,7 +330,9 @@ class CausalGraph:
         self._core = old_core if preserve_state else None
         self._rebuild_core()
 
-    def apply_env_observation(self, env_obs: dict[str, float]) -> None:
+    def apply_env_observation(
+        self, env_obs: dict[str, float], *, engine_tick: int = -1
+    ) -> None:
         """Обновить узлы из observe() среды; пересчитать значения concept_* (среднее по members)."""
         for k, v in env_obs.items():
             if k not in self.nodes:
@@ -335,7 +341,17 @@ class CausalGraph:
                 self.nodes[k] = float(v)
             except (TypeError, ValueError):
                 pass
-        self.refresh_concept_aggregates()
+        every = 1
+        try:
+            every = max(1, int(os.environ.get("RKK_CONCEPT_REFRESH_EVERY", "5")))
+        except ValueError:
+            every = 5
+        if (
+            not self._concept_meta
+            or engine_tick < 0
+            or engine_tick % every == 0
+        ):
+            self.refresh_concept_aggregates()
 
     def refresh_concept_aggregates(self) -> None:
         for cid, meta in self._concept_meta.items():
@@ -616,8 +632,37 @@ class CausalGraph:
             if len(self._seq_buffer) > max_seqs * 2:
                 self._seq_buffer = self._seq_buffer[-max_seqs:]
 
-    def record_intervention(self, var_name: str, val: float,
-                            obs_before: dict, obs_after: dict) -> None:
+    def set_locomotion_train_context(
+        self, *, reward_ema: float, cpg_active: bool, fallen: bool = False
+    ) -> None:
+        """Вызывается из simulation tick перед agent.step (CPG/L1 контекст)."""
+        self._loco_reward_ema = float(reward_ema)
+        self._loco_cpg_active = bool(cpg_active)
+        self._loco_fallen = bool(fallen)
+
+    def _locomotion_wm_scales(self) -> tuple[float, float, float]:
+        return locomotion_wm_scales(
+            self._loco_reward_ema,
+            self._loco_cpg_active,
+            fallen=getattr(self, "_loco_fallen", False),
+        )
+
+    def _int_buffer_for_training(self, int_scale: float) -> list[dict]:
+        buf = self._int_buffer
+        if int_scale >= 0.7 or len(buf) < 4:
+            return buf
+        agent_only = [x for x in buf if x.get("source", "agent") != "cpg_burst"]
+        return agent_only if len(agent_only) >= 4 else buf
+
+    def record_intervention(
+        self,
+        var_name: str,
+        val: float,
+        obs_before: dict,
+        obs_after: dict,
+        *,
+        source: str = "agent",
+    ) -> None:
         if is_read_only_macro_var(var_name):
             return
         if var_name not in self._node_ids:
@@ -627,6 +672,7 @@ class CausalGraph:
             "val":        val,
             "obs_before": [obs_before.get(n, 0.0) for n in self._node_ids],
             "obs_after":  [obs_after.get(n, 0.0)  for n in self._node_ids],
+            "source":     str(source),
         })
         if len(self._int_buffer) > self.BUFFER_SIZE:
             self._int_buffer = self._int_buffer[-self.BUFFER_SIZE:]
@@ -738,8 +784,10 @@ class CausalGraph:
         for p in core.parameters():
             p.requires_grad = True
 
-    def _finish_train_step(self, loss: torch.Tensor) -> None:
+    def _finish_train_step(self, loss: torch.Tensor, *, lr_scale: float = 1.0) -> None:
         """Shared backward + optimizer step for both training modes."""
+        if lr_scale < 0.999:
+            loss = loss * float(lr_scale)
         loss.backward()
         self._zero_grad_frozen_W()
         torch.nn.utils.clip_grad_norm_(self._core.parameters(), max_norm=1.0)
@@ -768,7 +816,11 @@ class CausalGraph:
 
         # Sample batch of sequences
         buf = self._seq_buffer
-        batch_size = min(4, len(buf))
+        try:
+            batch_cap = max(1, int(os.environ.get("RKK_WM_SEQ_BATCH", "2")))
+        except ValueError:
+            batch_cap = 2
+        batch_size = min(batch_cap, len(buf))
         indices = random.sample(range(len(buf)), batch_size)
         
         batch_items = [buf[i] for i in indices]
@@ -827,19 +879,32 @@ class CausalGraph:
         l_rec_elementwise = F.mse_loss(X_pred, X_target, reduction='none')
         l_rec = (l_rec_elementwise * weights).mean()
         
-        # 2.5 Multi-scale reconstruction
-        if X_pred_5 is not None and T > 5:
-            X_target_5 = X_seq[:, 5:]
-            l_rec = l_rec + 0.5 * F.mse_loss(X_pred_5[:, :-5], X_target_5)
-        if X_pred_20 is not None and T > 20:
-            X_target_20 = X_seq[:, 20:]
-            l_rec = l_rec + 0.25 * F.mse_loss(X_pred_20[:, :-20], X_target_20)
+        # 2.5 Multi-scale reconstruction (skip when T small — saves ~30% seq train time)
+        try:
+            ms_rec = os.environ.get("RKK_WM_SEQ_MULTISCALE", "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        except Exception:
+            ms_rec = True
+        if ms_rec and T > 12:
+            if X_pred_5 is not None and T > 5:
+                X_target_5 = X_seq[:, 5:]
+                l_rec = l_rec + 0.5 * F.mse_loss(X_pred_5[:, :-5], X_target_5)
+            if X_pred_20 is not None and T > 20:
+                X_target_20 = X_seq[:, 20:]
+                l_rec = l_rec + 0.25 * F.mse_loss(X_pred_20[:, :-20], X_target_20)
 
         try:
             rec_coeff = float(os.environ.get("RKK_JEPA_SEQ_REC_COEFF", "0.2"))
         except ValueError:
             rec_coeff = 0.2
         rec_coeff = max(0.0, min(1.5, rec_coeff))
+        int_scale, rec_scale, lr_scale = self._locomotion_wm_scales()
+        rec_coeff = rec_coeff * rec_scale
+        l_rec = l_rec * rec_scale
 
         # 3. SIGReg anti-collapse
         l_sig = lambda_sig * self._sigreg(Z_flat)
@@ -849,9 +914,13 @@ class CausalGraph:
 
         # 5. Intervention prediction (same term as legacy — gradient through W when edges active)
         l_int = torch.tensor(0.0, device=self.device)
-        int_b = self._int_buffer
+        int_b = self._int_buffer_for_training(int_scale)
         if len(int_b) >= 4:
-            k = min(8, len(int_b))
+            try:
+                k_cap = max(4, int(os.environ.get("RKK_WM_INT_SAMPLES", "4")))
+            except ValueError:
+                k_cap = 4
+            k = min(k_cap, len(int_b))
             picks = random.sample(int_b, k)
             rows_X = [self._coerce_row_to_d(it["obs_before"]) for it in picks]
             rows_Y = [self._coerce_row_to_d(it["obs_after"]) for it in picks]
@@ -866,7 +935,7 @@ class CausalGraph:
             Y_i = torch.tensor(rows_Y, dtype=torch.float32, device=self.device)
             A_i = torch.tensor(rows_a, dtype=torch.float32, device=self.device)
             Xp_i = integrate_world_model_step(self, X_i, A_i)
-            l_int = self.LAMBDA_INT * F.mse_loss(Xp_i, Y_i)
+            l_int = self.LAMBDA_INT * int_scale * F.mse_loss(Xp_i, Y_i)
 
         # 6. Trajectory contrastive loss (Phase T)
         l_traj = torch.tensor(0.0, device=self.device)
@@ -909,7 +978,7 @@ class CausalGraph:
 
         loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1 + l_int + l_traj + l_sz
 
-        self._finish_train_step(loss)
+        self._finish_train_step(loss, lr_scale=lr_scale)
 
         # Update EMA target encoder (JEPA)
         if hasattr(self._core, "update_target_encoder"):
@@ -928,6 +997,8 @@ class CausalGraph:
             "l_dag":   round(l_dag.item(), 5),
             "l_l1":    round(l_l1.item(), 5),
             "l_int":   round(l_int.item(), 5),
+            "loco_int_scale": round(int_scale, 4),
+            "loco_lr_scale": round(lr_scale, 4),
             "l_traj":  round(l_traj.item(), 5),
             "l_sz":    round(l_sz.item(), 5),
             "h_W":     round(h_W.item(), 5),
@@ -941,7 +1012,8 @@ class CausalGraph:
         Legacy single-transition training (original behavior).
         Used as fallback when sequences haven't accumulated yet.
         """
-        int_b = self._int_buffer
+        int_scale, rec_scale, lr_scale = self._locomotion_wm_scales()
+        int_b = self._int_buffer_for_training(int_scale)
         obs_b = self._obs_buffer
         batch_cap = 32
         try:
@@ -992,10 +1064,13 @@ class CausalGraph:
 
         h_W, l_dag, l_l1 = self._compute_dag_and_l1()
 
+        int_scale, rec_scale, lr_scale = self._locomotion_wm_scales()
+        l_rec = l_rec * rec_scale
+
         if n_i > 0:
             int_pred = X_pred[:n_i]
             int_true = X_tp1[:n_i]
-            l_int = self.LAMBDA_INT * F.mse_loss(int_pred, int_true)
+            l_int = self.LAMBDA_INT * int_scale * F.mse_loss(int_pred, int_true)
         else:
             l_int = torch.tensor(0.0, device=self.device)
 
@@ -1045,7 +1120,7 @@ class CausalGraph:
         else:
             loss = l_rec + l_dag + l_l1 + l_int + lambda_jepa * l_jepa + l_traj
 
-        self._finish_train_step(loss)
+        self._finish_train_step(loss, lr_scale=lr_scale)
 
         if lambda_jepa > 0.0 and hasattr(self._core, "update_target_encoder"):
             try:
@@ -1067,6 +1142,8 @@ class CausalGraph:
             "mode":  "legacy",
             "batch_int": n_i,
             "batch_passive": n_p,
+            "loco_int_scale": round(int_scale, 4),
+            "loco_lr_scale": round(lr_scale, 4),
         }
 
     def set_edge(self, from_: str, to: str, weight: float, alpha: float) -> None:
@@ -1181,6 +1258,21 @@ class CausalGraph:
             m = min(m, av)
         return m
 
+    def _dicts_from_pred_batch(self, pred: torch.Tensor) -> list[dict[str, float]]:
+        """(B, d) tensor → list of node dicts (length B)."""
+        b = int(pred.shape[0])
+        d_out = min(int(pred.shape[1]), self._d)
+        nids = self._node_ids
+        return [
+            {nids[j]: float(pred[i, j].item()) for j in range(d_out)}
+            for i in range(b)
+        ]
+
+    def _state_matrix_from_dicts(self, bases: list[dict[str, float]]) -> torch.Tensor:
+        nids = self._node_ids
+        rows = [[float(b.get(nid, 0.0)) for nid in nids] for b in bases]
+        return torch.tensor(rows, dtype=torch.float32, device=self.device)
+
     def propagate_from(
         self, base: dict[str, float], variable: str, value: float
     ) -> dict[str, float]:
@@ -1188,37 +1280,76 @@ class CausalGraph:
         Предсказание после do(variable=value) от произвольного снимка узлов
         (Фаза 13: imagination rollout без мутации self.nodes).
         """
-        if is_read_only_macro_var(variable):
-            return dict(base)
+        batch = self.propagate_from_batch(base, [(variable, value)])
+        return batch[0] if batch else dict(base)
+
+    def propagate_from_batch(
+        self,
+        base: dict[str, float],
+        interventions: list[tuple[str, float]],
+    ) -> list[dict[str, float]]:
+        """Batched do(): один forward WM на все пары (variable, value) от одного base."""
+        if not interventions:
+            return []
         if self._core is None:
-            return dict(base)
-        state_vec = torch.tensor(
-            [[float(base.get(n, 0.0)) for n in self._node_ids]],
-            dtype=torch.float32, device=self.device,
-        )
-        a_vec = torch.zeros(1, self._d, dtype=torch.float32, device=self.device)
-        if variable in self._node_ids:
-            a_vec[0, self._node_ids.index(variable)] = float(value)
+            return [dict(base) for _ in interventions]
+        n = len(interventions)
+        state_vec = self._state_matrix_from_dicts([base] * n)
+        a_vec = torch.zeros(n, self._d, dtype=torch.float32, device=self.device)
+        nid_to_i = {nid: i for i, nid in enumerate(self._node_ids)}
+        for i, (variable, value) in enumerate(interventions):
+            if is_read_only_macro_var(variable):
+                continue
+            if variable in nid_to_i:
+                a_vec[i, nid_to_i[variable]] = float(value)
         with torch.no_grad():
             pred = integrate_world_model_step(self, state_vec, a_vec)
-        result = {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
-        return result
+        return self._dicts_from_pred_batch(pred)
+
+    def propagate_from_multi_batch(
+        self,
+        bases: list[dict[str, float]],
+        interventions: list[tuple[str, float]],
+    ) -> list[dict[str, float]]:
+        """Batched do() с разным base на строку (beam planning)."""
+        if not bases or not interventions or len(bases) != len(interventions):
+            return []
+        if self._core is None:
+            return [dict(b) for b in bases]
+        state_vec = self._state_matrix_from_dicts(bases)
+        n = len(interventions)
+        a_vec = torch.zeros(n, self._d, dtype=torch.float32, device=self.device)
+        nid_to_i = {nid: i for i, nid in enumerate(self._node_ids)}
+        for i, (variable, value) in enumerate(interventions):
+            if is_read_only_macro_var(variable):
+                continue
+            if variable in nid_to_i:
+                a_vec[i, nid_to_i[variable]] = float(value)
+        with torch.no_grad():
+            pred = integrate_world_model_step(self, state_vec, a_vec)
+        return self._dicts_from_pred_batch(pred)
 
     def rollout_step_free(self, base: dict[str, float]) -> dict[str, float]:
         """
         Один шаг «свободной» динамики GNN: X' = core(X), без интервенции.
         Используется для многошагового imagination после мысленного do().
         """
+        batch = self.rollout_step_free_batch([base])
+        return batch[0] if batch else dict(base)
+
+    def rollout_step_free_batch(
+        self, bases: list[dict[str, float]]
+    ) -> list[dict[str, float]]:
+        """Свободная динамика WM для B состояний за один forward."""
+        if not bases:
+            return []
         if self._core is None:
-            return dict(base)
-        state_vec = torch.tensor(
-            [[float(base.get(n, 0.0)) for n in self._node_ids]],
-            dtype=torch.float32, device=self.device,
-        )
+            return [dict(b) for b in bases]
+        state_vec = self._state_matrix_from_dicts(bases)
         z = torch.zeros_like(state_vec)
         with torch.no_grad():
             pred = integrate_world_model_step(self, state_vec, z)
-        return {nid: float(pred[0, i].item()) for i, nid in enumerate(self._node_ids)}
+        return self._dicts_from_pred_batch(pred)
 
     # ── Pearl-style API (Phase A): L1/L2/L3 ───────────────────────────────────
     def observe_predict(self, base: dict[str, float] | None = None) -> dict[str, float]:

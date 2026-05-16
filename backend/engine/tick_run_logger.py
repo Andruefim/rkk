@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from engine.core.constants import cpg_during_fixed_root_enabled
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Rolling inner tick duration (ms) for slowdown detection in log
@@ -70,6 +72,39 @@ def _obs_key(obs: dict, *keys: str) -> float | None:
         if k in obs:
             return _safe_float(obs[k], 0.5)
     return None
+
+
+def _unwrap_base_env(env: Any) -> Any:
+    e = env
+    for _ in range(8):
+        nxt = getattr(e, "base_env", None)
+        if nxt is None or nxt is e:
+            break
+        e = nxt
+    return e
+
+
+def _phys_from_sim_raw(base: Any) -> dict[str, float]:
+    """com_* / torso в логе даже в fixed_root (observe их не включает)."""
+    sim_obj = getattr(base, "_sim", None)
+    norm = getattr(base, "_norm", None)
+    if sim_obj is None or not callable(norm):
+        return {}
+    try:
+        raw = sim_obj.get_state()
+        if not isinstance(raw, dict):
+            return {}
+    except Exception:
+        return {}
+    out: dict[str, float] = {}
+    for k in ("com_x", "com_y", "com_z", "torso_pitch", "torso_roll"):
+        if k not in raw:
+            continue
+        try:
+            out[k] = round(float(norm(k, raw[k])), 4)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 class TickRunLogger:
@@ -133,6 +168,18 @@ class TickRunLogger:
         med_ms = float(sorted(_INNER_MS_WINDOW)[len(_INNER_MS_WINDOW) // 2]) if _INNER_MS_WINDOW else inner_ms
         slowdown = inner_ms > max(500.0, 2.5 * med_ms) if len(_INNER_MS_WINDOW) >= 8 else inner_ms > 2000.0
 
+        agent_timings = dict(getattr(agent, "_last_step_timings", {}) or {})
+        agent_total = float(
+            agent_timings.get("total_ms")
+            or sum(
+                float(v)
+                for k, v in agent_timings.items()
+                if k != "total_ms" and isinstance(v, (int, float))
+            )
+        )
+        inner_phases = dict(getattr(sim, "_inner_phase_ms", {}) or {})
+        sim_post_ms = round(max(0.0, inner_ms - agent_total), 2)
+
         record: dict[str, Any] = {
             "type": "tick",
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -142,7 +189,10 @@ class TickRunLogger:
                 "inner_ms": round(inner_ms, 2),
                 "inner_median_ms": round(med_ms, 2),
                 "slowdown_flag": slowdown,
-                "agent_step_ms": dict(getattr(agent, "_last_step_timings", {}) or {}),
+                "agent_step_ms": agent_timings,
+                "agent_total_ms": round(agent_total, 2),
+                "sim_post_ms": sim_post_ms,
+                "inner_phases_ms": inner_phases,
             },
             "hud": {
                 "phi": snap.get("phi"),
@@ -167,7 +217,9 @@ class TickRunLogger:
             },
             "scope": {
                 "phase": prog.get("phase"),
-                "mastery_quality": prog.get("mastery_quality"),
+                "mastery_quality": prog.get(
+                    "mastery_quality", prog.get("mastery", 0.0)
+                ),
                 "ticks_in_phase": prog.get("ticks_in_phase"),
             }
             if prog
@@ -183,6 +235,10 @@ class TickRunLogger:
                 "fallen": fallen,
                 "fall_count": snap.get("fall_count"),
                 "fixed_root": bool(getattr(sim, "_fixed_root_active", False)),
+                "cpg_blocked_by_fixed_root": bool(
+                    getattr(sim, "_fixed_root_active", False)
+                    and not cpg_during_fixed_root_enabled()
+                ),
                 "visual_mode": bool(getattr(sim, "_visual_mode", False)),
                 "posture_stability": posture,
             },
@@ -209,7 +265,7 @@ class TickRunLogger:
         }
 
         if _env_flag("RKK_TICK_RUN_LOG_PHYS", True) and obs:
-            record["phys"] = _phys_snapshot(obs, agent)
+            record["phys"] = _phys_snapshot(obs, agent, sim=sim)
 
         if _env_flag("RKK_TICK_RUN_LOG_EVENTS", True):
             record["events"] = _tick_events(sim, tick)
@@ -263,7 +319,7 @@ def _run_config_snapshot() -> dict[str, str]:
     return {k: os.environ.get(k, "") for k in keys if os.environ.get(k) is not None}
 
 
-def _phys_snapshot(obs: dict, agent: Any) -> dict[str, Any]:
+def _phys_snapshot(obs: dict, agent: Any, *, sim: Any | None = None) -> dict[str, Any]:
     out: dict[str, Any] = {
         "posture_stability": _obs_key(obs, "posture_stability", "phys_posture_stability"),
         "com_z": _obs_key(obs, "com_z", "phys_com_z"),
@@ -272,7 +328,15 @@ def _phys_snapshot(obs: dict, agent: Any) -> dict[str, Any]:
         "foot_contact_r": _obs_key(obs, "foot_contact_r", "phys_foot_contact_r"),
         "torso_pitch": _obs_key(obs, "torso_pitch", "phys_torso_pitch"),
     }
-    ms = getattr(getattr(agent, "env", None), "_motor_state", None)
+    base = _unwrap_base_env(getattr(agent, "env", None))
+    if base is not None:
+        for k, v in _phys_from_sim_raw(base).items():
+            if out.get(k) is None:
+                out[k] = v
+        out["cpg_owns_legs"] = bool(getattr(base, "cpg_owns_legs", False))
+    ms = getattr(base, "_motor_state", None) if base is not None else None
+    if ms is None:
+        ms = getattr(getattr(agent, "env", None), "_motor_state", None)
     if isinstance(ms, dict):
         intents = {
             k: round(_safe_float(v), 4)
@@ -281,9 +345,11 @@ def _phys_snapshot(obs: dict, agent: Any) -> dict[str, Any]:
         }
         if intents:
             out["motor_intents"] = intents
-    env = getattr(agent, "env", None)
-    if env is not None:
-        out["cpg_owns_legs"] = bool(getattr(env, "cpg_owns_legs", False))
+    if sim is not None:
+        out["cpg_l1_last_apply_tick"] = int(getattr(sim, "_l1_last_apply_tick", -1))
+        out["cpg_decoupled_hz"] = round(
+            float(os.environ.get("RKK_CPG_LOOP_HZ", "0") or 0), 1
+        )
     return out
 
 
@@ -300,16 +366,25 @@ def _sleep_snapshot(sim: Any) -> dict[str, Any] | None:
 
 def _locomotion_snapshot(sim: Any) -> dict[str, Any] | None:
     lc = getattr(sim, "_locomotion_controller", None)
+    reward = round(
+        _safe_float(sim._locomotion_reward_ema())
+        if callable(getattr(sim, "_locomotion_reward_ema", None))
+        else 0.0,
+        4,
+    )
     if lc is None:
-        return None
+        return {
+            "controller_ready": False,
+            "cpg_blocked_by_fixed_root": bool(
+                getattr(sim, "_fixed_root_active", False)
+                and not cpg_during_fixed_root_enabled()
+            ),
+            "reward_ema": reward,
+        }
     return {
+        "controller_ready": True,
         "cpg_weight": round(_safe_float(getattr(lc, "cpg_weight", 0.0)), 4),
-        "reward_ema": round(
-            _safe_float(sim._locomotion_reward_ema())
-            if callable(getattr(sim, "_locomotion_reward_ema", None))
-            else 0.0,
-            4,
-        ),
+        "reward_ema": reward,
     }
 
 

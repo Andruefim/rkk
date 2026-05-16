@@ -76,7 +76,11 @@ class SimulationEpisodicRssmMixin:
             return
         if not curriculum_enabled():
             return
-        if self.current_world != "humanoid" or self._fixed_root_active:
+        if self.current_world != "humanoid":
+            return
+        if fallen:
+            return
+        if self.tick <= getattr(self, "_curriculum_stabilize_until", 0):
             return
 
         fall_rate = (
@@ -96,6 +100,25 @@ class SimulationEpisodicRssmMixin:
                 "#aaffaa",
                 "phase",
             )
+            if _PHASE_K_AVAILABLE and self._physical_curriculum is not None:
+                from engine.physical_curriculum import ALL_SKILLS_BY_ID
+
+                prev = self._curriculum._stages[
+                    max(0, self._curriculum._current_idx - 1)
+                ]
+                for skill in ALL_SKILLS_BY_ID.values():
+                    if skill.stage.name == prev.name or skill.name == prev.name:
+                        self._physical_curriculum.mark_mastered(skill.skill_id)
+                added = self._physical_curriculum.inject_into_scheduler(
+                    self._curriculum
+                )
+                if added:
+                    ns = self._curriculum._stages[-1].name
+                    self._add_event(
+                        f"🏃 Physical skill unlocked: {ns}",
+                        "#aaffaa",
+                        "curriculum",
+                    )
 
         if tick % self._curriculum_apply_every == 0:
             self._curriculum.apply_stage_intents(self.agent.env)

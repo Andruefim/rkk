@@ -118,7 +118,7 @@ TIER0_SKILLS: list[PhysicalSkill] = [
                 "intent_support_right": 0.42,
                 "intent_torso_forward": 0.54,
             },
-            advance_conditions={"posture_stability": 0.67, "support_bias_range": 0.28},
+            advance_conditions={"posture_stability": 0.65, "support_bias_range": 0.20},
             seeds=[
                 {"from_": "support_bias", "to": "torso_roll", "weight": -0.22, "alpha": 0.05},
             ],

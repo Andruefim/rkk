@@ -143,6 +143,21 @@ class ProgressiveScope:
     def phase(self) -> int:
         return self._phase
 
+    @property
+    def mastery_quality(self) -> float:
+        """Среднее качество по тикам без падения (upright-only для release/логов)."""
+        if not self._quality_window:
+            return 0.0
+        if len(self._fallen_window) == len(self._quality_window):
+            upright = [
+                q
+                for q, f in zip(self._quality_window, self._fallen_window)
+                if not f
+            ]
+            if upright:
+                return float(np.mean(upright))
+        return float(np.mean(list(self._quality_window)))
+
     def classify_vars(self, var_ids: list[str]) -> None:
         """Classify all variables on first encounter (or when vars change)."""
         for v in var_ids:
@@ -192,12 +207,14 @@ class ProgressiveScope:
         self._phase_ticks += 1
         self._total_ticks += 1
 
-        # Quality signal: composite of upright + stability
-        q = quality if quality is not None else (
-            (0.0 if is_fallen else 0.6) + posture * 0.4
-        )
-        self._quality_window.append(float(np.clip(q, 0.0, 1.0)))
         self._fallen_window.append(bool(is_fallen))
+        if is_fallen:
+            self._quality_window.append(0.0)
+            return False
+
+        # Quality signal: composite of upright + stability
+        q = quality if quality is not None else (0.6 + posture * 0.4)
+        self._quality_window.append(float(np.clip(q, 0.0, 1.0)))
 
         if self._phase >= self._max_phase:
             return False
@@ -215,8 +232,8 @@ class ProgressiveScope:
         mastery = float(np.mean(list(self._quality_window)))
         fallen_rate = sum(1 for f in self._fallen_window if f) / len(self._fallen_window)
 
-        # Advance if quality is high AND fall rate is low
-        if is_fixed_root:
+        # Phase 0 (intent-only) may advance during fixed_root; legs need free pelvis.
+        if is_fixed_root and self._phase >= 1:
             return False
         if mastery >= threshold and fallen_rate < 0.3:
             return self._advance_phase(mastery, fallen_rate)
@@ -265,10 +282,7 @@ class ProgressiveScope:
             "max_phase": self._max_phase,
             "phase_ticks": self._phase_ticks,
             "total_ticks": self._total_ticks,
-            "mastery": round(
-                float(np.mean(list(self._quality_window)))
-                if self._quality_window else 0.0, 4
-            ),
+            "mastery": round(self.mastery_quality, 4),
             "fallen_rate": round(
                 sum(1 for f in self._fallen_window if f) /
                 max(1, len(self._fallen_window)), 4

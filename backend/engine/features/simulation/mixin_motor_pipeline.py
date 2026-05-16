@@ -103,13 +103,16 @@ class SimulationMotorPipelineMixin:
                 sig.append((d, k, fv))
         sig.sort(key=lambda t: -t[0])
         for _d, k, fv in sig[:4]:
-            self.agent.graph.record_intervention(k, fv, obs_before_full, obs_after_full)
+            self.agent.graph.record_intervention(
+                k, fv, obs_before_full, obs_after_full, source="cpg_burst"
+            )
 
     def _drain_l1_motor_commands(self) -> None:
         base = self._unwrap_base_env(self.agent.env)
         fn = getattr(base, "apply_cpg_leg_targets", None)
         if not callable(fn):
             return
+        base.cpg_owns_legs = False
         latest = None
         while True:
             try:

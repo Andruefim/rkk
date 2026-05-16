@@ -1,6 +1,7 @@
 """Simulation mixin: CPG, motor cortex (обучение — intrinsic objective)."""
 from __future__ import annotations
 
+from engine.core.constants import cpg_during_fixed_root_enabled
 from engine.features.simulation.mixin_imports import *
 
 
@@ -15,8 +16,11 @@ class SimulationLocomotionMixin:
     @staticmethod
     def _unwrap_base_env(env):
         e = env
-        while hasattr(e, "base_env"):
-            e = e.base_env
+        for _ in range(8):
+            nxt = getattr(e, "base_env", None)
+            if nxt is None or nxt is e:
+                break
+            e = nxt
         return e
 
     def _locomotion_cpg_enabled(self) -> bool:
@@ -25,6 +29,9 @@ class SimulationLocomotionMixin:
 
     def _cpg_decoupled_enabled(self) -> bool:
         return self._locomotion_cpg_enabled() and _cpg_loop_hz_from_env() > 0.0
+
+    def _cpg_blocked_by_fixed_root(self) -> bool:
+        return bool(self._fixed_root_active) and not cpg_during_fixed_root_enabled()
 
     def _agi_substrate_blend_enabled(self) -> bool:
         """CPG(+MC) как базовый ритм ног; Active Inference остаётся слоем намерений."""
@@ -47,7 +54,7 @@ class SimulationLocomotionMixin:
             return
         if not self._locomotion_cpg_enabled():
             return
-        if self.current_world != "humanoid" or self._fixed_root_active:
+        if self.current_world != "humanoid" or self._cpg_blocked_by_fixed_root():
             return
 
         if not self._agi_substrate_blend_enabled():

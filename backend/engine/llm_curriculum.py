@@ -341,6 +341,7 @@ class CurriculumScheduler:
             "com_x_mean": com_x,
             "gait_symmetry": gait_sym,
             "foot_contact_min": foot_min,
+            "support_bias": bias,
             "support_bias_range": bias_range,
             "fall_rate_recent": 0.0,  # updated externally
         }
@@ -358,12 +359,12 @@ class CurriculumScheduler:
         if not curriculum_enabled() or not self._stages:
             return self.current_stage, False
 
+        if fallen:
+            return self.current_stage, False
+
         stage = self.current_stage
         stage.ticks_in_stage += 1
         self._metrics_history.append(self.compute_metrics(obs))
-
-        if fallen:
-            return stage, False
 
         # Compute mean metrics over recent history
         if len(self._metrics_history) < 20:
@@ -374,6 +375,9 @@ class CurriculumScheduler:
             for k in recent[0].keys()
         }
         mean_metrics["fall_rate_recent"] = fall_rate
+        biases = [float(m.get("support_bias", 0.5)) for m in recent]
+        if biases:
+            mean_metrics["support_bias_range"] = float(max(biases) - min(biases))
 
         # Check advance conditions
         if stage.is_ready_to_advance(tick, mean_metrics):

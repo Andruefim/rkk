@@ -58,6 +58,7 @@ from engine.phase3_teacher import TeacherIGRule
 from engine.environment_humanoid import SELF_VARS
 from engine.goal_planning import (
     goal_planning_globally_disabled,
+    plan_max_branch_effective,
     parse_plan_value_levels,
     plan_beam_k,
     plan_depth,
@@ -85,7 +86,7 @@ from engine.trajectory_contrastive import TrajectoryCollector, trajectory_enable
 from engine.progressive_scope import ProgressiveScope, progressive_scope_enabled
 
 ACTIVATIONS   = ["relu", "gelu", "tanh"]
-MAX_FALLBACK_TRIES = 5  # больше кандидатов, чтобы пройти Value Layer в начале обучения
+# RKK_VL_FALLBACK_TRIES (default 3): сколько top-кандидатов проверяет Value Layer за тик.
 # Вес slot_* в actual_ig для System 1; основной сигнал — не-визуальные узлы (RKK_VISUAL_IG_WEIGHT=0 → только физика).
 VISUAL_IG_WEIGHT = float(os.environ.get("RKK_VISUAL_IG_WEIGHT", "0.1"))
 _SELF_VAR_SET = frozenset(SELF_VARS)
@@ -276,6 +277,8 @@ _DBG_LOG_F7_AGENT = Path(__file__).resolve().parents[2] / "debug-f7a777.log"
 
 
 def _dbg_agent(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
+    if os.environ.get("RKK_DBG_AGENT", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return
     try:
         with _DBG_LOG_F7_AGENT.open("a", encoding="utf-8") as _df:
             _df.write(
@@ -327,11 +330,44 @@ def _score_max_candidates() -> int:
 
 
 def _score_cache_every() -> int:
-    """Пересчёт score_interventions не чаще чем раз в N тиков движка (RKK_SCORE_CACHE_EVERY; 1 = каждый тик)."""
+    """Пересчёт score_interventions не чаще чем раз в N тиков движка (RKK_SCORE_CACHE_EVERY)."""
+    if "RKK_SCORE_CACHE_EVERY" in os.environ:
+        try:
+            return max(1, int(os.environ["RKK_SCORE_CACHE_EVERY"]))
+        except ValueError:
+            return 1
+    # Windows: sync score ~1–3s; без env — реже пересчёт, чаще stale-кеш.
+    if sys.platform == "win32":
+        return 12
+    return 4
+
+
+def _score_stale_mult() -> int:
+    """Допустимый возраст кеша score = sce * mult (RKK_SCORE_STALE_MULT)."""
     try:
-        return max(1, int(os.environ.get("RKK_SCORE_CACHE_EVERY", "1")))
+        return max(1, int(os.environ.get("RKK_SCORE_STALE_MULT", "8")))
     except ValueError:
-        return 1
+        return 8
+
+
+def _score_stale_only() -> bool:
+    """Не блокировать тик синхронным score при протухшем кеше (RKK_SCORE_STALE_ONLY)."""
+    return os.environ.get("RKK_SCORE_STALE_ONLY", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _score_bg_refresh_enabled() -> bool:
+    """Фоновый пересчёт score между тиками (RKK_SCORE_BG_REFRESH; риск гонки с train_step)."""
+    return os.environ.get("RKK_SCORE_BG_REFRESH", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _notears_every() -> int:
@@ -367,9 +403,17 @@ def _score_async_enabled() -> bool:
     return True
 
 
+def _max_fallback_tries_from_env() -> int:
+    try:
+        n = int(os.environ.get("RKK_VL_FALLBACK_TRIES", "3"))
+    except ValueError:
+        n = 3
+    return max(1, min(12, n))
+
+
 def _imagination_horizon_from_env() -> int:
     """Фаза 13: RKK_IMAGINATION_STEPS — число шагов core(X) после мысленного do(); 0 = как раньше."""
-    raw = os.environ.get("RKK_IMAGINATION_STEPS", "2")
+    raw = os.environ.get("RKK_IMAGINATION_STEPS", "1")
     try:
         h = int(raw)
     except ValueError:
@@ -421,9 +465,12 @@ class RKKAgent:
         self._score_thread: threading.Thread | None = None
         self._score_result: list[dict] = []
         self._score_lock = threading.Lock()
+        self._score_refresh_tick: int = -9_999_999
         # Cache for dag_constraint (4× d×d matmuls) — recompute at most once per score_cache window
         self._h_W_cache: float = 0.0
         self._h_W_cache_tick: int = -9_999_999
+        self._disc_rate_tick: int = -1
+        self._disc_rate_val: float = 0.0
 
         # Фаза 3: LLM-учитель (IG-бонус затухает с числом интервенций)
         self._teacher_rules: list[TeacherIGRule] = []
@@ -609,19 +656,57 @@ class RKKAgent:
             eigs.extend(total.tolist())
         return eigs
 
+    def _batch_rollout_imagination_states(
+        self,
+        base: dict[str, float],
+        actions: list[tuple[str, float]],
+        *,
+        row_bases: list[dict[str, float]] | None = None,
+    ) -> list[dict[str, float]]:
+        """Batched do + free-rollout (goal planning / diagnostics)."""
+        if not actions:
+            return []
+        if row_bases is None:
+            states = self.graph.propagate_from_batch(dict(base), actions)
+        else:
+            states = self.graph.propagate_from_multi_batch(row_bases, actions)
+        for _ in range(max(0, self._imagination_horizon)):
+            states = self.graph.rollout_step_free_batch(states)
+        return states
+
     def _rollout_imagination_state(
         self, base: dict[str, float], var: str, val: float
     ) -> dict[str, float]:
         """Этап E: один мысленный do + столько же свободных шагов, сколько в VL imagination."""
-        s = self.graph.propagate_from(dict(base), var, float(val))
-        for _ in range(max(0, self._imagination_horizon)):
-            s = self.graph.rollout_step_free(s)
-        return s
+        out = self._batch_rollout_imagination_states(dict(base), [(var, float(val))])
+        return out[0] if out else dict(base)
+
+    def _effective_imagination_horizon(self, enable_l3: bool) -> int:
+        if not enable_l3:
+            return 0
+        if getattr(self.value_layer.bounds, "fixed_root_mode", False):
+            return 0
+        if _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(self.graph.nodes):
+            return 0
+        return self._imagination_horizon
+
+    def _goal_planning_suppressed(self) -> bool:
+        if goal_planning_globally_disabled() or self.graph._core is None:
+            return True
+        if getattr(self.value_layer.bounds, "fixed_root_mode", False):
+            return True
+        if _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(self.graph.nodes):
+            return True
+        try:
+            min_steps = int(os.environ.get("RKK_GOAL_PLAN_MIN_WM_STEPS", "40"))
+        except ValueError:
+            min_steps = 40
+        return self._notears_steps < min_steps
 
     def _features_for_intervention_pair(self, v_from: str, v_to: str) -> list[float]:
         """Один вектор признаков System1 для пары (в_from→в_to), как в score_interventions."""
         h_W_norm = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
-        disc_rate = self.discovery_rate
+        disc_rate = self._discovery_rate_for_tick(self._last_engine_tick)
         nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
         core = self.graph._core
         ii, jj = nid_to_i.get(v_from), nid_to_i.get(v_to)
@@ -681,9 +766,7 @@ class RKKAgent:
         }
 
     def _maybe_goal_planned_candidate(self) -> dict | None:
-        if goal_planning_globally_disabled():
-            return None
-        if self.graph._core is None:
+        if self._goal_planning_suppressed():
             return None
         if self.graph.nodes.get("self_goal_active") is None:
             return None
@@ -704,7 +787,12 @@ class RKKAgent:
 
         levels = parse_plan_value_levels()
         actions = [(v, x) for v in motor for x in levels]
-        max_b = plan_max_branch()
+        fixed_root = (
+            getattr(self.value_layer.bounds, "fixed_root_mode", False)
+            or _env_fixed_root_flag(self.env)
+            or _graph_fixed_root_flag(self.graph.nodes)
+        )
+        max_b = plan_max_branch_effective(fixed_root=fixed_root)
         if len(actions) > max_b:
             idx = np.random.choice(len(actions), size=max_b, replace=False)
             actions = [actions[i] for i in idx]
@@ -719,11 +807,14 @@ class RKKAgent:
         best_first: tuple[str, float] | None = None
 
         if depth <= 1:
-            for var, val in actions:
-                try:
-                    sfin = self._rollout_imagination_state(state0, var, val)
-                except Exception:
-                    continue
+            try:
+                states_fin = self._batch_rollout_imagination_states(state0, actions)
+            except Exception:
+                states_fin = []
+            for i, (var, val) in enumerate(actions):
+                if i >= len(states_fin):
+                    break
+                sfin = states_fin[i]
                 if symbolic_verifier_enabled():
                     ok, _ = verify_normalized_prediction(dict(sfin), self.env)
                     if not ok:
@@ -734,31 +825,46 @@ class RKKAgent:
                     best_first = (var, val)
         else:
             scored: list[tuple[float, str, float, dict[str, float]]] = []
-            for var, val in actions:
-                try:
-                    s1 = self._rollout_imagination_state(state0, var, val)
-                except Exception:
-                    continue
+            try:
+                states1 = self._batch_rollout_imagination_states(state0, actions)
+            except Exception:
+                states1 = []
+            for i, (var, val) in enumerate(actions):
+                if i >= len(states1):
+                    break
+                s1 = states1[i]
                 if symbolic_verifier_enabled():
                     ok, _ = verify_normalized_prediction(dict(s1), self.env)
                     if not ok:
                         continue
                 scored.append((_td(s1), var, val, dict(s1)))
             scored.sort(key=lambda t: t[0])
+            row_bases: list[dict[str, float]] = []
+            row_actions: list[tuple[str, float]] = []
+            row_meta: list[tuple[str, float]] = []
             for _td1, v1, x1, s1 in scored[:beam_k]:
                 for v2, x2 in actions:
-                    try:
-                        sfin = self._rollout_imagination_state(s1, v2, x2)
-                    except Exception:
+                    row_bases.append(s1)
+                    row_actions.append((v2, x2))
+                    row_meta.append((v1, x1))
+            try:
+                states2 = self._batch_rollout_imagination_states(
+                    state0, row_actions, row_bases=row_bases
+                )
+            except Exception:
+                states2 = []
+            for j, sfin in enumerate(states2):
+                if j >= len(row_meta):
+                    break
+                v1, x1 = row_meta[j]
+                if symbolic_verifier_enabled():
+                    ok, _ = verify_normalized_prediction(dict(sfin), self.env)
+                    if not ok:
                         continue
-                    if symbolic_verifier_enabled():
-                        ok, _ = verify_normalized_prediction(dict(sfin), self.env)
-                        if not ok:
-                            continue
-                    td = _td(sfin)
-                    if td < best_td - 1e-6:
-                        best_td = td
-                        best_first = (v1, x1)
+                td = _td(sfin)
+                if td < best_td - 1e-6:
+                    best_td = td
+                    best_first = (v1, x1)
 
         if best_first is None:
             return None
@@ -1269,7 +1375,7 @@ class RKKAgent:
             self._h_W_cache_tick = self._last_engine_tick
         h_W_norm = min(self._h_W_cache / max(self.graph._d, 1), 1.0)
         h_clip = float(np.clip(h_W_norm, 0.0, 1.0))
-        disc_rate = self.discovery_rate
+        disc_rate = self._discovery_rate_for_tick(self._last_engine_tick)
         disc_clip = float(np.clip(disc_rate, 0.0, 1.0))
 
         nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
@@ -1578,6 +1684,34 @@ class RKKAgent:
         except Exception as ex:
             print(f"[RKKAgent] score_interventions (async): {ex}")
 
+    def _score_bg_refresh_worker(self, engine_tick: int) -> None:
+        try:
+            with torch.no_grad():
+                result = self.score_interventions()
+            with self._score_lock:
+                self._score_result = list(result)
+            self._score_cache = list(result)
+            self._score_cache_tick = engine_tick
+            self._score_refresh_tick = engine_tick
+        except Exception as ex:
+            print(f"[RKKAgent] score_interventions (bg_refresh): {ex}")
+
+    def _schedule_score_refresh(self, engine_tick: int) -> None:
+        if not _score_bg_refresh_enabled():
+            return
+        if self._score_thread is not None and self._score_thread.is_alive():
+            return
+        if engine_tick - self._score_refresh_tick < max(1, _score_cache_every()):
+            return
+        self._score_refresh_tick = engine_tick
+        self._score_thread = threading.Thread(
+            target=self._score_bg_refresh_worker,
+            args=(engine_tick,),
+            name="rkk_score_refresh",
+            daemon=True,
+        )
+        self._score_thread.start()
+
     def set_teacher_state(self, rules: list[TeacherIGRule], weight: float) -> None:
         """Фаза 3: правила от LLM и текущий teacher_weight (симуляция считает annealing)."""
         self._teacher_rules = list(rules)
@@ -1608,6 +1742,8 @@ class RKKAgent:
         _slow_t = {
             "observe": 0.0,
             "score_interventions": 0.0,
+            "value_layer": 0.0,
+            "intervene": 0.0,
             "train_step": 0.0,
             "cem": 0.0,
             "discovery_rate": 0.0,
@@ -1638,25 +1774,30 @@ class RKKAgent:
         self._last_engine_tick = engine_tick
         _t0 = time.perf_counter()
         try:
-            self.graph.apply_env_observation(dict(self.env.observe()))
+            self.graph.apply_env_observation(
+                dict(self.env.observe()), engine_tick=engine_tick
+            )
         except Exception:
             pass
         _slow_t["observe"] = time.perf_counter() - _t0
         sce = _score_cache_every()
+        stale_mult = _score_stale_mult()
+        cache_age = engine_tick - self._score_cache_tick
+        cache_fresh = bool(self._score_cache) and cache_age < sce
+        cache_stale_ok = bool(self._score_cache) and cache_age < sce * stale_mult
+        due_recompute = not self._score_cache or cache_age >= sce
         _t0_si = time.perf_counter()
         # #region agent log
         _t_score = time.perf_counter()
         _score_mode = "?"
         # #endregion
-        if (
-            sce > 1
-            and self._score_cache
-            and (engine_tick - self._score_cache_tick) < sce
-        ):
+        if cache_fresh:
             scores = list(self._score_cache)
-            # #region agent log
-            _score_mode = "sce_span_cache"
-            # #endregion
+            _score_mode = "cache"
+        elif cache_stale_ok and _score_stale_only() and due_recompute:
+            scores = list(self._score_cache)
+            _score_mode = "stale"
+            self._schedule_score_refresh(engine_tick)
         elif _score_async_enabled():
             if self._score_thread is None or not self._score_thread.is_alive():
                 self._score_thread = threading.Thread(
@@ -1669,34 +1810,42 @@ class RKKAgent:
                 have = list(self._score_result) if self._score_result else []
             if have:
                 scores = have
-                # #region agent log
                 _score_mode = "async_have"
-                # #endregion
             elif self._score_cache:
                 scores = list(self._score_cache)
-                # #region agent log
                 _score_mode = "async_stale_cache"
-                # #endregion
+            elif _score_stale_only():
+                scores = []
+                _score_mode = "async_empty_skip"
             else:
                 with torch.no_grad():
                     scores = self.score_interventions()
-                # #region agent log
                 _score_mode = "async_fallback_sync"
-                # #endregion
                 with self._score_lock:
                     self._score_result = list(scores)
+            if scores and sce > 1:
+                self._score_cache = list(scores)
+                self._score_cache_tick = engine_tick
+        elif due_recompute and (
+            not self._score_cache or engine_tick % max(1, sce) == 0
+        ):
+            with torch.no_grad():
+                scores = self.score_interventions()
+            _score_mode = "sync_refresh"
             if sce > 1:
                 self._score_cache = list(scores)
                 self._score_cache_tick = engine_tick
+        elif self._score_cache:
+            scores = list(self._score_cache)
+            _score_mode = "sync_deferred"
+            if due_recompute:
+                self._schedule_score_refresh(engine_tick)
         else:
             with torch.no_grad():
                 scores = self.score_interventions()
-            # #region agent log
-            _score_mode = "sync"
-            # #endregion
-            if sce > 1:
-                self._score_cache = list(scores)
-                self._score_cache_tick = engine_tick
+            _score_mode = "sync_bootstrap"
+            self._score_cache = list(scores)
+            self._score_cache_tick = engine_tick
         _slow_t["score_interventions"] = time.perf_counter() - _t0_si
         # #region agent log
         _dbg_agent(
@@ -1750,22 +1899,34 @@ class RKKAgent:
                 _pfr_vl = 0.3
             _pfr_vl = float(np.clip(_pfr_vl, 0.0, 1.0))
 
+        vl_horizon = self._effective_imagination_horizon(enable_l3)
+        vl_tries = min(_max_fallback_tries_from_env(), len(scores))
+        vl_batch = scores[:vl_tries]
+        current_nodes = dict(self.graph.nodes)
+        _t0_vl = time.perf_counter()
+        s1_batch = self.graph.propagate_from_batch(
+            current_nodes,
+            [(c["variable"], c["value"]) for c in vl_batch],
+        )
+
         # Перебираем кандидатов пока не найдём допустимое действие
-        for candidate in scores[:MAX_FALLBACK_TRIES]:
+        for i, candidate in enumerate(vl_batch):
             var   = candidate["variable"]
             value = candidate["value"]
+            pre_s1 = s1_batch[i] if i < len(s1_batch) else None
 
             check_result = self.value_layer.check_action(
                 variable=var,
                 value=value,
-                current_nodes=dict(self.graph.nodes),
+                current_nodes=current_nodes,
                 graph=self.graph,
                 temporal=self.temporal,
                 current_phi=current_phi,
                 other_agents_phi=self.other_agents_phi,
                 engine_tick=engine_tick,
-                imagination_horizon=(self._imagination_horizon if enable_l3 else 0),
+                imagination_horizon=vl_horizon,
                 post_fr_loco_relax=_pfr_vl,
+                precomputed_s1=pre_s1,
             )
 
             if check_result.allowed:
@@ -1780,6 +1941,7 @@ class RKKAgent:
                 blocked_count += 1
                 self._total_blocked += 1
                 self._last_blocked_reason = check_result.reason.value
+        _slow_t["value_layer"] = time.perf_counter() - _t0_vl
 
         # Все кандидаты заблокированы — возвращаем событие
         if chosen is None:
@@ -1855,6 +2017,7 @@ class RKKAgent:
             self._symbolic_prediction_bad = not sym_ok
         else:
             self._symbolic_prediction_bad = False
+        _t0_iv = time.perf_counter()
         observed_env = self.env.intervene(var, value)
 
         # Temporal step (только размерность среды)
@@ -1867,6 +2030,7 @@ class RKKAgent:
         self.graph.record_observation(obs_before_full)
         self.graph.record_observation(observed_full)
         self.graph.record_intervention(var, value, obs_before_full, observed_full)
+        _slow_t["intervene"] = time.perf_counter() - _t0_iv
 
         # NOTEARS train
         notears_result = None
@@ -2068,7 +2232,7 @@ class RKKAgent:
             )
 
         _t0_dr = time.perf_counter()
-        cur_dr = self.discovery_rate
+        cur_dr = self._discovery_rate_for_tick(engine_tick)
         _slow_t["discovery_rate"] = time.perf_counter() - _t0_dr
         if cur_dr > self._peak_discovery_rate:
             self._peak_discovery_rate = cur_dr
@@ -2154,19 +2318,28 @@ class RKKAgent:
             return 0.0
         return float(np.mean(list(self._cg_history)))
 
+    def _discovery_rate_for_tick(self, engine_tick: int) -> float:
+        """Один расчёт discovery_rate на engine-тик (step + snapshot + score)."""
+        if engine_tick == self._disc_rate_tick:
+            return self._disc_rate_val
+        gt_dr = self._gt_discovery_rate_fast()
+        ss_dr = self.self_supervised_discovery_rate
+        if self._total_interventions < 200:
+            val = gt_dr
+        else:
+            blend = min(1.0, (self._total_interventions - 200) / 1000.0)
+            val = (1.0 - blend) * gt_dr + blend * ss_dr
+        self._disc_rate_tick = engine_tick
+        self._disc_rate_val = float(val)
+        return self._disc_rate_val
+
     @property
     def discovery_rate(self) -> float:
         """
         Blend of GT-based and self-supervised discovery rate.
         As the agent matures, self-supervised metric gets more weight.
         """
-        gt_dr = self._gt_discovery_rate_fast()
-        ss_dr = self.self_supervised_discovery_rate
-        # Blend: GT dominates early (calibration), self-supervised dominates later
-        if self._total_interventions < 200:
-            return gt_dr
-        blend = min(1.0, (self._total_interventions - 200) / 1000.0)
-        return (1.0 - blend) * gt_dr + blend * ss_dr
+        return self._discovery_rate_for_tick(self._last_engine_tick)
 
     @property
     def self_supervised_discovery_rate(self) -> float:
@@ -2242,7 +2415,7 @@ class RKKAgent:
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
     def snapshot(self) -> dict:
-        cur_dr = self.discovery_rate
+        cur_dr = self._discovery_rate_for_tick(self._last_engine_tick)
         if cur_dr > self._peak_discovery_rate:
             self._peak_discovery_rate = cur_dr
 
@@ -2308,12 +2481,14 @@ class RKKAgent:
                 "graph_BUFFER_SIZE": int(self.graph.BUFFER_SIZE),
                 "imagination_horizon": int(self._imagination_horizon),
             },
-            "progressive_scope": {
-                "enabled": True,
-                "phase": self._prog_scope.phase,
-                "ticks_in_phase": getattr(self._prog_scope, "_phase_ticks", 0),
-                "mastery_quality": round(self._prog_scope.mastery_quality, 3) if getattr(self._prog_scope, "mastery_quality", None) is not None else 0.0,
-            } if getattr(self, "_prog_scope", None) else None,
+            "progressive_scope": (
+                {
+                    **self._prog_scope.snapshot(),
+                    "mastery_quality": round(self._prog_scope.mastery_quality, 3),
+                }
+                if getattr(self, "_prog_scope", None)
+                else None
+            ),
             "trajectory": {
                 "enabled": True,
                 "segments": len(self.graph._traj_segments) if hasattr(self.graph, "_traj_segments") else 0,

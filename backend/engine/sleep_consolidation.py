@@ -323,6 +323,84 @@ class REMReplay:
 
         return n_replayed, l_before, l_after
 
+    def replay_one_episode(
+        self,
+        ep,
+        graph,
+        *,
+        lr_mult: float = 10.0,
+    ) -> tuple[bool, float, float]:
+        """Train GNN on a single fall episode. Returns (ok, loss_before, loss_after)."""
+        core = getattr(graph, "_core", None)
+        if core is None:
+            return False, 0.0, 0.0
+
+        node_ids = list(graph._node_ids)
+        d = len(node_ids)
+        try:
+            dev = next(core.parameters()).device
+        except StopIteration:
+            dev = torch.device("cpu")
+
+        optim = getattr(graph, "_optim", None)
+        original_lrs: list[float] = []
+        if optim is not None:
+            for pg in optim.param_groups:
+                original_lrs.append(pg["lr"])
+                pg["lr"] = pg["lr"] * lr_mult
+
+        obs_before = ep.obs_before
+        obs_fall = ep.obs_at_fall
+        X_t = torch.tensor(
+            [float(obs_before.get(n, obs_before.get(f"phys_{n}", 0.5))) for n in node_ids],
+            dtype=torch.float32,
+            device=dev,
+        )
+        X_fall = torch.tensor(
+            [float(obs_fall.get(n, obs_fall.get(f"phys_{n}", 0.5))) for n in node_ids],
+            dtype=torch.float32,
+            device=dev,
+        )
+        action = ep.trigger_action
+        a = torch.zeros(d, dtype=torch.float32, device=dev)
+        if action and action[0] in node_ids:
+            a[node_ids.index(action[0])] = float(action[1])
+
+        X_t = X_t.unsqueeze(0)
+        X_fall = X_fall.unsqueeze(0)
+        a = a.unsqueeze(0)
+
+        ok = False
+        l_before = 0.0
+        l_after = 0.0
+        try:
+            from engine.wm_neural_ode import integrate_world_model_step
+            import torch.nn.functional as F
+
+            with torch.inference_mode():
+                X_pred_metric = integrate_world_model_step(graph, X_t, a)
+                l_before = float(F.mse_loss(X_pred_metric, X_fall).item())
+
+            if optim is not None:
+                optim.zero_grad()
+                X_pred_train = integrate_world_model_step(graph, X_t, a)
+                loss = F.mse_loss(X_pred_train, X_fall)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(core.parameters(), 0.5)
+                optim.step()
+                l_after = float(loss.item())
+                del loss, X_pred_train
+            ok = True
+        except Exception:
+            ok = False
+
+        if optim is not None:
+            for i, pg in enumerate(optim.param_groups):
+                if i < len(original_lrs):
+                    pg["lr"] = original_lrs[i]
+
+        return ok, l_before, l_after
+
     def replay_top_surprise_wm_train(
         self,
         episodic_memory,
@@ -596,6 +674,7 @@ class SleepController:
         self._sessions: deque[SleepSession] = deque(maxlen=20)
         self._lesson_scheduled: bool = False
         self._lesson_result: Any = None
+        self._rem_state: dict[str, Any] | None = None
 
     @property
     def is_sleeping(self) -> bool:
@@ -680,6 +759,132 @@ class SleepController:
         self._session = SleepSession(trigger_tick=tick, trigger_reason=reason)
         self._lesson_scheduled = False
         self._lesson_result = None
+        self._rem_state = None
+
+    def _init_rem_state(self, sim) -> None:
+        episodes: list = []
+        em = getattr(sim, "_episodic_memory", None)
+        if em is not None and em.falls:
+            try:
+                kk = max(1, int(os.environ.get("RKK_SLEEP_REM_TOP_K", "32")))
+            except ValueError:
+                kk = 32
+            sort_surprise = os.environ.get(
+                "RKK_SLEEP_REM_SURPRISE_SORT", "1"
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if sort_surprise and hasattr(em, "get_top_k_by_surprise"):
+                episodes = list(em.get_top_k_by_surprise(kk))
+            else:
+                episodes = list(em.falls)[-min(20, len(em.falls)) :]
+
+        self._rem_state = {
+            "episodes": episodes,
+            "idx": 0,
+            "losses_before": [],
+            "losses_after": [],
+            "replayed": 0,
+            "wm_done": False,
+            "finalized": False,
+        }
+
+    def _rem_budget_ms(self) -> float:
+        try:
+            return max(10.0, float(os.environ.get("RKK_SLEEP_REM_BUDGET_MS", "80")))
+        except ValueError:
+            return 80.0
+
+    def _rem_tick_slice(self, tick: int, sim) -> None:
+        """Spread REM replay across engine ticks (avoid 10–20s stalls on tick 0)."""
+        if self._rem_state is None:
+            self._init_rem_state(sim)
+        st = self._rem_state
+        if st.get("finalized"):
+            return
+
+        session = self._session
+        budget = self._rem_budget_ms() / 1000.0
+        t0 = time.perf_counter()
+        graph = sim.agent.graph
+        lr_mult = _env_float("RKK_SLEEP_REM_LR_MULT", 10.0)
+
+        episodes = st.get("episodes") or []
+        idx = int(st.get("idx", 0))
+        while idx < len(episodes) and (time.perf_counter() - t0) < budget:
+            ok, lb, la = self._rem_replayer.replay_one_episode(
+                episodes[idx], graph, lr_mult=lr_mult
+            )
+            if ok:
+                st["losses_before"].append(lb)
+                st["losses_after"].append(la)
+                st["replayed"] = int(st.get("replayed", 0)) + 1
+            idx += 1
+        st["idx"] = idx
+
+        if idx >= len(episodes) and not st.get("wm_done"):
+            if os.environ.get("RKK_REM_WM_TRAIN", "1").strip().lower() not in (
+                "0", "false", "no", "off",
+            ):
+                n_wm = self._rem_replayer.replay_top_surprise_wm_train(
+                    getattr(sim, "_episodic_memory", None),
+                    graph,
+                )
+                if n_wm > 0:
+                    print(f"[Sleep] REM: WM train_step on top-surprise batches (ok={n_wm})")
+            st["wm_done"] = True
+
+        if idx >= len(episodes) and st.get("wm_done") and not st.get("finalized"):
+            self._rem_finalize_rem(tick, sim, st, session)
+            st["finalized"] = True
+
+    def _rem_finalize_rem(self, tick: int, sim, st: dict, session: SleepSession | None) -> None:
+        lb = st.get("losses_before") or []
+        la = st.get("losses_after") or []
+        l_before = float(np.mean(lb)) if lb else 0.0
+        l_after = float(np.mean(la)) if la else 0.0
+        n = int(st.get("replayed", 0))
+        if session is not None:
+            session.rem_episodes_replayed = n
+            session.rem_loss_before = l_before
+            session.rem_loss_after = l_after
+        print(f"[Sleep] REM: replayed {n} episodes, loss {l_before:.4f}→{l_after:.4f}")
+
+        if mocap_dreams_enabled():
+            n_mocap = self._rem_replayer.inject_mocap_dreams(sim.agent.graph, n_steps=150)
+            print(
+                f"[Sleep] REM: injected {n_mocap} steps of MoCap dreams "
+                "(Walking manifold learned)"
+            )
+        else:
+            print("[Sleep] REM: MoCap dreams skipped (RKK_SLEEP_MOCAP_DREAMS=0)")
+
+        core = getattr(sim.agent.graph, "_core", None)
+        if core is not None:
+            with torch.no_grad():
+                w_max = core.W.abs().max()
+                if w_max > 1.5:
+                    core.W.data.div_(w_max / 1.5)
+                    print(f"[Sleep] REM: Normalized W max {w_max:.2f} → 1.5 to prevent densification")
+
+        _memory_diag_log(sim, "sleep_after_REM_replay")
+
+        try:
+            from engine.world_state_bridge import grounded_sleep_consolidate
+
+            gsn = grounded_sleep_consolidate(sim)
+            if session is not None and gsn.get("ok"):
+                session.grounded_samples = int(gsn.get("samples_pushed", 0))
+                session.grounded_loss_last = float(gsn.get("loss_last") or 0.0)
+                print(
+                    f"[Sleep] Grounded: samples={session.grounded_samples} "
+                    f"loss={session.grounded_loss_last}"
+                )
+        except Exception as e:
+            print(f"[Sleep] Grounded consolidate: {e}")
+        _memory_diag_log(sim, "sleep_after_grounded_inner_voice")
+        self._schedule_lesson(tick, sim)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def tick(self, tick: int, sim) -> dict[str, Any]:
         """
@@ -698,70 +903,9 @@ class SleepController:
 
         # ── REM phase ──────────────────────────────────────────────────────────
         if self._phase == SleepPhase.REM:
-            if ticks_in_phase == 0:
-                # Execute REM replay (once, synchronously)
-                n, l_before, l_after = self._rem_replayer.replay_falls(
-                    episodic_memory=getattr(sim, "_episodic_memory", None),
-                    graph=sim.agent.graph,
-                    motor_cortex=getattr(sim, "_motor_cortex", None),
-                    lr_mult=_env_float("RKK_SLEEP_REM_LR_MULT", 10.0),
-                )
-                session.rem_episodes_replayed = n
-                session.rem_loss_before = l_before
-                session.rem_loss_after = l_after
-                print(f"[Sleep] REM: replayed {n} episodes, loss {l_before:.4f}→{l_after:.4f}")
-
-                n_wm = self._rem_replayer.replay_top_surprise_wm_train(
-                    getattr(sim, "_episodic_memory", None),
-                    sim.agent.graph,
-                )
-                if n_wm > 0:
-                    print(f"[Sleep] REM: WM train_step on top-surprise batches (ok={n_wm})")
-
-                # ИНЪЕКЦИЯ СНОВ О ХОДЬБЕ (Physical Priors; опционально — RKK_SLEEP_MOCAP_DREAMS=0)
-                if mocap_dreams_enabled():
-                    n_mocap = self._rem_replayer.inject_mocap_dreams(
-                        sim.agent.graph, n_steps=150
-                    )
-                    print(
-                        f"[Sleep] REM: injected {n_mocap} steps of MoCap dreams "
-                        "(Walking manifold learned)"
-                    )
-                else:
-                    print(
-                        "[Sleep] REM: MoCap dreams skipped "
-                        "(RKK_SLEEP_MOCAP_DREAMS=0)"
-                    )
-                # Normalize W after REM to prevent densification (the LR boost causes weight explosion)
-                core = getattr(sim.agent.graph, "_core", None)
-                if core is not None:
-                    with torch.no_grad():
-                        w_max = core.W.abs().max()
-                        if w_max > 1.5:
-                            core.W.data.div_(w_max / 1.5)
-                            print(f"[Sleep] REM: Normalized W max {w_max:.2f} → 1.5 to prevent densification")
-
-                _memory_diag_log(sim, "sleep_after_REM_replay")
-
-                try:
-                    from engine.world_state_bridge import grounded_sleep_consolidate
-
-                    gsn = grounded_sleep_consolidate(sim)
-                    if gsn.get("ok"):
-                        session.grounded_samples = int(gsn.get("samples_pushed", 0))
-                        session.grounded_loss_last = float(gsn.get("loss_last") or 0.0)
-                        print(
-                            f"[Sleep] Grounded: samples={session.grounded_samples} "
-                            f"loss={session.grounded_loss_last}"
-                        )
-                except Exception as e:
-                    print(f"[Sleep] Grounded consolidate: {e}")
-                _memory_diag_log(sim, "sleep_after_grounded_inner_voice")
-
-                # Schedule LLM lesson (async, non-blocking)
-                self._schedule_lesson(tick, sim)
-
-            if ticks_in_phase >= self._rem_ticks:
+            self._rem_tick_slice(tick, sim)
+            rem_done = bool(self._rem_state and self._rem_state.get("finalized"))
+            if rem_done or ticks_in_phase >= self._rem_ticks:
                 self._phase = SleepPhase.LESSON
                 self._phase_start_tick = tick
 

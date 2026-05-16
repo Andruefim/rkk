@@ -394,6 +394,7 @@ class ValueLayer:
         engine_tick:      int = 0,
         imagination_horizon: int = 0,
         post_fr_loco_relax: float = 0.0,
+        precomputed_s1: dict[str, float] | None = None,
     ) -> CheckResult:
         self.total_checked += 1
         if imagination_horizon > 0:
@@ -570,7 +571,7 @@ class ValueLayer:
 
         # §2–4 Виртуальный do() + imagination rollout
         S = dict(current_nodes)
-        S1 = graph.propagate_from(S, variable, value)
+        S1 = precomputed_s1 if precomputed_s1 is not None else graph.propagate_from(S, variable, value)
         br_msg = self._graph_constraints(
             S1, S, eff, slot_action, raw_prev_entropy=True,
             skip_entropy=fixed_root,  # в fixed_root пропускаем entropy_spike

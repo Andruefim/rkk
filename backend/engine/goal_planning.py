@@ -102,3 +102,15 @@ def plan_max_branch() -> int:
     except ValueError:
         m = 64
     return max(12, min(200, m))
+
+
+def plan_max_branch_effective(*, fixed_root: bool) -> int:
+    """Меньше ветвлений в curriculum fixed_root — меньше WM-forward на тик."""
+    m = plan_max_branch()
+    if not fixed_root:
+        return m
+    try:
+        cap = int(os.environ.get("RKK_PLAN_MAX_BRANCH_FIXED", "16"))
+    except ValueError:
+        cap = 16
+    return max(8, min(m, cap))

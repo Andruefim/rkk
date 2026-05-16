@@ -6,6 +6,7 @@ import os
 import numpy as np
 import torch
 
+from engine.core.constants import cpg_during_fixed_root_enabled
 from engine.features.humanoid.constants import (
     ARM_VARS,
     FALLEN_Z,
@@ -636,7 +637,7 @@ class EnvironmentHumanoid:
         if self._intero_control_lost:
             return
         for name, val in targets.items():
-            if self._fixed_root and name in LEG_VARS:
+            if self._fixed_root and name in LEG_VARS and not cpg_during_fixed_root_enabled():
                 continue
             if getattr(self, "cpg_owns_legs", False) and name in LEG_VARS:
                 continue
@@ -656,7 +657,7 @@ class EnvironmentHumanoid:
         Also marks cpg_owns_legs=True so _apply_motor_intents doesn't fight CPG.
         cpg_sync: фаза CPG + отставание CoM — согласует корпус с ритмом ног.
         """
-        if self._fixed_root:
+        if self._fixed_root and not cpg_during_fixed_root_enabled():
             return
         self.cpg_owns_legs = True
         try:

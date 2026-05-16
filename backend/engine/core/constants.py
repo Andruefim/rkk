@@ -27,6 +27,18 @@ def cpg_loop_hz_from_env() -> float:
     return max(0.0, min(hz, 240.0))
 
 
+def cpg_during_fixed_root_enabled() -> bool:
+    """
+    Ритм ног (CPG) при закреплённом pelvis: in-place шаг, intent_stride имеет физический эффект.
+    По умолчанию следует RKK_LOCOMOTION_CPG.
+    """
+    raw = os.environ.get("RKK_CPG_DURING_FIXED_ROOT", "").strip()
+    if not raw:
+        v = os.environ.get("RKK_LOCOMOTION_CPG", "0").strip().lower()
+        return v in ("1", "true", "yes", "on")
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
 def agent_loop_hz_from_env() -> float:
     """0 = полный tick_step в вызывающем потоке (WS); >0 = high-level в daemon."""
     try:

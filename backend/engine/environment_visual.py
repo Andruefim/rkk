@@ -43,7 +43,14 @@ VISION_PIPELINE_JPEG_Q = 72
 # Полные маски для UI — не на каждый _refresh (дорого: 8× JPEG + upscale)
 VISION_UI_MASK_EVERY = 3
 # Полный камера+encode раз в N интервенций (между — старые слоты, свежие phys_*)
-VISION_ENCODE_EVERY = 6
+def _vision_encode_every() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_VISION_ENCODE_EVERY", "6")))
+    except ValueError:
+        return 6
+
+
+VISION_ENCODE_EVERY = _vision_encode_every()
 # Фоновый cortex.encode + JPEG (очередь maxsize=1); GPU с второго потока — только если устраивает драйвер
 VISION_ASYNC_ENCODE = os.environ.get("RKK_VISION_ASYNC_ENCODE", "0").strip().lower() in (
     "1", "true", "yes", "on",
@@ -237,13 +244,14 @@ class EnvironmentVisual:
     def _refresh(self, run_encode: bool = True, force_sync: bool = False) -> None:
         """
         run_encode=True: камера + cortex.encode + UI-кэш.
-        False: только смена поколения hybrid (свежий base_env.observe), слоты с прошлого encode.
+        False: не трогаем поколение hybrid — phys_* остаётся валидным до следующего encode.
         force_sync: игнорировать фоновый encode (первый кадр, смена fixed_root).
         """
-        self._vision_generation += 1
-        self._hybrid_phys_gen = -1
         if not run_encode:
             return
+
+        self._vision_generation += 1
+        self._hybrid_phys_gen = -1
 
         frame = self._get_raw_frame()
         self._last_frame = frame
