@@ -118,6 +118,7 @@ function normAgent(a) {
     notears:a.notears??null, valueLayer:a.value_layer??null, edges:a.edges??[],
     fallen:a.fallen??false, fallCount:a.fall_count??0,
     progressiveScope:a.progressive_scope??null, trajectory:a.trajectory??null,
+    fromSystem2: Boolean(a.from_system2 ?? a.fromSystem2),
   };
 }
 
@@ -138,6 +139,7 @@ function normFrame(raw) {
     visionTicks:raw.vision_ticks??0,
     vision:raw.vision??null,
     fixedRoot:raw.fixed_root??false,  // НОВОЕ
+    system2: raw.system2 ?? null,
   };
 }
 
@@ -1046,6 +1048,12 @@ export default function RKKHumanoid() {
           &nbsp;│&nbsp;<span style={{color:isFR?frColor:isVis?visColor:wCol}}>🌍 {ui.worldLabel||ui.currentWorld}</span>
           {isFR&&<>&nbsp;│&nbsp;<span style={{color:frColor}}>arms+spine+cubes</span></>}
           &nbsp;│&nbsp;<span style={{color:fallen?"#ff2244":"#335544"}}>{fallen?`💀×${ui.fallCount}`:"✓"}</span>
+          {ui.system2 && ui.system2.enabled !== false && !ui.system2.error && (
+            <>&nbsp;│&nbsp;<span style={{color:"#8899ff"}} title={typeof ui.system2==="object"?JSON.stringify(ui.system2):""}>
+              S2 {ui.system2.macro ?? "—"}{ui.system2.idle ? " · wait" : ""}{ui.system2.source ? ` · ${ui.system2.source}` : ""}
+              {ui.agent?.fromSystem2 ? " · lastDo" : ""}
+            </span></>
+          )}
         </div>
       </div>
 
@@ -1240,7 +1248,7 @@ export default function RKKHumanoid() {
             </div>
           </div>}
         </div>
-        <NovaChatWidget />
+        <NovaChatWidget system2={ui.system2} tick={ui.tick} feedMode="system2" />
       </div>
 
       {/* Right HUD */}

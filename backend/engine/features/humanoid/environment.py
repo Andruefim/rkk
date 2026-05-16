@@ -86,6 +86,9 @@ class EnvironmentHumanoid:
         self.cpg_owns_legs: bool = False
         # Самомодель: значения держим в среде, observe() мержит с физикой; intervene(self_*) не трогает суставы.
         self._self_state: dict[str, float] = {k: 0.5 for k in SELF_VARS}
+        # Цели по умолчанию: «стоять» и устойчивая осанка (нормализованные [0,1]).
+        self._self_state["self_com_z_target"] = 0.62
+        self._self_state["self_posture_target"] = 0.58
         self._motor_state: dict[str, float] = {
             k: float(MOTOR_INTENT_DEFAULTS.get(k, 0.5)) for k in MOTOR_INTENT_VARS
         }
@@ -774,6 +777,13 @@ class EnvironmentHumanoid:
         """Removed GT edges to allow true open-ended discovery metrics."""
         return []
 
+    def apply_self_state_patch(self, updates: dict[str, float]) -> None:
+        """Обновить self_* без лишнего PyBullet step (для System2 / графа)."""
+        for k, v in (updates or {}).items():
+            if k not in SELF_VARS:
+                continue
+            self._self_state[k] = float(np.clip(float(v), 0.05, 0.95))
+
     # ── Упал? ─────────────────────────────────────────────────────────────────
     def is_fallen(self) -> bool:
         # В fixed_root mode робот никогда не падает
@@ -786,6 +796,8 @@ class EnvironmentHumanoid:
         self._sim.reset_stance()
         for k in SELF_VARS:
             self._self_state[k] = 0.5
+        self._self_state["self_com_z_target"] = 0.62
+        self._self_state["self_posture_target"] = 0.58
         for k in MOTOR_INTENT_VARS:
             self._motor_state[k] = float(MOTOR_INTENT_DEFAULTS.get(k, 0.5))
         self._intero_state = {"intero_energy": 1.0, "intero_stress": 0.0}

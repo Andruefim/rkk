@@ -87,6 +87,7 @@ def build_simulation_snapshot(
             "rolling_block_rate": round(sim._rolling_block_rate(), 4),
             "stats": dict(sim._llm_loop_stats),
         },
+        "system2": getattr(sim, "_system2_last", None),
         "agent_loop": {
             "hz": round(_agent_loop_hz_from_env(), 1),
             "decoupled": _agent_loop_hz_from_env() > 0.0,

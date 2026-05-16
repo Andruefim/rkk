@@ -223,6 +223,9 @@ class Simulation(
         self._curriculum = CurriculumScheduler() if _CURRICULUM_AVAILABLE else None
         self._curriculum_apply_every: int = 50
 
+        self._system2: Any = None
+        self._system2_last: dict | None = None
+
         self._rssm_trainer: "RSSMTrainer | None" = None
         self._rssm_imagination: "RSSMImagination | None" = None
         self._rssm_upgraded: bool = False

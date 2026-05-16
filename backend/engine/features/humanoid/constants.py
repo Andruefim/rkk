@@ -61,6 +61,8 @@ SELF_VARS: tuple[str, ...] = (
     "self_intention_rarm",
     "self_energy",
     "self_attention",
+    "self_com_z_target",
+    "self_posture_target",
     "self_goal_target_dist",
     "self_goal_active",
 )

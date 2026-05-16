@@ -512,12 +512,19 @@ class RKKAgent:
         self._last_applied_do_key: tuple[str, float] | None = None
         self._repeat_same_top_scores: int = 0
 
+        # System 2: optional slow macro plan injected into agent.step (see engine.system2).
+        self._system2_candidate: dict | None = None
+
         # Phase T: Trajectory contrastive learning
         self._traj_collector = TrajectoryCollector()
         # Phase T: Progressive variable scope
         self._prog_scope = ProgressiveScope()
 
         self._bootstrap()
+
+    def set_system2_candidate(self, candidate: dict | None) -> None:
+        """Simulation sets one scoring row before agent.step (from_system2)."""
+        self._system2_candidate = candidate
 
     # ── Bootstrap + LLM seed interface ───────────────────────────────────────
     def _bootstrap(self):
@@ -1928,6 +1935,11 @@ class RKKAgent:
         if cem_cand is not None:
             scores.insert(0, cem_cand)
 
+        s2c = getattr(self, "_system2_candidate", None)
+        if s2c is not None:
+            scores.insert(0, s2c)
+            self._system2_candidate = None
+
         post_to = int(getattr(self, "_post_fr_explore_until", 0))
         if post_to > engine_tick and len(scores) >= 10:
             head = scores[:10]
@@ -1977,6 +1989,7 @@ class RKKAgent:
             return {
                 "blocked": False, "skipped": True, "prediction_error": 0.0,
                 "cf_predicted": {}, "cf_observed": {}, "goal_planned": False,
+                "from_system2": False,
             }
 
         current_phi = self.phi_approx()
@@ -2064,6 +2077,7 @@ class RKKAgent:
                 "cf_predicted": {},
                 "cf_observed": {},
                 "goal_planned": False,
+                "from_system2": False,
             }
 
         # ── Выполняем допустимое действие ────────────────────────────────────
@@ -2084,6 +2098,7 @@ class RKKAgent:
                 "cf_predicted": {},
                 "cf_observed": {},
                 "goal_planned": False,
+                "from_system2": False,
             }
 
         mdl_before = self.graph.mdl_size
@@ -2116,6 +2131,7 @@ class RKKAgent:
                 "cf_predicted": {},
                 "cf_observed": {},
                 "goal_planned": False,
+                "from_system2": False,
             }
         sym_ok, sym_fail = True, []
         if symbolic_verifier_enabled():
@@ -2399,6 +2415,7 @@ class RKKAgent:
             "cf_observed":  {k: float(round(float(observed_full.get(k, 0.0)), 4)) for k in _cf_keys},
             "goal_planned":  bool(chosen.get("from_goal_plan")),
             "from_cem":      bool(chosen.get("from_cem")),
+            "from_system2": bool(chosen.get("from_system2")),
             "symbolic_ok": sym_ok,
             "symbolic_violations": sym_fail,
             "rsi_lite": rsi_event,
@@ -2569,6 +2586,7 @@ class RKKAgent:
             p = np.clip(A, 1e-7, 1.0 - 1e-7)
             h_W_edge_entropy = float(-(p * np.log(p) + (1.0 - p) * np.log(1.0 - p)).sum())
 
+        _lr = getattr(self, "_last_result", None) or {}
         snap: dict = {
             "id":                    self.id,
             "name":                  self.name,
@@ -2582,6 +2600,7 @@ class RKKAgent:
             "total_interventions":   self._total_interventions,
             "total_blocked":         self._total_blocked,
             "last_do":               self._last_do,
+            "from_system2":          bool(_lr.get("from_system2", False)),
             "last_blocked_reason":   self._last_blocked_reason,
             "discovery_rate":        round(cur_dr, 3),
             "peak_discovery_rate":   round(self._peak_discovery_rate, 3),

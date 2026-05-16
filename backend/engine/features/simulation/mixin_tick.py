@@ -417,7 +417,30 @@ class SimulationTickMixin:
         self.agent.other_agents_phi = []
         self._maybe_step_hierarchical_l1()
         self._sync_temporal_blankets_to_graph()
-        
+
+        if self.current_world == "humanoid":
+            try:
+                from engine.system2.controller import system2_enabled
+
+                if system2_enabled():
+                    if getattr(self, "_system2", None) is None:
+                        from engine.system2 import System2Controller
+
+                        self._system2 = System2Controller()
+                    obs_s2 = dict(self.agent.graph.snapshot_vec_dict())
+                    self._system2_last = self._system2.tick(
+                        sim_tick=self.tick,
+                        agent=self.agent,
+                        obs=obs_s2,
+                        sim=self,
+                    )
+                else:
+                    self._system2_last = None
+            except Exception:
+                self._system2_last = {"enabled": False, "error": "system2_tick"}
+        else:
+            self._system2_last = None
+
         # Controlled perturbations during fixed_root to teach active balance
         if self.current_world == "humanoid" and self._fixed_root_active:
             if self.tick % 40 == 0:

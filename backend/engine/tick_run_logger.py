@@ -252,6 +252,7 @@ class TickRunLogger:
                 "compression_delta": result.get("compression_delta"),
                 "goal_planned": result.get("goal_planned"),
                 "from_cem": result.get("from_cem"),
+                "from_system2": result.get("from_system2"),
                 "hierarchy": result.get("hierarchy"),
                 "skill": result.get("skill"),
             },
