@@ -96,6 +96,39 @@ def _spine_pitch_euler_coeff() -> float:
         return 0.92
 
 
+def _recovery_pose_motor_multiplier(com_z: float, lfoot_z: float, rfoot_z: float) -> float:
+    """
+    Усиление PD/моментов при низком CoM и/или стопах без контакта (вставание, отталкивание руками).
+    Выкл: RKK_RECOVERY_MOTOR_ENABLE=0. Верх: RKK_RECOVERY_MOTOR_BOOST (по умолч. 1.28).
+    """
+    off = os.environ.get("RKK_RECOVERY_MOTOR_ENABLE", "1").strip().lower()
+    if off in ("0", "false", "no", "off"):
+        return 1.0
+    try:
+        cz_th = float(os.environ.get("RKK_RECOVERY_COM_Z_BELOW", "0.56"))
+    except ValueError:
+        cz_th = 0.56
+    try:
+        fz_th = float(os.environ.get("RKK_RECOVERY_FOOT_Z_BELOW", "0.12"))
+    except ValueError:
+        fz_th = 0.12
+    try:
+        b_max = float(os.environ.get("RKK_RECOVERY_MOTOR_BOOST", "1.28"))
+    except ValueError:
+        b_max = 1.28
+    b_max = float(np.clip(b_max, 1.0, 2.0))
+    feet_hi = max(float(lfoot_z), float(rfoot_z))
+    cz = float(com_z)
+    w = 0.0
+    if cz < cz_th:
+        w = max(w, float(np.clip((cz_th - cz) / max(cz_th * 0.4, 1e-6), 0.0, 1.0)))
+    if feet_hi < fz_th:
+        w = max(w, float(np.clip((fz_th - feet_hi) / max(fz_th, 1e-6), 0.0, 1.0)))
+    if w <= 0:
+        return 1.0
+    return float(1.0 + (b_max - 1.0) * w)
+
+
 def _ctrl_profile_from_delta(delta_norm: float) -> tuple[float, float]:
     """
     Convert command delta [0..1] into (velocity_scale, force_scale).
@@ -150,6 +183,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self._bg_hz = 0.0
         self._mt = _humanoid_motor_torque_table()
         self._joint_target_norm: dict[str, float] = {}
+        self._recovery_motor_boost_cached = 1.0
 
         self.client = pb.connect(pb.DIRECT)
         pb.setGravity(0, 0, -9.81, physicsClientId=self.client)
@@ -204,6 +238,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             self.ball_id, -1, restitution=0.55, lateralFriction=0.35,
             rollingFriction=0.02, physicsClientId=self.client,
         )
+        self._ball_radius = float(br)
         self._build_lever_pedestal()
         self._build_target_marker()
         self.prop_ids: list[int] = []
@@ -819,6 +854,57 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self._reset_base_orn = pb.getQuaternionFromEuler([0.0, 0.0, 0.0])
         return robot
 
+    def _maybe_unstick_ball_from_torso(self) -> None:
+        """
+        Если мяч песочницы заезжает под таз на низком CoM, он работает как «подкладка»:
+        корпус не может нормально согнуться / intent_lean_forward почти не виден в позе.
+        Сдвиг по горизонтали от CoM (без ломания сцены). Выкл: RKK_BALL_UNSTUCK_ENABLE=0.
+        Вызывать только под self._physics_lock.
+        """
+        off = os.environ.get("RKK_BALL_UNSTUCK_ENABLE", "1").strip().lower()
+        if off in ("0", "false", "no", "off"):
+            return
+        bid = getattr(self, "ball_id", None)
+        if bid is None:
+            return
+        try:
+            cz_th = float(os.environ.get("RKK_BALL_UNSTUCK_COM_Z_BELOW", "0.62"))
+        except ValueError:
+            cz_th = 0.62
+        try:
+            pad = float(os.environ.get("RKK_BALL_UNSTUCK_HORIZ_PAD", "0.42"))
+        except ValueError:
+            pad = 0.42
+        try:
+            push = float(os.environ.get("RKK_BALL_UNSTUCK_PUSH", "0.62"))
+        except ValueError:
+            push = 0.62
+        br = float(getattr(self, "_ball_radius", 0.1125))
+        cid = self.client
+        com, _ = self.get_com()
+        cz = float(com[2])
+        if cz > cz_th:
+            return
+        bp, _ = pb.getBasePositionAndOrientation(bid, physicsClientId=cid)
+        bx, by, bz = float(bp[0]), float(bp[1]), float(bp[2])
+        dx, dy = bx - float(com[0]), by - float(com[1])
+        horiz = float(np.hypot(dx, dy))
+        if horiz > br + pad:
+            return
+        if abs(bz - cz) > 0.48:
+            return
+        ev = np.array([dx, dy, 0.0], dtype=float)
+        nrm = float(np.linalg.norm(ev))
+        if nrm < 1e-4:
+            ev = np.array([1.0, 0.0, 0.0], dtype=float)
+        else:
+            ev = ev / nrm
+        nx = float(com[0]) + float(ev[0]) * (br + push)
+        ny = float(com[1]) + float(ev[1]) * (br + push)
+        nz = max(float(br) + 0.02, bz)
+        pb.resetBasePositionAndOrientation(bid, [nx, ny, nz], [0, 0, 0, 1], physicsClientId=cid)
+        pb.resetBaseVelocity(bid, [0, 0, 0], [0, 0, 0], physicsClientId=cid)
+
     def step(self, n: int = 10):
         if self._bg_hz > 0:
             return
@@ -827,6 +913,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 pb.stepSimulation(physicsClientId=self.client)
                 self._tick_hidden_state()
                 self._apply_friction_to_ankle_joints()
+            self._maybe_unstick_ball_from_torso()
 
     def _motor_relax_velocity(self) -> None:
         rid, cid = self.robot_id, self.client
@@ -1019,6 +1106,12 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             cmd_norm = float(np.clip(prev_norm + step, 0.0, 1.0))
             self._joint_target_norm[var_name] = cmd_norm
             vel_scale, force_scale = _ctrl_profile_from_delta(abs(cmd_norm - prev_norm))
+            rb = float(getattr(self, "_recovery_motor_boost_cached", 1.0))
+            if rb > 1.001:
+                vel_scale = float(
+                    np.clip(vel_scale * (0.88 + 0.12 * min(rb, 1.4)), 0.0, 1.12)
+                )
+                force_scale = float(np.clip(force_scale * rb, 0.0, 1.5))
             real_pos = float(np.clip(cmd_norm * (hi - lo) + lo, lo, hi))
             rid, cid = self.robot_id, self.client
             jt = self._joint_types[jid]
@@ -1028,11 +1121,10 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if not callable(motor_m) or jt != pb.JOINT_SPHERICAL:
                     return
                 if var_name == "neck_yaw":
-                    self._neck_euler[2] = 0.55 * real_pos
+                    self._neck_euler[1] = 0.55 * real_pos  # Yaw is rotation around Y (longitudinal)
                 else:
-                    # БЫЛО: self._neck_euler[0] = 0.45 * real_pos
-                    self._neck_euler[1] = 0.45 * real_pos  # ИСПРАВЛЕНО: Индекс 1 (Ось Y - Pitch)
-                ex, ey, ez = float(self._neck_euler[0]), float(self._neck_euler[1]), float(self._neck_euler[2])
+                    self._neck_euler[2] = 0.45 * real_pos  # Pitch is rotation around Z (lateral)
+                ex, ey, ez = float(self._neck_euler[0]), float(self._neck_euler[1]), -float(self._neck_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                         positionGain=0.62, velocityGain=0.18, maxVelocity=4.0 * vel_scale,
@@ -1043,10 +1135,10 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if not callable(motor_m) or jt != pb.JOINT_SPHERICAL:
                     return
                 if var_name == "spine_yaw":
-                    self._spine_euler[2] = 0.65 * real_pos
+                    self._spine_euler[1] = 0.65 * real_pos  # Yaw is rotation around Y
                 else:
-                    self._spine_euler[1] = _spine_pitch_euler_coeff() * real_pos
-                ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), float(self._spine_euler[2])
+                    self._spine_euler[2] = _spine_pitch_euler_coeff() * real_pos  # Pitch is rotation around Z
+                ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), -float(self._spine_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
                         positionGain=0.85, velocityGain=0.25, maxVelocity=3.5 * vel_scale,
@@ -1101,12 +1193,10 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         return np.array(pos), np.array(euler)
 
     def get_joint_angle(self, var_name: str) -> float:
-        if var_name == "neck_yaw":   return float(self._neck_euler[2])
-        # Должно совпадать с set_joint: neck_pitch пишет в _neck_euler[1]
-        if var_name == "neck_pitch": return float(self._neck_euler[1])
-        if var_name == "spine_yaw":  return float(self._spine_euler[2])
-        # Должно совпадать с set_joint: spine_pitch пишет в _spine_euler[1]
-        if var_name == "spine_pitch": return float(self._spine_euler[1])
+        if var_name == "neck_yaw":   return float(self._neck_euler[1])
+        if var_name == "neck_pitch": return float(self._neck_euler[2])
+        if var_name == "spine_yaw":  return float(self._spine_euler[1])
+        if var_name == "spine_pitch": return float(self._spine_euler[2])
         if var_name not in self.joint_by_var:
             return 0.0
         jid = self.joint_by_var[var_name]
@@ -1265,6 +1355,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             s["floor_friction"] = self._compute_floor_friction_effect()
             s["stack_height"] = float(self._stack_height)
             s["stability_score"] = float(self._stability_score)
+            self._recovery_motor_boost_cached = _recovery_pose_motor_multiplier(
+                float(s["com_z"]), float(s["lfoot_z"]), float(s["rfoot_z"])
+            )
             return s
 
     def _named_link_world_positions(self) -> dict[str, np.ndarray]:

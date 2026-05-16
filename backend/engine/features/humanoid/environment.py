@@ -360,7 +360,70 @@ class EnvironmentHumanoid:
         neutral_x = 0.41
         behind = float(np.clip((neutral_x - cx) / 0.22, 0.0, 1.0))
         low_h = float(np.clip((0.52 - cz) / 0.35, 0.0, 1.0))
-        return float(np.clip(gain * (0.55 * behind + 0.45 * low_h), 0.0, 0.20))
+        base = float(np.clip(gain * (0.55 * behind + 0.45 * low_h), 0.0, 0.20))
+        rw = self._recovery_pose_weight(raw)
+        if rw > 0:
+            try:
+                bm = float(os.environ.get("RKK_RECOVERY_BALANCE_REFLEX_MULT", "1.32"))
+            except ValueError:
+                bm = 1.32
+            bm = float(np.clip(bm, 1.0, 2.0))
+            # Лёгкий «sit-up» bias, если ноги в воздухе, а com_x ещё не даёт behind/low_h.
+            base = float(
+                np.clip(
+                    base * (1.0 + (bm - 1.0) * rw) + 0.035 * rw * gain,
+                    0.0,
+                    0.28,
+                )
+            )
+        return base
+
+    def _recovery_pose_weight(self, raw: dict[str, float]) -> float:
+        """0..1: низкий CoM и/или стопы без контакта (общие пороги с recovery motor в PyBullet)."""
+        try:
+            cz_th = float(os.environ.get("RKK_RECOVERY_COM_Z_BELOW", "0.56"))
+        except ValueError:
+            cz_th = 0.56
+        try:
+            fz_th = float(os.environ.get("RKK_RECOVERY_FOOT_Z_BELOW", "0.12"))
+        except ValueError:
+            fz_th = 0.12
+        cz = float(raw.get("com_z", STAND_Z))
+        lf = float(raw.get("lfoot_z", 0.2))
+        rf = float(raw.get("rfoot_z", 0.2))
+        feet_hi = max(lf, rf)
+        w = 0.0
+        if cz < cz_th:
+            w = max(w, float(np.clip((cz_th - cz) / max(cz_th * 0.4, 1e-6), 0.0, 1.0)))
+        if feet_hi < fz_th:
+            w = max(w, float(np.clip((fz_th - feet_hi) / max(fz_th, 1e-6), 0.0, 1.0)))
+        return float(w)
+
+    def _recovery_body_mapping_scales(self, raw: dict[str, float]) -> tuple[float, float]:
+        """
+        Сильнее отображать intent_torso_forward / lean / arm_cb на spine и плечи,
+        когда тело низко или стопы не на полу (вставание со спины, упор руками).
+        Выкл: RKK_RECOVERY_INTENT_MAP_ENABLE=0.
+        """
+        off = os.environ.get("RKK_RECOVERY_INTENT_MAP_ENABLE", "1").strip().lower()
+        if off in ("0", "false", "no", "off"):
+            return 1.0, 1.0
+        try:
+            smax = float(os.environ.get("RKK_RECOVERY_SPINE_GAIN_MAX", "1.52"))
+        except ValueError:
+            smax = 1.52
+        try:
+            amax = float(os.environ.get("RKK_RECOVERY_ARM_GAIN_MAX", "1.32"))
+        except ValueError:
+            amax = 1.32
+        smax = float(np.clip(smax, 1.0, 2.2))
+        amax = float(np.clip(amax, 1.0, 2.0))
+        w = self._recovery_pose_weight(raw)
+        if w <= 0:
+            return 1.0, 1.0
+        spine = float(1.0 + (smax - 1.0) * w)
+        arm = float(1.0 + (amax - 1.0) * w)
+        return spine, arm
 
     def intervene(self, variable: str, value: float, *, count_intervention: bool = True) -> dict[str, float]:
         if count_intervention:
@@ -461,9 +524,10 @@ class EnvironmentHumanoid:
 
         raw_phys = self._sim.get_state()
         bal = self._balance_spine_pitch_nudge(raw_phys)
+        sm, am = self._recovery_body_mapping_scales(raw_phys)
         pitch = float(
             np.clip(
-                0.5 + (torso - 0.5) * 0.55 + (lean - 0.5) * 0.28 + bal,
+                0.5 + (torso - 0.5) * 0.55 * sm + (lean - 0.5) * 0.28 * sm + bal,
                 0.05,
                 0.95,
             )
@@ -477,9 +541,9 @@ class EnvironmentHumanoid:
         l_sh = float(
             np.clip(
                 0.5
-                - (arm_cb - 0.5) * 0.65
-                + (rl - 0.5) * 0.88
-                - (wave - 0.5) * 0.12,
+                - (arm_cb - 0.5) * 0.65 * am
+                + (rl - 0.5) * 0.88 * am
+                - (wave - 0.5) * 0.12 * am,
                 0.05,
                 0.95,
             )
@@ -487,9 +551,9 @@ class EnvironmentHumanoid:
         r_sh = float(
             np.clip(
                 0.5
-                + (arm_cb - 0.5) * 0.65
-                + (rr - 0.5) * 0.88
-                + (wave - 0.5) * 0.12,
+                + (arm_cb - 0.5) * 0.65 * am
+                + (rr - 0.5) * 0.88 * am
+                + (wave - 0.5) * 0.12 * am,
                 0.05,
                 0.95,
             )
@@ -537,29 +601,10 @@ class EnvironmentHumanoid:
         lean = float(ms.get("intent_lean_forward", 0.5))
         raw_phys = self._sim.get_state()
         bal = self._balance_spine_pitch_nudge(raw_phys)
+        sm, am = self._recovery_body_mapping_scales(raw_phys)
 
         if self._fixed_root:
-            self._sim.set_joint(
-                "spine_pitch",
-                float(
-                    np.clip(
-                        0.5
-                        + (torso - 0.5) * 0.5
-                        + (lean - 0.5) * 0.25
-                        + bal,
-                        0.05,
-                        0.95,
-                    )
-                ),
-            )
-            self._sim.set_joint(
-                "lshoulder",
-                float(np.clip(0.5 - (arm_cb - 0.5) * 0.6, 0.05, 0.95)),
-            )
-            self._sim.set_joint(
-                "rshoulder",
-                float(np.clip(0.5 + (arm_cb - 0.5) * 0.6, 0.05, 0.95)),
-            )
+            self._apply_upper_body_from_intents(cpg_sync=None)
             return
 
         if self.cpg_owns_legs:
@@ -590,28 +635,7 @@ class EnvironmentHumanoid:
         self._sim.set_joint("lankle", ankle)
         self._sim.set_joint("rankle", ankle)
 
-        # Как _apply_upper_body_from_intents: torso + lean → spine_pitch (+ постуральный bal)
-        self._sim.set_joint(
-            "spine_pitch",
-            float(
-                np.clip(
-                    0.5
-                    + (torso - 0.5) * 0.55
-                    + (lean - 0.5) * 0.28
-                    + bal,
-                    0.05,
-                    0.95,
-                )
-            ),
-        )
-        self._sim.set_joint(
-            "lshoulder",
-            float(np.clip(0.5 - (arm_cb - 0.5) * 0.65, 0.05, 0.95)),
-        )
-        self._sim.set_joint(
-            "rshoulder",
-            float(np.clip(0.5 + (arm_cb - 0.5) * 0.65, 0.05, 0.95)),
-        )
+        self._apply_upper_body_from_intents(cpg_sync=None)
 
     def apply_motor_intent_residuals(self, residuals: dict[str, float]) -> None:
         """
