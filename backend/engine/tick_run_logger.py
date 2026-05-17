@@ -7,6 +7,7 @@ RKK_TICK_RUN_LOG_EVERY=1        — log every N engine ticks
 RKK_TICK_RUN_LOG_PHYS=1         — include humanoid posture/com/feet + motor intents
 RKK_TICK_RUN_LOG_EVENTS=1       — include causal-stream events for this tick
 RKK_TICK_RUN_LOG_NOTEAR=1       — include last train_step loss dict when present
+RKK_TICK_RUN_LOG_SYSTEM2=1     — include sim._system2_last snapshot per tick (default on)
 """
 from __future__ import annotations
 
@@ -50,6 +51,61 @@ def _env_flag(key: str, default: bool = True) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# Subset of System2Controller._last_diag — JSON-safe, bounded size for jsonl.
+_TICK_LOG_SYSTEM2_KEYS: frozenset[str] = frozenset(
+    {
+        "enabled",
+        "macro",
+        "source",
+        "until",
+        "idle",
+        "sim_tick",
+        "macro_horizon_expired",
+        "macro_outcome_deferred",
+        "llm_inflight",
+        "llm_submit_tick",
+        "llm_submitted",
+        "llm_wait_ticks",
+        "has_candidate",
+        "last_candidate_var",
+        "residuals_applied",
+        "last_neuro_node",
+        "blocked",
+        "skipped",
+        "error",
+        "outcome_ema",
+        "student_conf",
+        "last_source",
+        "online_buf",
+        "neuro_streak",
+    }
+)
+
+
+def _system2_tick_log_snapshot(sim: Any) -> dict[str, Any] | None:
+    """Per-tick System2 diagnostics (separate from action.from_system2)."""
+    if not _env_flag("RKK_TICK_RUN_LOG_SYSTEM2", True):
+        return None
+    raw = getattr(sim, "_system2_last", None)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return {"parse_error": "not_a_dict"}
+    out: dict[str, Any] = {}
+    for k in _TICK_LOG_SYSTEM2_KEYS:
+        if k not in raw:
+            continue
+        v = raw[k]
+        if v is None or isinstance(v, (bool, int, str)):
+            out[k] = v
+        elif isinstance(v, float):
+            out[k] = round(v, 5)
+        elif k == "neuro_streak" and isinstance(v, dict):
+            items = list(v.items())[:48]
+            out[k] = {str(a): round(float(b), 4) for a, b in items}
+    return out or {"enabled": bool(raw.get("enabled", False))}
 
 
 def _log_path() -> Path:
@@ -265,6 +321,10 @@ class TickRunLogger:
             "locomotion": _locomotion_snapshot(sim),
         }
 
+        s2snap = _system2_tick_log_snapshot(sim)
+        if s2snap is not None:
+            record["system2"] = s2snap
+
         if _env_flag("RKK_TICK_RUN_LOG_PHYS", True) and obs:
             record["phys"] = _phys_snapshot(obs, agent, sim=sim)
 
@@ -316,6 +376,9 @@ def _run_config_snapshot() -> dict[str, str]:
         "RKK_EDGE_THRESH",
         "RKK_CEM_PLANNING",
         "RKK_TRAJECTORY_ENABLED",
+        "RKK_SYSTEM2",
+        "RKK_SYSTEM2_PLAN_EVERY",
+        "RKK_SYSTEM2_MACRO_TICKS",
     )
     return {k: os.environ.get(k, "") for k in keys if os.environ.get(k) is not None}
 

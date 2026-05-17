@@ -804,25 +804,28 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         inertial_pos, inertial_orn, parents, jtypes, jaxes = [], [], [], [], []
 
         segments = [
-            ([0.1,0.15,0.12], [0.7,0.7,0.7,1], [0,0,0],      0),
-            ([0.05,0.05,0.05],[0.9,0.8,0.7,1], [0,0,0.22],   0),
-            ([0.04,0.04,0.14],[0.7,0.7,0.7,1], [-0.18,0,0.1],0),
-            ([0.04,0.04,0.14],[0.7,0.7,0.7,1], [0.18,0,0.1], 0),
-            ([0.03,0.03,0.12],[0.8,0.8,0.8,1], [-0.18,0,-0.14],2),
-            ([0.03,0.03,0.12],[0.8,0.8,0.8,1], [0.18,0,-0.14],3),
-            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [-0.10,0,-0.15],0),
-            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [0.10,0,-0.15], 0),
-            ([0.05,0.05,0.14],[0.8,0.8,0.8,1], [0,0,-0.15],   6),
-            ([0.05,0.05,0.14],[0.8,0.8,0.8,1], [0,0,-0.15],   7),
-            ([0.09,0.04,0.035],[0.6,0.6,0.6,1], [0,0,-0.14],  8),
-            ([0.09,0.04,0.035],[0.6,0.6,0.6,1], [0,0,-0.14],  9),
+            # he (halfExtents), color, joint_pos_in_parent, parent_idx, shape_offset
+            ([0.1,0.15,0.12], [0.7,0.7,0.7,1], [0,0,0],      0, [0,0,0]),      # 0 torso
+            ([0.05,0.05,0.05],[0.9,0.8,0.7,1], [0,0,0.22],   0, [0,0,0]),      # 1 head
+            ([0.04,0.04,0.14],[0.7,0.7,0.7,1], [-0.18,0,0.1],0, [0,0,-0.1]),   # 2 larm
+            ([0.04,0.04,0.14],[0.7,0.7,0.7,1], [0.18,0,0.1], 0, [0,0,-0.1]),   # 3 rarm
+            ([0.03,0.03,0.12],[0.8,0.8,0.8,1], [-0.18,0,-0.14],2, [0,0,-0.1]), # 4 llowerarm
+            ([0.03,0.03,0.12],[0.8,0.8,0.8,1], [0.18,0,-0.14],3, [0,0,-0.1]),  # 5 rlowerarm
+            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [-0.10,0,-0.15],0, [0,0,-0.1]), # 6 lthigh
+            ([0.06,0.06,0.15],[0.7,0.7,0.7,1], [0.10,0,-0.15], 0, [0,0,-0.1]), # 7 rthigh
+            ([0.05,0.05,0.14],[0.8,0.8,0.8,1], [0,0,-0.25],   6, [0,0,-0.1]),  # 8 lcalf
+            ([0.05,0.05,0.14],[0.8,0.8,0.8,1], [0,0,-0.25],   7, [0,0,-0.1]),  # 9 rcalf
+            # Feet: x is lateral, y is forward, z is vertical. Make them 8cm wide, 24cm long, 4cm tall.
+            # Offset y by 0.06 so the ankle is near the back (heel).
+            ([0.04,0.12,0.02],[0.2,0.2,0.2,1], [0,0,-0.24],  8, [0,0.06,-0.02]), # 10 lfoot
+            ([0.04,0.12,0.02],[0.2,0.2,0.2,1], [0,0,-0.24],  9, [0,0.06,-0.02]), # 11 rfoot
         ]
-        for i, (he, col_c, pos, par) in enumerate(segments):
-            col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=he, physicsClientId=self.client)
-            vis = pb.createVisualShape(pb.GEOM_BOX, halfExtents=he, rgbaColor=col_c, physicsClientId=self.client)
+        for i, (he, col_c, pos, par, off) in enumerate(segments):
+            col = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=he, collisionFramePosition=off, physicsClientId=self.client)
+            vis = pb.createVisualShape(pb.GEOM_BOX, halfExtents=he, visualFramePosition=off, rgbaColor=col_c, physicsClientId=self.client)
             col_shapes.append(col); vis_shapes.append(vis)
             positions.append(pos); orientations.append([0,0,0,1])
-            inertial_pos.append([0,0,0]); inertial_orn.append([0,0,0,1])
+            inertial_pos.append(off); inertial_orn.append([0,0,0,1])
             parents.append(par)
             jtypes.append(pb.JOINT_REVOLUTE)
             jaxes.append([1,0,0] if i not in [1,2,3] else [0,1,0])

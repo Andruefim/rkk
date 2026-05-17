@@ -9,7 +9,7 @@ sleep_consolidation.py — Phase K: Sleep Consolidation.
   PHASE_PRUNE:  Synaptic pruning — обрезка слабых GNN edges
 
 Триггеры (любой из):
-  - Каждые RKK_SLEEP_EVERY_TICKS тиков (default: 10000)
+  - Каждые RKK_SLEEP_EVERY_TICKS тиков с последнего пробуждения (periodic)
   - После RKK_SLEEP_FALL_THRESHOLD падений с последнего сна
   - По команде через API endpoint /sleep
 
@@ -52,6 +52,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import pathlib
 import threading
 import time
 from collections import deque
@@ -472,8 +473,14 @@ class REMReplay:
         """
         if sim is None or not hasattr(sim, "agent"):
             return 0
-            
+
         env = sim.agent.env
+        base = getattr(env, "base_env", None)
+        if base is not None:
+            env = base
+        if not callable(getattr(env, "apply_cpg_leg_targets", None)):
+            return 0
+
         node_ids = list(graph._node_ids)
         if not node_ids:
             return 0
@@ -489,18 +496,47 @@ class REMReplay:
         print(f"[Sleep] 🧠 Dreaming of perfect walking (MoCap replay for {n_steps} ticks)...")
 
         try:
+            from engine.core.constants import cpg_during_fixed_root_enabled
+            from engine.features.humanoid.constants import LEG_VARS
             from engine.mocap_loader import MoCapDataLoader
+
             loader = MoCapDataLoader()
             clip = loader.sample_clip(n_steps)
             actual_steps = len(clip)
 
+            def _advance_mocap_physics(targets: dict[str, float]) -> dict[str, float]:
+                fixed = bool(getattr(env, "_fixed_root", False))
+                if fixed and not cpg_during_fixed_root_enabled():
+                    ph = getattr(env, "_sim", None)
+                    if ph is None:
+                        return dict(env.observe())
+                    try:
+                        n_sub = int(os.environ.get("RKK_CPG_PHYS_SUBSTEPS", "0"))
+                    except ValueError:
+                        n_sub = 0
+                    if n_sub <= 0:
+                        n_sub = max(1, int(getattr(env, "steps_per_do", 10)) // 2)
+                    n_sub = min(max(n_sub, 1), 32)
+                    if not getattr(env, "_intero_control_lost", False):
+                        env._apply_upper_body_from_intents(cpg_sync=None)
+                        for name, val in targets.items():
+                            if name in LEG_VARS:
+                                ph.set_joint(
+                                    name, float(np.clip(float(val), 0.05, 0.95))
+                                )
+                        ph.step(int(n_sub))
+                        env._update_interoception()
+                    return dict(env.observe())
+                env.apply_cpg_leg_targets(targets)
+                return dict(env.observe())
+
             # Поднимаем агента
             env.reset_stance()
-            
+
             # Проигрываем MoCap клип через физику
             transitions = []
             for t in range(actual_steps):
-                # Извлекаем суставные углы из клипа: 
+                # Извлекаем суставные углы из клипа:
                 # 0:lhip, 1:rhip, 2:lknee, 3:rknee, 4:lankle, 5:rankle
                 frame = clip[t]
                 targets = {
@@ -511,14 +547,10 @@ class REMReplay:
                     "lankle": frame[4],
                     "rankle": frame[5],
                 }
-                
-                # Применяем их в PyBullet (как force-цели, чтобы симулятор обсчитал физику)
-                env.apply_cpg_leg_targets(targets)
-                
-                # Читаем настоящую физику (com_z, posture_stability и тд)
-                obs_raw = env.observe()
+
+                obs_raw = _advance_mocap_physics(targets)
                 transitions.append(dict(obs_raw))
-                
+
             # ── Inverse Dynamics (Goal-Conditioned Motor Babbling) ──
             # Teacher-forcing stack: forward_dynamics_seq uses true X_t each step (not chain rollout).
             # Per-timestep inverse: for each t minimize MSE(f(X_t, A_t), X_{t+1}) with Adam on intents only.
@@ -669,8 +701,8 @@ class SleepController:
             self._sleep_duration
         )
 
-        # State
-        self.last_sleep_tick: int = -self._every_ticks  # allow first sleep
+        # State (0 = never woken; periodic uses tick - last_sleep_tick >= RKK_SLEEP_EVERY_TICKS)
+        self.last_sleep_tick: int = 0
         self._falls_since_sleep: int = 0
         self.sleep_count: int = 0
         self.total_sleep_ticks: int = 0
@@ -746,6 +778,11 @@ class SleepController:
 
         if self._falls_since_sleep >= self._fall_threshold:
             return "fall_threshold"
+
+        # Periodic consolidation (docstring): long runs without falls/stagnation still get REM.
+        if self._every_ticks > 0 and tick > 0:
+            if (tick - int(self.last_sleep_tick)) >= int(self._every_ticks):
+                return "periodic"
 
         return None
 
@@ -853,7 +890,9 @@ class SleepController:
         print(f"[Sleep] REM: replayed {n} episodes, loss {l_before:.4f}→{l_after:.4f}")
 
         if mocap_dreams_enabled():
-            n_mocap = self._rem_replayer.inject_mocap_dreams(sim.agent.graph, n_steps=150)
+            n_mocap = self._rem_replayer.inject_mocap_dreams(
+                sim.agent.graph, n_steps=150, sim=sim
+            )
             print(
                 f"[Sleep] REM: injected {n_mocap} steps of MoCap dreams "
                 "(Walking manifold learned)"

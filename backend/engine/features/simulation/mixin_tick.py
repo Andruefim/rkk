@@ -56,6 +56,129 @@ class SimulationTickMixin:
             return
         self.agent.temporal = TemporalBlankets(d_input=g_d, device=self.device)
 
+    def _maybe_post_release_stabilize_intents(self) -> None:
+        """После снятия fixed_root — в окне stabilize_until усилить recover/support (плавный decay)."""
+        if self.current_world != "humanoid" or self._fixed_root_active:
+            return
+        if not getattr(self, "_curriculum_auto_fr_released", False):
+            return
+        t0 = int(getattr(self, "_post_fr_last_release_tick", -1))
+        if t0 < 0:
+            return
+        until = int(getattr(self, "_curriculum_stabilize_until", 0) or 0)
+        if until <= 0:
+            return
+        if self.tick > until:
+            return
+        span = max(1, until - t0)
+        age = max(0, int(self.tick) - t0)
+        if age > span:
+            return
+        base = self._unwrap_base_env(self.agent.env)
+        fn = getattr(base, "apply_motor_intent_residuals", None)
+        if not callable(fn):
+            return
+        try:
+            d_rec = float(os.environ.get("RKK_POST_FR_STOP_RECOVER_DELTA", "0.07"))
+        except ValueError:
+            d_rec = 0.07
+        try:
+            d_sup = float(os.environ.get("RKK_POST_FR_SUPPORT_DELTA", "0.06"))
+        except ValueError:
+            d_sup = 0.06
+        decay = max(0.12, 1.0 - float(age) / float(span))
+        scale = float(np.clip(decay, 0.2, 1.0))
+        fn(
+            {
+                "intent_stop_recover": d_rec * scale,
+                "intent_support_left": d_sup * scale,
+                "intent_support_right": d_sup * scale,
+            }
+        )
+
+    def _fr_curriculum_finalize_release(self, *, reason: str) -> None:
+        """Снять fixed_root в симуляции + VL, выставить окно stabilize (после мягкой физики)."""
+        self._curriculum_auto_fr_released = True
+        self.disable_fixed_root()
+        self._fr_soft_release_deadline = 0
+        self._fr_soft_release_start = 0
+        self._fr_soft_release_initial_ratio = 1.0
+        try:
+            stab = int(os.environ.get("RKK_POST_FR_STABILIZE_TICKS", "120"))
+        except ValueError:
+            stab = 120
+        self._curriculum_stabilize_until = self.tick + max(0, stab)
+        self._add_event(
+            f"📌 fixed_root OFF ({reason}) tick {self.tick}, "
+            f"stabilize until {self._curriculum_stabilize_until}",
+            "#66ccaa",
+            "phase",
+        )
+
+    def _maybe_damp_motor_intents_blind_fixed_root(self) -> None:
+        """При fixed_root и низком compression_gain подтягивать intent_* к дефолтам среды (меньше слепого дрейфа)."""
+        if self.current_world != "humanoid" or not self._fixed_root_active:
+            return
+        if os.environ.get("RKK_FR_BLIND_MOTOR_DAMP", "1").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return
+        try:
+            cg_abs_max = float(os.environ.get("RKK_FR_BLIND_CG_ABS_MAX", "0.04"))
+        except ValueError:
+            cg_abs_max = 0.04
+        cg_abs_max = float(max(0.005, min(0.25, cg_abs_max)))
+        if abs(float(self.agent.compression_gain)) > cg_abs_max:
+            return
+        try:
+            excursion_scale = float(
+                os.environ.get("RKK_FR_BLIND_INTENT_EXCURSION_SCALE", "0.92")
+            )
+        except ValueError:
+            excursion_scale = 0.92
+        excursion_scale = float(np.clip(excursion_scale, 0.55, 0.999))
+        base = self._unwrap_base_env(self.agent.env)
+        ms = getattr(base, "_motor_state", None)
+        if not isinstance(ms, dict):
+            return
+        try:
+            from engine.features.humanoid.constants import MOTOR_INTENT_DEFAULTS
+        except Exception:
+            MOTOR_INTENT_DEFAULTS = {}
+        raw_skip = os.environ.get("RKK_FR_BLIND_DAMP_SKIP", "")
+        skip: set[str] = {x.strip() for x in raw_skip.split(",") if x.strip()}
+        changed = False
+        for sk in list(ms.keys()):
+            if not str(sk).startswith("intent_"):
+                continue
+            if str(sk) in skip:
+                continue
+            prev = float(ms.get(sk, 0.5))
+            anchor = float(MOTOR_INTENT_DEFAULTS.get(str(sk), 0.5))
+            new_v = float(anchor + (prev - anchor) * excursion_scale)
+            new_v = float(np.clip(new_v, 0.05, 0.95))
+            if abs(new_v - prev) > 1e-6:
+                ms[str(sk)] = new_v
+                changed = True
+        if not changed:
+            return
+        if not getattr(base, "_intero_control_lost", False):
+            fn = getattr(base, "_apply_motor_intents", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+        try:
+            obs = dict(self.agent.env.observe())
+            self.agent.graph.apply_env_observation(obs, engine_tick=self.tick)
+            self._sync_motor_state(obs, source="fr_blind_damp", tick=self.tick)
+        except Exception:
+            pass
+
     def _fr_posture_and_bias_from_graph(self) -> tuple[float, float]:
         g = self.agent.graph.nodes
         posture = float(
@@ -146,8 +269,13 @@ class SimulationTickMixin:
     def _fr_maybe_end_reattach(self) -> None:
         if not self._fr_reattach_active or self.tick < self._fr_reattach_until:
             return
-        is_fn = getattr(self.agent.env, "is_fallen", None)
-        fallen = is_fn() if callable(is_fn) else False
+        base = self._unwrap_base_env(self.agent.env)
+        z_fn = getattr(base, "_fallen_z_below_threshold", None)
+        if callable(z_fn):
+            fallen = bool(z_fn())
+        else:
+            is_fn = getattr(self.agent.env, "is_fallen", None)
+            fallen = is_fn() if callable(is_fn) else False
         posture, _ = self._fr_posture_and_bias_from_graph()
         try:
             posture_ok = float(os.environ.get("RKK_FR_REATTACH_POSTURE_MIN", "0.82"))
@@ -308,45 +436,86 @@ class SimulationTickMixin:
             ):
                 self._fr_update_release_tracking()
                 release_window = 200
-                if self.tick >= auto_fr_ticks - release_window:
-                    ratio = max(
-                        0.0, float(auto_fr_ticks - self.tick) / float(release_window)
+                soft_deadline = int(getattr(self, "_fr_soft_release_deadline", 0) or 0)
+                if soft_deadline > 0 and self.tick < soft_deadline:
+                    start = int(getattr(self, "_fr_soft_release_start", 0) or 0)
+                    span = max(1, soft_deadline - start)
+                    progress = float(self.tick - start) / float(span)
+                    init_r = float(
+                        getattr(self, "_fr_soft_release_initial_ratio", 1.0) or 1.0
                     )
-                    self.set_fixed_root_force(ratio)
+                    init_r = float(np.clip(init_r, 0.0, 1.0))
+                    soft_ratio = float(max(0.0, init_r * (1.0 - progress)))
+                    self.set_fixed_root_force(soft_ratio)
+                elif soft_deadline > 0 and self.tick >= soft_deadline:
+                    reason = str(getattr(self, "_fr_soft_release_reason", "") or "?")
+                    self._fr_curriculum_finalize_release(reason=reason)
+                else:
+                    if self.tick >= auto_fr_ticks - release_window:
+                        ratio = max(
+                            0.0,
+                            float(auto_fr_ticks - self.tick) / float(release_window),
+                        )
+                        self.set_fixed_root_force(ratio)
 
-                early_release, rel_reason = self._fr_early_release_ready()
-                time_release = self.tick >= auto_fr_ticks
+                    early_release, rel_reason = self._fr_early_release_ready()
+                    time_release = self.tick >= auto_fr_ticks
 
-                if time_release or early_release:
-                    self._curriculum_auto_fr_released = True
-                    self.disable_fixed_root()
-                    try:
-                        stab = int(os.environ.get("RKK_POST_FR_STABILIZE_TICKS", "120"))
-                    except ValueError:
-                        stab = 120
-                    self._curriculum_stabilize_until = self.tick + max(0, stab)
-                    if early_release and not time_release:
-                        reason = rel_reason
-                    elif time_release and not early_release:
-                        reason = f"tick≥{auto_fr_ticks}"
-                    else:
-                        reason = f"{rel_reason}+tick≥{auto_fr_ticks}"
-                    self._add_event(
-                        f"📌 fixed_root OFF ({reason}) tick {self.tick}, "
-                        f"stabilize until {self._curriculum_stabilize_until}",
-                        "#66ccaa",
-                        "phase",
-                    )
+                    if time_release or early_release:
+                        if early_release and not time_release:
+                            reason = rel_reason
+                        elif time_release and not early_release:
+                            reason = f"tick≥{auto_fr_ticks}"
+                        else:
+                            reason = f"{rel_reason}+tick≥{auto_fr_ticks}"
+                        try:
+                            n_soft = int(
+                                os.environ.get("RKK_FR_SOFT_RELEASE_TICKS", "40")
+                            )
+                        except ValueError:
+                            n_soft = 40
+                        n_soft = max(0, min(120, n_soft))
+                        if n_soft > 0:
+                            init_r = float(
+                                np.clip(
+                                    float(auto_fr_ticks - self.tick)
+                                    / float(max(1, release_window)),
+                                    0.0,
+                                    1.0,
+                                )
+                            )
+                            if not time_release:
+                                init_r = max(init_r, 0.35)
+                            # At tick==auto_fr_ticks the 200-tick window ratio is 0; without a floor
+                            # soft-release would decay from zero and never unload stored constraint stress.
+                            init_r = max(init_r, 0.12)
+                            self._fr_soft_release_start = self.tick
+                            self._fr_soft_release_deadline = self.tick + n_soft
+                            self._fr_soft_release_initial_ratio = init_r
+                            self._fr_soft_release_reason = reason
+                            soft_ratio0 = float(max(0.0, init_r))
+                            self.set_fixed_root_force(soft_ratio0)
+                            self._add_event(
+                                f"📌 fixed_root SOFT-RELEASE {n_soft} ticks (physics) → "
+                                f"init_force_ratio={init_r:.2f}",
+                                "#66ccaa",
+                                "phase",
+                            )
+                        else:
+                            self._fr_curriculum_finalize_release(reason=reason)
 
         # Fallen check + автосброс физики (иначе VL и block_rate залипают)
         fallen = False
         is_fn  = getattr(self.agent.env, "is_fallen", None)
         if callable(is_fn) and not self._fixed_root_active:
             fallen = is_fn()
+            prev_f = bool(getattr(self, "_prev_fallen", False))
+            fallen_edge = bool(fallen and not prev_f)
             if self._fall_recovery_active and not fallen:
                 self._clear_fall_recovery()
             if fallen:
-                self._fall_count += 1
+                if fallen_edge:
+                    self._fall_count += 1
                 obs_fall = dict(self.agent.env.observe())
                 if (
                     self._curriculum_auto_fr_released
@@ -362,11 +531,14 @@ class SimulationTickMixin:
                     self.agent.graph.record_observation(obs)
                     self.agent.temporal.step(obs)
                     fallen = is_fn()
-                if self._fall_count % 20 == 1:
+                if fallen_edge and self._fall_count % 20 == 1:
                     self._add_event(
                         f"💀 [FALLEN] Nova упал! (×{self._fall_count})",
                         "#ff2244", "value"
                     )
+            self._prev_fallen = bool(fallen)
+        else:
+            self._prev_fallen = False
 
         # Фаза 12: передаём GNN prediction в visual env (не каждый тик — см. VISION_GNN_FEED_EVERY)
         if self._visual_mode and self._visual_env is not None:
@@ -395,12 +567,13 @@ class SimulationTickMixin:
         # CPG runs BEFORE agent step so legs are stabilized before high-level exploration
         self._ensure_cpg_background_loop()
         self._drain_l1_motor_commands()
-        fallen_pre = False
-        is_fn_pre = getattr(self.agent.env, "is_fallen", None)
-        if callable(is_fn_pre) and not self._fixed_root_active:
-            fallen_pre = is_fn_pre()
+        # Re-use ``fallen`` from the early check (after optional recovery): no extra
+        # ``is_fallen()`` here — duplicate calls would double-advance debounce streak.
+        fallen_pre = bool(fallen)
         self._maybe_apply_cpg_locomotion(fallen_pre)
         self._publish_cpg_node_snapshot()
+        if self.current_world == "humanoid" and not self._fixed_root_active:
+            self._maybe_post_release_stabilize_intents()
         if self.current_world == "humanoid":
             base_env = self._unwrap_base_env(self.agent.env)
             cpg_on = bool(getattr(base_env, "cpg_owns_legs", False))
@@ -458,6 +631,8 @@ class SimulationTickMixin:
 
         # Track action for episodic memory
         self._record_last_action(result)
+        if self.current_world == "humanoid" and self._fixed_root_active:
+            self._maybe_damp_motor_intents_blind_fixed_root()
 
         _obs_for_d_e: dict = {}
         try:

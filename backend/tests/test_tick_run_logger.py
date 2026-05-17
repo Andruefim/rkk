@@ -32,6 +32,13 @@ class TickRunLoggerTests(unittest.TestCase):
             sim.events = []
             sim._sleep_ctrl = None
             sim._locomotion_controller = None
+            sim._system2_last = {
+                "enabled": True,
+                "macro": "LOCOMOTE_DELIVERY",
+                "source": "student",
+                "until": 120,
+                "idle": False,
+            }
             sim.agent = MagicMock()
             sim.agent.graph._node_ids = ["a", "b"]
             sim.agent._last_step_timings = {"total_ms": 12.5, "observe": 1.0}
@@ -84,6 +91,9 @@ class TickRunLoggerTests(unittest.TestCase):
             self.assertEqual(tick["type"], "tick")
             self.assertEqual(tick["tick"], 1)
             self.assertEqual(tick["action"]["variable"], "phys_intent_lean_forward")
+            self.assertIn("system2", tick)
+            self.assertEqual(tick["system2"]["macro"], "LOCOMOTE_DELIVERY")
+            self.assertEqual(tick["system2"]["source"], "student")
             self.assertIn("perf", tick)
             end = json.loads(lines[-1])
             self.assertEqual(end["type"], "run_end")

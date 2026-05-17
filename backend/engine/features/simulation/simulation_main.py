@@ -140,6 +140,8 @@ class Simulation(
         self._last_snapshot: dict = {}
 
         self._fall_count = 0
+        self._prev_fallen: bool = False
+        self._post_fr_last_release_tick: int = -1
         self._fixed_root_active = False
         self._curriculum_auto_fr_released = False
         self._curriculum_stabilize_until: int = 0
@@ -149,6 +151,10 @@ class Simulation(
         self._fr_reattach_until: int = 0
         self._fr_reattach_count: int = 0
         self._fr_release_blocked_until: int = 0
+        self._fr_soft_release_deadline: int = 0
+        self._fr_soft_release_start: int = 0
+        self._fr_soft_release_initial_ratio: float = 1.0
+        self._fr_soft_release_reason: str = ""
         self._stand_ticks = 0
         self._last_fall_reset_tick: int = -999
         self._fall_recovery_active = False

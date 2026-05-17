@@ -160,6 +160,10 @@ class SimulationWorldMixin:
             return {"fixed_root": True, "already_enabled": True}
 
         with self._sim_step_lock:
+            self._fr_soft_release_deadline = 0
+            self._fr_soft_release_start = 0
+            self._fr_soft_release_initial_ratio = 1.0
+            self._fr_soft_release_reason = ""
             if self._visual_mode and self._visual_env is not None:
                 self._visual_env.set_fixed_root(True)
             else:
@@ -189,6 +193,7 @@ class SimulationWorldMixin:
 
             self._fixed_root_active = True
             self._fall_count = 0
+            self._prev_fallen = False
             self._stop_cpg_background_loop()
             self.agent._post_fr_explore_until = 0
             self.agent._post_fr_vl_relax_until = 0
@@ -273,6 +278,7 @@ class SimulationWorldMixin:
             result = self.agent.inject_text_priors(humanoid_hardcoded_seeds())
 
             self._fixed_root_active = False
+            self._post_fr_last_release_tick = int(getattr(self, "tick", 0))
 
             try:
                 n_exp = int(os.environ.get("RKK_POST_FR_EXPLORE_TICKS", "300"))

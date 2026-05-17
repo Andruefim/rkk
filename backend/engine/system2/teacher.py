@@ -127,7 +127,7 @@ def proposal_from_llm_network_fetch(
             "format": "json",
             "options": {"temperature": 0.12, "num_predict": 240},
         }
-        with httpx.Client(timeout=35.0) as client:
+        with httpx.Client(timeout=httpx.Timeout(40.0, connect=8.0)) as client:
             r = client.post(url, json=body)
             r.raise_for_status()
             data = r.json()
@@ -151,7 +151,7 @@ def proposal_from_llm_network_fetch(
                 "stream": False,
                 "options": {"temperature": 0.12, "num_predict": 240},
             }
-            with httpx.Client(timeout=35.0) as client:
+            with httpx.Client(timeout=httpx.Timeout(40.0, connect=8.0)) as client:
                 r = client.post(url, json=body)
                 r.raise_for_status()
                 data = r.json()

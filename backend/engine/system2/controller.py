@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import uuid
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from engine.goal_planning import resolve_humanoid_base
-from engine.system2.learned_student import LearnedMacroStudent
+from engine.system2.learned_student import LearnedMacroStudent, snapshot_obs_for_distill
 from engine.system2.macros import macro_bundle
 from engine.system2.schema import System2Proposal
 from engine.system2.student import MacroStudent, choose_macro_from_obs
@@ -223,6 +224,23 @@ class System2Controller:
                 continue
         return out
 
+    def _macro_outcome_deferred(self, sim_tick: int) -> bool:
+        """Номинальный горизонт вышел, но исход макроса не считаем — ждём async LLM."""
+        if not self._macro_start_obs or self._macro_until_tick < 0:
+            return False
+        if sim_tick < self._macro_until_tick:
+            return False
+        fut = self._llm_future
+        return fut is not None and not fut.done()
+
+    def _macro_horizon_expired(self, sim_tick: int) -> bool:
+        ut = self._macro_until_tick
+        if ut < 0 or sim_tick <= ut:
+            return False
+        if self._macro_outcome_deferred(sim_tick):
+            return False
+        return not self._macro_start_obs
+
     def _merge_llm_goal_into_graph(self, graph: Any, proposal: System2Proposal) -> None:
         g = proposal.goal
         nodes = getattr(graph, "nodes", None)
@@ -265,22 +283,23 @@ class System2Controller:
         source: str,
         success: bool,
         delta: dict[str, float],
+        obs0: dict[str, float] | None = None,
     ) -> None:
         if not _distill_enabled():
             return
         path = _distill_log_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            line = json.dumps(
-                {
-                    "tick": tick,
-                    "macro": macro,
-                    "source": source,
-                    "success": success,
-                    "delta": delta,
-                },
-                ensure_ascii=False,
-            )
+            row: dict[str, Any] = {
+                "tick": tick,
+                "macro": macro,
+                "source": source,
+                "success": success,
+                "delta": delta,
+            }
+            if obs0:
+                row["obs0"] = obs0
+            line = json.dumps(row, ensure_ascii=False)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError:
@@ -341,8 +360,13 @@ class System2Controller:
         node_keys: frozenset[str],
         sim: Any | None,
         proposal_llm: System2Proposal | None,
+        *,
+        plan_tick_bump: bool = True,
     ) -> dict[str, Any]:
-        """Один цикл планирования; обновляет `_last_plan_tick` только здесь (после готовности LLM)."""
+        """Один цикл планирования. `plan_tick_bump=False` — ответ async-LLM: не сдвигать
+        `_last_plan_tick` (счётчик PLAN_EVERY от момента submit, как при старте старого блокирующего запроса)."""
+        if plan_tick_bump:
+            self._last_plan_tick = sim_tick
         if (
             self._learned.enabled()
             and not self._bootstrap_attempted
@@ -408,7 +432,9 @@ class System2Controller:
 
         residuals_applied = False
         fn = getattr(base, "apply_motor_intent_residuals", None)
-        if callable(fn) and residuals and self._should_apply_residuals(sim_tick, macro):
+        if callable(fn) and residuals and self._should_apply_residuals(
+            sim_tick, macro, base=base, sim=sim
+        ):
             scale = _residual_scale()
             scaled = {k: float(v) * scale for k, v in residuals.items() if k in node_keys}
             if scaled:
@@ -450,14 +476,22 @@ class System2Controller:
         self._last_source = source
         self._macro_until_tick = sim_tick + _macro_horizon_ticks()
         self._macro_start_obs = dict(obs_f)
-        self._last_plan_tick = sim_tick
 
         inflight = self._llm_future is not None and not self._llm_future.done()
+        hz_exp = self._macro_horizon_expired(sim_tick)
+        defer = self._macro_outcome_deferred(sim_tick)
+        wt = None
+        if inflight and self._llm_submit_tick >= 0:
+            wt = int(sim_tick - self._llm_submit_tick)
         self._last_diag = {
             "enabled": True,
             "macro": macro,
             "source": source,
             "until": self._macro_until_tick,
+            "sim_tick": sim_tick,
+            "macro_horizon_expired": hz_exp,
+            "macro_outcome_deferred": defer,
+            "llm_wait_ticks": wt,
             "has_candidate": candidate is not None,
             "last_candidate_var": last_var,
             "blocked": False,
@@ -472,7 +506,35 @@ class System2Controller:
         }
         return self._last_diag
 
-    def _should_apply_residuals(self, sim_tick: int, macro: str) -> bool:
+    def _should_apply_residuals(
+        self,
+        sim_tick: int,
+        macro: str,
+        *,
+        base: Any | None = None,
+        sim: Any | None = None,
+    ) -> bool:
+        if os.environ.get("RKK_SYSTEM2_RESIDUAL_CPG_GUARD", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            if base is not None and bool(getattr(base, "cpg_owns_legs", False)):
+                fnr = getattr(sim, "_locomotion_reward_ema", None) if sim is not None else None
+                if callable(fnr):
+                    try:
+                        thr = float(
+                            os.environ.get("RKK_SYSTEM2_RESIDUAL_MIN_LOCOREWARD", "0.22")
+                        )
+                    except ValueError:
+                        thr = 0.22
+                    thr = float(max(0.05, min(0.55, thr)))
+                    try:
+                        if float(fnr()) < thr:
+                            return False
+                    except Exception:
+                        pass
         gap = sim_tick - self._last_residual_tick
         if gap < _residual_min_every():
             return False
@@ -511,7 +573,14 @@ class System2Controller:
         ending_macro = self._active_macro
         ending_source = self._last_source
         # Завершение макроса: оценка прогресса для студента + лог дистилляции
-        if sim_tick >= self._macro_until_tick and self._macro_start_obs:
+        # Пока LLM в полёте — не закрывать эпизод по календарю: окно отсчитывается до применения ответа.
+        if (
+            sim_tick >= self._macro_until_tick
+            and self._macro_start_obs
+            and not (
+                self._llm_future is not None and not self._llm_future.done()
+            )
+        ):
             cz0 = float(
                 self._macro_start_obs.get(
                     "com_z", self._macro_start_obs.get("phys_com_z", 0.5)
@@ -536,13 +605,20 @@ class System2Controller:
                 max(0.0, min(1.0, 0.92 * self._outcome_ema + 0.08 * (1.0 if success else 0.0)))
             )
             if self._learned.enabled():
-                self._learned.learn(ending_macro, success, dict(self._macro_start_obs))
+                self._learned.learn(
+                    ending_macro,
+                    success,
+                    dict(self._macro_start_obs),
+                    d_com_z=cz1 - cz0,
+                    d_posture=ps1 - ps0,
+                )
             self._append_distill(
                 tick=sim_tick,
                 macro=ending_macro,
                 source=ending_source,
                 success=success,
                 delta={"d_com_z": round(cz1 - cz0, 5), "d_posture": round(ps1 - ps0, 5)},
+                obs0=snapshot_obs_for_distill(dict(self._macro_start_obs)) or None,
             )
             try:
                 self._online_buf.append(
@@ -580,8 +656,11 @@ class System2Controller:
             drained_llm: System2Proposal | None
             try:
                 drained_llm = self._llm_future.result(timeout=0)
-            except Exception:
+            except Exception as ex:
                 drained_llm = None
+                logging.getLogger(__name__).warning(
+                    "System2 LLM future failed: %s", ex, exc_info=True
+                )
             self._llm_future = None
             if drained_llm is not None:
                 drained_llm = validate_proposal(
@@ -596,14 +675,24 @@ class System2Controller:
                 node_keys,
                 sim,
                 drained_llm,
+                plan_tick_bump=False,
             )
 
         if not should_plan:
             inflight = self._llm_future is not None and not self._llm_future.done()
+            hz_exp = self._macro_horizon_expired(sim_tick)
+            defer = self._macro_outcome_deferred(sim_tick)
+            wt = None
+            if inflight and self._llm_submit_tick >= 0:
+                wt = int(sim_tick - self._llm_submit_tick)
             self._last_diag = {
                 "enabled": True,
                 "macro": self._active_macro,
                 "until": self._macro_until_tick,
+                "sim_tick": sim_tick,
+                "macro_horizon_expired": hz_exp,
+                "macro_outcome_deferred": defer,
+                "llm_wait_ticks": wt,
                 "idle": True,
                 "outcome_ema": round(self._outcome_ema, 4),
                 "student_conf": self._last_diag.get("student_conf"),
@@ -643,10 +732,21 @@ class System2Controller:
                     prop,
                 )
             if self._llm_future is not None and not self._llm_future.done():
+                hz_exp = self._macro_horizon_expired(sim_tick)
+                defer = self._macro_outcome_deferred(sim_tick)
+                wt = (
+                    int(sim_tick - self._llm_submit_tick)
+                    if self._llm_submit_tick >= 0
+                    else None
+                )
                 self._last_diag = {
                     "enabled": True,
                     "macro": self._active_macro,
                     "until": self._macro_until_tick,
+                    "sim_tick": sim_tick,
+                    "macro_horizon_expired": hz_exp,
+                    "macro_outcome_deferred": defer,
+                    "llm_wait_ticks": wt,
                     "idle": True,
                     "outcome_ema": round(self._outcome_ema, 4),
                     "student_conf": self._last_diag.get("student_conf"),
@@ -664,10 +764,17 @@ class System2Controller:
                 vlm,
             )
             self._llm_submit_tick = sim_tick
+            self._last_plan_tick = sim_tick
+            hz_exp = self._macro_horizon_expired(sim_tick)
+            defer = self._macro_outcome_deferred(sim_tick)
             self._last_diag = {
                 "enabled": True,
                 "macro": self._active_macro,
                 "until": self._macro_until_tick,
+                "sim_tick": sim_tick,
+                "macro_horizon_expired": hz_exp,
+                "macro_outcome_deferred": defer,
+                "llm_wait_ticks": 0,
                 "idle": True,
                 "outcome_ema": round(self._outcome_ema, 4),
                 "student_conf": self._last_diag.get("student_conf"),

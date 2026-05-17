@@ -10,19 +10,24 @@ from __future__ import annotations
 import os
 import glob
 import math
+import pathlib
 import numpy as np
 import torch
 import torch.nn as nn
 from typing import Any
 
+_DEFAULT_MOCAP_DIR = str(pathlib.Path(__file__).resolve().parent.parent / "mocap_data")
+
+
 # TODO: Для полной поддержки BVH без зависимостей можно реализовать рекурсивный
-# спуск по дереву костей. Пока мы используем заглушку, которая читает JSON/NPZ 
-# (например отработанный через MediaPipe) или использует fallback-манифолд, 
+# спуск по дереву костей. Пока мы используем заглушку, которая читает JSON/NPZ
+# (например отработанный через MediaPipe) или использует fallback-манифолд,
 # если директория пуста.
 
+
 class MoCapDataLoader:
-    def __init__(self, data_dir: str = "mocap_data"):
-        self.data_dir = data_dir
+    def __init__(self, data_dir: str | None = None):
+        self.data_dir = os.path.abspath(data_dir) if data_dir else _DEFAULT_MOCAP_DIR
         self.clips: list[np.ndarray] = []
         self._load_all_clips()
 

@@ -190,7 +190,12 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
       if (system2.last_neuro_node) chips.push(String(system2.last_neuro_node).slice(0, 20));
       setConcepts(chips.slice(0, 4));
       let line = `tick ${tick} · S2 ${system2.macro ?? "—"} · ${system2.source ?? ""}`;
-      if (system2.idle) line += " · ожидание";
+      if (system2.idle) {
+        line += " · ожидание";
+        if (system2.llm_inflight) line += " · LLM";
+        if (system2.macro_outcome_deferred) line += " · макрос→LLM";
+        else if (system2.macro_horizon_expired) line += " · горизонт истёк";
+      }
       if (system2.outcome_ema != null) line += ` · ema ${system2.outcome_ema}`;
       setStatusLine(line);
       setStatusColor("#9b7ed9");
@@ -205,6 +210,11 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
       system2.last_candidate_var ?? "",
       String(system2.residuals_applied ?? ""),
       system2.skipped ?? "",
+      String(system2.macro_horizon_expired ?? ""),
+      String(system2.macro_outcome_deferred ?? ""),
+      String(system2.llm_inflight ?? ""),
+      String(system2.llm_submitted ?? ""),
+      String(system2.llm_submit_tick ?? ""),
     ].join("|");
 
     if (key === lastPlanKeyRef.current) return;
@@ -214,7 +224,33 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
     if (system2.skipped) {
       lines.push(`Пропуск: ${system2.skipped}`);
     } else if (system2.idle) {
-      lines.push(`Макрос «${system2.macro ?? "—"}» активен до тика ${system2.until ?? "—"}.`);
+      const st = system2.sim_tick ?? tick;
+      if (system2.llm_inflight) {
+        const sub = system2.llm_submit_tick;
+        if (system2.macro_outcome_deferred) {
+          lines.push(
+            `Ждём ответ LLM${sub != null ? ` (запрос с тика ${sub})` : ""}. Итог текущего макроса посчитаем после ответа; новый горизонт — от тика, когда план реально применится.`
+          );
+        } else if (system2.macro_horizon_expired) {
+          lines.push(
+            `Ждём LLM${sub != null ? ` с тика ${sub}` : ""}. Предыдущий эпизод закрыт; следующее окно задастся от тика применения нового плана (сейчас тик ${st}).`
+          );
+        } else {
+          lines.push(
+            `Ждём LLM${sub != null ? ` с тика ${sub}` : ""}. Окно оценки макроса «${system2.macro ?? "—"}» до тика ${system2.until ?? "—"}.`
+          );
+        }
+      } else if (system2.macro_horizon_expired) {
+        lines.push(
+          `Горизонт последнего макроса в прошлом (до тика ${system2.until ?? "—"}); сейчас тик ${st}. Следующий шаг планировщика по расписанию или при смене фазы.`
+        );
+      } else if (system2.until != null && system2.until >= 0) {
+        lines.push(
+          `Макрос «${system2.macro ?? "—"}»: окно оценки до тика ${system2.until}; сейчас тик ${st}.`
+        );
+      } else {
+        lines.push(`Планировщик в паузе (тик ${st}, макрос «${system2.macro ?? "—"}»).`);
+      }
       if (system2.outcome_ema != null) lines.push(`EMA исходов макросов: ${system2.outcome_ema}`);
       if (system2.student_conf != null) lines.push(`Уверенность студента: ${system2.student_conf}`);
     } else {

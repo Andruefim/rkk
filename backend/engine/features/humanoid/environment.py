@@ -99,6 +99,8 @@ class EnvironmentHumanoid:
         }
         self._intero_control_lost: bool = False
         self._prev_raw_obs: dict[str, float] | None = None
+        # is_fallen: consecutive ticks with com_z (normalized) below FALLEN_Z gate
+        self._fallen_low_z_streak: int = 0
 
     # ── Fixed root switch ─────────────────────────────────────────────────────
     @property
@@ -113,6 +115,7 @@ class EnvironmentHumanoid:
         """
         if enabled == self._fixed_root:
             return
+        self._fallen_low_z_streak = 0
         self._fixed_root = enabled
         if isinstance(self._sim, _PyBulletHumanoid):
             if enabled:
@@ -141,6 +144,15 @@ class EnvironmentHumanoid:
     def _norm(self, key: str, val: float) -> float:
         lo, hi = _RANGES.get(key, (-1.0, 1.0))
         return float(np.clip((val - lo) / (hi - lo), 0.05, 0.95))
+
+    def _fallen_z_below_threshold(self) -> bool:
+        """Instant gate: normalized com_z (base link height) below FALLEN_Z — no debounce."""
+        if self._fixed_root:
+            return False
+        obs = self.observe()
+        cz = float(obs.get("com_z", 0.5))
+        th = float(self._norm("com_z", float(FALLEN_Z)))
+        return cz < th
 
     def _denorm(self, key: str, val: float) -> float:
         lo, hi = _RANGES.get(key, (-1.0, 1.0))
@@ -786,13 +798,28 @@ class EnvironmentHumanoid:
 
     # ── Упал? ─────────────────────────────────────────────────────────────────
     def is_fallen(self) -> bool:
-        # В fixed_root mode робот никогда не падает
+        """Падение по низкой высоте *базы* (см. PyBulletHumanoid.get_com → base position).
+
+        com_z в observe — нормализация этой высоты; это не инерциальный CoM всего тела.
+        После снятия pin возможны 1–2 тика с аномально низким base z → ложный ``fallen``.
+        Требуем ``RKK_FALLEN_CONFIRM_TICKS`` подряд тиков ниже порога FALLEN_Z.
+        """
         if self._fixed_root:
+            self._fallen_low_z_streak = 0
             return False
-        obs = self.observe()
-        return obs.get("com_z", 0.5) < self._norm("com_z", FALLEN_Z)
+        low = self._fallen_z_below_threshold()
+        try:
+            n_need = max(1, int(os.environ.get("RKK_FALLEN_CONFIRM_TICKS", "4")))
+        except ValueError:
+            n_need = 4
+        if low:
+            self._fallen_low_z_streak = min(int(self._fallen_low_z_streak) + 1, 10_000)
+        else:
+            self._fallen_low_z_streak = 0
+        return self._fallen_low_z_streak >= n_need
 
     def reset_stance(self) -> None:
+        self._fallen_low_z_streak = 0
         self._sim.reset_stance()
         for k in SELF_VARS:
             self._self_state[k] = 0.5
@@ -823,7 +850,7 @@ class EnvironmentHumanoid:
             "ankleQuats": self._sim.get_ankle_quaternions_three_js(),
             "cubes":      self.get_cube_positions(),
             "target":     self.get_target(),
-            "fallen":     self.is_fallen(),
+            "fallen":     self._fallen_z_below_threshold(),
             "com_z":      self.observe().get("com_z", 0.5) if not self._fixed_root else 0.75,
             "fixed_root": self._fixed_root,
         }
