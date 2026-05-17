@@ -57,6 +57,39 @@ def test_validate_proposal_clips_goal():
     assert out.goal.posture_stability_min == 0.95
 
 
+def test_parse_recovery_motor_steps_valid():
+    from engine.system2.schema import parse_recovery_motor_steps
+
+    steps = parse_recovery_motor_steps(
+        {
+            "steps": [
+                {"ticks": 10, "intent_deltas": {"intent_stop_recover": 0.06}},
+                {"ticks": 5, "intent_deltas": {"intent_torso_forward": 0.04}},
+            ]
+        }
+    )
+    assert steps is not None
+    assert len(steps) == 2
+    assert steps[0]["ticks"] == 10
+    assert "intent_stop_recover" in steps[0]["intent_deltas"]
+
+
+def test_parse_recovery_motor_steps_filters_non_intent_keys():
+    from engine.system2.schema import parse_recovery_motor_steps
+
+    out = parse_recovery_motor_steps(
+        {"steps": [{"ticks": 3, "intent_deltas": {"not_intent": 1.0}}]}
+    )
+    assert out is not None
+    assert out[0]["intent_deltas"] == {}
+
+
+def test_parse_recovery_motor_steps_rejects_non_list():
+    from engine.system2.schema import parse_recovery_motor_steps
+
+    assert parse_recovery_motor_steps({"steps": {}}) is None
+
+
 def test_learned_student_bootstrap_uses_obs0(tmp_path):
     from engine.system2.learned_student import LearnedMacroStudent
 
@@ -79,3 +112,40 @@ def test_learned_student_bootstrap_uses_obs0(tmp_path):
     st = LearnedMacroStudent()
     n = st.bootstrap_from_log(log, max_lines=50)
     assert n == 1
+
+
+def test_proposal_from_dict_expected_state_filters_unknown():
+    from engine.features.humanoid.constants import VAR_NAMES
+
+    known = next(iter(VAR_NAMES))
+    p = proposal_from_dict(
+        {
+            "macro": "idle",
+            "expected_state": {known: 0.71, "totally_unknown_sensor_xyz": 0.5},
+            "max_prediction_error": 0.33,
+            "skill_id": "test_skill",
+        }
+    )
+    assert p is not None
+    assert known in p.expected_state
+    assert "totally_unknown_sensor_xyz" not in p.expected_state
+    assert abs(p.expected_state[known] - 0.71) < 1e-6
+    assert p.max_prediction_error == 0.33
+    assert p.skill_id == "test_skill"
+
+
+def test_parse_recovery_llm_plan_expected_state():
+    from engine.system2.schema import parse_recovery_llm_plan
+
+    plan = parse_recovery_llm_plan(
+        {
+            "steps": [{"ticks": 4, "intent_deltas": {"intent_stop_recover": 0.05}}],
+            "expected_state": {"posture_stability": 0.6},
+            "max_prediction_error": 0.4,
+        }
+    )
+    assert plan is not None
+    steps, es, mx = plan
+    assert len(steps) == 1
+    assert es.get("posture_stability") == 0.6
+    assert mx == 0.4

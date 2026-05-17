@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import os
@@ -13,13 +14,26 @@ from typing import Any
 from engine.goal_planning import resolve_humanoid_base
 from engine.system2.learned_student import LearnedMacroStudent, snapshot_obs_for_distill
 from engine.system2.macros import macro_bundle
-from engine.system2.schema import System2Proposal
+from engine.system2.schema import (
+    EpisodeSuccessSpec,
+    System2Proposal,
+    merge_episode_success_specs,
+)
+from engine.system2.success_predicates import (
+    build_s2_detector_id,
+    curriculum_stage_to_spec,
+    episode_success_with_pe_fallback,
+    should_attach_curriculum_pe_spec,
+)
 from engine.system2.student import MacroStudent, choose_macro_from_obs
 from engine.system2.teacher import (
+    build_compact_recovery_state,
     llm_teacher_enabled,
     proposal_from_llm,
     proposal_from_llm_cache_only,
     proposal_from_llm_network_fetch,
+    recovery_llm_enabled,
+    recovery_steps_from_llm_network_fetch,
     vlm_slots_from_sim,
 )
 from engine.system2.validate import validate_proposal
@@ -96,6 +110,21 @@ def _residual_scale() -> float:
 def _distill_log_path() -> Path:
     raw = os.environ.get("RKK_SYSTEM2_DISTILL_LOG", "logs/system2_distill.jsonl")
     return Path(raw)
+
+
+def _pe_distill_extra(
+    pe_diag: dict[str, Any], spec: EpisodeSuccessSpec
+) -> dict[str, Any]:
+    """JSONL fields for Wave-2 PE / homeostasis (optional)."""
+    out: dict[str, Any] = {}
+    for k in ("pe_total", "max_pe", "homeo_veto", "veto_reason", "wave1", "reason"):
+        if k in pe_diag and pe_diag[k] is not None:
+            out[k] = pe_diag[k]
+    if spec.expected_state:
+        out["expected_state"] = {str(k): float(v) for k, v in spec.expected_state.items()}
+    if spec.skill_id:
+        out["skill_id"] = spec.skill_id
+    return out
 
 
 def _distill_enabled() -> bool:
@@ -188,6 +217,29 @@ def _llm_sync_forced() -> bool:
     )
 
 
+def _s2_override_enabled() -> bool:
+    return os.environ.get("RKK_S2_OVERRIDE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _s2_override_fallen_ticks_need() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_S2_OVERRIDE_FALLEN_TICKS", "8")))
+    except ValueError:
+        return 8
+
+
+def _s2_override_max_ticks() -> int:
+    try:
+        return max(8, int(os.environ.get("RKK_S2_OVERRIDE_MAX_TICKS", "220")))
+    except ValueError:
+        return 220
+
+
 class System2Controller:
     """
     Медленный контур: раз в N тиков выбирает макрос (LLM или студент),
@@ -203,6 +255,8 @@ class System2Controller:
         self._last_plan_tick = -10**9
         self._last_source = "init"
         self._macro_start_obs: dict[str, float] = {}
+        self._macro_episode_spec: EpisodeSuccessSpec = EpisodeSuccessSpec()
+        self._recovery_episode_spec: EpisodeSuccessSpec = EpisodeSuccessSpec()
         self._last_diag: dict[str, Any] = {}
         self._outcome_ema = 0.5
         self._last_residual_tick = -10**9
@@ -214,6 +268,13 @@ class System2Controller:
         self._last_neuro_node: str | None = None
         self._llm_future: Future[System2Proposal | None] | None = None
         self._llm_submit_tick: int = -1
+        self._s2_override_active: bool = False
+        self._s2_override_start_tick: int = -1
+        self._s2_fallen_streak_override: int = 0
+        self._recovery_steps: list[dict[str, Any]] = []
+        self._recovery_cumulative: list[int] = []
+        self._recovery_llm_future: Future[Any] | None = None
+        self._override_start_obs_f: dict[str, float] = {}
 
     def _obs_floats(self, obs: dict[str, Any]) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -284,6 +345,7 @@ class System2Controller:
         success: bool,
         delta: dict[str, float],
         obs0: dict[str, float] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         if not _distill_enabled():
             return
@@ -299,11 +361,21 @@ class System2Controller:
             }
             if obs0:
                 row["obs0"] = obs0
+            if extra:
+                for k, v in extra.items():
+                    if v is not None:
+                        row[k] = v
             line = json.dumps(row, ensure_ascii=False)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError:
             pass
+
+    def _neuro_streak_key(self, macro: str, episode_spec: EpisodeSuccessSpec | None) -> str:
+        spec = episode_spec or EpisodeSuccessSpec()
+        if spec.expected_state:
+            return build_s2_detector_id(macro, spec.skill_id, spec.expected_state)
+        return macro
 
     def _maybe_materialize_macro_concept(
         self,
@@ -312,23 +384,37 @@ class System2Controller:
         agent: Any,
         macro: str,
         success: bool,
+        episode_spec: EpisodeSuccessSpec | None = None,
     ) -> str | None:
         if not _neuro_enabled() or not success or macro == "IDLE":
             return None
+        spec_e = episode_spec or EpisodeSuccessSpec()
+        streak_key = self._neuro_streak_key(macro, spec_e)
         need = _neuro_streak_need()
-        if self._neuro_streak.get(macro, 0) < need:
+        if self._neuro_streak.get(streak_key, 0) < need:
             return None
         if sim_tick - self._last_neuro_tick < _neuro_cooldown_ticks():
             return None
         graph = agent.graph
         max_n = _neuro_max_nodes()
         if max_n <= 0 or _s2_concept_count(graph) >= max_n:
-            self._neuro_streak[macro] = 0
+            self._neuro_streak[streak_key] = 0
             return None
         cands = _MACRO_MEMBER_CANDIDATES.get(macro, ("posture_stability", "com_z"))
-        mems = [m for m in cands if m in getattr(graph, "nodes", {})]
+        graph_nodes = getattr(graph, "nodes", {}) or {}
+        es = spec_e.expected_state
+        if es:
+            detector_id = build_s2_detector_id(macro, spec_e.skill_id, es)
+            extra_members = [k for k in sorted(es.keys()) if k in graph_nodes][:12]
+            base_mems = [m for m in cands if m in graph_nodes]
+            mems = list(dict.fromkeys(base_mems + extra_members))
+            pattern = [macro] + sorted(k for k in es if k in graph_nodes)[:16]
+        else:
+            detector_id = f"system2:{macro}"
+            mems = [m for m in cands if m in graph_nodes]
+            pattern = [macro]
         if len(mems) < 2:
-            self._neuro_streak[macro] = 0
+            self._neuro_streak[streak_key] = 0
             return None
         suf = uuid.uuid4().hex[:6]
         node_id = f"concept_s2_{macro}_{suf}"
@@ -337,18 +423,383 @@ class System2Controller:
                 graph.materialize_concept_macro(
                     node_id,
                     mems,
-                    detector_id=f"system2:{macro}",
-                    pattern=[macro],
+                    detector_id=detector_id,
+                    pattern=pattern,
                 )
             )
         except Exception:
             ok = False
         if ok:
             self._last_neuro_tick = sim_tick
-            self._neuro_streak[macro] = 0
+            self._neuro_streak[streak_key] = 0
             return node_id
-        self._neuro_streak[macro] = max(0, self._neuro_streak.get(macro, 0) - 3)
+        self._neuro_streak[streak_key] = max(0, self._neuro_streak.get(streak_key, 0) - 3)
         return None
+
+    def _clear_override_session(self) -> None:
+        self._s2_override_active = False
+        self._s2_override_start_tick = -1
+        self._recovery_steps = []
+        self._recovery_cumulative = []
+        self._recovery_llm_future = None
+        self._override_start_obs_f = {}
+        self._recovery_episode_spec = EpisodeSuccessSpec()
+
+    def _ingest_recovery_steps(self, steps: list[dict[str, Any]] | None) -> None:
+        self._recovery_steps = list(steps or [])
+        acc = 0
+        cums: list[int] = []
+        for s in self._recovery_steps:
+            acc += int(max(1, s.get("ticks", 1)))
+            cums.append(acc)
+        self._recovery_cumulative = cums
+
+    def _recovery_extra_residuals(self, sim_tick: int) -> dict[str, float]:
+        if not self._recovery_steps or not self._recovery_cumulative:
+            return {}
+        rel = max(0, int(sim_tick) - int(self._s2_override_start_tick))
+        idx = bisect.bisect_right(self._recovery_cumulative, rel)
+        idx = min(idx, len(self._recovery_steps) - 1)
+        d = self._recovery_steps[idx].get("intent_deltas") or {}
+        return dict(d) if isinstance(d, dict) else {}
+
+    def _override_episode_eval(
+        self, obs_f: dict[str, float], *, fallen: bool
+    ) -> tuple[bool, dict[str, Any]]:
+        if fallen:
+            return False, {"fallen": True}
+        return episode_success_with_pe_fallback(
+            self._override_start_obs_f,
+            obs_f,
+            self._recovery_episode_spec,
+            macro="RECOVER_POSTURE",
+        )
+
+    def _record_override_distill_neuro(
+        self,
+        *,
+        sim_tick: int,
+        agent: Any,
+        obs_f: dict[str, float],
+        success: bool,
+        source_note: str,
+        pe_diag: dict[str, Any] | None = None,
+    ) -> None:
+        macro = "RECOVER_POSTURE"
+        cz0 = float(
+            self._override_start_obs_f.get(
+                "com_z", self._override_start_obs_f.get("phys_com_z", 0.5)
+            )
+        )
+        cz1 = float(obs_f.get("com_z", obs_f.get("phys_com_z", cz0)))
+        ps0 = float(
+            self._override_start_obs_f.get(
+                "posture_stability",
+                self._override_start_obs_f.get("phys_posture_stability", 0.5),
+            )
+        )
+        ps1 = float(
+            obs_f.get(
+                "posture_stability",
+                obs_f.get("phys_posture_stability", ps0),
+            )
+        )
+        self._student.record_outcome(macro, success, weight=1.0)
+        if self._learned.enabled():
+            self._learned.learn(
+                macro,
+                success,
+                dict(self._override_start_obs_f),
+                d_com_z=cz1 - cz0,
+                d_posture=ps1 - ps0,
+            )
+        ex = _pe_distill_extra(pe_diag or {}, self._recovery_episode_spec)
+        self._append_distill(
+            tick=sim_tick,
+            macro=macro,
+            source=f"fallen_override:{source_note}",
+            success=success,
+            delta={"d_com_z": round(cz1 - cz0, 5), "d_posture": round(ps1 - ps0, 5)},
+            obs0=snapshot_obs_for_distill(dict(self._override_start_obs_f)) or None,
+            extra=ex,
+        )
+        sk = self._neuro_streak_key(macro, self._recovery_episode_spec)
+        if success:
+            self._neuro_streak[sk] = self._neuro_streak.get(sk, 0) + 1
+        else:
+            self._neuro_streak[sk] = 0
+        neuro_new = self._maybe_materialize_macro_concept(
+            sim_tick=sim_tick,
+            agent=agent,
+            macro=macro,
+            success=success,
+            episode_spec=self._recovery_episode_spec,
+        )
+        if neuro_new:
+            self._last_neuro_node = neuro_new
+
+    def _apply_recover_bundle_no_candidate(
+        self,
+        sim_tick: int,
+        agent: Any,
+        base: Any,
+        graph: Any,
+        node_keys: frozenset[str],
+        extra_residuals: dict[str, float] | None,
+    ) -> bool:
+        macro = "RECOVER_POSTURE"
+        bundle = macro_bundle(macro)
+        graph_patch: dict[str, float] = dict(bundle.get("graph") or {})
+        residuals: dict[str, float] = dict(bundle.get("residuals") or {})
+        if extra_residuals:
+            for k, v in extra_residuals.items():
+                sk = str(k)
+                if sk in node_keys:
+                    residuals[sk] = residuals.get(sk, 0.0) + float(v)
+        nodes = agent.graph.nodes
+        for k, v in graph_patch.items():
+            if k in nodes:
+                nodes[k] = float(max(0.05, min(0.95, float(v))))
+        self._sync_self_graph_to_env(base, agent.graph)
+        agent.set_system2_candidate(None)
+        fn = getattr(base, "apply_motor_intent_residuals", None)
+        if not callable(fn) or not residuals:
+            return False
+        scale = _residual_scale()
+        scaled = {k: float(v) * scale for k, v in residuals.items() if k in node_keys}
+        if not scaled:
+            return False
+        try:
+            fn(scaled)
+            self._last_residual_tick = sim_tick
+            self._prev_residual_macro = macro
+            return True
+        except Exception:
+            return False
+
+    def _force_reset_stance_base(self, base: Any) -> None:
+        fn = getattr(base, "reset_stance", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _drain_completed_llm_future(
+        self,
+        sim_tick: int,
+        agent: Any,
+        obs_f: dict[str, float],
+        base: Any,
+        graph: Any,
+        node_keys: frozenset[str],
+        sim: Any | None,
+    ) -> dict[str, Any] | None:
+        if self._llm_future is not None and self._llm_future.done():
+            drained_llm: System2Proposal | None
+            try:
+                drained_llm = self._llm_future.result(timeout=0)
+            except Exception as ex:
+                drained_llm = None
+                logging.getLogger(__name__).warning(
+                    "System2 LLM future failed: %s", ex, exc_info=True
+                )
+            self._llm_future = None
+            if drained_llm is not None:
+                drained_llm = validate_proposal(
+                    drained_llm, allowed_intent_keys=node_keys
+                )
+            return self._apply_planning_step(
+                sim_tick,
+                agent,
+                obs_f,
+                base,
+                graph,
+                node_keys,
+                sim,
+                drained_llm,
+                plan_tick_bump=False,
+            )
+        return None
+
+    def _build_override_diag(
+        self,
+        sim_tick: int,
+        fallen: bool,
+        age: int,
+        max_age: int,
+        *,
+        recovered: bool = False,
+        max_reset: bool = False,
+        applied: bool | None = None,
+    ) -> dict[str, Any]:
+        inflight = (
+            self._recovery_llm_future is not None
+            and not self._recovery_llm_future.done()
+        )
+        base_diag: dict[str, Any] = {
+            "enabled": True,
+            "fallen_override_active": True,
+            "fallen_override_ticks": int(max(0, age)) + 1,
+            "fallen_override_max_ticks": int(max_age),
+            "s2_fallen_streak": int(self._s2_fallen_streak_override),
+            "override_recovered": bool(recovered),
+            "override_max_reset": bool(max_reset),
+            "recovery_llm_inflight": bool(inflight),
+            "recovery_steps_loaded": len(self._recovery_steps),
+            "macro": "RECOVER_POSTURE",
+            "source": "fallen_override",
+            "sim_tick": sim_tick,
+            "fallen": bool(fallen),
+            "blocked": False,
+            "neuro_streak": dict(self._neuro_streak),
+            "outcome_ema": round(self._outcome_ema, 4),
+        }
+        if applied is not None:
+            base_diag["residuals_applied"] = applied
+        return base_diag
+
+    def _maybe_tick_fallen_override(
+        self,
+        sim_tick: int,
+        fallen: bool,
+        agent: Any,
+        obs_f: dict[str, float],
+        base: Any,
+        graph: Any,
+        node_keys: frozenset[str],
+        sim: Any | None,
+    ) -> dict[str, Any] | None:
+        if not _s2_override_enabled():
+            return None
+        if fallen:
+            self._s2_fallen_streak_override += 1
+        else:
+            self._s2_fallen_streak_override = 0
+
+        if self._recovery_llm_future is not None and self._recovery_llm_future.done():
+            pack: Any = None
+            try:
+                pack = self._recovery_llm_future.result(timeout=0)
+            except Exception:
+                pack = None
+            self._recovery_llm_future = None
+            steps_try: list[dict[str, Any]] | None = None
+            if isinstance(pack, tuple) and len(pack) == 3:
+                st_l, es_rec, mx_rec = pack
+                steps_try = st_l if isinstance(st_l, list) else None
+                mx_f: float | None = None
+                if mx_rec is not None:
+                    try:
+                        mx_f = float(max(0.02, min(6.0, float(mx_rec))))
+                    except (TypeError, ValueError):
+                        mx_f = None
+                self._recovery_episode_spec = EpisodeSuccessSpec(
+                    expected_state=dict(es_rec or {}),
+                    max_prediction_error=mx_f,
+                    skill_id="recovery_llm",
+                )
+            elif isinstance(pack, list) and pack:
+                steps_try = pack
+            if steps_try:
+                self._ingest_recovery_steps(steps_try)
+
+        if not self._s2_override_active:
+            if self._s2_fallen_streak_override < _s2_override_fallen_ticks_need():
+                return None
+            self._s2_override_active = True
+            self._s2_override_start_tick = sim_tick
+            self._override_start_obs_f = dict(obs_f)
+            self._recovery_steps = []
+            self._recovery_cumulative = []
+            self._recovery_llm_future = None
+            self._recovery_episode_spec = EpisodeSuccessSpec()
+            if recovery_llm_enabled() and not _llm_sync_forced():
+                compact = build_compact_recovery_state(base, obs_f)
+                self._recovery_llm_future = _system2_llm_executor().submit(
+                    recovery_steps_from_llm_network_fetch,
+                    compact,
+                    vlm_slots_from_sim(sim),
+                )
+            elif recovery_llm_enabled() and _llm_sync_forced():
+                compact = build_compact_recovery_state(base, obs_f)
+                sr = recovery_steps_from_llm_network_fetch(
+                    compact, vlm_slots_from_sim(sim)
+                )
+                if isinstance(sr, tuple) and len(sr) == 3:
+                    st_l, es_r, mx_r = sr
+                    self._ingest_recovery_steps(st_l)
+                    mx_f: float | None = None
+                    if mx_r is not None:
+                        try:
+                            mx_f = float(max(0.02, min(6.0, float(mx_r))))
+                        except (TypeError, ValueError):
+                            mx_f = None
+                    self._recovery_episode_spec = EpisodeSuccessSpec(
+                        expected_state=dict(es_r or {}),
+                        max_prediction_error=mx_f,
+                        skill_id="recovery_llm",
+                    )
+        else:
+            age = int(sim_tick) - int(self._s2_override_start_tick)
+            max_age = _s2_override_max_ticks()
+            if not fallen:
+                ok, pe_diag = self._override_episode_eval(obs_f, fallen=False)
+                self._record_override_distill_neuro(
+                    sim_tick=sim_tick,
+                    agent=agent,
+                    obs_f=obs_f,
+                    success=ok,
+                    source_note="recovered",
+                    pe_diag=pe_diag,
+                )
+                diag = self._build_override_diag(
+                    sim_tick,
+                    fallen,
+                    age,
+                    max_age,
+                    recovered=True,
+                )
+                self._clear_override_session()
+                return diag
+            if age >= max_age:
+                self._force_reset_stance_base(base)
+                self._record_override_distill_neuro(
+                    sim_tick=sim_tick,
+                    agent=agent,
+                    obs_f=obs_f,
+                    success=False,
+                    source_note="max_ticks_reset",
+                    pe_diag={"max_ticks_reset": True},
+                )
+                diag = self._build_override_diag(
+                    sim_tick,
+                    fallen,
+                    age,
+                    max_age,
+                    max_reset=True,
+                )
+                self._clear_override_session()
+                return diag
+
+        extra = self._recovery_extra_residuals(sim_tick)
+        applied = self._apply_recover_bundle_no_candidate(
+            sim_tick,
+            agent,
+            base,
+            graph,
+            node_keys,
+            extra if extra else None,
+        )
+        age = int(sim_tick) - int(self._s2_override_start_tick)
+        max_age = _s2_override_max_ticks()
+        return self._build_override_diag(
+            sim_tick,
+            fallen,
+            age,
+            max_age,
+            applied=applied,
+        )
 
     def _apply_planning_step(
         self,
@@ -475,6 +926,17 @@ class System2Controller:
         self._active_macro = macro
         self._last_source = source
         self._macro_until_tick = sim_tick + _macro_horizon_ticks()
+        gov = EpisodeSuccessSpec()
+        if sim is not None:
+            cur = getattr(sim, "_curriculum", None)
+            st = getattr(cur, "current_stage", None) if cur is not None else None
+            if st is not None:
+                cand = curriculum_stage_to_spec(st)
+                if should_attach_curriculum_pe_spec(macro, cand):
+                    gov = cand
+        self._macro_episode_spec = merge_episode_success_specs(
+            EpisodeSuccessSpec.from_proposal(proposal_effective), gov
+        )
         self._macro_start_obs = dict(obs_f)
 
         inflight = self._llm_future is not None and not self._llm_future.done()
@@ -550,6 +1012,7 @@ class System2Controller:
         agent: Any,
         obs: dict[str, Any],
         sim: Any | None = None,
+        fallen: bool = False,
     ) -> dict[str, Any]:
         if not system2_enabled():
             self._last_diag = {"enabled": False}
@@ -570,12 +1033,27 @@ class System2Controller:
         graph = agent.graph
         node_keys = frozenset(getattr(graph, "_node_ids", ()) or ())
 
+        ov = self._maybe_tick_fallen_override(
+            sim_tick, fallen, agent, obs_f, base, graph, node_keys, sim
+        )
+        if ov is not None:
+            self._last_diag = ov
+            return self._last_diag
+
+        drained_early = self._drain_completed_llm_future(
+            sim_tick, agent, obs_f, base, graph, node_keys, sim
+        )
+        if drained_early is not None:
+            self._last_diag = drained_early
+            return self._last_diag
+
         ending_macro = self._active_macro
         ending_source = self._last_source
         # Завершение макроса: оценка прогресса для студента + лог дистилляции
         # Пока LLM в полёте — не закрывать эпизод по календарю: окно отсчитывается до применения ответа.
         if (
-            sim_tick >= self._macro_until_tick
+            not self._s2_override_active
+            and sim_tick >= self._macro_until_tick
             and self._macro_start_obs
             and not (
                 self._llm_future is not None and not self._llm_future.done()
@@ -599,7 +1077,12 @@ class System2Controller:
                     obs_f.get("phys_posture_stability", ps0),
                 )
             )
-            success = (cz1 - cz0) > 0.018 or (ps1 - ps0) > 0.04
+            success, pe_diag = episode_success_with_pe_fallback(
+                self._macro_start_obs,
+                obs_f,
+                self._macro_episode_spec,
+                macro=ending_macro,
+            )
             self._student.record_outcome(ending_macro, success, weight=1.0)
             self._outcome_ema = float(
                 max(0.0, min(1.0, 0.92 * self._outcome_ema + 0.08 * (1.0 if success else 0.0)))
@@ -612,6 +1095,7 @@ class System2Controller:
                     d_com_z=cz1 - cz0,
                     d_posture=ps1 - ps0,
                 )
+            distill_x = _pe_distill_extra(pe_diag, self._macro_episode_spec)
             self._append_distill(
                 tick=sim_tick,
                 macro=ending_macro,
@@ -619,6 +1103,7 @@ class System2Controller:
                 success=success,
                 delta={"d_com_z": round(cz1 - cz0, 5), "d_posture": round(ps1 - ps0, 5)},
                 obs0=snapshot_obs_for_distill(dict(self._macro_start_obs)) or None,
+                extra=distill_x,
             )
             try:
                 self._online_buf.append(
@@ -633,50 +1118,27 @@ class System2Controller:
                 )
             except Exception:
                 pass
+            sk = self._neuro_streak_key(ending_macro, self._macro_episode_spec)
             if success:
-                self._neuro_streak[ending_macro] = self._neuro_streak.get(ending_macro, 0) + 1
+                self._neuro_streak[sk] = self._neuro_streak.get(sk, 0) + 1
             else:
-                self._neuro_streak[ending_macro] = 0
+                self._neuro_streak[sk] = 0
             neuro_new = self._maybe_materialize_macro_concept(
                 sim_tick=sim_tick,
                 agent=agent,
                 macro=ending_macro,
                 success=success,
+                episode_spec=self._macro_episode_spec,
             )
             if neuro_new:
                 self._last_neuro_node = neuro_new
             self._macro_start_obs = {}
+            self._macro_episode_spec = EpisodeSuccessSpec()
 
         plan_every = _plan_every_ticks()
         should_plan = (sim_tick - self._last_plan_tick) >= plan_every
         if sim_tick >= self._macro_until_tick:
             should_plan = True
-
-        if self._llm_future is not None and self._llm_future.done():
-            drained_llm: System2Proposal | None
-            try:
-                drained_llm = self._llm_future.result(timeout=0)
-            except Exception as ex:
-                drained_llm = None
-                logging.getLogger(__name__).warning(
-                    "System2 LLM future failed: %s", ex, exc_info=True
-                )
-            self._llm_future = None
-            if drained_llm is not None:
-                drained_llm = validate_proposal(
-                    drained_llm, allowed_intent_keys=node_keys
-                )
-            return self._apply_planning_step(
-                sim_tick,
-                agent,
-                obs_f,
-                base,
-                graph,
-                node_keys,
-                sim,
-                drained_llm,
-                plan_tick_bump=False,
-            )
 
         if not should_plan:
             inflight = self._llm_future is not None and not self._llm_future.done()

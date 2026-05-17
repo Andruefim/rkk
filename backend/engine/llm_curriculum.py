@@ -45,6 +45,7 @@ import numpy as np
 
 from engine.llm_json_extract import parse_json_object_loose, parse_json_array_loose
 from engine.ollama_env import get_ollama_generate_url, get_ollama_model, ollama_think_disabled_payload
+from engine.system2.schema import filter_expected_state_raw
 
 
 def curriculum_enabled() -> bool:
@@ -86,6 +87,10 @@ class CurriculumStage:
     min_ticks: int = 200
     # VL bounds adjustments
     vl_warmup_override: int | None = None
+    # Wave 2: intentional expected observe for System2 PE success (optional)
+    s2_expected_state: dict[str, float] = field(default_factory=dict)
+    s2_max_prediction_error: float | None = None
+    s2_skill_id: str | None = None
 
     # Runtime state
     entered_tick: int = 0
@@ -116,6 +121,9 @@ class CurriculumStage:
             "skill_goals": self.skill_goals,
             "min_ticks": self.min_ticks,
             "ticks_in_stage": self.ticks_in_stage,
+            "s2_expected_state": self.s2_expected_state,
+            "s2_max_prediction_error": self.s2_max_prediction_error,
+            "s2_skill_id": self.s2_skill_id,
         }
 
 
@@ -271,6 +279,22 @@ def parse_curriculum_stage(
     if not intent_targets and not advance_conditions:
         return None
 
+    raw_s2 = obj.get("s2_expected_state")
+    s2_es = filter_expected_state_raw(raw_s2 if isinstance(raw_s2, dict) else None)
+    s2_mx_r = obj.get("s2_max_prediction_error")
+    try:
+        s2_mx_f = float(s2_mx_r) if s2_mx_r is not None else None
+    except (TypeError, ValueError):
+        s2_mx_f = None
+    if s2_mx_f is not None:
+        s2_mx_f = float(max(0.02, min(6.0, s2_mx_f)))
+    s2_sid_o = obj.get("s2_skill_id")
+    s2_skill = (
+        str(s2_sid_o).strip()[:120]
+        if s2_sid_o is not None and str(s2_sid_o).strip()
+        else None
+    )
+
     return CurriculumStage(
         stage_id=stage_id,
         name=name,
@@ -280,6 +304,9 @@ def parse_curriculum_stage(
         seeds=seeds,
         skill_goals=skill_goals,
         min_ticks=min_ticks,
+        s2_expected_state=s2_es,
+        s2_max_prediction_error=s2_mx_f,
+        s2_skill_id=s2_skill,
     )
 
 

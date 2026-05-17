@@ -225,6 +225,7 @@ class Simulation(
         self._episodic_memory = EpisodicMemory() if _EPISODIC_MEMORY_AVAILABLE else None
         self._last_action_for_memory: tuple[str, float] | None = None
         self._last_fall_memory_tick: int = -999_999
+        self._pending_fall_obs_for_memory: dict[str, float] | None = None
 
         self._curriculum = CurriculumScheduler() if _CURRICULUM_AVAILABLE else None
         self._curriculum_apply_every: int = 50

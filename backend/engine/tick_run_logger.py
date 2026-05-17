@@ -80,6 +80,14 @@ _TICK_LOG_SYSTEM2_KEYS: frozenset[str] = frozenset(
         "last_source",
         "online_buf",
         "neuro_streak",
+        "fallen_override_active",
+        "fallen_override_ticks",
+        "fallen_override_max_ticks",
+        "s2_fallen_streak",
+        "override_recovered",
+        "override_max_reset",
+        "recovery_llm_inflight",
+        "recovery_steps_loaded",
     }
 )
 

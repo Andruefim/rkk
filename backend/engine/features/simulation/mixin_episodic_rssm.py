@@ -61,9 +61,16 @@ class SimulationEpisodicRssmMixin:
                 }
             except Exception:
                 pass
-            ep = self._episodic_memory.on_fall(tick, obs, intents, physics_context=physics_ctx)
+            obs_for_fall = obs
+            pending = getattr(self, "_pending_fall_obs_for_memory", None)
+            if isinstance(pending, dict) and pending:
+                obs_for_fall = pending
+            ep = self._episodic_memory.on_fall(
+                tick, obs_for_fall, intents, physics_context=physics_ctx
+            )
             if ep is not None:
                 self._last_fall_memory_tick = tick
+                self._pending_fall_obs_for_memory = None
                 seeds = self._episodic_memory.get_seeds_from_patterns(
                     set(self.agent.graph.nodes.keys())
                 )

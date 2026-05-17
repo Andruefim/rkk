@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from engine.system2.schema import MACRO_IDS, GoalSpec, System2Proposal
+from engine.system2.schema import MACRO_IDS, GoalSpec, System2Proposal, filter_expected_state_raw
 
 
 def _clip01(x: float) -> float:
@@ -37,6 +37,10 @@ def clip_intent_deltas(
     return out
 
 
+def _clip_expected_value(v: float) -> float:
+    return float(max(-0.5, min(2.5, float(v))))
+
+
 def validate_proposal(
     proposal: System2Proposal | None,
     *,
@@ -63,5 +67,24 @@ def validate_proposal(
         deltas = {
             k: v for k, v in deltas.items() if k in allowed_intent_keys
         }
+    es = filter_expected_state_raw(proposal.expected_state)
+    es = {k: _clip_expected_value(v) for k, v in es.items()}
+    mx = proposal.max_prediction_error
+    if mx is not None:
+        try:
+            mx = float(mx)
+            mx = float(max(0.02, min(6.0, mx)))
+        except (TypeError, ValueError):
+            mx = None
+    sid = proposal.skill_id
+    skill_id = str(sid).strip()[:120] if sid is not None and str(sid).strip() else None
     rat = str(proposal.rationale or "")[: int(max(32, rationale_max))]
-    return System2Proposal(macro=macro, goal=goal, intent_deltas=deltas, rationale=rat)
+    return System2Proposal(
+        macro=macro,
+        goal=goal,
+        intent_deltas=deltas,
+        rationale=rat,
+        expected_state=es,
+        max_prediction_error=mx,
+        skill_id=skill_id,
+    )

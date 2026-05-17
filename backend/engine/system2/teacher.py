@@ -8,9 +8,11 @@ from typing import Any
 from engine.system2.schema import (
     System2Proposal,
     _extract_json_object,
+    expected_state_key_allowlist,
+    parse_recovery_llm_plan,
     proposal_from_dict,
 )
-from engine.system2.validate import validate_proposal
+from engine.system2.validate import clip_intent_deltas, validate_proposal
 
 
 def _ollama_url() -> str:
@@ -105,12 +107,19 @@ def proposal_from_llm_network_fetch(
         return ent[1]
 
     extra = f"\nVLM_slots: {vlm_slots_str}\n" if vlm_slots_str else ""
+    es_hint = ", ".join(sorted(expected_state_key_allowlist())[:56])
     prompt = (
         "You are System2 for an embodied humanoid (Nova). Output ONLY one JSON object, no markdown.\n"
         "Keys: macro (one of IDLE, RECOVER_POSTURE, LOCOMOTE_DELIVERY, EXPLORE), "
         "goal (optional: com_z_min, posture_stability_min, target_dist_max as floats in [0.05,0.95]), "
         "intent_deltas (optional: small floats for keys starting with intent_ only, max magnitude 0.12), "
         "rationale (one short sentence).\n"
+        "Optional intentional prior for episode success: expected_state object mapping sensor names to "
+        "target floats (subset of known keys only; unknown keys ignored). "
+        "max_prediction_error (optional positive float): allowed L1 prediction error across those keys; "
+        "if omitted, a code fallback scales with how many keys you set. "
+        "skill_id (optional short string) for curriculum / concept naming.\n"
+        f"Example expected_state keys (not exhaustive): {es_hint}\n"
         f"{extra}"
         "Current summary:\n"
         f"{json.dumps(obs_summary, ensure_ascii=False, indent=2)[:3200]}\n"
@@ -177,6 +186,120 @@ def proposal_from_llm_network_fetch(
     if prop is not None:
         _llm_cache[key] = (now, prop)
     return prop
+
+
+def recovery_llm_enabled() -> bool:
+    """Multi-step motor recovery JSON (requires ``RKK_SYSTEM2_LLM``)."""
+    if not llm_teacher_enabled():
+        return False
+    return os.environ.get("RKK_S2_RECOVERY_LLM", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def build_compact_recovery_state(base: Any, obs_f: dict[str, Any]) -> dict[str, float]:
+    """Grounded pose vector: raw m + normalized torso/com where available + graph snapshot cues."""
+    out: dict[str, float] = {}
+    sim = getattr(base, "_sim", None)
+    raw: dict[str, Any] = {}
+    if sim is not None and callable(getattr(sim, "get_state", None)):
+        try:
+            r = sim.get_state()
+            if isinstance(r, dict):
+                raw = r
+        except Exception:
+            raw = {}
+    norm = getattr(base, "_norm", None)
+    for key in ("com_z", "torso_pitch", "torso_roll"):
+        if key in raw:
+            try:
+                out[f"{key}_m"] = float(raw[key])
+            except (TypeError, ValueError):
+                pass
+        if key in raw and callable(norm):
+            try:
+                out[f"{key}_norm"] = float(norm(key, float(raw[key])))
+            except Exception:
+                pass
+    for key in ("foot_contact_l", "foot_contact_r", "posture_stability", "support_bias"):
+        v = obs_f.get(key, obs_f.get(f"phys_{key}"))
+        if v is not None:
+            try:
+                out[key] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def recovery_steps_from_llm_network_fetch(
+    compact: dict[str, Any],
+    vlm_slots_str: str,
+) -> tuple[list[dict[str, Any]], dict[str, float], float | None] | None:
+    """
+    Blocking Ollama call: JSON with ``steps`` plus optional ``expected_state``, ``max_prediction_error``.
+    Returns ``(steps, expected_state, max_pe)`` or None if steps invalid.
+    Worker-thread only; same host as ``proposal_from_llm_network_fetch``.
+    """
+    if not recovery_llm_enabled():
+        return None
+
+    extra = f"\nVLM_slots: {vlm_slots_str}\n" if vlm_slots_str else ""
+    es_hint = ", ".join(sorted(expected_state_key_allowlist())[:40])
+    prompt = (
+        "You are System2 motor recovery planner for humanoid Nova. "
+        "Output ONLY one JSON object, no markdown.\n"
+        "Schema: {\"steps\": [{\"ticks\": <int 1-80>, \"intent_deltas\": "
+        "{ \"intent_*\": <small float -0.12..0.12> } }, ...] }\n"
+        "Optional top-level keys: expected_state (map of sensor names to target floats), "
+        "max_prediction_error (positive float, L1 cap vs expected_state at episode end).\n"
+        "2–6 steps. Prefer intent_stop_recover, intent_support_left/right, "
+        "intent_torso_forward, intent_arm_counterbalance, intent_lean_forward. "
+        "Do not invent keys outside intent_* for intent_deltas; "
+        f"expected_state keys must be from the registry, e.g. {es_hint}\n"
+        f"{extra}"
+        "Current grounded state (m = meters, _norm = env normalization):\n"
+        f"{json.dumps(compact, ensure_ascii=False, indent=2)[:2800]}\n"
+    )
+    raw: dict[str, Any] | None = None
+    try:
+        import httpx
+
+        url = f"{_ollama_url()}/api/chat"
+        body = {
+            "model": _ollama_model(),
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.1, "num_predict": 320},
+        }
+        with httpx.Client(timeout=httpx.Timeout(40.0, connect=8.0)) as client:
+            r = client.post(url, json=body)
+            r.raise_for_status()
+            data = r.json()
+        msg = (data.get("message") or {}) if isinstance(data, dict) else {}
+        text = str(msg.get("content", "")).strip()
+        if not text:
+            text = str(data.get("response", "")).strip() if isinstance(data, dict) else ""
+        if text:
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError:
+                raw = _extract_json_object(text)
+    except Exception:
+        return None
+
+    if not isinstance(raw, dict):
+        return None
+    plan = parse_recovery_llm_plan(raw)
+    if plan is None:
+        return None
+    steps, es, mx = plan
+    for st in steps:
+        st["intent_deltas"] = clip_intent_deltas(st.get("intent_deltas") or {})
+    return (steps, es, mx)
 
 
 def proposal_from_llm(

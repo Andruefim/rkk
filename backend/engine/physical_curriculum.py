@@ -102,6 +102,13 @@ TIER0_SKILLS: list[PhysicalSkill] = [
                 {"from_": "foot_contact_r", "to": "support_bias", "weight": 0.30, "alpha": 0.05},
             ],
             skill_goals=["stand"], min_ticks=400,
+            s2_expected_state={
+                "posture_stability": 0.72,
+                "foot_contact_l": 0.62,
+                "foot_contact_r": 0.62,
+            },
+            s2_max_prediction_error=0.22,
+            s2_skill_id="0.0_static_stance",
         ),
     ),
     PhysicalSkill(

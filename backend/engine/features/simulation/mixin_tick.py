@@ -514,9 +514,20 @@ class SimulationTickMixin:
             if self._fall_recovery_active and not fallen:
                 self._clear_fall_recovery()
             if fallen:
+                obs_fall = dict(self.agent.env.observe())
                 if fallen_edge:
                     self._fall_count += 1
-                obs_fall = dict(self.agent.env.observe())
+                    try:
+                        pend = dict(obs_fall)
+                        base_b = self._unwrap_base_env(self.agent.env)
+                        sm = getattr(base_b, "_sim", None)
+                        if sm is not None and callable(getattr(sm, "get_state", None)):
+                            st = sm.get_state()
+                            if isinstance(st, dict) and "com_z" in st:
+                                pend["com_z_raw_m"] = float(st["com_z"])
+                        self._pending_fall_obs_for_memory = pend
+                    except Exception:
+                        self._pending_fall_obs_for_memory = None
                 if (
                     self._curriculum_auto_fr_released
                     and self.tick > self._curriculum_stabilize_until
@@ -531,6 +542,8 @@ class SimulationTickMixin:
                     self.agent.graph.record_observation(obs)
                     self.agent.temporal.step(obs)
                     fallen = is_fn()
+                if not fallen:
+                    self._pending_fall_obs_for_memory = None
                 if fallen_edge and self._fall_count % 20 == 1:
                     self._add_event(
                         f"💀 [FALLEN] Nova упал! (×{self._fall_count})",
@@ -539,6 +552,7 @@ class SimulationTickMixin:
             self._prev_fallen = bool(fallen)
         else:
             self._prev_fallen = False
+            self._pending_fall_obs_for_memory = None
 
         # Фаза 12: передаём GNN prediction в visual env (не каждый тик — см. VISION_GNN_FEED_EVERY)
         if self._visual_mode and self._visual_env is not None:
@@ -606,6 +620,7 @@ class SimulationTickMixin:
                         agent=self.agent,
                         obs=obs_s2,
                         sim=self,
+                        fallen=bool(fallen),
                     )
                 else:
                     self._system2_last = None

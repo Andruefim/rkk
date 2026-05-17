@@ -127,6 +127,12 @@ class FallEpisode:
             f"  torso_pitch_at={tp_a:.3f}",
             f"  posture_at={ps_a:.3f}",
         ]
+        if "com_z_raw_m" in self.obs_at_fall:
+            lines.insert(
+                3,
+                f"  com_z_raw_m={_safe_float(self.obs_at_fall.get('com_z_raw_m')):.3f} "
+                f"(PyBullet base Z; gate RKK_FALLEN_Z / constants)",
+            )
         if self.trigger_action:
             ta_v = _safe_float(self.trigger_action[1])
             lines.append(f"  last_action: do({self.trigger_action[0]}={ta_v:.3f})")

@@ -6,7 +6,6 @@ import os
 import numpy as np
 import torch
 
-from engine.core.constants import cpg_during_fixed_root_enabled
 from engine.features.humanoid.constants import (
     ARM_VARS,
     FALLEN_Z,
@@ -28,6 +27,27 @@ from engine.features.humanoid.fallback import _FallbackHumanoid
 from engine.features.humanoid.pybullet_humanoid import _PyBulletHumanoid
 
 _PHYS_INTENT_PREFIX = "phys_intent_"
+
+
+def _cpg_during_fixed_root_enabled() -> bool:
+    """Mirror ``engine.core.constants.cpg_during_fixed_root_enabled`` without importing ``engine.core``."""
+    raw = os.environ.get("RKK_CPG_DURING_FIXED_ROOT", "").strip()
+    if not raw:
+        v = os.environ.get("RKK_LOCOMOTION_CPG", "0").strip().lower()
+        return v in ("1", "true", "yes", "on")
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
+def effective_fallen_z_m() -> float:
+    """
+    Порог высоты **базы** (м): ``get_state()["com_z"]`` (PyBullet base Z).
+    Переопределение: ``RKK_FALLEN_Z``; иначе константа ``FALLEN_Z`` из ``constants``.
+    """
+    try:
+        z = float(os.environ.get("RKK_FALLEN_Z", str(FALLEN_Z)))
+    except ValueError:
+        z = float(FALLEN_Z)
+    return float(max(0.12, min(0.55, z)))
 
 
 def canonical_motor_intent_variable(variable: str) -> str:
@@ -99,7 +119,7 @@ class EnvironmentHumanoid:
         }
         self._intero_control_lost: bool = False
         self._prev_raw_obs: dict[str, float] | None = None
-        # is_fallen: consecutive ticks with com_z (normalized) below FALLEN_Z gate
+        # is_fallen: debounced streak only when normalized gate AND raw height agree (see is_fallen)
         self._fallen_low_z_streak: int = 0
 
     # ── Fixed root switch ─────────────────────────────────────────────────────
@@ -146,13 +166,29 @@ class EnvironmentHumanoid:
         return float(np.clip((val - lo) / (hi - lo), 0.05, 0.95))
 
     def _fallen_z_below_threshold(self) -> bool:
-        """Instant gate: normalized com_z (base link height) below FALLEN_Z — no debounce."""
+        """Instant gate: normalized ``observe()`` com_z below normalized ``effective_fallen_z_m()``."""
         if self._fixed_root:
             return False
         obs = self.observe()
         cz = float(obs.get("com_z", 0.5))
-        th = float(self._norm("com_z", float(FALLEN_Z)))
+        th = float(self._norm("com_z", float(effective_fallen_z_m())))
         return cz < th
+
+    def _com_z_raw_below_fallen(self) -> bool:
+        """True when base height in meters is below ``effective_fallen_z_m()`` (``RKK_FALLEN_Z`` / ``FALLEN_Z``)."""
+        if self._fixed_root:
+            return False
+        try:
+            raw = self._sim.get_state()
+        except Exception:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        try:
+            z = float(raw.get("com_z", STAND_Z))
+        except (TypeError, ValueError):
+            z = float(STAND_Z)
+        return z < float(effective_fallen_z_m())
 
     def _denorm(self, key: str, val: float) -> float:
         lo, hi = _RANGES.get(key, (-1.0, 1.0))
@@ -676,7 +712,7 @@ class EnvironmentHumanoid:
         if self._intero_control_lost:
             return
         for name, val in targets.items():
-            if self._fixed_root and name in LEG_VARS and not cpg_during_fixed_root_enabled():
+            if self._fixed_root and name in LEG_VARS and not _cpg_during_fixed_root_enabled():
                 continue
             if getattr(self, "cpg_owns_legs", False) and name in LEG_VARS:
                 continue
@@ -696,7 +732,7 @@ class EnvironmentHumanoid:
         Also marks cpg_owns_legs=True so _apply_motor_intents doesn't fight CPG.
         cpg_sync: фаза CPG + отставание CoM — согласует корпус с ритмом ног.
         """
-        if self._fixed_root and not cpg_during_fixed_root_enabled():
+        if self._fixed_root and not _cpg_during_fixed_root_enabled():
             return
         self.cpg_owns_legs = True
         try:
@@ -802,17 +838,23 @@ class EnvironmentHumanoid:
 
         com_z в observe — нормализация этой высоты; это не инерциальный CoM всего тела.
         После снятия pin возможны 1–2 тика с аномально низким base z → ложный ``fallen``.
-        Требуем ``RKK_FALLEN_CONFIRM_TICKS`` подряд тиков ниже порога FALLEN_Z.
+        Требуем ``RKK_FALLEN_CONFIRM_TICKS`` подряд тиков ниже порога ``effective_fallen_z_m()``.
+
+        Debounce streak наращивается только при **конъюнкции** мгновенного нормализованного
+        порога ``_fallen_z_below_threshold()`` и подтверждения в **метрах**
+        ``raw com_z < effective_fallen_z_m()`` из ``get_state()``. Иначе возможны ложные ``fallen`` при
+        «залипании» производных/осанки в ``_derived_motor_observables`` (например ``torso_pitch``
+        у пола нормализации 0.05) при ещё достаточной высоте базы.
         """
         if self._fixed_root:
             self._fallen_low_z_streak = 0
             return False
-        low = self._fallen_z_below_threshold()
+        low_for_streak = self._fallen_z_below_threshold() and self._com_z_raw_below_fallen()
         try:
             n_need = max(1, int(os.environ.get("RKK_FALLEN_CONFIRM_TICKS", "4")))
         except ValueError:
             n_need = 4
-        if low:
+        if low_for_streak:
             self._fallen_low_z_streak = min(int(self._fallen_low_z_streak) + 1, 10_000)
         else:
             self._fallen_low_z_streak = 0
