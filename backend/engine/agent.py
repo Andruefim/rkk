@@ -514,6 +514,9 @@ class RKKAgent:
 
         # System 2: optional slow macro plan injected into agent.step (see engine.system2).
         self._system2_candidate: dict | None = None
+        self._s2_planning_context: dict[str, Any] | None = None
+        self._s2_wm_cache_cand: dict | None = None
+        self._s2_wm_cache_tick: int = -10**9
 
         # Phase T: Trajectory contrastive learning
         self._traj_collector = TrajectoryCollector()
@@ -525,6 +528,10 @@ class RKKAgent:
     def set_system2_candidate(self, candidate: dict | None) -> None:
         """Simulation sets one scoring row before agent.step (from_system2)."""
         self._system2_candidate = candidate
+
+    def set_s2_planning_context(self, ctx: dict[str, Any] | None) -> None:
+        """Контекст System2 для S2-gated WM planner (после system2.tick)."""
+        self._s2_planning_context = ctx
 
     # ── Bootstrap + LLM seed interface ───────────────────────────────────────
     def _bootstrap(self):
@@ -727,7 +734,55 @@ class RKKAgent:
             return 0
         if _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(self.graph.nodes):
             return 0
+        ctx = getattr(self, "_s2_planning_context", None)
+        if isinstance(ctx, dict) and ctx.get("fallen_override_active"):
+            return 0
         return self._imagination_horizon
+
+    def _s2_wm_cache_every(self) -> int:
+        ctx = getattr(self, "_s2_planning_context", None) or {}
+        if ctx.get("fallen_override_active"):
+            try:
+                return max(1, int(os.environ.get("RKK_S2_WM_CACHE_EVERY_FALLEN", "24")))
+            except ValueError:
+                return 24
+        try:
+            return max(1, int(os.environ.get("RKK_S2_WM_CACHE_EVERY", "8")))
+        except ValueError:
+            return 8
+
+    def _maybe_s2_wm_candidate(
+        self,
+        *,
+        enable_l3: bool,
+        fixed_root: bool,
+        engine_tick: int,
+        slow_t: dict[str, float],
+    ) -> dict | None:
+        s2_ctx = getattr(self, "_s2_planning_context", None)
+        if not enable_l3 or s2_ctx is None:
+            return None
+        from engine.system2.wm_planner import plan_s2_wm_candidate, s2_wm_planner_enabled
+
+        if not s2_wm_planner_enabled():
+            return None
+        every = self._s2_wm_cache_every()
+        cached = getattr(self, "_s2_wm_cache_cand", None)
+        ct = int(getattr(self, "_s2_wm_cache_tick", -10**9))
+        if cached is not None and (engine_tick - ct) < every:
+            slow_t["s2_wm_planner"] = 0.0
+            return cached
+        t0 = time.perf_counter()
+        cand = plan_s2_wm_candidate(
+            self,
+            planning_context=s2_ctx,
+            enable_l3=enable_l3,
+            fixed_root=fixed_root,
+        )
+        slow_t["s2_wm_planner"] = time.perf_counter() - t0
+        self._s2_wm_cache_cand = cand
+        self._s2_wm_cache_tick = engine_tick
+        return cand
 
     def _goal_planning_suppressed(self) -> bool:
         if goal_planning_globally_disabled() or self.graph._core is None:
@@ -804,7 +859,19 @@ class RKKAgent:
             "from_goal_plan": True,
         }
 
+    def _s2_wm_task_active(self) -> bool:
+        from engine.system2.wm_planner import s2_wm_planner_enabled, task_from_planning_context
+
+        if not s2_wm_planner_enabled():
+            return False
+        ctx = getattr(self, "_s2_planning_context", None)
+        if not ctx:
+            return False
+        return task_from_planning_context(ctx, dict(self.graph.nodes)).active
+
     def _maybe_goal_planned_candidate(self) -> dict | None:
+        if self._s2_wm_task_active():
+            return None
         if self._goal_planning_suppressed():
             return None
         if self.graph.nodes.get("self_goal_active") is None:
@@ -930,6 +997,8 @@ class RKKAgent:
         Only activates for motor intent variables (intent_stride, intent_stop_recover, etc.)
         and only when the world model has trained enough to be informative.
         """
+        if self._s2_wm_task_active():
+            return None
         if not self._cem_planning_enabled():
             return None
         if self.graph._core is None:
@@ -1842,73 +1911,84 @@ class RKKAgent:
         except Exception:
             pass
         _slow_t["observe"] = time.perf_counter() - _t0
-        sce = self._effective_score_cache_every(engine_tick)
-        stale_mult = _score_stale_mult()
-        cache_age = engine_tick - self._score_cache_tick
-        cache_fresh = bool(self._score_cache) and cache_age < sce
-        cache_stale_ok = bool(self._score_cache) and cache_age < sce * stale_mult
-        due_recompute = not self._score_cache or cache_age >= sce
-        _t0_si = time.perf_counter()
-        # #region agent log
-        _t_score = time.perf_counter()
-        _score_mode = "?"
-        # #endregion
-        if cache_fresh:
-            scores = list(self._score_cache)
-            _score_mode = "cache"
-        elif cache_stale_ok and _score_stale_only() and due_recompute:
-            scores = list(self._score_cache)
-            _score_mode = "stale"
-            self._schedule_score_refresh(engine_tick)
-        elif _score_async_enabled():
-            if self._score_thread is None or not self._score_thread.is_alive():
-                self._score_thread = threading.Thread(
-                    target=self._score_async_worker,
-                    name="rkk_score_interventions",
-                    daemon=True,
-                )
-                self._score_thread.start()
-            with self._score_lock:
-                have = list(self._score_result) if self._score_result else []
-            if have:
-                scores = have
-                _score_mode = "async_have"
+        from engine.system2.wm_planner import s2_wm_gate_strict
+
+        _use_s2_wm_strict = (
+            enable_l3 and s2_wm_gate_strict() and self._s2_wm_task_active()
+        )
+        if _use_s2_wm_strict:
+            scores = []
+            _score_mode = "s2_wm_strict"
+            _slow_t["score_interventions"] = 0.0
+            _t_score = time.perf_counter()
+        else:
+            sce = self._effective_score_cache_every(engine_tick)
+            stale_mult = _score_stale_mult()
+            cache_age = engine_tick - self._score_cache_tick
+            cache_fresh = bool(self._score_cache) and cache_age < sce
+            cache_stale_ok = bool(self._score_cache) and cache_age < sce * stale_mult
+            due_recompute = not self._score_cache or cache_age >= sce
+            _t0_si = time.perf_counter()
+            # #region agent log
+            _t_score = time.perf_counter()
+            _score_mode = "?"
+            # #endregion
+            if cache_fresh:
+                scores = list(self._score_cache)
+                _score_mode = "cache"
+            elif cache_stale_ok and _score_stale_only() and due_recompute:
+                scores = list(self._score_cache)
+                _score_mode = "stale"
+                self._schedule_score_refresh(engine_tick)
+            elif _score_async_enabled():
+                if self._score_thread is None or not self._score_thread.is_alive():
+                    self._score_thread = threading.Thread(
+                        target=self._score_async_worker,
+                        name="rkk_score_interventions",
+                        daemon=True,
+                    )
+                    self._score_thread.start()
+                with self._score_lock:
+                    have = list(self._score_result) if self._score_result else []
+                if have:
+                    scores = have
+                    _score_mode = "async_have"
+                elif self._score_cache:
+                    scores = list(self._score_cache)
+                    _score_mode = "async_stale_cache"
+                elif _score_stale_only():
+                    scores = []
+                    _score_mode = "async_empty_skip"
+                else:
+                    with torch.no_grad():
+                        scores = self.score_interventions()
+                    _score_mode = "async_fallback_sync"
+                    with self._score_lock:
+                        self._score_result = list(scores)
+                if scores and sce > 1:
+                    self._score_cache = list(scores)
+                    self._score_cache_tick = engine_tick
+            elif due_recompute and (
+                not self._score_cache or engine_tick % max(1, sce) == 0
+            ):
+                with torch.no_grad():
+                    scores = self.score_interventions()
+                _score_mode = "sync_refresh"
+                if sce > 1:
+                    self._score_cache = list(scores)
+                    self._score_cache_tick = engine_tick
             elif self._score_cache:
                 scores = list(self._score_cache)
-                _score_mode = "async_stale_cache"
-            elif _score_stale_only():
-                scores = []
-                _score_mode = "async_empty_skip"
+                _score_mode = "sync_deferred"
+                if due_recompute:
+                    self._schedule_score_refresh(engine_tick)
             else:
                 with torch.no_grad():
                     scores = self.score_interventions()
-                _score_mode = "async_fallback_sync"
-                with self._score_lock:
-                    self._score_result = list(scores)
-            if scores and sce > 1:
+                _score_mode = "sync_bootstrap"
                 self._score_cache = list(scores)
                 self._score_cache_tick = engine_tick
-        elif due_recompute and (
-            not self._score_cache or engine_tick % max(1, sce) == 0
-        ):
-            with torch.no_grad():
-                scores = self.score_interventions()
-            _score_mode = "sync_refresh"
-            if sce > 1:
-                self._score_cache = list(scores)
-                self._score_cache_tick = engine_tick
-        elif self._score_cache:
-            scores = list(self._score_cache)
-            _score_mode = "sync_deferred"
-            if due_recompute:
-                self._schedule_score_refresh(engine_tick)
-        else:
-            with torch.no_grad():
-                scores = self.score_interventions()
-            _score_mode = "sync_bootstrap"
-            self._score_cache = list(scores)
-            self._score_cache_tick = engine_tick
-        _slow_t["score_interventions"] = time.perf_counter() - _t0_si
+            _slow_t["score_interventions"] = time.perf_counter() - _t0_si
         # #region agent log
         _dbg_agent(
             "H1",
@@ -1922,22 +2002,76 @@ class RKKAgent:
             },
         )
         # #endregion
-        gp = self._maybe_goal_planned_candidate() if enable_l3 else None
-        if gp is not None and not (
-            symbolic_verifier_enabled() and self._symbolic_prediction_bad
-        ):
-            scores.insert(0, gp)
+        s2_ctx = getattr(self, "_s2_planning_context", None)
+        s2_task_active = self._s2_wm_task_active()
+        fr_for_plan = bool(
+            _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(self.graph.nodes)
+        )
 
-        # ── CEM planning: use world model for model-based action selection ────
-        _t0_cem = time.perf_counter()
-        cem_cand = self._maybe_cem_candidate(engine_tick) if enable_l3 else None
-        _slow_t["cem"] = time.perf_counter() - _t0_cem
-        if cem_cand is not None:
-            scores.insert(0, cem_cand)
+        wm_cand: dict | None = None
+        if enable_l3 and s2_ctx is not None:
+            wm_cand = self._maybe_s2_wm_candidate(
+                enable_l3=enable_l3,
+                fixed_root=fr_for_plan,
+                engine_tick=engine_tick,
+                slow_t=_slow_t,
+            )
 
-        s2c = getattr(self, "_system2_candidate", None)
-        if s2c is not None:
-            scores.insert(0, s2c)
+        if s2_wm_gate_strict() and s2_task_active:
+            scores = []
+            if wm_cand is not None:
+                scores.append(wm_cand)
+            else:
+                s2c = getattr(self, "_system2_candidate", None)
+                if s2c is not None:
+                    scores.append(s2c)
+                self._system2_candidate = None
+            _slow_t["cem"] = 0.0
+            if scores and (s2_ctx or {}).get("fallen_override_active"):
+                k_top = (
+                    str(scores[0].get("variable", "")),
+                    round(float(scores[0].get("value", 0.5)), 4),
+                )
+                le = getattr(self, "_last_applied_do_key", None)
+                if le is not None and k_top == le:
+                    self._repeat_same_top_scores += 1
+                else:
+                    self._repeat_same_top_scores = 0
+                try:
+                    rlim = max(
+                        4,
+                        int(os.environ.get("RKK_S2_WM_STUCK_ROTATE_TICKS", "16")),
+                    )
+                except ValueError:
+                    rlim = 16
+                if self._repeat_same_top_scores >= rlim and scores:
+                    v0 = scores[0]
+                    var0 = str(v0.get("variable", ""))
+                    val0 = float(v0.get("value", 0.5))
+                    alt = float(np.clip(val0 - 0.12, 0.06, 0.94))
+                    if abs(alt - val0) < 0.02:
+                        alt = float(np.clip(val0 + 0.12, 0.06, 0.94))
+                    scores[0] = {**v0, "value": alt, "s2_wm_stuck_nudge": True}
+                    self._repeat_same_top_scores = 0
+        else:
+            gp = self._maybe_goal_planned_candidate() if enable_l3 else None
+            if gp is not None and not (
+                symbolic_verifier_enabled() and self._symbolic_prediction_bad
+            ):
+                scores.insert(0, gp)
+
+            _t0_cem = time.perf_counter()
+            cem_cand = self._maybe_cem_candidate(engine_tick) if enable_l3 else None
+            _slow_t["cem"] = time.perf_counter() - _t0_cem
+            if cem_cand is not None:
+                scores.insert(0, cem_cand)
+
+            if wm_cand is not None:
+                scores.insert(0, wm_cand)
+            else:
+                s2c = getattr(self, "_system2_candidate", None)
+                if s2c is not None:
+                    scores.insert(0, s2c)
             self._system2_candidate = None
 
         post_to = int(getattr(self, "_post_fr_explore_until", 0))
@@ -2416,6 +2550,9 @@ class RKKAgent:
             "goal_planned":  bool(chosen.get("from_goal_plan")),
             "from_cem":      bool(chosen.get("from_cem")),
             "from_system2": bool(chosen.get("from_system2")),
+            "from_s2_wm_planner": bool(chosen.get("from_s2_wm_planner")),
+            "s2_wm_macro": chosen.get("s2_wm_macro"),
+            "s2_wm_score": chosen.get("s2_wm_score"),
             "symbolic_ok": sym_ok,
             "symbolic_violations": sym_fail,
             "rsi_lite": rsi_event,

@@ -89,6 +89,14 @@ _TICK_LOG_SYSTEM2_KEYS: frozenset[str] = frozenset(
         "recovery_llm_inflight",
         "recovery_steps_loaded",
         "recovery_llm_dispatches",
+        "recovery_schedule_source",
+        "recovery_llm_error",
+        "distill_window",
+        "distill_success_rate",
+        "distill_recover_success_rate",
+        "distill_recover_conf_median",
+        "distill_blend_ready",
+        "distill_quality_warn",
     }
 )
 
@@ -318,6 +326,9 @@ class TickRunLogger:
                 "goal_planned": result.get("goal_planned"),
                 "from_cem": result.get("from_cem"),
                 "from_system2": result.get("from_system2"),
+                "from_s2_wm_planner": result.get("from_s2_wm_planner"),
+                "s2_wm_macro": result.get("s2_wm_macro"),
+                "s2_wm_score": result.get("s2_wm_score"),
                 "hierarchy": result.get("hierarchy"),
                 "skill": result.get("skill"),
             },

@@ -13,6 +13,19 @@ from pathlib import Path
 from typing import Any
 
 from engine.goal_planning import resolve_humanoid_base
+from engine.system2.distill_log import (
+    DistillHealthTracker,
+    compress_recovery_steps,
+    distill_enabled,
+    distill_log_path,
+    pe_distill_extra,
+    proposal_distill_extra,
+)
+from engine.system2.recovery_schedule import (
+    default_recovery_fallback_steps,
+    enrich_recovery_steps,
+    recovery_fallback_enabled,
+)
 from engine.system2.learned_student import LearnedMacroStudent, snapshot_obs_for_distill
 from engine.system2.macros import macro_bundle
 from engine.system2.schema import (
@@ -110,35 +123,6 @@ def _residual_scale() -> float:
         return float(os.environ.get("RKK_SYSTEM2_RESIDUAL_SCALE", "1.0"))
     except ValueError:
         return 1.0
-
-
-def _distill_log_path() -> Path:
-    raw = os.environ.get("RKK_SYSTEM2_DISTILL_LOG", "logs/system2_distill.jsonl")
-    return Path(raw)
-
-
-def _pe_distill_extra(
-    pe_diag: dict[str, Any], spec: EpisodeSuccessSpec
-) -> dict[str, Any]:
-    """JSONL fields for Wave-2 PE / homeostasis (optional)."""
-    out: dict[str, Any] = {}
-    for k in ("pe_total", "max_pe", "homeo_veto", "veto_reason", "wave1", "reason"):
-        if k in pe_diag and pe_diag[k] is not None:
-            out[k] = pe_diag[k]
-    if spec.expected_state:
-        out["expected_state"] = {str(k): float(v) for k, v in spec.expected_state.items()}
-    if spec.skill_id:
-        out["skill_id"] = spec.skill_id
-    return out
-
-
-def _distill_enabled() -> bool:
-    return os.environ.get("RKK_SYSTEM2_DISTILL", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
 
 
 def _neuro_enabled() -> bool:
@@ -357,6 +341,27 @@ def _recovery_replan_after_last_step_ticks() -> int:
         return 12
 
 
+def _recovery_llm_fail_before_fallback() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_S2_RECOVERY_LLM_FAIL_BEFORE_FALLBACK", "1")))
+    except ValueError:
+        return 1
+
+
+def _distill_override_sample_every() -> int:
+    try:
+        return max(0, int(os.environ.get("RKK_S2_DISTILL_OVERRIDE_SAMPLE_EVERY", "240")))
+    except ValueError:
+        return 240
+
+
+def _recovery_llm_timeout_ticks() -> int:
+    try:
+        return max(8, int(os.environ.get("RKK_S2_RECOVERY_LLM_TIMEOUT_TICKS", "60")))
+    except ValueError:
+        return 60
+
+
 def _recovery_replan_empty_schedule_ticks() -> int:
     """Если шаги так и не пришли (или пустой JSON), повторить запрос не раньше этого age сессии."""
     try:
@@ -404,6 +409,14 @@ class System2Controller:
         self._recovery_schedule_anchor_tick: int = -1
         self._recovery_llm_dispatch_tick: int = -1
         self._recovery_llm_dispatch_count: int = 0
+        self._recovery_steps_from_llm: bool = False
+        self._recovery_schedule_source: str = "none"
+        self._recovery_llm_fail_count: int = 0
+        self._recovery_fallback_applied: bool = False
+        self._last_recovery_llm_error: str = ""
+        self._last_override_distill_sample_tick: int = -10**9
+        self._episode_plan_distill_extra: dict[str, Any] = {}
+        self._distill_health = DistillHealthTracker()
 
     def ollama_busy(self) -> bool:
         """True, если к Ollama уходит или ждётся ответ (план S2 или recovery)."""
@@ -413,6 +426,34 @@ class System2Controller:
             and not self._recovery_llm_future.done()
         )
         return plan or rec
+
+    def planning_context_for_wm(self, *, fallen: bool = False) -> dict[str, Any]:
+        """Контекст для S2-gated WM planner (agent.step после tick)."""
+        macro = (
+            "RECOVER_POSTURE"
+            if self._s2_override_active
+            else str(self._active_macro or "IDLE")
+        )
+        spec = (
+            self._recovery_episode_spec
+            if self._s2_override_active
+            else self._macro_episode_spec
+        )
+        bundle = macro_bundle(macro)
+        return {
+            "macro": macro,
+            "fallen": bool(fallen),
+            "fallen_override_active": bool(self._s2_override_active),
+            "expected_state": dict(spec.expected_state or {}),
+            "max_prediction_error": spec.max_prediction_error,
+            "skill_id": spec.skill_id,
+            "bundle_candidate": bundle.get("candidate"),
+            "source": (
+                "fallen_override"
+                if self._s2_override_active
+                else str(self._last_source or "")
+            ),
+        }
 
     def _obs_floats(self, obs: dict[str, Any]) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -484,10 +525,13 @@ class System2Controller:
         delta: dict[str, float],
         obs0: dict[str, float] | None = None,
         extra: dict[str, Any] | None = None,
+        ending_source: str | None = None,
+        student_conf: float | None = None,
+        count_health: bool = True,
     ) -> None:
-        if not _distill_enabled():
+        if not distill_enabled():
             return
-        path = _distill_log_path()
+        path = distill_log_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             row: dict[str, Any] = {
@@ -497,8 +541,12 @@ class System2Controller:
                 "success": success,
                 "delta": delta,
             }
+            if ending_source is not None:
+                row["ending_source"] = ending_source
             if obs0:
                 row["obs0"] = obs0
+            if student_conf is not None:
+                row["student_conf"] = round(float(student_conf), 4)
             if extra:
                 for k, v in extra.items():
                     if v is not None:
@@ -506,8 +554,17 @@ class System2Controller:
             line = json.dumps(row, ensure_ascii=False)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+            if count_health:
+                self._distill_health.record(
+                    success=success,
+                    macro=macro,
+                    student_conf=student_conf,
+                )
         except OSError:
             pass
+
+    def _distill_health_diag(self) -> dict[str, Any]:
+        return dict(self._distill_health.snapshot())
 
     def _neuro_streak_key(self, macro: str, episode_spec: EpisodeSuccessSpec | None) -> str:
         spec = episode_spec or EpisodeSuccessSpec()
@@ -585,11 +642,126 @@ class System2Controller:
         self._recovery_schedule_anchor_tick = -1
         self._recovery_llm_dispatch_tick = -1
         self._recovery_llm_dispatch_count = 0
+        self._recovery_steps_from_llm = False
+        self._recovery_schedule_source = "none"
+        self._recovery_llm_fail_count = 0
+        self._recovery_fallback_applied = False
+        self._last_recovery_llm_error = ""
+
+    def _recovery_schedule_exhausted(self, sim_tick: int) -> bool:
+        if not self._recovery_cumulative:
+            return True
+        anchor = int(self._recovery_schedule_anchor_tick)
+        if anchor < 0:
+            anchor = int(self._s2_override_start_tick)
+        rel = max(0, int(sim_tick) - anchor)
+        return rel > int(self._recovery_cumulative[-1])
+
+    def _apply_fallback_recovery_schedule(self, sim_tick: int) -> bool:
+        if self._recovery_fallback_applied or not recovery_fallback_enabled():
+            return False
+        steps = enrich_recovery_steps(default_recovery_fallback_steps())
+        if not steps:
+            return False
+        self._ingest_recovery_steps(steps, sim_tick=sim_tick, from_llm=False)
+        self._recovery_fallback_applied = True
+        self._recovery_schedule_source = "fallback"
+        self._recovery_episode_spec = EpisodeSuccessSpec(skill_id="recovery_fallback")
+        return True
+
+    def _ingest_recovery_pack(
+        self,
+        pack: Any,
+        *,
+        sim_tick: int,
+    ) -> bool:
+        """Apply (steps, expected_state, max_pe) tuple from LLM worker."""
+        steps_try: list[dict[str, Any]] | None = None
+        es_rec: dict[str, float] = {}
+        mx_f: float | None = None
+        if isinstance(pack, tuple) and len(pack) >= 1:
+            st_l = pack[0]
+            steps_try = st_l if isinstance(st_l, list) else None
+            if len(pack) >= 2 and isinstance(pack[1], dict):
+                es_rec = dict(pack[1])
+            if len(pack) >= 3 and pack[2] is not None:
+                try:
+                    mx_f = float(max(0.02, min(6.0, float(pack[2]))))
+                except (TypeError, ValueError):
+                    mx_f = None
+        elif isinstance(pack, list) and pack:
+            steps_try = pack
+        if not steps_try:
+            return False
+        steps_try = enrich_recovery_steps(steps_try)
+        if not any(st.get("intent_deltas") for st in steps_try):
+            return False
+        self._ingest_recovery_steps(steps_try, sim_tick=sim_tick, from_llm=True)
+        self._recovery_schedule_source = "llm"
+        self._recovery_llm_fail_count = 0
+        self._recovery_episode_spec = EpisodeSuccessSpec(
+            expected_state=dict(es_rec or {}),
+            max_prediction_error=mx_f,
+            skill_id="recovery_llm",
+        )
+        return True
+
+    def _maybe_timeout_recovery_llm(self, sim_tick: int) -> None:
+        fut = self._recovery_llm_future
+        if fut is None or fut.done():
+            return
+        dt = int(self._recovery_llm_dispatch_tick)
+        if dt < 0:
+            return
+        if int(sim_tick) - dt < _recovery_llm_timeout_ticks():
+            return
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+        self._recovery_llm_future = None
+        self._recovery_llm_fail_count = int(self._recovery_llm_fail_count) + 1
+        self._last_recovery_llm_error = "timeout"
+        if recovery_fallback_enabled() and not self._recovery_steps:
+            self._apply_fallback_recovery_schedule(sim_tick)
+
+    def _drain_recovery_llm_future(self, sim_tick: int) -> None:
+        if self._recovery_llm_future is None or not self._recovery_llm_future.done():
+            return
+        pack: Any = None
+        err = ""
+        try:
+            pack = self._recovery_llm_future.result(timeout=0)
+        except Exception as ex:
+            err = f"exception:{type(ex).__name__}"
+            pack = None
+        self._recovery_llm_future = None
+        if self._ingest_recovery_pack(pack, sim_tick=sim_tick):
+            self._last_recovery_llm_error = ""
+            return
+        self._recovery_llm_fail_count = int(self._recovery_llm_fail_count) + 1
+        if pack is None:
+            self._last_recovery_llm_error = err or "null_response"
+        else:
+            self._last_recovery_llm_error = "invalid_steps"
+        need = _recovery_llm_fail_before_fallback()
+        if (
+            recovery_fallback_enabled()
+            and not self._recovery_fallback_applied
+            and self._recovery_llm_fail_count >= need
+        ):
+            self._apply_fallback_recovery_schedule(sim_tick)
 
     def _ingest_recovery_steps(
-        self, steps: list[dict[str, Any]] | None, *, sim_tick: int
+        self,
+        steps: list[dict[str, Any]] | None,
+        *,
+        sim_tick: int,
+        from_llm: bool = False,
     ) -> None:
         self._recovery_steps = list(steps or [])
+        if from_llm and self._recovery_steps:
+            self._recovery_steps_from_llm = True
         acc = 0
         cums: list[int] = []
         for s in self._recovery_steps:
@@ -629,20 +801,15 @@ class System2Controller:
                 vlm,
                 images_b64=exo_imgs,
             )
-            if isinstance(sr, tuple) and len(sr) == 3:
-                st_l, es_r, mx_r = sr
-                self._ingest_recovery_steps(st_l, sim_tick=sim_tick)
-                mx_f: float | None = None
-                if mx_r is not None:
-                    try:
-                        mx_f = float(max(0.02, min(6.0, float(mx_r))))
-                    except (TypeError, ValueError):
-                        mx_f = None
-                self._recovery_episode_spec = EpisodeSuccessSpec(
-                    expected_state=dict(es_r or {}),
-                    max_prediction_error=mx_f,
-                    skill_id="recovery_llm",
-                )
+            if not self._ingest_recovery_pack(sr, sim_tick=sim_tick):
+                self._recovery_llm_fail_count = int(self._recovery_llm_fail_count) + 1
+                self._last_recovery_llm_error = "sync_invalid_or_null"
+                if (
+                    recovery_fallback_enabled()
+                    and not self._recovery_fallback_applied
+                    and self._recovery_llm_fail_count >= _recovery_llm_fail_before_fallback()
+                ):
+                    self._apply_fallback_recovery_schedule(sim_tick)
         else:
             self._recovery_llm_future = _system2_llm_executor().submit(
                 partial(
@@ -667,7 +834,18 @@ class System2Controller:
             return
         if self._recovery_llm_future is not None:
             return
+        if self._recovery_steps and not self._recovery_schedule_exhausted(sim_tick):
+            return
+        if self._recovery_fallback_applied and not self._recovery_schedule_exhausted(
+            sim_tick
+        ):
+            return
         if self._recovery_llm_dispatch_count >= _recovery_llm_calls_max():
+            return
+        if (
+            self._recovery_fallback_applied
+            and self._recovery_llm_fail_count >= _recovery_llm_fail_before_fallback()
+        ):
             return
         dt = int(self._recovery_llm_dispatch_tick)
         if dt >= 0 and (int(sim_tick) - dt) < _recovery_replan_min_interval_ticks():
@@ -736,7 +914,25 @@ class System2Controller:
                 d_com_z=cz1 - cz0,
                 d_posture=ps1 - ps0,
             )
-        ex = _pe_distill_extra(pe_diag or {}, self._recovery_episode_spec)
+        spec = self._recovery_episode_spec
+        ex = pe_distill_extra(
+            pe_diag or {},
+            dict(spec.expected_state or {}),
+            spec.skill_id,
+        )
+        if self._recovery_steps:
+            ex["recovery_steps"] = compress_recovery_steps(self._recovery_steps)
+        ex["recovery_llm"] = bool(
+            self._recovery_steps_from_llm and self._recovery_steps
+        )
+        ex["recovery_schedule_source"] = str(self._recovery_schedule_source)
+        ex["recovery_llm_fail_count"] = int(self._recovery_llm_fail_count)
+        ex["distill_event"] = f"override_end:{source_note}"
+        if self._last_recovery_llm_error:
+            ex["recovery_llm_error"] = str(self._last_recovery_llm_error)
+        stud_conf: float | None = None
+        if self._learned.enabled():
+            _, stud_conf = self._learned.predict(dict(self._override_start_obs_f))
         self._append_distill(
             tick=sim_tick,
             macro=macro,
@@ -745,6 +941,8 @@ class System2Controller:
             delta={"d_com_z": round(cz1 - cz0, 5), "d_posture": round(ps1 - ps0, 5)},
             obs0=snapshot_obs_for_distill(dict(self._override_start_obs_f)) or None,
             extra=ex,
+            ending_source=f"fallen_override:{source_note}",
+            student_conf=stud_conf,
         )
         sk = self._neuro_streak_key(macro, self._recovery_episode_spec)
         if success:
@@ -894,7 +1092,85 @@ class System2Controller:
         }
         if applied is not None:
             base_diag["residuals_applied"] = applied
+        base_diag["recovery_schedule_source"] = str(self._recovery_schedule_source)
+        base_diag["recovery_steps_loaded"] = len(self._recovery_steps)
+        if self._last_recovery_llm_error:
+            base_diag["recovery_llm_error"] = str(self._last_recovery_llm_error)
+        base_diag.update(self._distill_health_diag())
         return base_diag
+
+    def _maybe_distill_override_sample(
+        self,
+        sim_tick: int,
+        obs_f: dict[str, float],
+        *,
+        fallen: bool,
+    ) -> None:
+        every = _distill_override_sample_every()
+        if every <= 0 or not self._s2_override_active:
+            return
+        if int(sim_tick) - int(self._last_override_distill_sample_tick) < every:
+            return
+        self._last_override_distill_sample_tick = int(sim_tick)
+        age = int(sim_tick) - int(self._s2_override_start_tick)
+        ex: dict[str, Any] = {
+            "distill_event": "override_sample",
+            "fallen": bool(fallen),
+            "override_age_ticks": age,
+            "recovery_schedule_source": str(self._recovery_schedule_source),
+            "recovery_steps_loaded": len(self._recovery_steps),
+            "recovery_llm_inflight": bool(
+                self._recovery_llm_future is not None
+                and not self._recovery_llm_future.done()
+            ),
+            "recovery_llm_dispatches": int(self._recovery_llm_dispatch_count),
+        }
+        if self._last_recovery_llm_error:
+            ex["recovery_llm_error"] = str(self._last_recovery_llm_error)
+        if self._recovery_steps:
+            ex["recovery_steps"] = compress_recovery_steps(self._recovery_steps)
+        stud_conf: float | None = None
+        if self._learned.enabled():
+            _, stud_conf = self._learned.predict(dict(self._override_start_obs_f))
+        self._append_distill(
+            tick=sim_tick,
+            macro="RECOVER_POSTURE",
+            source="fallen_override:sample",
+            success=False,
+            delta={
+                "d_com_z": round(
+                    float(obs_f.get("com_z", obs_f.get("phys_com_z", 0.5)))
+                    - float(
+                        self._override_start_obs_f.get(
+                            "com_z",
+                            self._override_start_obs_f.get("phys_com_z", 0.5),
+                        )
+                    ),
+                    5,
+                ),
+                "d_posture": round(
+                    float(
+                        obs_f.get(
+                            "posture_stability",
+                            obs_f.get("phys_posture_stability", 0.5),
+                        )
+                    )
+                    - float(
+                        self._override_start_obs_f.get(
+                            "posture_stability",
+                            self._override_start_obs_f.get(
+                                "phys_posture_stability", 0.5
+                            ),
+                        )
+                    ),
+                    5,
+                ),
+            },
+            obs0=snapshot_obs_for_distill(dict(self._override_start_obs_f)) or None,
+            extra=ex,
+            student_conf=stud_conf,
+            count_health=False,
+        )
 
     def _maybe_tick_fallen_override(
         self,
@@ -914,32 +1190,8 @@ class System2Controller:
         else:
             self._s2_fallen_streak_override = 0
 
-        if self._recovery_llm_future is not None and self._recovery_llm_future.done():
-            pack: Any = None
-            try:
-                pack = self._recovery_llm_future.result(timeout=0)
-            except Exception:
-                pack = None
-            self._recovery_llm_future = None
-            steps_try: list[dict[str, Any]] | None = None
-            if isinstance(pack, tuple) and len(pack) == 3:
-                st_l, es_rec, mx_rec = pack
-                steps_try = st_l if isinstance(st_l, list) else None
-                mx_f: float | None = None
-                if mx_rec is not None:
-                    try:
-                        mx_f = float(max(0.02, min(6.0, float(mx_rec))))
-                    except (TypeError, ValueError):
-                        mx_f = None
-                self._recovery_episode_spec = EpisodeSuccessSpec(
-                    expected_state=dict(es_rec or {}),
-                    max_prediction_error=mx_f,
-                    skill_id="recovery_llm",
-                )
-            elif isinstance(pack, list) and pack:
-                steps_try = pack
-            if steps_try:
-                self._ingest_recovery_steps(steps_try, sim_tick=sim_tick)
+        self._maybe_timeout_recovery_llm(sim_tick)
+        self._drain_recovery_llm_future(sim_tick)
 
         if not self._s2_override_active:
             if self._s2_fallen_streak_override < _s2_override_fallen_ticks_need():
@@ -954,7 +1206,10 @@ class System2Controller:
             self._recovery_schedule_anchor_tick = -1
             self._recovery_llm_dispatch_tick = -1
             self._recovery_llm_dispatch_count = 0
-            self._dispatch_recovery_llm_once(sim_tick, agent, base, obs_f, sim)
+            if recovery_fallback_enabled() and not self._recovery_steps:
+                self._apply_fallback_recovery_schedule(sim_tick)
+            if recovery_llm_enabled():
+                self._dispatch_recovery_llm_once(sim_tick, agent, base, obs_f, sim)
         else:
             age = int(sim_tick) - int(self._s2_override_start_tick)
             max_age = _s2_override_max_ticks()
@@ -1001,6 +1256,7 @@ class System2Controller:
             self._maybe_dispatch_recovery_llm_replan(
                 sim_tick, agent, base, obs_f, sim
             )
+            self._maybe_distill_override_sample(sim_tick, obs_f, fallen=fallen)
 
         extra = self._recovery_extra_residuals(sim_tick)
         applied = self._apply_recover_bundle_no_candidate(
@@ -1044,7 +1300,7 @@ class System2Controller:
             and os.environ.get("RKK_SYSTEM2_STUDENT_BOOTSTRAP", "0").strip().lower()
             in ("1", "true", "yes", "on")
         ):
-            self._learned.bootstrap_from_log(_distill_log_path())
+            self._learned.bootstrap_from_log(distill_log_path())
         self._bootstrap_attempted = True
 
         p_llm = proposal_llm
@@ -1060,6 +1316,7 @@ class System2Controller:
             macro = macro_heur
             source = "student"
 
+        self._episode_plan_distill_extra = {}
         proposal_effective: System2Proposal | None = None
         if p_llm is not None:
             llm_m = p_llm.normalized_macro()
@@ -1080,6 +1337,13 @@ class System2Controller:
                 macro = llm_m
                 source = "llm"
                 proposal_effective = p_llm
+
+        if proposal_effective is not None:
+            self._episode_plan_distill_extra = proposal_distill_extra(
+                proposal_effective,
+                source=source,
+                llm_macro=p_llm.normalized_macro() if p_llm is not None else None,
+            )
 
         bundle = macro_bundle(macro)
         graph_patch: dict[str, float] = dict(bundle.get("graph") or {})
@@ -1185,7 +1449,9 @@ class System2Controller:
             "last_neuro_node": self._last_neuro_node,
             "llm_inflight": bool(inflight),
             "llm_submit_tick": self._llm_submit_tick if inflight else None,
+            "recovery_steps_loaded": 0,
         }
+        self._last_diag.update(self._distill_health_diag())
         return self._last_diag
 
     def _should_apply_residuals(
@@ -1315,7 +1581,16 @@ class System2Controller:
                     d_com_z=cz1 - cz0,
                     d_posture=ps1 - ps0,
                 )
-            distill_x = _pe_distill_extra(pe_diag, self._macro_episode_spec)
+            spec_e = self._macro_episode_spec
+            distill_x = pe_distill_extra(
+                pe_diag,
+                dict(spec_e.expected_state or {}),
+                spec_e.skill_id,
+            )
+            distill_x.update(self._episode_plan_distill_extra)
+            stud_conf_end: float | None = None
+            if self._learned.enabled():
+                _, stud_conf_end = self._learned.predict(dict(self._macro_start_obs))
             self._append_distill(
                 tick=sim_tick,
                 macro=ending_macro,
@@ -1324,7 +1599,10 @@ class System2Controller:
                 delta={"d_com_z": round(cz1 - cz0, 5), "d_posture": round(ps1 - ps0, 5)},
                 obs0=snapshot_obs_for_distill(dict(self._macro_start_obs)) or None,
                 extra=distill_x,
+                ending_source=ending_source,
+                student_conf=stud_conf_end,
             )
+            self._episode_plan_distill_extra = {}
             try:
                 self._online_buf.append(
                     {
@@ -1382,7 +1660,9 @@ class System2Controller:
                 "last_neuro_node": self._last_neuro_node,
                 "llm_inflight": bool(inflight),
                 "llm_submit_tick": self._llm_submit_tick if inflight else None,
+                "recovery_steps_loaded": len(self._recovery_steps),
             }
+            self._last_diag.update(self._distill_health_diag())
             return self._last_diag
 
         summary = {

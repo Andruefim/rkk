@@ -206,15 +206,15 @@ def parse_recovery_motor_steps(
     out: list[dict[str, Any]] = []
     for step in steps[: int(max(1, max_steps))]:
         if not isinstance(step, dict):
-            return None
+            continue
         try:
             nt = int(step.get("ticks", 0))
         except (TypeError, ValueError):
-            return None
+            continue
         nt = max(1, min(int(max_ticks_per_step), nt))
         deltas = step.get("intent_deltas") or step.get("deltas") or {}
         if not isinstance(deltas, dict):
-            return None
+            continue
         clean: dict[str, float] = {}
         for k, v in deltas.items():
             sk = str(k).strip()
@@ -225,7 +225,7 @@ def parse_recovery_motor_steps(
             except (TypeError, ValueError):
                 continue
         out.append({"ticks": nt, "intent_deltas": clean})
-    return out or None
+    return out if out else None
 
 
 def parse_recovery_llm_plan(

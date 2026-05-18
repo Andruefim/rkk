@@ -584,8 +584,13 @@ def recovery_steps_from_llm_network_fetch(
     if plan is None:
         return None
     steps, es, mx = plan
+    from engine.system2.recovery_schedule import enrich_recovery_steps
+
     for st in steps:
         st["intent_deltas"] = clip_intent_deltas(st.get("intent_deltas") or {})
+    steps = enrich_recovery_steps(steps)
+    if not any(st.get("intent_deltas") for st in steps):
+        return None
     return (steps, es, mx)
 
 

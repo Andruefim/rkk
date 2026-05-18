@@ -635,12 +635,22 @@ class SimulationTickMixin:
                         sim=self,
                         fallen=bool(fallen),
                     )
+                    fn_ctx = getattr(self._system2, "planning_context_for_wm", None)
+                    if callable(fn_ctx):
+                        self.agent.set_s2_planning_context(
+                            fn_ctx(fallen=bool(fallen))
+                        )
+                    else:
+                        self.agent.set_s2_planning_context(None)
                 else:
                     self._system2_last = None
+                    self.agent.set_s2_planning_context(None)
             except Exception:
                 self._system2_last = {"enabled": False, "error": "system2_tick"}
+                self.agent.set_s2_planning_context(None)
         else:
             self._system2_last = None
+            self.agent.set_s2_planning_context(None)
 
         # Controlled perturbations during fixed_root to teach active balance
         if self.current_world == "humanoid" and self._fixed_root_active:
