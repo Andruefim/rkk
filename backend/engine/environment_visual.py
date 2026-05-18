@@ -603,7 +603,7 @@ class EnvironmentVisual:
 
     def get_frame_base64(self, view: str | None = None) -> str | None:
         fn = getattr(self.base_env, "get_frame_base64", None)
-        return fn(None) if callable(fn) else None
+        return fn(view) if callable(fn) else None
 
     def get_full_scene(self) -> dict:
         fn = getattr(self.base_env, "get_full_scene", None)

@@ -8,6 +8,7 @@ import random
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -28,12 +29,16 @@ from engine.system2.success_predicates import (
 from engine.system2.student import MacroStudent, choose_macro_from_obs
 from engine.system2.teacher import (
     build_compact_recovery_state,
+    collect_s2_planning_frames,
+    enrich_summary_for_s2_llm,
+    llm_plan_worker,
     llm_teacher_enabled,
-    proposal_from_llm,
     proposal_from_llm_cache_only,
-    proposal_from_llm_network_fetch,
     recovery_llm_enabled,
     recovery_steps_from_llm_network_fetch,
+    s2_recovery_vision_enabled,
+    s2_unified_slots_enabled,
+    s2_unified_vlm_enabled,
     vlm_slots_from_sim,
 )
 from engine.system2.validate import validate_proposal
@@ -217,6 +222,96 @@ def _llm_sync_forced() -> bool:
     )
 
 
+def _s2_build_llm_plan_job(
+    *,
+    agent: Any,
+    graph: Any,
+    sim: Any | None,
+    obs_f: dict[str, float],
+    base: Any,
+    summary: dict[str, Any],
+    fallen: bool,
+    node_keys: frozenset[str],
+) -> dict[str, Any]:
+    job: dict[str, Any] = {
+        "summary": dict(summary),
+        "vlm_slots": vlm_slots_from_sim(sim),
+    }
+    if not s2_unified_vlm_enabled() or sim is None or not getattr(sim, "_visual_mode", False):
+        return job
+    from engine.slot_lexicon import allowed_target_ids
+
+    job["summary"] = enrich_summary_for_s2_llm(base, obs_f, dict(summary), fallen=fallen)
+    imgs, cap = collect_s2_planning_frames(agent, fallen=fallen)
+    vis = getattr(sim, "_visual_env", None)
+    if not imgs and vis is not None:
+        try:
+            snap = vis.get_slot_visualization()
+        except Exception:
+            snap = {}
+        fb = snap.get("frame") if isinstance(snap, dict) else None
+        if fb:
+            imgs = [str(fb)]
+            cap = "Cached visual-environment camera frame (same tick as slot masks)."
+    if not imgs and not s2_unified_slots_enabled():
+        return job
+
+    job["unified_vlm"] = True
+    job["images"] = imgs
+    job["image_caption"] = cap
+    job["include_slots"] = s2_unified_slots_enabled()
+    if vis is not None and job["include_slots"]:
+        n = int(getattr(vis, "n_slots", 0) or 0)
+        job["slot_ids"] = [f"slot_{k}" for k in range(max(0, n))]
+        job["variable_ids"] = [str(k) for k in sorted(node_keys)]
+        allowed = allowed_target_ids(job["variable_ids"])
+        alist = sorted(allowed)
+        job["allowed_csv"] = ", ".join(alist[:80]) + (" ..." if len(alist) > 80 else "")
+        try:
+            snap = vis.get_slot_visualization()
+            job["masks_b64"] = list((snap or {}).get("masks") or [])
+        except Exception:
+            job["masks_b64"] = []
+    return job
+
+
+def _s2_apply_unified_slot_lexicon(
+    sim: Any | None,
+    *,
+    labels: dict[str, dict[str, Any]] | None,
+    sim_tick: int,
+    frame_b64: str | None,
+) -> None:
+    if not labels or sim is None:
+        return
+    vis = getattr(sim, "_visual_env", None)
+    if vis is None:
+        return
+    try:
+        vis.set_slot_lexicon(labels, sim_tick, frame_b64)
+    except Exception:
+        return
+    sync = getattr(sim, "_phase_m_sync_from_vision", None)
+    if callable(sync):
+        try:
+            sync()
+        except Exception:
+            pass
+
+
+def _s2_recovery_exo_images(agent: Any) -> list[str] | None:
+    if not s2_recovery_vision_enabled():
+        return None
+    fn = getattr(getattr(agent, "env", None), "get_frame_base64", None)
+    if not callable(fn):
+        return None
+    try:
+        b = fn("exo")
+        return [str(b)] if b else None
+    except Exception:
+        return None
+
+
 def _s2_override_enabled() -> bool:
     return os.environ.get("RKK_S2_OVERRIDE", "1").strip().lower() not in (
         "0",
@@ -235,9 +330,39 @@ def _s2_override_fallen_ticks_need() -> int:
 
 def _s2_override_max_ticks() -> int:
     try:
-        return max(8, int(os.environ.get("RKK_S2_OVERRIDE_MAX_TICKS", "220")))
+        return max(8, int(os.environ.get("RKK_S2_OVERRIDE_MAX_TICKS", "420")))
     except ValueError:
-        return 220
+        return 420
+
+
+def _recovery_llm_calls_max() -> int:
+    """Максимум вызовов recovery LLM за одну сессию fallen_override (включая первый)."""
+    try:
+        return max(1, int(os.environ.get("RKK_S2_RECOVERY_LLM_CALLS_MAX", "14")))
+    except ValueError:
+        return 14
+
+
+def _recovery_replan_min_interval_ticks() -> int:
+    try:
+        return max(4, int(os.environ.get("RKK_S2_RECOVERY_REPLAN_MIN_TICKS", "48")))
+    except ValueError:
+        return 48
+
+
+def _recovery_replan_after_last_step_ticks() -> int:
+    try:
+        return max(0, int(os.environ.get("RKK_S2_RECOVERY_REPLAN_AFTER_LAST_STEP_TICKS", "12")))
+    except ValueError:
+        return 12
+
+
+def _recovery_replan_empty_schedule_ticks() -> int:
+    """Если шаги так и не пришли (или пустой JSON), повторить запрос не раньше этого age сессии."""
+    try:
+        return max(8, int(os.environ.get("RKK_S2_RECOVERY_REPLAN_EMPTY_SCHEDULE_TICKS", "40")))
+    except ValueError:
+        return 40
 
 
 class System2Controller:
@@ -268,6 +393,7 @@ class System2Controller:
         self._last_neuro_node: str | None = None
         self._llm_future: Future[System2Proposal | None] | None = None
         self._llm_submit_tick: int = -1
+        self._llm_slot_lexicon_frame: str | None = None
         self._s2_override_active: bool = False
         self._s2_override_start_tick: int = -1
         self._s2_fallen_streak_override: int = 0
@@ -275,6 +401,18 @@ class System2Controller:
         self._recovery_cumulative: list[int] = []
         self._recovery_llm_future: Future[Any] | None = None
         self._override_start_obs_f: dict[str, float] = {}
+        self._recovery_schedule_anchor_tick: int = -1
+        self._recovery_llm_dispatch_tick: int = -1
+        self._recovery_llm_dispatch_count: int = 0
+
+    def ollama_busy(self) -> bool:
+        """True, если к Ollama уходит или ждётся ответ (план S2 или recovery)."""
+        plan = self._llm_future is not None and not self._llm_future.done()
+        rec = (
+            self._recovery_llm_future is not None
+            and not self._recovery_llm_future.done()
+        )
+        return plan or rec
 
     def _obs_floats(self, obs: dict[str, Any]) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -444,8 +582,13 @@ class System2Controller:
         self._recovery_llm_future = None
         self._override_start_obs_f = {}
         self._recovery_episode_spec = EpisodeSuccessSpec()
+        self._recovery_schedule_anchor_tick = -1
+        self._recovery_llm_dispatch_tick = -1
+        self._recovery_llm_dispatch_count = 0
 
-    def _ingest_recovery_steps(self, steps: list[dict[str, Any]] | None) -> None:
+    def _ingest_recovery_steps(
+        self, steps: list[dict[str, Any]] | None, *, sim_tick: int
+    ) -> None:
         self._recovery_steps = list(steps or [])
         acc = 0
         cums: list[int] = []
@@ -453,15 +596,95 @@ class System2Controller:
             acc += int(max(1, s.get("ticks", 1)))
             cums.append(acc)
         self._recovery_cumulative = cums
+        self._recovery_schedule_anchor_tick = int(sim_tick)
 
     def _recovery_extra_residuals(self, sim_tick: int) -> dict[str, float]:
         if not self._recovery_steps or not self._recovery_cumulative:
             return {}
-        rel = max(0, int(sim_tick) - int(self._s2_override_start_tick))
+        anchor = int(self._recovery_schedule_anchor_tick)
+        if anchor < 0:
+            anchor = int(self._s2_override_start_tick)
+        rel = max(0, int(sim_tick) - anchor)
         idx = bisect.bisect_right(self._recovery_cumulative, rel)
         idx = min(idx, len(self._recovery_steps) - 1)
         d = self._recovery_steps[idx].get("intent_deltas") or {}
         return dict(d) if isinstance(d, dict) else {}
+
+    def _dispatch_recovery_llm_once(
+        self,
+        sim_tick: int,
+        agent: Any,
+        base: Any,
+        obs_f: dict[str, float],
+        sim: Any | None,
+    ) -> None:
+        if not recovery_llm_enabled():
+            return
+        compact = build_compact_recovery_state(base, obs_f)
+        exo_imgs = _s2_recovery_exo_images(agent)
+        vlm = vlm_slots_from_sim(sim)
+        if _llm_sync_forced():
+            sr = recovery_steps_from_llm_network_fetch(
+                compact,
+                vlm,
+                images_b64=exo_imgs,
+            )
+            if isinstance(sr, tuple) and len(sr) == 3:
+                st_l, es_r, mx_r = sr
+                self._ingest_recovery_steps(st_l, sim_tick=sim_tick)
+                mx_f: float | None = None
+                if mx_r is not None:
+                    try:
+                        mx_f = float(max(0.02, min(6.0, float(mx_r))))
+                    except (TypeError, ValueError):
+                        mx_f = None
+                self._recovery_episode_spec = EpisodeSuccessSpec(
+                    expected_state=dict(es_r or {}),
+                    max_prediction_error=mx_f,
+                    skill_id="recovery_llm",
+                )
+        else:
+            self._recovery_llm_future = _system2_llm_executor().submit(
+                partial(
+                    recovery_steps_from_llm_network_fetch,
+                    images_b64=exo_imgs,
+                ),
+                compact,
+                vlm,
+            )
+        self._recovery_llm_dispatch_tick = int(sim_tick)
+        self._recovery_llm_dispatch_count = int(self._recovery_llm_dispatch_count) + 1
+
+    def _maybe_dispatch_recovery_llm_replan(
+        self,
+        sim_tick: int,
+        agent: Any,
+        base: Any,
+        obs_f: dict[str, float],
+        sim: Any | None,
+    ) -> None:
+        if not recovery_llm_enabled():
+            return
+        if self._recovery_llm_future is not None:
+            return
+        if self._recovery_llm_dispatch_count >= _recovery_llm_calls_max():
+            return
+        dt = int(self._recovery_llm_dispatch_tick)
+        if dt >= 0 and (int(sim_tick) - dt) < _recovery_replan_min_interval_ticks():
+            return
+        rel_session = int(sim_tick) - int(self._s2_override_start_tick)
+        anc = int(self._recovery_schedule_anchor_tick)
+        if anc < 0:
+            anc = int(self._s2_override_start_tick)
+        rel_sched = max(0, int(sim_tick) - anc)
+        if self._recovery_cumulative:
+            last = int(self._recovery_cumulative[-1])
+            need = rel_sched >= last + _recovery_replan_after_last_step_ticks()
+        else:
+            need = rel_session >= _recovery_replan_empty_schedule_ticks()
+        if not need:
+            return
+        self._dispatch_recovery_llm_once(sim_tick, agent, base, obs_f, sim)
 
     def _override_episode_eval(
         self, obs_f: dict[str, float], *, fallen: bool
@@ -597,14 +820,27 @@ class System2Controller:
     ) -> dict[str, Any] | None:
         if self._llm_future is not None and self._llm_future.done():
             drained_llm: System2Proposal | None
+            slot_labels: dict[str, dict[str, Any]] | None = None
             try:
-                drained_llm = self._llm_future.result(timeout=0)
+                pack = self._llm_future.result(timeout=0)
             except Exception as ex:
+                pack = None
                 drained_llm = None
                 logging.getLogger(__name__).warning(
                     "System2 LLM future failed: %s", ex, exc_info=True
                 )
+            else:
+                if isinstance(pack, tuple) and len(pack) >= 1:
+                    drained_llm = pack[0]  # type: ignore[assignment]
+                    slot_labels = pack[1] if len(pack) >= 2 else None
+                else:
+                    drained_llm = pack  # type: ignore[assignment]
             self._llm_future = None
+            fb = self._llm_slot_lexicon_frame
+            self._llm_slot_lexicon_frame = None
+            _s2_apply_unified_slot_lexicon(
+                sim, labels=slot_labels, sim_tick=sim_tick, frame_b64=fb
+            )
             if drained_llm is not None:
                 drained_llm = validate_proposal(
                     drained_llm, allowed_intent_keys=node_keys
@@ -647,6 +883,7 @@ class System2Controller:
             "override_max_reset": bool(max_reset),
             "recovery_llm_inflight": bool(inflight),
             "recovery_steps_loaded": len(self._recovery_steps),
+            "recovery_llm_dispatches": int(self._recovery_llm_dispatch_count),
             "macro": "RECOVER_POSTURE",
             "source": "fallen_override",
             "sim_tick": sim_tick,
@@ -702,7 +939,7 @@ class System2Controller:
             elif isinstance(pack, list) and pack:
                 steps_try = pack
             if steps_try:
-                self._ingest_recovery_steps(steps_try)
+                self._ingest_recovery_steps(steps_try, sim_tick=sim_tick)
 
         if not self._s2_override_active:
             if self._s2_fallen_streak_override < _s2_override_fallen_ticks_need():
@@ -714,32 +951,10 @@ class System2Controller:
             self._recovery_cumulative = []
             self._recovery_llm_future = None
             self._recovery_episode_spec = EpisodeSuccessSpec()
-            if recovery_llm_enabled() and not _llm_sync_forced():
-                compact = build_compact_recovery_state(base, obs_f)
-                self._recovery_llm_future = _system2_llm_executor().submit(
-                    recovery_steps_from_llm_network_fetch,
-                    compact,
-                    vlm_slots_from_sim(sim),
-                )
-            elif recovery_llm_enabled() and _llm_sync_forced():
-                compact = build_compact_recovery_state(base, obs_f)
-                sr = recovery_steps_from_llm_network_fetch(
-                    compact, vlm_slots_from_sim(sim)
-                )
-                if isinstance(sr, tuple) and len(sr) == 3:
-                    st_l, es_r, mx_r = sr
-                    self._ingest_recovery_steps(st_l)
-                    mx_f: float | None = None
-                    if mx_r is not None:
-                        try:
-                            mx_f = float(max(0.02, min(6.0, float(mx_r))))
-                        except (TypeError, ValueError):
-                            mx_f = None
-                    self._recovery_episode_spec = EpisodeSuccessSpec(
-                        expected_state=dict(es_r or {}),
-                        max_prediction_error=mx_f,
-                        skill_id="recovery_llm",
-                    )
+            self._recovery_schedule_anchor_tick = -1
+            self._recovery_llm_dispatch_tick = -1
+            self._recovery_llm_dispatch_count = 0
+            self._dispatch_recovery_llm_once(sim_tick, agent, base, obs_f, sim)
         else:
             age = int(sim_tick) - int(self._s2_override_start_tick)
             max_age = _s2_override_max_ticks()
@@ -781,6 +996,11 @@ class System2Controller:
                 )
                 self._clear_override_session()
                 return diag
+
+        if self._s2_override_active and fallen:
+            self._maybe_dispatch_recovery_llm_replan(
+                sim_tick, agent, base, obs_f, sim
+            )
 
         extra = self._recovery_extra_residuals(sim_tick)
         applied = self._apply_recover_bundle_no_candidate(
@@ -1219,12 +1439,20 @@ class System2Controller:
                     "llm_submitted": False,
                 }
                 return self._last_diag
-            vlm = vlm_slots_from_sim(sim)
-            self._llm_future = _system2_llm_executor().submit(
-                proposal_from_llm_network_fetch,
-                dict(summary),
-                vlm,
+            job = _s2_build_llm_plan_job(
+                agent=agent,
+                graph=graph,
+                sim=sim,
+                obs_f=obs_f,
+                base=base,
+                summary=dict(summary),
+                fallen=fallen,
+                node_keys=node_keys,
             )
+            self._llm_slot_lexicon_frame = (
+                (job.get("images") or [None])[0] if job.get("unified_vlm") else None
+            )
+            self._llm_future = _system2_llm_executor().submit(llm_plan_worker, job)
             self._llm_submit_tick = sim_tick
             self._last_plan_tick = sim_tick
             hz_exp = self._macro_horizon_expired(sim_tick)
@@ -1250,7 +1478,25 @@ class System2Controller:
 
         proposal_llm: System2Proposal | None = None
         if llm_on and _llm_sync_forced():
-            proposal_llm = proposal_from_llm(summary, sim=sim)
+            job = _s2_build_llm_plan_job(
+                agent=agent,
+                graph=graph,
+                sim=sim,
+                obs_f=obs_f,
+                base=base,
+                summary=dict(summary),
+                fallen=fallen,
+                node_keys=node_keys,
+            )
+            self._llm_slot_lexicon_frame = (
+                (job.get("images") or [None])[0] if job.get("unified_vlm") else None
+            )
+            prop_try, slot_try = llm_plan_worker(job)
+            self._llm_slot_lexicon_frame = None
+            _s2_apply_unified_slot_lexicon(
+                sim, labels=slot_try, sim_tick=sim_tick, frame_b64=(job.get("images") or [None])[0]
+            )
+            proposal_llm = prop_try
             if proposal_llm is not None:
                 proposal_llm = validate_proposal(
                     proposal_llm, allowed_intent_keys=node_keys

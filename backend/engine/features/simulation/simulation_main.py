@@ -150,6 +150,7 @@ class Simulation(
         self._fr_reattach_active: bool = False
         self._fr_reattach_until: int = 0
         self._fr_reattach_count: int = 0
+        self._fr_fallen_ticks_accum: int = 0
         self._fr_release_blocked_until: int = 0
         self._fr_soft_release_deadline: int = 0
         self._fr_soft_release_start: int = 0

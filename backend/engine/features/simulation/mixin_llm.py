@@ -134,6 +134,8 @@ class SimulationLlmLoopMixin:
             return
         if self._llm_level2_inflight or self._pending_llm_bundle is not None:
             return
+        if ollama_yield_to_system2_enabled() and system2_ollama_busy(self):
+            return
         try:
             cooldown = int(os.environ.get("RKK_LLM_LEVEL2_COOLDOWN", "1200"))
         except ValueError:

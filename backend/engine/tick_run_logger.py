@@ -88,6 +88,7 @@ _TICK_LOG_SYSTEM2_KEYS: frozenset[str] = frozenset(
         "override_max_reset",
         "recovery_llm_inflight",
         "recovery_steps_loaded",
+        "recovery_llm_dispatches",
     }
 )
 

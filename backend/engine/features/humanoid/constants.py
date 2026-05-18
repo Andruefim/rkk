@@ -123,7 +123,7 @@ _RANGES["com_z"] = (0.0, 1.8)
 _RANGES["torso_roll"] = (-1.2, 1.2)
 _RANGES["torso_pitch"] = (-1.2, 1.2)
 for v in SPINE_VARS:
-    _RANGES[v] = (-1.2, 1.2)
+    _RANGES[v] = (-1.45, 1.45)
 for v in HEAD_VARS:
     _RANGES[v] = (-1.2, 1.2)
 for v in VESTIBULAR_VARS:
@@ -166,8 +166,9 @@ FALLEN_Z = 0.30  # default base-height gate (m); override at runtime with RKK_FA
 STAND_Z = 0.80
 HUMANOID_URDF_STAND_EULER = (np.pi / 2, 0.0, 0.0)
 HUMANOID_URDF_SPAWN_Z = 1.10
-PENTHOUSE_SPAWN_X = 1.85
-PENTHOUSE_SPAWN_Y = -1.15
+# Default XY spawn in penthouse; central tree planter is at origin with radius ~1.42 m — stay clearly outside.
+PENTHOUSE_SPAWN_X = 2.55
+PENTHOUSE_SPAWN_Y = -1.50
 
 # Путь к URDF относительно корня пакета `engine/` (features/humanoid/constants.py → .. ×3)
 HUMANOID_URDF_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "humanoid" / "humanoid.urdf"

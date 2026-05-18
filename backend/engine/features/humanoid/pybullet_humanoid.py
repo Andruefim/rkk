@@ -73,27 +73,89 @@ def _humanoid_motor_torque_table() -> dict:
 def _joint_smooth_alpha() -> float:
     """LPF for target commands: 0.0=freeze, 1.0=no smoothing."""
     try:
-        return float(np.clip(float(os.environ.get("RKK_HUMANOID_JOINT_SMOOTH_ALPHA", "0.28")), 0.0, 1.0))
+        return float(np.clip(float(os.environ.get("RKK_HUMANOID_JOINT_SMOOTH_ALPHA", "0.34")), 0.0, 1.0))
     except ValueError:
-        return 0.28
+        return 0.34
 
 
 def _joint_slew_max_step() -> float:
     """Max normalized target step per set_joint call."""
     try:
-        return float(np.clip(float(os.environ.get("RKK_HUMANOID_JOINT_MAX_STEP", "0.09")), 0.0, 1.0))
+        return float(np.clip(float(os.environ.get("RKK_HUMANOID_JOINT_MAX_STEP", "0.115")), 0.0, 1.0))
     except ValueError:
-        return 0.09
+        return 0.115
 
 
 def _spine_pitch_euler_coeff() -> float:
     """Масштаб Эйлер-компоненты наклона таза (около оси pitch URDF); см. RKK_SPINE_PITCH_EULER_COEFF."""
     try:
         return float(
-            np.clip(float(os.environ.get("RKK_SPINE_PITCH_EULER_COEFF", "0.92")), 0.35, 1.35)
+            np.clip(float(os.environ.get("RKK_SPINE_PITCH_EULER_COEFF", "1.02")), 0.35, 1.45)
         )
     except ValueError:
-        return 0.92
+        return 1.02
+
+
+def _humanoid_custom_leg_mass_scale() -> float:
+    """Доп. множитель к массам ног кастомного humanoid (звенья бедро–стопа)."""
+    try:
+        return float(
+            np.clip(float(os.environ.get("RKK_HUMANOID_CUSTOM_LEG_MASS_SCALE", "1.0")), 0.75, 1.65)
+        )
+    except ValueError:
+        return 1.0
+
+
+def _humanoid_urdf_leg_mass_scale() -> float:
+    """После loadURDF: масштаб массы *hip / *knee / *ankle (тяжелее ноги → сильнее тянут таз вниз)."""
+    try:
+        return float(
+            np.clip(float(os.environ.get("RKK_HUMANOID_URDF_LEG_MASS_SCALE", "1.30")), 1.0, 1.8)
+        )
+    except ValueError:
+        return 1.30
+
+
+def _custom_humanoid_mass_vector() -> list[float]:
+    """
+    base + 12 звеньев кастомной куклы. Бедро ≥ голень, иначе «палки» не перевешивают таз.
+    """
+    masses = [
+        9.2,
+        2.2,
+        2.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        5.4,
+        5.4,
+        4.0,
+        4.0,
+        2.4,
+        2.4,
+    ]
+    sc = _humanoid_custom_leg_mass_scale()
+    if abs(sc - 1.0) > 1e-6:
+        for idx in range(7, 13):
+            masses[idx] = float(max(0.08, masses[idx] * sc))
+    return masses
+
+
+def _hip_euler_xyz(real_pos: float, var_name: str) -> tuple[float, float, float]:
+    """
+    Сферический тазобедренный: целевой quaternion из псевдо-Эйлера по нормализованной команде.
+    Увеличенный AY даёт сильнее сгибание «бёдра к груди» (вставание); настраивается env.
+    """
+    try:
+        ax = float(os.environ.get("RKK_HIP_EULER_AX", "0.50"))
+        ay = float(os.environ.get("RKK_HIP_EULER_AY", "1.14"))
+        az = float(os.environ.get("RKK_HIP_EULER_AZ", "0.12"))
+    except ValueError:
+        ax, ay, az = 0.50, 1.14, 0.12
+    if var_name == "rhip":
+        return (ax * real_pos, -ay * real_pos, -az * real_pos)
+    return (ax * real_pos, ay * real_pos, az * real_pos)
 
 
 def _recovery_pose_motor_multiplier(com_z: float, lfoot_z: float, rfoot_z: float) -> float:
@@ -285,6 +347,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 pb.changeDynamics(self.robot_id, i,
                     jointDamping=0.5, linearDamping=0.04, angularDamping=0.04,
                     physicsClientId=self.client)
+
+        self._apply_urdf_leg_mass_scale()
 
         # ── Fixed root constraint (None = not applied) ───────────────────────
         self._root_constraint: int | None = None
@@ -798,8 +862,41 @@ class _PyBulletHumanoid(InstrumentalSandbox):
 
         return self._build_custom_humanoid()
 
+    def _apply_urdf_leg_mass_scale(self) -> None:
+        sc = _humanoid_urdf_leg_mass_scale()
+        if sc <= 1.0005:
+            return
+        cid = self.client
+        rid = self.robot_id
+        for i in range(self.n_joints):
+            lname = self.link_names[i].lower()
+            if not lname:
+                continue
+            if not any(p in lname for p in ("_hip", "_knee", "_ankle")):
+                continue
+            try:
+                di = pb.getDynamicsInfo(rid, i, physicsClientId=cid)
+                m = float(di[0])
+                lid = di[2]
+                if not isinstance(lid, (list, tuple)) or len(lid) < 3:
+                    continue
+                ixx, iyy, izz = float(lid[0]), float(lid[1]), float(lid[2])
+                pb.changeDynamics(
+                    rid,
+                    i,
+                    mass=max(1e-6, m * sc),
+                    localInertiaDiagonal=[
+                        max(1e-9, ixx * sc),
+                        max(1e-9, iyy * sc),
+                        max(1e-9, izz * sc),
+                    ],
+                    physicsClientId=cid,
+                )
+            except Exception:
+                continue
+
     def _build_custom_humanoid(self) -> int:
-        masses     = [8.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 3.0, 3.0, 1.5, 1.5, 0.5, 0.5]
+        masses = _custom_humanoid_mass_vector()
         col_shapes, vis_shapes, positions, orientations = [], [], [], []
         inertial_pos, inertial_orn, parents, jtypes, jaxes = [], [], [], [], []
 
@@ -1104,12 +1201,15 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             prev_norm = float(self._joint_target_norm.get(var_name, tgt_norm))
             alpha = _joint_smooth_alpha()
             slew = _joint_slew_max_step()
+            rb0 = float(getattr(self, "_recovery_motor_boost_cached", 1.0))
+            if rb0 > 1.02:
+                slew = float(min(0.22, slew * (1.0 + 0.55 * min(rb0 - 1.0, 0.85))))
             desired = prev_norm + (tgt_norm - prev_norm) * alpha
             step = float(np.clip(desired - prev_norm, -slew, slew))
             cmd_norm = float(np.clip(prev_norm + step, 0.0, 1.0))
             self._joint_target_norm[var_name] = cmd_norm
             vel_scale, force_scale = _ctrl_profile_from_delta(abs(cmd_norm - prev_norm))
-            rb = float(getattr(self, "_recovery_motor_boost_cached", 1.0))
+            rb = rb0
             if rb > 1.001:
                 vel_scale = float(
                     np.clip(vel_scale * (0.88 + 0.12 * min(rb, 1.4)), 0.0, 1.12)
@@ -1143,8 +1243,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     self._spine_euler[2] = _spine_pitch_euler_coeff() * real_pos  # Pitch is rotation around Z
                 ex, ey, ez = float(self._spine_euler[0]), float(self._spine_euler[1]), -float(self._spine_euler[2])
                 q = pb.getQuaternionFromEuler((ex, ey, ez))
+                sp_vmax = (4.85 if rb > 1.02 else 3.65) * vel_scale
                 motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                        positionGain=0.85, velocityGain=0.25, maxVelocity=3.5 * vel_scale,
+                        positionGain=0.92, velocityGain=0.28, maxVelocity=sp_vmax,
                         force=[f * force_scale for f in self._mt["spine_sph"]], physicsClientId=cid)
                 return
 
@@ -1154,10 +1255,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     q = pb.getQuaternionFromEuler((0.32 * real_pos, 0.42 * real_pos, 0.28 * real_pos))
                 elif var_name == "rshoulder":
                     q = pb.getQuaternionFromEuler((0.32 * real_pos, -0.42 * real_pos, -0.28 * real_pos))
-                elif var_name == "lhip":
-                    q = pb.getQuaternionFromEuler((0.4 * real_pos, 0.85 * real_pos, 0.1 * real_pos))
-                elif var_name == "rhip":
-                    q = pb.getQuaternionFromEuler((0.4 * real_pos, -0.85 * real_pos, -0.1 * real_pos))
+                elif var_name in ("lhip", "rhip"):
+                    hx, hy, hz = _hip_euler_xyz(real_pos, var_name)
+                    q = pb.getQuaternionFromEuler((hx, hy, hz))
                 elif var_name == "lankle":
                     q = pb.getQuaternionFromEuler((-0.22 * real_pos, 0.1 * real_pos, 0.0))
                 elif var_name == "rankle":
@@ -1165,8 +1265,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 else:
                     q = [0.0, 0.0, 0.0, 1.0]
                 if is_leg:
+                    leg_sph_v = (5.1 if rb > 1.02 else 4.0) * vel_scale
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                            positionGain=0.85, velocityGain=0.25, maxVelocity=4.0 * vel_scale,
+                            positionGain=0.88, velocityGain=0.27, maxVelocity=leg_sph_v,
                             force=[f * force_scale for f in self._mt["leg_sph"]], physicsClientId=cid)
                 else:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
@@ -1174,11 +1275,16 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                             force=[f * force_scale for f in self._mt["arm_sph"]], physicsClientId=cid)
             else:
                 if is_leg:
+                    rev_v = (
+                        (5.45 if rb > 1.02 else 4.0) * vel_scale
+                        if var_name in ("lknee", "rknee")
+                        else 4.0 * vel_scale
+                    )
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
-                        positionGain=0.80, velocityGain=0.20,
-                        maxVelocity=4.0 * vel_scale,
+                        positionGain=0.86, velocityGain=0.22,
+                        maxVelocity=rev_v,
                         force=float(self._mt["leg_rev"]) * force_scale, physicsClientId=cid,
                     )
                 else:
@@ -1562,17 +1668,35 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             return None
         try:
             with self._physics_lock:
-                eg = self._ego_camera_rt()
-                if eg is None:
+                vkey = str(view or "ego").strip().lower()
+                use_exo = vkey in (
+                    "exo",
+                    "third",
+                    "third_person",
+                    "side",
+                    "orbit",
+                    "world",
+                )
+                if use_exo:
                     vm = pb.computeViewMatrix(
                         [2.2, -2.2, 1.6], [0, 0, 0.75], [0, 0, 1],
                         physicsClientId=self.client,
                     )
                     ego_cam = False
                 else:
-                    eye, tgt, cup = eg
-                    vm = pb.computeViewMatrix(eye, tgt, cup, physicsClientId=self.client)
-                    ego_cam = True
+                    eg = self._ego_camera_rt()
+                    if eg is None:
+                        vm = pb.computeViewMatrix(
+                            [2.2, -2.2, 1.6], [0, 0, 0.75], [0, 0, 1],
+                            physicsClientId=self.client,
+                        )
+                        ego_cam = False
+                    else:
+                        eye, tgt, cup = eg
+                        vm = pb.computeViewMatrix(
+                            eye, tgt, cup, physicsClientId=self.client
+                        )
+                        ego_cam = True
                 pm = pb.computeProjectionMatrixFOV(
                     fov=60, aspect=width/height, nearVal=0.1, farVal=15.0,
                     physicsClientId=self.client)

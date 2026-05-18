@@ -13,6 +13,16 @@ from __future__ import annotations
 import os
 from typing import Any
 
+__all__ = [
+    "DEFAULT_OLLAMA_GENERATE_URL",
+    "DEFAULT_OLLAMA_MODEL",
+    "get_ollama_generate_url",
+    "get_ollama_model",
+    "ollama_think_disabled_payload",
+    "ollama_yield_to_system2_enabled",
+    "system2_ollama_busy",
+]
+
 DEFAULT_OLLAMA_MODEL = "gemma4:e4b"
 DEFAULT_OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
 
@@ -45,3 +55,31 @@ def ollama_think_disabled_payload() -> dict[str, Any]:
     ):
         return {}
     return {"think": False}
+
+
+def ollama_yield_to_system2_enabled() -> bool:
+    """
+    Если включено (по умолчанию да), фоновые вызовы Ollama (L2/L3, curriculum LLM)
+    не стартуют, пока System2 держит in-flight запрос к Ollama — один GPU/CPU у Ollama.
+    Выкл: RKK_OLLAMA_YIELD_TO_S2=0
+    """
+    return os.environ.get("RKK_OLLAMA_YIELD_TO_S2", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def system2_ollama_busy(sim: Any) -> bool:
+    """True, если у симуляции активен System2 и у него незавершённый Ollama (план или recovery)."""
+    s2 = getattr(sim, "_system2", None)
+    if s2 is None:
+        return False
+    fn = getattr(s2, "ollama_busy", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        return False

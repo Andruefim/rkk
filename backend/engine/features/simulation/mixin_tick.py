@@ -241,6 +241,14 @@ class SimulationTickMixin:
         if self._fr_reattach_active:
             return
         try:
+            min_fallen = max(
+                0, int(os.environ.get("RKK_FR_REATTACH_MIN_FALLEN_TICKS", "0"))
+            )
+        except ValueError:
+            min_fallen = 0
+        if min_fallen > 0 and int(getattr(self, "_fr_fallen_ticks_accum", 0)) < min_fallen:
+            return
+        try:
             max_n = max(1, int(os.environ.get("RKK_POST_FR_REATTACH_MAX", "3")))
             dur = max(40, int(os.environ.get("RKK_POST_FR_REATTACH_TICKS", "150")))
         except ValueError:
@@ -514,6 +522,7 @@ class SimulationTickMixin:
             if self._fall_recovery_active and not fallen:
                 self._clear_fall_recovery()
             if fallen:
+                self._fr_fallen_ticks_accum += 1
                 obs_fall = dict(self.agent.env.observe())
                 if fallen_edge:
                     self._fall_count += 1
@@ -544,15 +553,19 @@ class SimulationTickMixin:
                     fallen = is_fn()
                 if not fallen:
                     self._pending_fall_obs_for_memory = None
+                    self._fr_fallen_ticks_accum = 0
                 if fallen_edge and self._fall_count % 20 == 1:
                     self._add_event(
                         f"💀 [FALLEN] Nova упал! (×{self._fall_count})",
                         "#ff2244", "value"
                     )
+            else:
+                self._fr_fallen_ticks_accum = 0
             self._prev_fallen = bool(fallen)
         else:
             self._prev_fallen = False
             self._pending_fall_obs_for_memory = None
+            self._fr_fallen_ticks_accum = 0
 
         # Фаза 12: передаём GNN prediction в visual env (не каждый тик — см. VISION_GNN_FEED_EVERY)
         if self._visual_mode and self._visual_env is not None:

@@ -662,6 +662,9 @@ class EnvironmentHumanoid:
             self._apply_upper_body_from_intents(cpg_sync=None)
             return
 
+        w_rec = self._recovery_pose_weight(raw_phys)
+        torso_pull = float(max(0.0, torso - 0.48))
+
         knee = float(
             np.clip(
                 0.45 - (sup_l + sup_r - 1.0) * 0.20 + (recover - 0.5) * 0.45,
@@ -669,17 +672,41 @@ class EnvironmentHumanoid:
                 0.95,
             )
         )
+        knee = float(
+            np.clip(
+                knee - 0.11 * torso_pull * (0.35 + 0.65 * w_rec),
+                0.05,
+                0.95,
+            )
+        )
         self._sim.set_joint("lknee", knee)
         self._sim.set_joint("rknee", knee)
+
+        rec_excess = float(np.clip((recover - 0.5) * 2.4, 0.0, 1.0))
+        bilateral_hip_tuck = float(
+            0.16 * w_rec * rec_excess + 0.22 * torso_pull * (0.35 + 0.65 * w_rec)
+        )
 
         hip_base = float(np.clip(0.5 - (sup_l + sup_r - 1.0) * 0.15, 0.05, 0.95))
         self._sim.set_joint(
             "lhip",
-            float(np.clip(hip_base - (stride - 0.5) * 0.3, 0.05, 0.95)),
+            float(
+                np.clip(
+                    hip_base - (stride - 0.5) * 0.3 + bilateral_hip_tuck,
+                    0.05,
+                    0.95,
+                )
+            ),
         )
         self._sim.set_joint(
             "rhip",
-            float(np.clip(hip_base + (stride - 0.5) * 0.3, 0.05, 0.95)),
+            float(
+                np.clip(
+                    hip_base + (stride - 0.5) * 0.3 + bilateral_hip_tuck,
+                    0.05,
+                    0.95,
+                )
+            ),
         )
 
         ankle = float(np.clip(0.5 + (sup_l + sup_r - 1.0) * 0.12, 0.05, 0.95))

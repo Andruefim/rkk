@@ -5,6 +5,9 @@ Swing (бедро/колено):
   - Фаза осцилляторов CPG [0],[1] для лев/прав бедра; swing_factor = max(0, sin(phi))
   - В swing добавляется подъём бедра и сгиб колена (RKK_CPG_SWING_HIP_LIFT / KNEE_FLEX),
     чтобы не компенсировать только наклоном торса назад.
+  - walk_gate учитывает intent_stop_recover и низкий com_z (при stride≈0.5 иначе gate=0).
+  - Двусторонний tuck бёдер/коленей: RKK_CPG_RECOVERY_HIP_TUCK, RKK_CPG_RECOVERY_KNEE_FLEX_EXTRA.
+  - Связка «наклон вперёд в интентах» → бёдра: RKK_CPG_TORSO_HIP_COEFF, RKK_CPG_TORSO_KNEE_COEFF (масштаб по low_z/recover/torso).
   - Компенсация торса от com_lag ослаблена (RKK_CPG_COM_LAG_PITCH, дефолт 0.08) — см. environment_humanoid.
 
 ИЗМЕНЕНИЯ (Motor Cortex / Phase D):
@@ -159,6 +162,11 @@ class LocomotionController:
         # Мы хотим com_x чуть впереди опорной стопы при ходьбе.
         com_lag = float(np.clip(0.48 - com_x, 0.0, 0.15))  # >0 если CoM отстаёт
         stride_n = max(0.0, stride)  # только positive stride (forward)
+        recover_raw = float(self._node(agent_nodes, "intent_stop_recover"))
+        recover_n = float(np.clip((recover_raw - 0.5) * 2.0, 0.0, 1.0))
+        low_z = float(0.0)
+        if com_z < 0.52:
+            low_z = float(np.clip((0.52 - com_z) / max(0.22, 1e-6), 0.0, 1.0))
         
         # Forward lean: base + stride contribution + com_lag recovery
         torso_forward = (
@@ -203,7 +211,9 @@ class LocomotionController:
         )
 
         # Торс синхронизация с CPG: pitch_add > 0 = наклон вперёд
-        gscale = float(np.clip(stride_n * 1.8, 0.0, 1.0))
+        gscale = float(
+            np.clip(max(stride_n, 0.42 * recover_n + 0.48 * low_z) * 1.8, 0.0, 1.0)
+        )
         s = float(torch.sin(self.cpg._phase[0]).item())
         c_m = float(torch.cos(self.cpg._phase[2]).item())
         
@@ -232,7 +242,10 @@ class LocomotionController:
         swing_r = _swing_factor(phi_r)
         hip_lift = _env_cpg_swing_float("RKK_CPG_SWING_HIP_LIFT", "0.08")
         knee_flex = _env_cpg_swing_float("RKK_CPG_SWING_KNEE_FLEX", "0.10")
-        walk_gate = float(np.clip(stride_n * (0.35 + 0.65 * gscale), 0.0, 1.0))
+        walk_blend = float(
+            np.clip(max(stride_n, 0.5 * recover_n + 0.45 * low_z), 0.0, 1.0)
+        )
+        walk_gate = float(np.clip(walk_blend * (0.35 + 0.65 * gscale), 0.0, 1.0))
 
         self._last_cpg_sync = {
             "sin": s, "cos_mid": c_m,
@@ -269,6 +282,51 @@ class LocomotionController:
         targets["rknee"] = float(
             np.clip(targets["rknee"] - knee_flex * swing_r * walk_gate, 0.05, 0.95)
         )
+
+        # Вставание со спины: оба бедра к корпусу (stride≈0.5 давал walk_gate≈0 — только торс).
+        torso_f = float(self._node(agent_nodes, "intent_torso_forward"))
+        tuck_gate = float(
+            np.clip(
+                0.5 * recover_n
+                + 0.48 * low_z
+                + 0.42 * max(0.0, torso_f - 0.50),
+                0.0,
+                1.0,
+            )
+        )
+        hip_tuck = _env_cpg_swing_float("RKK_CPG_RECOVERY_HIP_TUCK", "0.17")
+        knee_tuck_x = _env_cpg_swing_float("RKK_CPG_RECOVERY_KNEE_FLEX_EXTRA", "0.12")
+        targets["lhip"] = float(np.clip(targets["lhip"] + hip_tuck * tuck_gate, 0.05, 0.95))
+        targets["rhip"] = float(np.clip(targets["rhip"] + hip_tuck * tuck_gate, 0.05, 0.95))
+        targets["lknee"] = float(np.clip(targets["lknee"] - knee_tuck_x * tuck_gate, 0.05, 0.95))
+        targets["rknee"] = float(np.clip(targets["rknee"] - knee_tuck_x * tuck_gate, 0.05, 0.95))
+
+        # Наклон «вперёд» в интентах → прижать бёдра (не только spine_pitch).
+        try:
+            coeff_th = float(os.environ.get("RKK_CPG_TORSO_HIP_COEFF", "0.17"))
+        except ValueError:
+            coeff_th = 0.17
+        try:
+            coeff_tk = float(os.environ.get("RKK_CPG_TORSO_KNEE_COEFF", "0.10"))
+        except ValueError:
+            coeff_tk = 0.10
+        coeff_th = float(np.clip(coeff_th, 0.0, 0.32))
+        coeff_tk = float(np.clip(coeff_tk, 0.0, 0.22))
+        raw_torso = float(self._node(agent_nodes, "intent_torso_forward"))
+        torso_excess = float(max(0.0, raw_torso - 0.48))
+        torso_hip_scale = float(
+            np.clip(
+                0.52 * low_z + 0.48 * recover_n + 0.38 * max(0.0, raw_torso - 0.52),
+                0.0,
+                1.0,
+            )
+        )
+        hip_from_torso = coeff_th * torso_excess * torso_hip_scale
+        knee_from_torso = coeff_tk * torso_excess * torso_hip_scale
+        targets["lhip"] = float(np.clip(targets["lhip"] + hip_from_torso, 0.05, 0.95))
+        targets["rhip"] = float(np.clip(targets["rhip"] + hip_from_torso, 0.05, 0.95))
+        targets["lknee"] = float(np.clip(targets["lknee"] - knee_from_torso, 0.05, 0.95))
+        targets["rknee"] = float(np.clip(targets["rknee"] - knee_from_torso, 0.05, 0.95))
 
         self._step_count += 1
         self._last_command = dict(targets)

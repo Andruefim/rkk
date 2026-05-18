@@ -149,6 +149,10 @@ class SimulationEpisodicRssmMixin:
             valid_intent = [k for k in self.agent.graph.nodes if k.startswith("intent_")]
             valid_graph = list(self.agent.graph.nodes.keys())
 
+            schedule_llm = not (
+                ollama_yield_to_system2_enabled() and system2_ollama_busy(self)
+            )
+
             def _run_curriculum_llm() -> None:
                 import asyncio
 
@@ -165,31 +169,32 @@ class SimulationEpisodicRssmMixin:
                     )
                 )
 
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            try:
-                if loop is not None:
-                    try:
-                        loop.create_task(
-                            self._curriculum.maybe_generate_next_stage_llm(
-                                tick=tick,
-                                skill_stats=skill_stats,
-                                fall_summary=fall_summary,
-                                pose_metrics=pose_metrics,
-                                valid_intent_vars=valid_intent,
-                                valid_graph_vars=valid_graph,
-                                llm_url=get_ollama_generate_url(),
-                                llm_model=get_ollama_model(),
+            if schedule_llm:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                try:
+                    if loop is not None:
+                        try:
+                            loop.create_task(
+                                self._curriculum.maybe_generate_next_stage_llm(
+                                    tick=tick,
+                                    skill_stats=skill_stats,
+                                    fall_summary=fall_summary,
+                                    pose_metrics=pose_metrics,
+                                    valid_intent_vars=valid_intent,
+                                    valid_graph_vars=valid_graph,
+                                    llm_url=get_ollama_generate_url(),
+                                    llm_model=get_ollama_model(),
+                                )
                             )
-                        )
-                    except RuntimeError:
+                        except RuntimeError:
+                            self._llm_loop_executor.submit(_run_curriculum_llm)
+                    else:
                         self._llm_loop_executor.submit(_run_curriculum_llm)
-                else:
-                    self._llm_loop_executor.submit(_run_curriculum_llm)
-            except Exception as e:
-                print(f"[Simulation] curriculum LLM error: {e}")
+                except Exception as e:
+                    print(f"[Simulation] curriculum LLM error: {e}")
 
     def _maybe_upgrade_rssm(self, tick: int) -> None:
         """Level 2-F: Upgrade GNN to RSSM after sufficient GNN training."""
