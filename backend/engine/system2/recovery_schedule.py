@@ -32,28 +32,38 @@ def default_recovery_fallback_steps() -> list[dict[str, Any]]:
             pass
     bundle = macro_bundle("RECOVER_POSTURE")
     res = dict(bundle.get("residuals") or {})
+    # Фазы: стоп+опора → tuck/торс (CPG) → наклон → снятие recovery-режима.
     return [
-        {
-            "ticks": 22,
-            "intent_deltas": {
-                "intent_stop_recover": res.get("intent_stop_recover", 0.08),
-                "intent_support_left": 0.06,
-                "intent_support_right": 0.06,
-            },
-        },
         {
             "ticks": 28,
             "intent_deltas": {
-                "intent_torso_forward": 0.08,
+                "intent_stop_recover": max(0.12, float(res.get("intent_stop_recover", 0.06)) + 0.06),
+                "intent_support_left": 0.08,
+                "intent_support_right": 0.08,
+                "intent_stride": -0.12,
+            },
+        },
+        {
+            "ticks": 32,
+            "intent_deltas": {
+                "intent_stop_recover": 0.08,
+                "intent_torso_forward": 0.10,
                 "intent_arm_counterbalance": res.get("intent_arm_counterbalance", 0.05),
             },
         },
         {
-            "ticks": 36,
+            "ticks": 40,
             "intent_deltas": {
                 "intent_torso_forward": 0.06,
                 "intent_lean_forward": res.get("intent_lean_forward", 0.05),
-                "intent_stop_recover": 0.04,
+                "intent_stop_recover": -0.04,
+            },
+        },
+        {
+            "ticks": 24,
+            "intent_deltas": {
+                "intent_stop_recover": -0.06,
+                "intent_stride": 0.04,
             },
         },
     ]

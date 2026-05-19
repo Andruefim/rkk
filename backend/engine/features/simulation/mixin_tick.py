@@ -638,7 +638,7 @@ class SimulationTickMixin:
                     fn_ctx = getattr(self._system2, "planning_context_for_wm", None)
                     if callable(fn_ctx):
                         self.agent.set_s2_planning_context(
-                            fn_ctx(fallen=bool(fallen))
+                            fn_ctx(fallen=bool(fallen), sim_tick=int(self.tick))
                         )
                     else:
                         self.agent.set_s2_planning_context(None)

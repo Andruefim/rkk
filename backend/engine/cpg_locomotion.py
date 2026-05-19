@@ -246,6 +246,14 @@ class LocomotionController:
             np.clip(max(stride_n, 0.5 * recover_n + 0.45 * low_z), 0.0, 1.0)
         )
         walk_gate = float(np.clip(walk_blend * (0.35 + 0.65 * gscale), 0.0, 1.0))
+        try:
+            suppress = float(os.environ.get("RKK_CPG_RECOVERY_WALK_SUPPRESS", "0.85"))
+        except ValueError:
+            suppress = 0.85
+        suppress = float(np.clip(suppress, 0.0, 1.0))
+        rec_gate = float(np.clip(max(recover_n, low_z * 0.9), 0.0, 1.0))
+        if rec_gate > 0.35:
+            walk_gate *= float(1.0 - suppress * rec_gate)
 
         self._last_cpg_sync = {
             "sin": s, "cos_mid": c_m,

@@ -280,7 +280,9 @@ def _bundle_fallback_quick(
 ) -> dict[str, Any] | None:
     """Лёгкий кандидат для fallen_override без batch WM-rollout."""
     ctx = planning_context or {}
-    bundle_c = ctx.get("bundle_candidate")
+    bundle_c = ctx.get("recovery_schedule_candidate")
+    if not isinstance(bundle_c, dict) or not bundle_c.get("variable"):
+        bundle_c = ctx.get("bundle_candidate")
     if not isinstance(bundle_c, dict) or not bundle_c.get("variable"):
         return None
     var = str(bundle_c["variable"])

@@ -61,6 +61,25 @@ def test_bundle_fallback_quick_from_context():
     assert cand.get("s2_wm_fast_override") is True
 
 
+def test_bundle_fallback_prefers_recovery_schedule_candidate():
+    class _Agent:
+        def _features_for_intervention_pair(self, a, b):
+            return [0.1]
+
+    ctx = {
+        "bundle_candidate": {"variable": "intent_torso_forward", "value": 0.68},
+        "recovery_schedule_candidate": {
+            "variable": "intent_stop_recover",
+            "value": 0.72,
+            "target": "posture_stability",
+        },
+    }
+    task = S2WmTask(macro="RECOVER_POSTURE", fallen_override=True)
+    cand = _bundle_fallback_quick(ctx, task, _Agent())
+    assert cand is not None
+    assert cand["variable"] == "intent_stop_recover"
+
+
 def test_recover_improves_posture_score():
     s0 = {"posture_stability": 0.2, "com_z": 0.3, "intero_energy": 0.7}
     s1 = {"posture_stability": 0.35, "com_z": 0.38, "intero_energy": 0.68}

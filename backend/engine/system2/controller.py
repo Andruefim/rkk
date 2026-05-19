@@ -37,6 +37,7 @@ from engine.system2.success_predicates import (
     build_s2_detector_id,
     curriculum_stage_to_spec,
     episode_success_with_pe_fallback,
+    override_recovered_posture_ok,
     should_attach_curriculum_pe_spec,
 )
 from engine.system2.student import MacroStudent, choose_macro_from_obs
@@ -427,7 +428,53 @@ class System2Controller:
         )
         return plan or rec
 
-    def planning_context_for_wm(self, *, fallen: bool = False) -> dict[str, Any]:
+    def _recovery_schedule_wm_candidate(
+        self, sim_tick: int
+    ) -> dict[str, Any] | None:
+        """Кандидат do() из текущей фазы recovery schedule (антропоморфная фаза, не только торс)."""
+        if not self._recovery_steps or not self._recovery_cumulative:
+            return None
+        anchor = int(self._recovery_schedule_anchor_tick)
+        if anchor < 0:
+            anchor = int(self._s2_override_start_tick)
+        rel = max(0, int(sim_tick) - anchor)
+        idx = bisect.bisect_right(self._recovery_cumulative, rel)
+        idx = min(idx, len(self._recovery_steps) - 1)
+        deltas = self._recovery_steps[idx].get("intent_deltas") or {}
+        if not isinstance(deltas, dict) or not deltas:
+            return None
+        priority = (
+            "intent_stop_recover",
+            "intent_support_left",
+            "intent_support_right",
+            "intent_torso_forward",
+            "intent_arm_counterbalance",
+            "intent_lean_forward",
+        )
+        var = None
+        for pk in priority:
+            if pk in deltas:
+                var = pk
+                break
+        if var is None:
+            var = max(deltas.keys(), key=lambda k: abs(float(deltas[k])))
+        base = macro_bundle("RECOVER_POSTURE").get("candidate") or {}
+        try:
+            base_val = float(base.get("value", 0.5))
+        except (TypeError, ValueError):
+            base_val = 0.5
+        val = float(max(0.06, min(0.94, base_val + float(deltas[var]))))
+        return {
+            "variable": str(var),
+            "value": val,
+            "target": str(base.get("target", "posture_stability")),
+            "uncertainty": float(base.get("uncertainty", 0.38)),
+            "expected_ig": float(base.get("expected_ig", 0.62)),
+        }
+
+    def planning_context_for_wm(
+        self, *, fallen: bool = False, sim_tick: int = -1
+    ) -> dict[str, Any]:
         """Контекст для S2-gated WM planner (agent.step после tick)."""
         macro = (
             "RECOVER_POSTURE"
@@ -440,6 +487,9 @@ class System2Controller:
             else self._macro_episode_spec
         )
         bundle = macro_bundle(macro)
+        sched_cand = None
+        if self._s2_override_active and int(sim_tick) >= 0:
+            sched_cand = self._recovery_schedule_wm_candidate(int(sim_tick))
         return {
             "macro": macro,
             "fallen": bool(fallen),
@@ -448,6 +498,7 @@ class System2Controller:
             "max_prediction_error": spec.max_prediction_error,
             "skill_id": spec.skill_id,
             "bundle_candidate": bundle.get("candidate"),
+            "recovery_schedule_candidate": sched_cand,
             "source": (
                 "fallen_override"
                 if self._s2_override_active
@@ -869,12 +920,18 @@ class System2Controller:
     ) -> tuple[bool, dict[str, Any]]:
         if fallen:
             return False, {"fallen": True}
-        return episode_success_with_pe_fallback(
+        posture_ok, posture_diag = override_recovered_posture_ok(obs_f)
+        if not posture_ok:
+            return False, {"override_posture_gate": False, **posture_diag}
+        ok, pe_diag = episode_success_with_pe_fallback(
             self._override_start_obs_f,
             obs_f,
             self._recovery_episode_spec,
             macro="RECOVER_POSTURE",
         )
+        pe_diag.update(posture_diag)
+        pe_diag["override_posture_gate"] = True
+        return ok, pe_diag
 
     def _record_override_distill_neuro(
         self,
@@ -971,6 +1028,13 @@ class System2Controller:
         macro = "RECOVER_POSTURE"
         bundle = macro_bundle(macro)
         graph_patch: dict[str, float] = dict(bundle.get("graph") or {})
+        graph_patch.update(
+            {
+                "intent_stop_recover": 0.78,
+                "intent_stride": 0.48,
+                "intent_gait_coupling": 0.42,
+            }
+        )
         residuals: dict[str, float] = dict(bundle.get("residuals") or {})
         if extra_residuals:
             for k, v in extra_residuals.items():
@@ -1215,23 +1279,24 @@ class System2Controller:
             max_age = _s2_override_max_ticks()
             if not fallen:
                 ok, pe_diag = self._override_episode_eval(obs_f, fallen=False)
-                self._record_override_distill_neuro(
-                    sim_tick=sim_tick,
-                    agent=agent,
-                    obs_f=obs_f,
-                    success=ok,
-                    source_note="recovered",
-                    pe_diag=pe_diag,
-                )
-                diag = self._build_override_diag(
-                    sim_tick,
-                    fallen,
-                    age,
-                    max_age,
-                    recovered=True,
-                )
-                self._clear_override_session()
-                return diag
+                if pe_diag.get("override_posture_gate", True):
+                    self._record_override_distill_neuro(
+                        sim_tick=sim_tick,
+                        agent=agent,
+                        obs_f=obs_f,
+                        success=ok,
+                        source_note="recovered",
+                        pe_diag=pe_diag,
+                    )
+                    diag = self._build_override_diag(
+                        sim_tick,
+                        fallen,
+                        age,
+                        max_age,
+                        recovered=True,
+                    )
+                    self._clear_override_session()
+                    return diag
             if age >= max_age:
                 self._force_reset_stance_base(base)
                 self._record_override_distill_neuro(

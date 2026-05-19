@@ -158,6 +158,46 @@ def evaluate_macro_success(
     return ok, diag
 
 
+def override_recovered_posture_ok(obs: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """
+    Минимальная «антропоморфная» готовность выйти из fallen_override:
+    не только ``is_fallen()==False``, но и достаточная осанка / высота CoM.
+    """
+    try:
+        ps_min = float(os.environ.get("RKK_S2_OVERRIDE_MIN_POSTURE", "0.42"))
+    except ValueError:
+        ps_min = 0.42
+    try:
+        cz_min = float(os.environ.get("RKK_S2_OVERRIDE_MIN_COM_Z", "0.38"))
+    except ValueError:
+        cz_min = 0.38
+    try:
+        foot_min = float(os.environ.get("RKK_S2_OVERRIDE_MIN_FOOT_CONTACT", "0.18"))
+    except ValueError:
+        foot_min = 0.18
+    ps = _g(obs, "posture_stability", 0.0)
+    cz = _g(obs, "com_z", 0.0)
+    fl = _g(obs, "foot_contact_l", 0.0)
+    fr = _g(obs, "foot_contact_r", 0.0)
+    foot_ok = max(fl, fr) >= foot_min
+    ok = ps >= ps_min and cz >= cz_min and foot_ok
+    diag = {
+        "posture_stability": round(ps, 4),
+        "com_z": round(cz, 4),
+        "foot_contact_max": round(max(fl, fr), 4),
+        "min_posture": ps_min,
+        "min_com_z": cz_min,
+    }
+    if not ok:
+        if ps < ps_min:
+            diag["override_exit_block"] = "posture_low"
+        elif cz < cz_min:
+            diag["override_exit_block"] = "com_z_low"
+        else:
+            diag["override_exit_block"] = "foot_contact_low"
+    return ok, diag
+
+
 def wave1_delta_success(
     obs0: Mapping[str, Any],
     obs1: Mapping[str, Any],

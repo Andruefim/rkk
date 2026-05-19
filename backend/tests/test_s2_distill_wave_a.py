@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from engine.system2.success_predicates import override_recovered_posture_ok
+from engine.system2.success_predicates import override_recovered_posture_ok
 from engine.system2.distill_log import (
     DistillHealthTracker,
     analyze_distill_file,
@@ -71,3 +73,20 @@ def test_analyze_distill_file(tmp_path: Path):
     assert rep["rows"] == 2
     assert rep["by_macro"]["RECOVER_POSTURE"] == 1.0
     assert rep["recover"]["count"] == 1
+
+
+def test_override_recovered_posture_gate():
+    ok, _ = override_recovered_posture_ok(
+        {
+            "posture_stability": 0.55,
+            "com_z": 0.48,
+            "foot_contact_l": 0.4,
+            "foot_contact_r": 0.35,
+        }
+    )
+    assert ok
+    ok2, diag = override_recovered_posture_ok(
+        {"posture_stability": 0.2, "com_z": 0.5, "foot_contact_l": 0.5, "foot_contact_r": 0.5}
+    )
+    assert not ok2
+    assert diag.get("override_exit_block") == "posture_low"
