@@ -185,6 +185,7 @@ def _s2_concept_count(graph: Any) -> int:
 
 
 _S2_LLM_EXECUTOR: ThreadPoolExecutor | None = None
+_RECOVERY_LLM_EXECUTOR: ThreadPoolExecutor | None = None
 
 
 def _system2_llm_executor() -> ThreadPoolExecutor:
@@ -195,6 +196,23 @@ def _system2_llm_executor() -> ThreadPoolExecutor:
             thread_name_prefix="rkk_s2_llm",
         )
     return _S2_LLM_EXECUTOR
+
+
+def _recovery_llm_executor() -> ThreadPoolExecutor:
+    global _RECOVERY_LLM_EXECUTOR
+    if _RECOVERY_LLM_EXECUTOR is None:
+        _RECOVERY_LLM_EXECUTOR = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="rkk_s2_recovery_llm",
+        )
+    return _RECOVERY_LLM_EXECUTOR
+
+
+def _recovery_llm_max_ingest_delay_ticks() -> int:
+    try:
+        return max(8, int(os.environ.get("RKK_S2_RECOVERY_LLM_MAX_INGEST_DELAY_TICKS", "90")))
+    except ValueError:
+        return 90
 
 
 def _llm_sync_forced() -> bool:
@@ -747,6 +765,11 @@ class System2Controller:
         steps_try = enrich_recovery_steps(steps_try)
         if not any(st.get("intent_deltas") for st in steps_try):
             return False
+        # Reject degenerate plans (e.g. cumulative duration too short, or all steps are <= 2 ticks)
+        total_ticks = sum(int(max(1, s.get("ticks", 1))) for s in steps_try)
+        all_short = all(int(s.get("ticks", 1)) <= 2 for s in steps_try)
+        if total_ticks <= 5 or all_short:
+            return False
         self._ingest_recovery_steps(steps_try, sim_tick=sim_tick, from_llm=True)
         self._recovery_schedule_source = "llm"
         self._recovery_llm_fail_count = 0
@@ -766,15 +789,12 @@ class System2Controller:
             return
         if int(sim_tick) - dt < _recovery_llm_timeout_ticks():
             return
-        try:
-            fut.cancel()
-        except Exception:
-            pass
-        self._recovery_llm_future = None
-        self._recovery_llm_fail_count = int(self._recovery_llm_fail_count) + 1
-        self._last_recovery_llm_error = "timeout"
-        if recovery_fallback_enabled() and not self._recovery_steps:
+        # If it is already running, we DO NOT cancel or nullify the future,
+        # to ensure that we give it time to complete and do not spawn a new one.
+        # However, we trigger the fallback recovery steps if nothing else is running yet.
+        if recovery_fallback_enabled() and not self._recovery_steps and not self._recovery_fallback_applied:
             self._apply_fallback_recovery_schedule(sim_tick)
+            self._last_recovery_llm_error = "timeout_fallback"
 
     def _drain_recovery_llm_future(self, sim_tick: int) -> None:
         if self._recovery_llm_future is None or not self._recovery_llm_future.done():
@@ -787,6 +807,16 @@ class System2Controller:
             err = f"exception:{type(ex).__name__}"
             pack = None
         self._recovery_llm_future = None
+
+        # Check if the plan arrived too late (since the physical context has changed completely)
+        dt = int(self._recovery_llm_dispatch_tick)
+        if dt >= 0 and (int(sim_tick) - dt) > _recovery_llm_max_ingest_delay_ticks():
+            self._recovery_llm_fail_count = int(self._recovery_llm_fail_count) + 1
+            self._last_recovery_llm_error = "too_late"
+            if recovery_fallback_enabled() and not self._recovery_steps and not self._recovery_fallback_applied:
+                self._apply_fallback_recovery_schedule(sim_tick)
+            return
+
         if self._ingest_recovery_pack(pack, sim_tick=sim_tick):
             self._last_recovery_llm_error = ""
             return
@@ -862,7 +892,7 @@ class System2Controller:
                 ):
                     self._apply_fallback_recovery_schedule(sim_tick)
         else:
-            self._recovery_llm_future = _system2_llm_executor().submit(
+            self._recovery_llm_future = _recovery_llm_executor().submit(
                 partial(
                     recovery_steps_from_llm_network_fetch,
                     images_b64=exo_imgs,
@@ -1147,7 +1177,7 @@ class System2Controller:
             "recovery_steps_loaded": len(self._recovery_steps),
             "recovery_llm_dispatches": int(self._recovery_llm_dispatch_count),
             "macro": "RECOVER_POSTURE",
-            "source": "fallen_override",
+            "source": f"fallen_override:{self._recovery_schedule_source}" if self._recovery_schedule_source and self._recovery_schedule_source != "none" else "fallen_override",
             "sim_tick": sim_tick,
             "fallen": bool(fallen),
             "blocked": False,
