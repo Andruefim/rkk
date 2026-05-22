@@ -149,3 +149,37 @@ def test_parse_recovery_llm_plan_expected_state():
     assert len(steps) == 1
     assert es.get("posture_stability") == 0.6
     assert mx == 0.4
+
+
+def test_parse_recovery_sequential_ticks_scaled():
+    from engine.system2.schema import parse_recovery_motor_steps
+
+    # Sequential index ticks (1, 2, 3) should be scaled by 25
+    steps = parse_recovery_motor_steps(
+        {
+            "steps": [
+                {"ticks": 1, "intent_deltas": {"intent_stop_recover": 0.05}},
+                {"ticks": 2, "intent_deltas": {"intent_torso_forward": 0.04}},
+                {"ticks": 3, "intent_deltas": {"intent_stride": 0.02}},
+            ]
+        }
+    )
+    assert steps is not None
+    assert len(steps) == 3
+    assert steps[0]["ticks"] == 25
+    assert steps[1]["ticks"] == 50
+    assert steps[2]["ticks"] == 75
+
+    # Non-sequential ticks should NOT be scaled
+    steps_normal = parse_recovery_motor_steps(
+        {
+            "steps": [
+                {"ticks": 30, "intent_deltas": {"intent_stop_recover": 0.05}},
+                {"ticks": 40, "intent_deltas": {"intent_torso_forward": 0.04}},
+            ]
+        }
+    )
+    assert steps_normal is not None
+    assert steps_normal[0]["ticks"] == 30
+    assert steps_normal[1]["ticks"] == 40
+

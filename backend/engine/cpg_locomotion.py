@@ -318,8 +318,8 @@ class LocomotionController:
             coeff_tk = float(os.environ.get("RKK_CPG_TORSO_KNEE_COEFF", "0.10"))
         except ValueError:
             coeff_tk = 0.10
-        coeff_th = float(np.clip(coeff_th, 0.0, 0.32))
-        coeff_tk = float(np.clip(coeff_tk, 0.0, 0.22))
+        coeff_th = float(np.clip(coeff_th, 0.0, 0.45))
+        coeff_tk = float(np.clip(coeff_tk, 0.0, 0.35))
         raw_torso = float(self._node(agent_nodes, "intent_torso_forward"))
         torso_excess = float(max(0.0, raw_torso - 0.48))
         torso_hip_scale = float(

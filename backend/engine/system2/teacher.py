@@ -219,7 +219,7 @@ def _build_unified_s2_prompt(
         "You are System2 for an embodied humanoid (Nova). Output ONLY one JSON object, no markdown.\n"
         "Primary keys: macro (IDLE, RECOVER_POSTURE, LOCOMOTE_DELIVERY, EXPLORE), "
         "goal (optional com_z_min, posture_stability_min, target_dist_max in [0.05,0.95]), "
-        "intent_deltas (optional intent_* floats, max magnitude 0.12), rationale (short).\n"
+        "intent_deltas (optional intent_* floats, max magnitude 0.85), rationale (short).\n"
         "Optional: expected_state (sensor→float), max_prediction_error (positive float), skill_id.\n"
         f"Example expected_state keys: {es_hint}\n"
         f"{slot_block}{img_block}{extra}"
@@ -370,7 +370,7 @@ def proposal_from_llm_network_fetch(
         "You are System2 for an embodied humanoid (Nova). Output ONLY one JSON object, no markdown.\n"
         "Keys: macro (one of IDLE, RECOVER_POSTURE, LOCOMOTE_DELIVERY, EXPLORE), "
         "goal (optional: com_z_min, posture_stability_min, target_dist_max as floats in [0.05,0.95]), "
-        "intent_deltas (optional: small floats for keys starting with intent_ only, max magnitude 0.12), "
+        "intent_deltas (optional: floats for keys starting with intent_ only, max magnitude 0.85), "
         "rationale (one short sentence).\n"
         "Optional intentional prior for episode success: expected_state object mapping sensor names to "
         "target floats (subset of known keys only; unknown keys ignored). "
@@ -518,24 +518,61 @@ def recovery_steps_from_llm_network_fetch(
     if not recovery_llm_enabled():
         return None
 
+    from engine.system2.recovery_schedule import prepare_llm_recovery_steps
+
+    imgs = [normalize_ollama_image_b64(x) for x in (images_b64 or []) if x]
+    imgs = [x for x in imgs if x]
+    for attempt in range(2):
+        raw = _fetch_recovery_llm_raw(compact, vlm_slots_str, images_b64=imgs)
+        if not isinstance(raw, dict):
+            continue
+        plan = parse_recovery_llm_plan(raw)
+        if plan is None:
+            continue
+        steps, es, mx = plan
+        for st in steps:
+            st["intent_deltas"] = clip_intent_deltas(st.get("intent_deltas") or {})
+        steps_ready, _ = prepare_llm_recovery_steps(steps)
+        if steps_ready:
+            return (steps_ready, es, mx)
+    return None
+
+
+def _fetch_recovery_llm_raw(
+    compact: dict[str, Any],
+    vlm_slots_str: str,
+    *,
+    images_b64: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Single Ollama attempt; used by recovery_steps_from_llm_network_fetch (+ retry)."""
+    if not recovery_llm_enabled():
+        return None
     extra = f"\nVLM_slots: {vlm_slots_str}\n" if vlm_slots_str else ""
     es_hint = ", ".join(sorted(expected_state_key_allowlist())[:40])
     prompt = (
         "You are System2 motor recovery planner for humanoid Nova. "
         "Output ONLY one JSON object, no markdown.\n"
-        "Schema: {\"steps\": [{\"ticks\": <int 1-80>, \"intent_deltas\": "
-        "{ \"intent_*\": <small float -0.12..0.12> } }, ...] }\n"
+        "Schema: {\"steps\": [{\"ticks\": <int 10-80, duration of this step in simulation frames, e.g., 30. NOT a sequential step index like 1, 2, 3!>, \"intent_deltas\": "
+        "{ \"intent_*\": <float -0.85..0.85> } }, ...] }\n"
+        "CRITICAL: ticks must be 10-80 frame counts per step. Forbidden: ticks 1,2,3,4,5,6 as step numbers.\n"
+        "SEMANTICS: intent_stop_recover is RECOVERY DRIVE (higher graph value = tuck/stand-up), "
+        "NOT 'stop recovering'. Use SMALL deltas +0.08..+0.20 in early steps, "
+        "then intent_torso_forward +0.10..+0.25, intent_support_left/right +0.08..+0.18. "
+        "Late step: intent_stop_recover delta -0.04..-0.08 to release walk. "
+        "Avoid intent_stride > +0.06 while com_z is low.\n"
+        "Example: [{\"ticks\": 30, \"intent_deltas\": {\"intent_torso_forward\": 0.18, "
+        "\"intent_support_left\": 0.12, \"intent_stop_recover\": 0.12}}, "
+        "{\"ticks\": 25, \"intent_deltas\": {\"intent_torso_forward\": 0.14, \"intent_stop_recover\": 0.08}}]\n"
         "Optional top-level keys: expected_state (map of sensor names to target floats), "
         "max_prediction_error (positive float, L1 cap vs expected_state at episode end).\n"
-        "2–6 steps. Prefer intent_stop_recover, intent_support_left/right, "
-        "intent_torso_forward, intent_arm_counterbalance, intent_lean_forward. "
+        "2–6 steps. Prefer intent_torso_forward, intent_support_left/right, "
+        "intent_stop_recover (small +deltas), intent_arm_counterbalance, intent_lean_forward. "
         "Do not invent keys outside intent_* for intent_deltas; "
         f"expected_state keys must be from the registry, e.g. {es_hint}\n"
         f"{extra}"
         "Current grounded state (m = meters, _norm = env normalization):\n"
         f"{json.dumps(compact, ensure_ascii=False, indent=2)[:2800]}\n"
     )
-    raw: dict[str, Any] | None = None
     imgs = [normalize_ollama_image_b64(x) for x in (images_b64 or []) if x]
     imgs = [x for x in imgs if x]
     if imgs:
@@ -549,49 +586,36 @@ def recovery_steps_from_llm_network_fetch(
             num_predict=380,
             temperature=0.1,
         )
-    if raw is None:
-        try:
-            import httpx
+        if isinstance(raw, dict):
+            return raw
+    try:
+        import httpx
 
-            url = f"{_ollama_url()}/api/chat"
-            body = {
-                "model": _ollama_model(),
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                **ollama_think_disabled_payload(),
-                "format": "json",
-                "options": {"temperature": 0.1, "num_predict": 320},
-            }
-            with httpx.Client(timeout=httpx.Timeout(55.0, connect=8.0)) as client:
-                r = client.post(url, json=body)
-                r.raise_for_status()
-                data = r.json()
-            msg = (data.get("message") or {}) if isinstance(data, dict) else {}
-            text = str(msg.get("content", "")).strip()
-            if not text:
-                text = str(data.get("response", "")).strip() if isinstance(data, dict) else ""
-            if text:
-                try:
-                    raw = json.loads(text)
-                except json.JSONDecodeError:
-                    raw = _extract_json_object(text)
-        except Exception:
-            return None
-
-    if not isinstance(raw, dict):
+        url = f"{_ollama_url()}/api/chat"
+        body = {
+            "model": _ollama_model(),
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            **ollama_think_disabled_payload(),
+            "format": "json",
+            "options": {"temperature": 0.1, "num_predict": 320},
+        }
+        with httpx.Client(timeout=httpx.Timeout(55.0, connect=8.0)) as client:
+            r = client.post(url, json=body)
+            r.raise_for_status()
+            data = r.json()
+        msg = (data.get("message") or {}) if isinstance(data, dict) else {}
+        text = str(msg.get("content", "")).strip()
+        if not text:
+            text = str(data.get("response", "")).strip() if isinstance(data, dict) else ""
+        if text:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return _extract_json_object(text)
+    except Exception:
         return None
-    plan = parse_recovery_llm_plan(raw)
-    if plan is None:
-        return None
-    steps, es, mx = plan
-    from engine.system2.recovery_schedule import enrich_recovery_steps
-
-    for st in steps:
-        st["intent_deltas"] = clip_intent_deltas(st.get("intent_deltas") or {})
-    steps = enrich_recovery_steps(steps)
-    if not any(st.get("intent_deltas") for st in steps):
-        return None
-    return (steps, es, mx)
+    return None
 
 
 def proposal_from_llm(

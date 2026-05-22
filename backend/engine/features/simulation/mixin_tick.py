@@ -542,7 +542,16 @@ class SimulationTickMixin:
                     and self.tick > self._curriculum_stabilize_until
                 ):
                     self._fr_try_reattach_after_fall(obs_fall)
-                if self._maybe_recover_or_reset_after_fall(obs_fall):
+                s2 = getattr(self, "_system2", None)
+                defer_fall_reset = (
+                    s2 is not None
+                    and callable(getattr(s2, "defer_sim_fall_hard_reset", None))
+                    and s2.defer_sim_fall_hard_reset()
+                )
+                if defer_fall_reset:
+                    if self._fall_recovery_active:
+                        self._clear_fall_recovery()
+                elif self._maybe_recover_or_reset_after_fall(obs_fall):
                     obs = self.agent.env.observe()
                     self._sync_motor_state(obs, source="reset", tick=self.tick)
                     for nid in self.agent.graph._node_ids:

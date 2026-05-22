@@ -751,6 +751,25 @@ class RKKAgent:
         except ValueError:
             return 8
 
+    def _enrich_s2_wm_candidate(self, cand: dict, *, macro: str | None = None) -> dict:
+        """System1 needs features[] on every WM / schedule candidate."""
+        out = dict(cand)
+        var = str(out.get("variable", ""))
+        if not var:
+            return out
+        target = str(out.get("target", "posture_stability"))
+        if not out.get("features"):
+            try:
+                out["features"] = self._features_for_intervention_pair(var, target)
+            except Exception:
+                out["features"] = []
+        out.setdefault("from_s2_wm_planner", True)
+        out.setdefault("from_system2", True)
+        if macro:
+            out.setdefault("s2_wm_macro", macro)
+        out.setdefault("s2_wm_score", float(out.get("s2_wm_score", 0.0)))
+        return out
+
     def _maybe_s2_wm_candidate(
         self,
         *,
@@ -766,11 +785,24 @@ class RKKAgent:
 
         if not s2_wm_planner_enabled():
             return None
+        if s2_ctx.get("wm_override_schedule_only") and s2_ctx.get(
+            "fallen_override_active"
+        ):
+            sched = s2_ctx.get("recovery_schedule_candidate")
+            if isinstance(sched, dict) and sched.get("variable"):
+                slow_t["s2_wm_planner"] = 0.0
+                return self._enrich_s2_wm_candidate(
+                    sched, macro=str(s2_ctx.get("macro", "RECOVER_POSTURE"))
+                )
         every = self._s2_wm_cache_every()
         cached = getattr(self, "_s2_wm_cache_cand", None)
         ct = int(getattr(self, "_s2_wm_cache_tick", -10**9))
         if cached is not None and (engine_tick - ct) < every:
             slow_t["s2_wm_planner"] = 0.0
+            if cached.get("variable") and not cached.get("features"):
+                cached = self._enrich_s2_wm_candidate(
+                    cached, macro=str(s2_ctx.get("macro", ""))
+                )
             return cached
         t0 = time.perf_counter()
         cand = plan_s2_wm_candidate(
@@ -2138,6 +2170,17 @@ class RKKAgent:
             except ValueError:
                 _pfr_vl = 0.3
             _pfr_vl = float(np.clip(_pfr_vl, 0.0, 1.0))
+        _recovery_vl = False
+        s2_ctx_vl = getattr(self, "_s2_planning_context", None)
+        if isinstance(s2_ctx_vl, dict) and s2_ctx_vl.get("fallen_override_active"):
+            if os.environ.get("RKK_S2_RECOVERY_VL_RELAX", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            ):
+                _recovery_vl = True
+                _pfr_vl = 1.0
 
         vl_horizon = self._effective_imagination_horizon(enable_l3)
         vl_tries = min(_max_fallback_tries_from_env(), len(scores))
@@ -2179,6 +2222,7 @@ class RKKAgent:
                 engine_tick=engine_tick,
                 imagination_horizon=vl_horizon,
                 post_fr_loco_relax=_pfr_vl,
+                recovery_override=_recovery_vl,
                 precomputed_s1=pre_s1,
             )
 

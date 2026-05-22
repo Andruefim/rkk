@@ -284,6 +284,8 @@ gantt
 
 **Не начинать B**, пока A не покажет приемлемый RECOVER/EXPLORE success rate — иначе автономия закрепит плохие макросы.
 
+**Foundation gate (после S2 Recovery Foundation):** `python backend/tools/analyze_s2_distill.py` — RECOVER `success_rate >= RKK_S2_DISTILL_RECOVER_MIN_SUCCESS_RATE` (0.25), `n>=20`, и ≥10% эпизодов с `recover_tier >= 1` в distill. Пока только `max_ticks_reset` — Wave B не стартовать.
+
 ---
 
 ## Риски

@@ -47,9 +47,28 @@ class SimulationLocomotionMixin:
     def _publish_cpg_node_snapshot(self) -> None:
         self._bg.publish_cpg_node_snapshot()
 
+    @staticmethod
+    def _s2_cpg_during_override_enabled() -> bool:
+        return os.environ.get("RKK_S2_CPG_DURING_OVERRIDE", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
     def _maybe_apply_cpg_locomotion(self, fallen: bool) -> None:
         """Phase A+D: CPG + Motor Cortex blended locomotion."""
         dt = 0.05
+        s2 = getattr(self, "_system2", None)
+        s2_override = s2 is not None and getattr(s2, "_s2_override_active", False)
+        if s2_override and not self._s2_cpg_during_override_enabled():
+            base = self._unwrap_base_env(self.agent.env)
+            if base is not None:
+                base.cpg_owns_legs = False
+            return
+        if s2_override:
+            fallen = True
+
         if self._cpg_decoupled_enabled():
             return
         if not self._locomotion_cpg_enabled():

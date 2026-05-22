@@ -158,44 +158,170 @@ def evaluate_macro_success(
     return ok, diag
 
 
-def override_recovered_posture_ok(obs: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
-    """
-    Минимальная «антропоморфная» готовность выйти из fallen_override:
-    не только ``is_fallen()==False``, но и достаточная осанка / высота CoM.
-    """
-    try:
-        ps_min = float(os.environ.get("RKK_S2_OVERRIDE_MIN_POSTURE", "0.42"))
-    except ValueError:
-        ps_min = 0.42
-    try:
-        cz_min = float(os.environ.get("RKK_S2_OVERRIDE_MIN_COM_Z", "0.38"))
-    except ValueError:
-        cz_min = 0.38
+def _override_foot_contact_ok(obs: Mapping[str, Any]) -> tuple[bool, float, float]:
     try:
         foot_min = float(os.environ.get("RKK_S2_OVERRIDE_MIN_FOOT_CONTACT", "0.18"))
     except ValueError:
         foot_min = 0.18
-    ps = _g(obs, "posture_stability", 0.0)
-    cz = _g(obs, "com_z", 0.0)
     fl = _g(obs, "foot_contact_l", 0.0)
     fr = _g(obs, "foot_contact_r", 0.0)
-    foot_ok = max(fl, fr) >= foot_min
-    ok = ps >= ps_min and cz >= cz_min and foot_ok
+    return max(fl, fr) >= foot_min, fl, fr
+
+
+def _override_min_com_z_abs() -> float:
+    raw = os.environ.get(
+        "RKK_S2_OVERRIDE_MIN_COM_Z_ABS",
+        os.environ.get("RKK_S2_OVERRIDE_MIN_COM_Z", "0.38"),
+    )
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.38
+
+
+def override_recovered_tier1_ok(
+    obs: Mapping[str, Any],
+    obs0: Mapping[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """
+    Tier1: not fallen + measurable progress vs override start (prone → crawl/kneel).
+    """
+    try:
+        d_cz_min = float(os.environ.get("RKK_S2_RECOVER_TIER1_DCOMZ", "0.04"))
+    except ValueError:
+        d_cz_min = 0.04
+    try:
+        d_ps_min = float(os.environ.get("RKK_S2_RECOVER_TIER1_DPOSTURE", "0.06"))
+    except ValueError:
+        d_ps_min = 0.06
+    cz0 = float(_g(obs0, "com_z", 0.5))
+    cz1 = float(_g(obs, "com_z", cz0))
+    ps0 = float(_g(obs0, "posture_stability", 0.5))
+    ps1 = float(_g(obs, "posture_stability", ps0))
+    foot_ok, fl, fr = _override_foot_contact_ok(obs)
+    d_cz = cz1 - cz0
+    d_ps = ps1 - ps0
+    try:
+        prone_cz = float(os.environ.get("RKK_S2_RECOVER_TIER1_PRONE_COM_Z", "0.22"))
+    except ValueError:
+        prone_cz = 0.22
+    try:
+        prone_ps = float(os.environ.get("RKK_S2_RECOVER_TIER1_PRONE_POSTURE", "0.18"))
+    except ValueError:
+        prone_ps = 0.18
+    try:
+        min_cz1 = float(os.environ.get("RKK_S2_RECOVER_TIER1_MIN_COM_Z", "0.10"))
+    except ValueError:
+        min_cz1 = 0.10
+    prone = cz0 < prone_cz or ps0 < prone_ps
+    if prone:
+        progress = d_cz >= d_cz_min and cz1 >= min_cz1
+    else:
+        progress = d_cz >= d_cz_min or d_ps >= d_ps_min
+    ok = foot_ok and progress
     diag = {
-        "posture_stability": round(ps, 4),
-        "com_z": round(cz, 4),
+        "recover_tier": 1,
+        "d_com_z": round(d_cz, 5),
+        "d_posture": round(d_ps, 5),
+        "tier1_prone_mode": prone,
+        "com_z": round(cz1, 4),
+        "posture_stability": round(ps1, 4),
         "foot_contact_max": round(max(fl, fr), 4),
-        "min_posture": ps_min,
-        "min_com_z": cz_min,
+        "tier1_d_com_z_min": d_cz_min,
+        "tier1_d_posture_min": d_ps_min,
     }
     if not ok:
-        if ps < ps_min:
+        if not foot_ok:
+            diag["override_exit_block"] = "foot_contact_low"
+        else:
+            diag["override_exit_block"] = "tier1_no_progress"
+    return ok, diag
+
+
+def override_recovered_tier2_ok(
+    obs: Mapping[str, Any],
+    obs0: Mapping[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    """Tier2: stand-ready — relative com_z lift + absolute floor + posture."""
+    try:
+        ps_min = float(os.environ.get("RKK_S2_OVERRIDE_MIN_POSTURE", "0.42"))
+    except ValueError:
+        ps_min = 0.42
+    cz_abs_min = _override_min_com_z_abs()
+    try:
+        d_cz_min = float(os.environ.get("RKK_S2_RECOVER_TIER2_DCOMZ", "0.08"))
+    except ValueError:
+        d_cz_min = 0.08
+    cz0 = float(_g(obs0, "com_z", 0.5))
+    cz1 = float(_g(obs, "com_z", cz0))
+    ps1 = float(_g(obs, "posture_stability", 0.0))
+    foot_ok, fl, fr = _override_foot_contact_ok(obs)
+    cz_ok = cz1 >= cz_abs_min and (cz1 - cz0) >= d_cz_min
+    ok = ps1 >= ps_min and cz_ok and foot_ok
+    diag = {
+        "recover_tier": 2,
+        "posture_stability": round(ps1, 4),
+        "com_z": round(cz1, 4),
+        "d_com_z": round(cz1 - cz0, 5),
+        "foot_contact_max": round(max(fl, fr), 4),
+        "min_posture": ps_min,
+        "min_com_z_abs": cz_abs_min,
+        "tier2_d_com_z_min": d_cz_min,
+    }
+    if not ok:
+        if ps1 < ps_min:
             diag["override_exit_block"] = "posture_low"
-        elif cz < cz_min:
+        elif not cz_ok:
             diag["override_exit_block"] = "com_z_low"
         else:
             diag["override_exit_block"] = "foot_contact_low"
     return ok, diag
+
+
+def override_recovered_posture_ok(obs: Mapping[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """
+    Tier2 stand gate without obs0 (legacy callers). Prefer tier2 with obs0.
+    Uses a prone floor baseline for relative com_z when obs0 is unknown.
+    """
+    try:
+        floor_cz = float(os.environ.get("RKK_S2_RECOVER_BASELINE_COM_Z", "0.10"))
+    except ValueError:
+        floor_cz = 0.10
+    cz = float(_g(obs, "com_z", 0.5))
+    obs0 = {"com_z": min(cz, floor_cz), "posture_stability": 0.0}
+    return override_recovered_tier2_ok(obs, obs0)
+
+
+def evaluate_override_recovery_exit(
+    obs: Mapping[str, Any],
+    obs0: Mapping[str, Any],
+    spec: EpisodeSuccessSpec,
+    *,
+    macro: str = "RECOVER_POSTURE",
+) -> tuple[int, bool, dict[str, Any]]:
+    """Returns (tier 0|1|2, success, diag). tier 0 = no exit. Check tier2 before tier1."""
+    t2_ok, t2_diag = override_recovered_tier2_ok(obs, obs0)
+    if t2_ok:
+        ok, pe_diag = episode_success_with_pe_fallback(obs0, obs, spec, macro=macro)
+        pe_diag.update(t2_diag)
+        pe_diag["override_posture_gate"] = True
+        return 2, ok, pe_diag
+    t1_ok, t1_diag = override_recovered_tier1_ok(obs, obs0)
+    if t1_ok:
+        ok, pe_diag = episode_success_with_pe_fallback(obs0, obs, spec, macro=macro)
+        pe_diag.update(t1_diag)
+        pe_diag["override_posture_gate"] = True
+        if not ok:
+            pe_diag["wave1"] = True
+            ok = wave1_delta_success(obs0, obs)
+        return 1, ok, pe_diag
+    block = t2_diag.get("override_exit_block") or t1_diag.get("override_exit_block", "")
+    return 0, False, {
+        "override_posture_gate": False,
+        "override_exit_block": block,
+        **{k: v for k, v in t2_diag.items() if k not in t1_diag},
+        **t1_diag,
+    }
 
 
 def wave1_delta_success(

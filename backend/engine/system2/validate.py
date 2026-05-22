@@ -18,12 +18,12 @@ def clip_intent_deltas(
     if not deltas:
         return {}
     try:
-        lim = float(os.environ.get("RKK_SYSTEM2_MAX_INTENT_DELTA", "0.12"))
+        lim = float(os.environ.get("RKK_SYSTEM2_MAX_INTENT_DELTA", "0.85"))
     except ValueError:
-        lim = 0.12
+        lim = 0.85
     if max_abs is not None:
         lim = min(lim, float(max_abs))
-    lim = float(max(0.0, min(0.35, lim)))
+    lim = float(max(0.0, min(1.0, lim)))
     out: dict[str, float] = {}
     for k, v in deltas.items():
         sk = str(k).strip()

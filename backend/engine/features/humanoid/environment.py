@@ -578,7 +578,7 @@ class EnvironmentHumanoid:
         sm, am = self._recovery_body_mapping_scales(raw_phys)
         pitch = float(
             np.clip(
-                0.5 + (torso - 0.5) * 0.55 * sm + (lean - 0.5) * 0.28 * sm + bal,
+                0.5 + (torso - 0.5) * 0.95 * sm + (lean - 0.5) * 0.28 * sm + bal,
                 0.05,
                 0.95,
             )
@@ -714,6 +714,71 @@ class EnvironmentHumanoid:
         self._sim.set_joint("rankle", ankle)
 
         self._apply_upper_body_from_intents(cpg_sync=None)
+
+    def apply_scripted_getup_physics(self, phase_name: str) -> None:
+        """
+        Direct joint + intent drive for scripted recovery (intents alone are too weak on the floor).
+        """
+        off = os.environ.get("RKK_S2_RECOVERY_SCRIPTED_PHYSICS", "1").strip().lower()
+        if off in ("0", "false", "no", "off"):
+            return
+        try:
+            from engine.system2.recovery_schedule import scripted_getup_joint_targets
+
+            targets = scripted_getup_joint_targets(phase_name)
+        except Exception:
+            return
+        if not targets:
+            return
+        phase_intents = {
+            "tuck": {
+                "intent_stop_recover": 0.68,
+                "intent_support_left": 0.62,
+                "intent_support_right": 0.62,
+                "intent_stride": 0.42,
+                "intent_torso_forward": 0.52,
+            },
+            "torso_lift": {
+                "intent_stop_recover": 0.62,
+                "intent_torso_forward": 0.72,
+                "intent_arm_counterbalance": 0.58,
+                "intent_stride": 0.44,
+            },
+            "push_up": {
+                "intent_torso_forward": 0.76,
+                "intent_lean_forward": 0.64,
+                "intent_support_left": 0.66,
+                "intent_stop_recover": 0.58,
+            },
+            "kneel": {
+                "intent_torso_forward": 0.66,
+                "intent_support_left": 0.58,
+                "intent_support_right": 0.58,
+                "intent_stop_recover": 0.54,
+            },
+            "release_walk": {
+                "intent_stop_recover": 0.48,
+                "intent_torso_forward": 0.56,
+                "intent_stride": 0.52,
+            },
+        }
+        for k, v in (phase_intents.get(str(phase_name)) or phase_intents["tuck"]).items():
+            if k in MOTOR_INTENT_VARS:
+                self._motor_state[k] = float(np.clip(v, 0.05, 0.95))
+        try:
+            n_sub = int(os.environ.get("RKK_S2_RECOVERY_SCRIPTED_PHYS_SUBSTEPS", "6"))
+        except ValueError:
+            n_sub = 6
+        n_sub = int(np.clip(n_sub, 1, 24))
+        prev_cpg = bool(getattr(self, "cpg_owns_legs", False))
+        self.cpg_owns_legs = False
+        self.set_joint_targets(targets)
+        if not self._intero_control_lost:
+            self._apply_motor_intents()
+        self.cpg_owns_legs = prev_cpg
+        for _ in range(n_sub):
+            self._sim.step(self.steps_per_do)
+        self._update_interoception()
 
     def apply_motor_intent_residuals(self, residuals: dict[str, float]) -> None:
         """

@@ -77,6 +77,17 @@ def main() -> int:
     print(f"  median d_com_z: {rec.get('median_d_com_z')}")
     print(f"  median d_posture: {rec.get('median_d_posture')}")
     print(f"  PE pass rate: {_pct(rec.get('pe_pass_rate'))}")
+    tiers = rec.get("tier_counts") or {}
+    if tiers:
+        print(f"  recover_tier counts: {dict(sorted(tiers.items()))}")
+    ends = rec.get("ending_counts") or {}
+    if ends:
+        print("  ending / distill_event:")
+        for k, v in sorted(ends.items(), key=lambda x: -x[1])[:12]:
+            print(f"    {k}: {v}")
+    sched = rec.get("schedule_sources") or {}
+    if sched:
+        print(f"  recovery_schedule_source: {sched}")
 
     health = report.get("health") or {}
     print("\nBlend readiness (rolling tracker):")
@@ -88,6 +99,22 @@ def main() -> int:
     print(f"  RKK_S2_DISTILL_MIN_SUCCESS_RATE={distill_min_success_rate()}")
     print(f"  RKK_S2_DISTILL_RECOVER_MIN_SUCCESS_RATE={distill_recover_min_success_rate()}")
     print(f"  RKK_S2_DISTILL_BLEND_READY_STUDENT_CONF={blend_ready_student_conf()}")
+
+    print("\nWave B readiness (foundation gate):")
+    rec_sr = rec.get("success_rate")
+    rec_n = int(rec.get("count") or 0)
+    t1p = sum(v for k, v in tiers.items() if int(k) >= 1)
+    ok_b = (
+        rec_sr is not None
+        and rec_sr >= distill_recover_min_success_rate()
+        and rec_n >= 20
+        and t1p >= max(1, int(0.1 * rec_n))
+    )
+    print(
+        f"  start Wave B when RECOVER success>={distill_recover_min_success_rate():.0%} "
+        f"and tier1+ episodes >=10% (now tier1+={t1p}, n={rec_n}): "
+        f"{'READY' if ok_b else 'NOT YET'}"
+    )
 
     return 0
 

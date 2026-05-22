@@ -394,6 +394,7 @@ class ValueLayer:
         engine_tick:      int = 0,
         imagination_horizon: int = 0,
         post_fr_loco_relax: float = 0.0,
+        recovery_override: bool = False,
         precomputed_s1: dict[str, float] | None = None,
     ) -> CheckResult:
         self.total_checked += 1
@@ -520,6 +521,8 @@ class ValueLayer:
                 loco_relax = float(
                     np.clip(loco_relax + post_fr_loco_relax, 0.0, 1.0)
                 )
+            if recovery_override:
+                loco_relax = 1.0
             if intent_key == "intent_stop_recover":
                 loco_relax = max(loco_relax, 0.65)
             if posture < 0.52:
@@ -538,8 +541,11 @@ class ValueLayer:
                     variable,
                     value,
                 )
-            # Destabilizing support switch while posture is low.
-            if intent_key in ("intent_support_left", "intent_support_right"):
+            # Destabilizing support switch while posture is low (skip during S2 recovery override).
+            if (
+                not recovery_override
+                and intent_key in ("intent_support_left", "intent_support_right")
+            ):
                 wants_left = intent_key.endswith("left") and value > 0.6
                 wants_right = intent_key.endswith("right") and value > 0.6
                 unstable = posture < (0.36 - 0.06 * loco_relax)

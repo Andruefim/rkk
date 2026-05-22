@@ -225,6 +225,18 @@ def parse_recovery_motor_steps(
             except (TypeError, ValueError):
                 continue
         out.append({"ticks": nt, "intent_deltas": clean})
+    if len(out) >= 2:
+        ticks_list = [s["ticks"] for s in out]
+        is_seq_index = True
+        for i in range(1, len(ticks_list)):
+            if ticks_list[i] != ticks_list[i - 1] + 1:
+                is_seq_index = False
+                break
+        if is_seq_index and ticks_list[-1] <= 12:
+            # LLM index bug: step 1 has 1 tick, step 2 has 2 ticks...
+            # Scale each step to represent actual physical duration
+            for s in out:
+                s["ticks"] = s["ticks"] * 25
     return out if out else None
 
 

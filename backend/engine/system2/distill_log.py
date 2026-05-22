@@ -231,6 +231,9 @@ def analyze_distill_file(
     d_ps = []
     pe_pass = 0
     pe_n = 0
+    tier_counts: dict[int, int] = {}
+    ending_counts: dict[str, int] = {}
+    schedule_sources: dict[str, int] = {}
     for r in recover:
         d = r.get("delta") or {}
         if isinstance(d, dict):
@@ -253,6 +256,18 @@ def analyze_distill_file(
         elif r.get("homeo_veto") is False and r.get("success"):
             pe_pass += 1
             pe_n += 1
+        try:
+            tr = r.get("recover_tier")
+            if tr is not None:
+                tier_counts[int(tr)] = tier_counts.get(int(tr), 0) + 1
+        except (TypeError, ValueError):
+            pass
+        end = str(r.get("ending_source") or r.get("distill_event") or "")
+        if end:
+            ending_counts[end] = ending_counts.get(end, 0) + 1
+        rss = r.get("recovery_schedule_source")
+        if rss:
+            schedule_sources[str(rss)] = schedule_sources.get(str(rss), 0) + 1
 
     llm_rows = [r for r in rows if str(r.get("source", "")) == "llm"]
     student_rows = [
@@ -292,6 +307,9 @@ def analyze_distill_file(
             "median_d_com_z": _median(d_cz),
             "median_d_posture": _median(d_ps),
             "pe_pass_rate": (pe_pass / pe_n) if pe_n else None,
+            "tier_counts": tier_counts,
+            "ending_counts": ending_counts,
+            "schedule_sources": schedule_sources,
         },
         "llm_share": (len(llm_rows) / len(rows)) if rows else None,
         "student_share": (len(student_rows) / len(rows)) if rows else None,

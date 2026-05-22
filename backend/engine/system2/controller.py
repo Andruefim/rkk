@@ -21,10 +21,21 @@ from engine.system2.distill_log import (
     pe_distill_extra,
     proposal_distill_extra,
 )
+from engine.system2.recovery_library import (
+    get_recovery_library,
+    recovery_library_enabled,
+)
 from engine.system2.recovery_schedule import (
     default_recovery_fallback_steps,
     enrich_recovery_steps,
+    prepare_llm_recovery_steps,
+    prepare_scripted_getup_steps,
     recovery_fallback_enabled,
+    recovery_scripted_enabled,
+    recovery_scripted_llm_on_entry,
+    recovery_scripted_lock_until_exhausted,
+    scripted_getup_episode_spec,
+    scripted_getup_phase_at,
 )
 from engine.system2.learned_student import LearnedMacroStudent, snapshot_obs_for_distill
 from engine.system2.macros import macro_bundle
@@ -37,6 +48,7 @@ from engine.system2.success_predicates import (
     build_s2_detector_id,
     curriculum_stage_to_spec,
     episode_success_with_pe_fallback,
+    evaluate_override_recovery_exit,
     override_recovered_posture_ok,
     should_attach_curriculum_pe_spec,
 )
@@ -210,9 +222,41 @@ def _recovery_llm_executor() -> ThreadPoolExecutor:
 
 def _recovery_llm_max_ingest_delay_ticks() -> int:
     try:
-        return max(8, int(os.environ.get("RKK_S2_RECOVERY_LLM_MAX_INGEST_DELAY_TICKS", "90")))
+        return max(8, int(os.environ.get("RKK_S2_RECOVERY_LLM_MAX_INGEST_DELAY_TICKS", "200")))
     except ValueError:
-        return 90
+        return 200
+
+
+def _recovery_llm_delay_first_dispatch_ticks() -> int:
+    try:
+        return max(0, int(os.environ.get("RKK_S2_RECOVERY_LLM_DELAY_FIRST_DISPATCH", "16")))
+    except ValueError:
+        return 16
+
+
+def _recovery_mid_schedule_replan_enabled() -> bool:
+    return os.environ.get("RKK_S2_RECOVERY_REPLAN_MID_SCHEDULE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _recovery_stagnation_replan_ticks() -> int:
+    try:
+        return max(20, int(os.environ.get("RKK_S2_RECOVERY_STAGNATION_REPLAN_TICKS", "50")))
+    except ValueError:
+        return 50
+
+
+def _s2_wm_override_schedule_only() -> bool:
+    return os.environ.get("RKK_S2_WM_OVERRIDE_SCHEDULE_ONLY", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def _llm_sync_forced() -> bool:
@@ -348,9 +392,9 @@ def _recovery_llm_calls_max() -> int:
 
 def _recovery_replan_min_interval_ticks() -> int:
     try:
-        return max(4, int(os.environ.get("RKK_S2_RECOVERY_REPLAN_MIN_TICKS", "48")))
+        return max(4, int(os.environ.get("RKK_S2_RECOVERY_REPLAN_MIN_TICKS", "20")))
     except ValueError:
-        return 48
+        return 20
 
 
 def _recovery_replan_after_last_step_ticks() -> int:
@@ -433,9 +477,31 @@ class System2Controller:
         self._recovery_llm_fail_count: int = 0
         self._recovery_fallback_applied: bool = False
         self._last_recovery_llm_error: str = ""
+        self._recovery_steps_remediated: bool = False
+        self._recovery_llm_latency_ticks: int = -1
+        self._recovery_best_com_z: float = 0.0
+        self._recovery_ticks_since_com_z_gain: int = 0
         self._last_override_distill_sample_tick: int = -10**9
         self._episode_plan_distill_extra: dict[str, Any] = {}
         self._distill_health = DistillHealthTracker()
+
+    @property
+    def fallen_override_active(self) -> bool:
+        return bool(self._s2_override_active)
+
+    def defer_sim_fall_hard_reset(self) -> bool:
+        """
+        Пока S2 fallen_override ведёт recovery, mixin_fall не должен вызывать reset_stance:
+        иначе поза сбрасывается до ответа recovery LLM (см. mixin_tick, до system2.tick).
+        """
+        if not self._s2_override_active:
+            return False
+        return os.environ.get("RKK_S2_DEFER_FALL_HARD_RESET", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
 
     def ollama_busy(self) -> bool:
         """True, если к Ollama уходит или ждётся ответ (план S2 или recovery)."""
@@ -461,27 +527,34 @@ class System2Controller:
         deltas = self._recovery_steps[idx].get("intent_deltas") or {}
         if not isinstance(deltas, dict) or not deltas:
             return None
-        priority = (
+        phase_keys = (
             "intent_stop_recover",
             "intent_support_left",
             "intent_support_right",
             "intent_torso_forward",
             "intent_arm_counterbalance",
             "intent_lean_forward",
+            "intent_stride",
         )
         var = None
-        for pk in priority:
-            if pk in deltas:
-                var = pk
-                break
-        if var is None:
-            var = max(deltas.keys(), key=lambda k: abs(float(deltas[k])))
+        if isinstance(deltas, dict) and deltas:
+            keys_in_phase = [k for k in phase_keys if k in deltas]
+            if keys_in_phase:
+                var = keys_in_phase[idx % len(keys_in_phase)]
+            else:
+                var = max(deltas.keys(), key=lambda k: abs(float(deltas[k])))
         base = macro_bundle("RECOVER_POSTURE").get("candidate") or {}
         try:
             base_val = float(base.get("value", 0.5))
         except (TypeError, ValueError):
             base_val = 0.5
         val = float(max(0.06, min(0.94, base_val + float(deltas[var]))))
+        if var == "intent_stop_recover":
+            try:
+                cap = float(os.environ.get("RKK_S2_RECOVER_STOP_RECOVER_GRAPH_MAX", "0.72"))
+            except ValueError:
+                cap = 0.72
+            val = min(val, cap)
         return {
             "variable": str(var),
             "value": val,
@@ -517,6 +590,15 @@ class System2Controller:
             "skill_id": spec.skill_id,
             "bundle_candidate": bundle.get("candidate"),
             "recovery_schedule_candidate": sched_cand,
+            "wm_override_schedule_only": bool(
+                self._s2_override_active and _s2_wm_override_schedule_only()
+            ),
+            "recovery_schedule_source": str(self._recovery_schedule_source),
+            "cpg_recovery_active": bool(
+                self._s2_override_active
+                and os.environ.get("RKK_S2_CPG_DURING_OVERRIDE", "1").strip().lower()
+                not in ("0", "false", "no", "off")
+            ),
             "source": (
                 "fallen_override"
                 if self._s2_override_active
@@ -716,6 +798,114 @@ class System2Controller:
         self._recovery_llm_fail_count = 0
         self._recovery_fallback_applied = False
         self._last_recovery_llm_error = ""
+        self._recovery_steps_remediated = False
+        self._recovery_best_com_z = 0.0
+        self._recovery_ticks_since_com_z_gain = 0
+
+    def _obs_com_z(self, obs_f: dict[str, float]) -> float:
+        return float(obs_f.get("com_z", obs_f.get("phys_com_z", 0.5)))
+
+    def _maybe_refresh_override_obs0(self, obs_f: dict[str, float], *, fallen: bool) -> None:
+        """Re-anchor obs0 when override opened on stale standing snapshot."""
+        if not fallen or not self._override_start_obs_f:
+            return
+        try:
+            hi = float(os.environ.get("RKK_S2_OVERRIDE_OBS0_REANCHOR_COM_Z", "0.32"))
+        except ValueError:
+            hi = 0.32
+        cz0 = self._obs_com_z(self._override_start_obs_f)
+        cz1 = self._obs_com_z(obs_f)
+        if cz0 > hi and cz1 < hi:
+            self._override_start_obs_f = dict(obs_f)
+            self._recovery_best_com_z = cz1
+            self._recovery_ticks_since_com_z_gain = 0
+
+    def _recovery_track_com_z_progress(self, obs_f: dict[str, float]) -> None:
+        cz = self._obs_com_z(obs_f)
+        try:
+            eps = float(os.environ.get("RKK_S2_RECOVERY_COM_Z_GAIN_EPS", "0.015"))
+        except ValueError:
+            eps = 0.015
+        if cz > self._recovery_best_com_z + eps:
+            self._recovery_best_com_z = cz
+            self._recovery_ticks_since_com_z_gain = 0
+        else:
+            self._recovery_ticks_since_com_z_gain += 1
+
+    def _recovery_mid_schedule_replan_wanted(
+        self, sim_tick: int, obs_f: dict[str, float]
+    ) -> bool:
+        if not _recovery_mid_schedule_replan_enabled():
+            return False
+        if not self._recovery_steps or self._recovery_schedule_exhausted(sim_tick):
+            return False
+        age = int(sim_tick) - int(self._s2_override_start_tick)
+        if age < _recovery_stagnation_replan_ticks():
+            return False
+        if self._recovery_ticks_since_com_z_gain >= _recovery_stagnation_replan_ticks():
+            return True
+        cz0 = self._obs_com_z(self._override_start_obs_f)
+        cz1 = self._obs_com_z(obs_f)
+        try:
+            drop = float(os.environ.get("RKK_S2_RECOVERY_REPLAN_COM_Z_DROP", "0.05"))
+        except ValueError:
+            drop = 0.05
+        return cz1 < cz0 - drop and cz1 < 0.30
+
+    def _capture_override_obs0_from_base(self, base: Any, obs_f: dict[str, float]) -> None:
+        """Use live physics snapshot so obs0 is prone, not stale standing graph nodes."""
+        raw: dict[str, float] = {}
+        fn = getattr(base, "observe", None)
+        if callable(fn):
+            try:
+                o = fn()
+                if isinstance(o, dict):
+                    for k, v in o.items():
+                        try:
+                            raw[str(k)] = float(v)
+                        except (TypeError, ValueError):
+                            pass
+            except Exception:
+                pass
+        if not raw:
+            gs = getattr(base, "_sim", None)
+            if gs is not None and hasattr(gs, "get_state"):
+                try:
+                    st = gs.get_state()
+                    if isinstance(st, dict):
+                        raw = {str(k): float(v) for k, v in st.items()}
+                except Exception:
+                    pass
+        if raw:
+            merged = dict(obs_f)
+            for k, v in raw.items():
+                merged[str(k)] = float(v)
+            self._override_start_obs_f = self._obs_floats(merged)
+        else:
+            self._override_start_obs_f = dict(obs_f)
+
+    def _scripted_schedule_locked(self, sim_tick: int) -> bool:
+        if not recovery_scripted_lock_until_exhausted():
+            return False
+        if self._recovery_schedule_source != "scripted":
+            return False
+        return not self._recovery_schedule_exhausted(sim_tick)
+
+    def _apply_scripted_getup_physics(self, base: Any, sim_tick: int) -> None:
+        if self._recovery_schedule_source != "scripted" or not self._recovery_steps:
+            return
+        anc = int(self._recovery_schedule_anchor_tick)
+        if anc < 0:
+            anc = int(self._s2_override_start_tick)
+        _idx, phase = scripted_getup_phase_at(
+            sim_tick, anc, self._recovery_cumulative, self._recovery_steps
+        )
+        fn = getattr(base, "apply_scripted_getup_physics", None)
+        if callable(fn):
+            try:
+                fn(phase)
+            except Exception:
+                pass
 
     def _recovery_schedule_exhausted(self, sim_tick: int) -> bool:
         if not self._recovery_cumulative:
@@ -736,6 +926,22 @@ class System2Controller:
         self._recovery_fallback_applied = True
         self._recovery_schedule_source = "fallback"
         self._recovery_episode_spec = EpisodeSuccessSpec(skill_id="recovery_fallback")
+        return True
+
+    def _apply_scripted_recovery_schedule(self, sim_tick: int) -> bool:
+        if not recovery_scripted_enabled():
+            return False
+        steps = prepare_scripted_getup_steps()
+        if not steps:
+            return False
+        self._ingest_recovery_steps(steps, sim_tick=sim_tick, from_llm=False)
+        self._recovery_schedule_source = "scripted"
+        spec = scripted_getup_episode_spec()
+        self._recovery_episode_spec = EpisodeSuccessSpec(
+            expected_state=dict(spec.get("expected_state") or {}),
+            max_prediction_error=spec.get("max_prediction_error"),
+            skill_id=str(spec.get("skill_id", "recovery_scripted_getup")),
+        )
         return True
 
     def _ingest_recovery_pack(
@@ -762,15 +968,14 @@ class System2Controller:
             steps_try = pack
         if not steps_try:
             return False
-        steps_try = enrich_recovery_steps(steps_try)
-        if not any(st.get("intent_deltas") for st in steps_try):
+        if self._scripted_schedule_locked(sim_tick):
+            self._last_recovery_llm_error = "scripted_locked"
             return False
-        # Reject degenerate plans (e.g. cumulative duration too short, or all steps are <= 2 ticks)
-        total_ticks = sum(int(max(1, s.get("ticks", 1))) for s in steps_try)
-        all_short = all(int(s.get("ticks", 1)) <= 2 for s in steps_try)
-        if total_ticks <= 5 or all_short:
+        steps_ready, remediated = prepare_llm_recovery_steps(steps_try)
+        if not steps_ready:
             return False
-        self._ingest_recovery_steps(steps_try, sim_tick=sim_tick, from_llm=True)
+        self._recovery_steps_remediated = remediated
+        self._ingest_recovery_steps(steps_ready, sim_tick=sim_tick, from_llm=True)
         self._recovery_schedule_source = "llm"
         self._recovery_llm_fail_count = 0
         self._recovery_episode_spec = EpisodeSuccessSpec(
@@ -819,6 +1024,8 @@ class System2Controller:
 
         if self._ingest_recovery_pack(pack, sim_tick=sim_tick):
             self._last_recovery_llm_error = ""
+            if dt >= 0:
+                self._recovery_llm_latency_ticks = int(sim_tick) - dt
             return
         self._recovery_llm_fail_count = int(self._recovery_llm_fail_count) + 1
         if pack is None:
@@ -861,7 +1068,21 @@ class System2Controller:
         idx = bisect.bisect_right(self._recovery_cumulative, rel)
         idx = min(idx, len(self._recovery_steps) - 1)
         d = self._recovery_steps[idx].get("intent_deltas") or {}
-        return dict(d) if isinstance(d, dict) else {}
+        ticks = int(max(1, self._recovery_steps[idx].get("ticks", 1)))
+        try:
+            rscale = float(os.environ.get("RKK_S2_RECOVERY_RESIDUAL_SCALE", "1.35"))
+        except ValueError:
+            rscale = 1.35
+        if self._recovery_schedule_source == "scripted":
+            try:
+                rscale = float(
+                    os.environ.get("RKK_S2_RECOVERY_SCRIPTED_RESIDUAL_SCALE", "1.65")
+                )
+            except ValueError:
+                rscale = 1.65
+        if not isinstance(d, dict):
+            return {}
+        return {k: float(v) / ticks * rscale for k, v in d.items()}
 
     def _dispatch_recovery_llm_once(
         self,
@@ -915,10 +1136,19 @@ class System2Controller:
             return
         if self._recovery_llm_future is not None:
             return
-        if self._recovery_steps and not self._recovery_schedule_exhausted(sim_tick):
+        if self._scripted_schedule_locked(sim_tick):
             return
-        if self._recovery_fallback_applied and not self._recovery_schedule_exhausted(
-            sim_tick
+        mid_replan = self._recovery_mid_schedule_replan_wanted(sim_tick, obs_f)
+        if (
+            self._recovery_steps
+            and not self._recovery_schedule_exhausted(sim_tick)
+            and not mid_replan
+        ):
+            return
+        if (
+            self._recovery_fallback_applied
+            and not self._recovery_schedule_exhausted(sim_tick)
+            and not mid_replan
         ):
             return
         if self._recovery_llm_dispatch_count >= _recovery_llm_calls_max():
@@ -947,21 +1177,21 @@ class System2Controller:
 
     def _override_episode_eval(
         self, obs_f: dict[str, float], *, fallen: bool
-    ) -> tuple[bool, dict[str, Any]]:
+    ) -> tuple[bool, dict[str, Any], str]:
+        """(success, diag, source_note_suffix). source_note empty if no tier exit."""
         if fallen:
-            return False, {"fallen": True}
-        posture_ok, posture_diag = override_recovered_posture_ok(obs_f)
-        if not posture_ok:
-            return False, {"override_posture_gate": False, **posture_diag}
-        ok, pe_diag = episode_success_with_pe_fallback(
-            self._override_start_obs_f,
+            return False, {"fallen": True}, ""
+        tier, ok, pe_diag = evaluate_override_recovery_exit(
             obs_f,
+            self._override_start_obs_f,
             self._recovery_episode_spec,
             macro="RECOVER_POSTURE",
         )
-        pe_diag.update(posture_diag)
-        pe_diag["override_posture_gate"] = True
-        return ok, pe_diag
+        if tier == 0:
+            return False, pe_diag, ""
+        note = "recovered" if tier == 2 else "recovered_tier1"
+        pe_diag["recover_tier"] = tier
+        return ok, pe_diag, note
 
     def _record_override_distill_neuro(
         self,
@@ -993,6 +1223,15 @@ class System2Controller:
             )
         )
         self._student.record_outcome(macro, success, weight=1.0)
+        if success and self._recovery_steps and recovery_library_enabled():
+            try:
+                get_recovery_library().add_success(
+                    dict(self._override_start_obs_f),
+                    list(self._recovery_steps),
+                    skill_id=str(self._recovery_episode_spec.skill_id or "recovery_library"),
+                )
+            except Exception:
+                pass
         if self._learned.enabled():
             self._learned.learn(
                 macro,
@@ -1014,6 +1253,14 @@ class System2Controller:
         )
         ex["recovery_schedule_source"] = str(self._recovery_schedule_source)
         ex["recovery_llm_fail_count"] = int(self._recovery_llm_fail_count)
+        if self._recovery_steps_remediated:
+            ex["recovery_steps_remediated"] = True
+        if pe_diag and pe_diag.get("recover_tier") is not None:
+            ex["recover_tier"] = int(pe_diag["recover_tier"])
+        if pe_diag and pe_diag.get("override_exit_block"):
+            ex["override_exit_block"] = str(pe_diag["override_exit_block"])
+        if int(self._recovery_llm_latency_ticks) >= 0:
+            ex["recovery_llm_latency_ticks"] = int(self._recovery_llm_latency_ticks)
         ex["distill_event"] = f"override_end:{source_note}"
         if self._last_recovery_llm_error:
             ex["recovery_llm_error"] = str(self._last_recovery_llm_error)
@@ -1058,14 +1305,45 @@ class System2Controller:
         macro = "RECOVER_POSTURE"
         bundle = macro_bundle(macro)
         graph_patch: dict[str, float] = dict(bundle.get("graph") or {})
+        try:
+            stop_rec = float(os.environ.get("RKK_S2_RECOVER_STOP_RECOVER_GRAPH", "0.58"))
+        except ValueError:
+            stop_rec = 0.58
+        torso_fwd = 0.68
+        if self._recovery_schedule_source == "scripted":
+            try:
+                stop_rec = float(
+                    os.environ.get("RKK_S2_RECOVERY_SCRIPTED_STOP_RECOVER_GRAPH", "0.64")
+                )
+            except ValueError:
+                stop_rec = 0.64
+            try:
+                torso_fwd = float(
+                    os.environ.get("RKK_S2_RECOVERY_SCRIPTED_TORSO_GRAPH", "0.74")
+                )
+            except ValueError:
+                torso_fwd = 0.74
+        if extra_residuals and "intent_stop_recover" in extra_residuals:
+            try:
+                cap = float(os.environ.get("RKK_S2_RECOVER_STOP_RECOVER_GRAPH_MAX", "0.72"))
+            except ValueError:
+                cap = 0.72
+            stop_rec = min(stop_rec, cap)
         graph_patch.update(
             {
-                "intent_stop_recover": 0.78,
-                "intent_stride": 0.48,
-                "intent_gait_coupling": 0.42,
+                "intent_stop_recover": stop_rec,
+                "intent_torso_forward": torso_fwd,
+                "intent_stride": 0.46,
+                "intent_gait_coupling": 0.40,
             }
         )
         residuals: dict[str, float] = dict(bundle.get("residuals") or {})
+        
+        # Divide baseline residuals by the planning interval (48) to scale smoothly
+        plan_every = _plan_every_ticks()
+        for k in list(residuals.keys()):
+            residuals[k] = float(residuals[k]) / plan_every
+
         if extra_residuals:
             for k, v in extra_residuals.items():
                 sk = str(k)
@@ -1160,6 +1438,7 @@ class System2Controller:
         recovered: bool = False,
         max_reset: bool = False,
         applied: bool | None = None,
+        pe_diag: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         inflight = (
             self._recovery_llm_future is not None
@@ -1188,8 +1467,18 @@ class System2Controller:
             base_diag["residuals_applied"] = applied
         base_diag["recovery_schedule_source"] = str(self._recovery_schedule_source)
         base_diag["recovery_steps_loaded"] = len(self._recovery_steps)
+        base_diag["cpg_recovery_active"] = bool(
+            self._s2_override_active
+            and os.environ.get("RKK_S2_CPG_DURING_OVERRIDE", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+        )
         if self._last_recovery_llm_error:
             base_diag["recovery_llm_error"] = str(self._last_recovery_llm_error)
+        if pe_diag:
+            if pe_diag.get("recover_tier") is not None:
+                base_diag["recover_tier"] = int(pe_diag["recover_tier"])
+            if pe_diag.get("override_exit_block"):
+                base_diag["override_exit_block"] = str(pe_diag["override_exit_block"])
         base_diag.update(self._distill_health_diag())
         return base_diag
 
@@ -1221,6 +1510,8 @@ class System2Controller:
         }
         if self._last_recovery_llm_error:
             ex["recovery_llm_error"] = str(self._last_recovery_llm_error)
+        if self._recovery_steps_remediated:
+            ex["recovery_steps_remediated"] = True
         if self._recovery_steps:
             ex["recovery_steps"] = compress_recovery_steps(self._recovery_steps)
         stud_conf: float | None = None
@@ -1292,7 +1583,8 @@ class System2Controller:
                 return None
             self._s2_override_active = True
             self._s2_override_start_tick = sim_tick
-            self._override_start_obs_f = dict(obs_f)
+            self._capture_override_obs0_from_base(base, obs_f)
+            self._maybe_refresh_override_obs0(obs_f, fallen=True)
             self._recovery_steps = []
             self._recovery_cumulative = []
             self._recovery_llm_future = None
@@ -1300,22 +1592,59 @@ class System2Controller:
             self._recovery_schedule_anchor_tick = -1
             self._recovery_llm_dispatch_tick = -1
             self._recovery_llm_dispatch_count = 0
+            self._recovery_best_com_z = self._obs_com_z(obs_f)
+            self._recovery_ticks_since_com_z_gain = 0
+            loaded_schedule = False
+            if self._apply_scripted_recovery_schedule(sim_tick):
+                loaded_schedule = True
+            elif recovery_library_enabled():
+                lib_hit = get_recovery_library().lookup(obs_f)
+                if lib_hit is not None:
+                    steps, es_rec, mx_f, skill = lib_hit
+                    self._ingest_recovery_steps(
+                        enrich_recovery_steps(steps),
+                        sim_tick=sim_tick,
+                        from_llm=False,
+                    )
+                    self._recovery_schedule_source = "library"
+                    self._recovery_episode_spec = EpisodeSuccessSpec(
+                        expected_state=dict(es_rec or {}),
+                        max_prediction_error=mx_f,
+                        skill_id=str(skill),
+                    )
+                    loaded_schedule = True
             if recovery_fallback_enabled() and not self._recovery_steps:
                 self._apply_fallback_recovery_schedule(sim_tick)
-            if recovery_llm_enabled():
+                loaded_schedule = bool(self._recovery_steps)
+            llm_on_entry = (
+                recovery_scripted_llm_on_entry()
+                if self._recovery_schedule_source == "scripted"
+                else True
+            )
+            if (
+                llm_on_entry
+                and recovery_llm_enabled()
+                and self._recovery_llm_future is None
+                and self._recovery_llm_dispatch_count == 0
+                and _recovery_llm_delay_first_dispatch_ticks() == 0
+            ):
                 self._dispatch_recovery_llm_once(sim_tick, agent, base, obs_f, sim)
         else:
+            self._maybe_refresh_override_obs0(obs_f, fallen=fallen)
+            self._recovery_track_com_z_progress(obs_f)
             age = int(sim_tick) - int(self._s2_override_start_tick)
             max_age = _s2_override_max_ticks()
             if not fallen:
-                ok, pe_diag = self._override_episode_eval(obs_f, fallen=False)
-                if pe_diag.get("override_posture_gate", True):
+                ok, pe_diag, exit_note = self._override_episode_eval(
+                    obs_f, fallen=False
+                )
+                if exit_note:
                     self._record_override_distill_neuro(
                         sim_tick=sim_tick,
                         agent=agent,
                         obs_f=obs_f,
                         success=ok,
-                        source_note="recovered",
+                        source_note=exit_note,
                         pe_diag=pe_diag,
                     )
                     diag = self._build_override_diag(
@@ -1347,7 +1676,15 @@ class System2Controller:
                 self._clear_override_session()
                 return diag
 
-        if self._s2_override_active and fallen:
+        if self._s2_override_active:
+            age_active = int(sim_tick) - int(self._s2_override_start_tick)
+            if (
+                recovery_llm_enabled()
+                and self._recovery_llm_dispatch_count == 0
+                and self._recovery_llm_future is None
+                and age_active >= _recovery_llm_delay_first_dispatch_ticks()
+            ):
+                self._dispatch_recovery_llm_once(sim_tick, agent, base, obs_f, sim)
             self._maybe_dispatch_recovery_llm_replan(
                 sim_tick, agent, base, obs_f, sim
             )
@@ -1362,14 +1699,19 @@ class System2Controller:
             node_keys,
             extra if extra else None,
         )
+        self._apply_scripted_getup_physics(base, sim_tick)
         age = int(sim_tick) - int(self._s2_override_start_tick)
         max_age = _s2_override_max_ticks()
+        pe_diag_live: dict[str, Any] = {}
+        if not fallen:
+            _, pe_diag_live, _ = self._override_episode_eval(obs_f, fallen=False)
         return self._build_override_diag(
             sim_tick,
             fallen,
             age,
             max_age,
             applied=applied,
+            pe_diag=pe_diag_live,
         )
 
     def _apply_planning_step(
