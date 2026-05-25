@@ -1801,3 +1801,4 @@ class CausalGraph:
             with torch.no_grad():
                 g._core.W.copy_(self._core.W)
         return g
+

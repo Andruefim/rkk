@@ -96,6 +96,38 @@ class SimulationTickMixin:
             }
         )
 
+    def _apply_hardcoded_reflexes(self, is_fallen: bool) -> None:
+        """Apply innate, high-speed physical reflexes (Biological Priors directly in engine)."""
+        base = self._unwrap_base_env(self.agent.env)
+        fn = getattr(base, "apply_motor_intent_residuals", None)
+        if not callable(fn) or getattr(base, "_intero_control_lost", False):
+            return
+
+        obs = dict(self.agent.graph.nodes)
+        
+        posture = float(obs.get("posture_stability", obs.get("phys_posture_stability", 1.0)))
+        pitch_vel = float(obs.get("torso_pitch_vel", obs.get("phys_torso_pitch_vel", 0.0)))
+        com_z = float(obs.get("com_z", obs.get("phys_com_z", 1.0)))
+        
+        residuals = {}
+        
+        # 1. Fall Protection (Brace for impact if falling forward)
+        if posture < 0.4 and pitch_vel < -0.4:
+            # Throw hands forward to counterbalance
+            residuals["intent_arm_counterbalance"] = 0.6
+        
+        # 2. Support Base widening on severe instability
+        if posture < 0.3:
+            residuals["intent_support_left"] = 0.3
+            residuals["intent_support_right"] = 0.3
+            
+        # 3. Crouch if falling vertically (reduce damage)
+        if com_z < 0.35 and not is_fallen:
+            residuals["intent_stop_recover"] = 0.5
+            
+        if residuals:
+            fn(residuals)
+
     def _fr_curriculum_finalize_release(self, *, reason: str) -> None:
         """Снять fixed_root в симуляции + VL, выставить окно stabilize (после мягкой физики)."""
         self._curriculum_auto_fr_released = True
@@ -610,6 +642,7 @@ class SimulationTickMixin:
         self._publish_cpg_node_snapshot()
         if self.current_world == "humanoid" and not self._fixed_root_active:
             self._maybe_post_release_stabilize_intents()
+            self._apply_hardcoded_reflexes(fallen_pre)
         if self.current_world == "humanoid":
             base_env = self._unwrap_base_env(self.agent.env)
             cpg_on = bool(getattr(base_env, "cpg_owns_legs", False))
