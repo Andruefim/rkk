@@ -97,34 +97,26 @@ class SimulationTickMixin:
         )
 
     def _apply_hardcoded_reflexes(self, is_fallen: bool) -> None:
-        """Apply innate, high-speed physical reflexes (Biological Priors directly in engine)."""
+        """Apply genome-based spinal reflexes: fast reactive balance corrections."""
         base = self._unwrap_base_env(self.agent.env)
         fn = getattr(base, "apply_motor_intent_residuals", None)
         if not callable(fn) or getattr(base, "_intero_control_lost", False):
             return
 
-        obs = dict(self.agent.graph.nodes)
-        
-        posture = float(obs.get("posture_stability", obs.get("phys_posture_stability", 1.0)))
-        pitch_vel = float(obs.get("torso_pitch_vel", obs.get("phys_torso_pitch_vel", 0.0)))
-        com_z = float(obs.get("com_z", obs.get("phys_com_z", 1.0)))
-        
+        obs = dict(self.agent.env.observe())
+        ms = dict(getattr(base, "_motor_state", {}))
+
+        try:
+            from engine.genome.priors import apply_reflexes
+            updated = apply_reflexes(obs, ms)
+        except Exception:
+            return
+
         residuals = {}
-        
-        # 1. Fall Protection (Brace for impact if falling forward)
-        if posture < 0.4 and pitch_vel < -0.4:
-            # Throw hands forward to counterbalance
-            residuals["intent_arm_counterbalance"] = 0.6
-        
-        # 2. Support Base widening on severe instability
-        if posture < 0.3:
-            residuals["intent_support_left"] = 0.3
-            residuals["intent_support_right"] = 0.3
-            
-        # 3. Crouch if falling vertically (reduce damage)
-        if com_z < 0.35 and not is_fallen:
-            residuals["intent_stop_recover"] = 0.5
-            
+        for k, v in updated.items():
+            if k in ms and abs(v - ms[k]) > 0.01:
+                residuals[k] = v - ms[k]
+
         if residuals:
             fn(residuals)
 

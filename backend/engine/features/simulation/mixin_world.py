@@ -191,6 +191,14 @@ class SimulationWorldMixin:
             seeds = fixed_root_seeds()
             result = self.agent.inject_text_priors(seeds)
 
+            try:
+                from engine.genome.priors import apply_causal_priors
+                n_genome = apply_causal_priors(self.agent.graph)
+                if n_genome > 0:
+                    print(f"[Genome] Injected {n_genome} innate causal priors")
+            except Exception as e:
+                print(f"[Genome] Failed to load priors: {e}")
+
             self._fixed_root_active = True
             self._fall_count = 0
             self._prev_fallen = False
@@ -276,6 +284,14 @@ class SimulationWorldMixin:
             )
 
             result = self.agent.inject_text_priors(humanoid_hardcoded_seeds())
+
+            try:
+                from engine.genome.priors import apply_causal_priors
+                n_genome = apply_causal_priors(self.agent.graph)
+                if n_genome > 0:
+                    print(f"[Genome] Re-injected {n_genome} innate causal priors (full body)")
+            except Exception as e:
+                print(f"[Genome] Failed: {e}")
 
             self._fixed_root_active = False
             self._post_fr_last_release_tick = int(getattr(self, "tick", 0))

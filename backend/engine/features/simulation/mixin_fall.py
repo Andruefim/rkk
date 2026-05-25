@@ -63,9 +63,37 @@ class SimulationFallMixin:
             self._fall_recovery_start_tick = self.tick
             self._fall_recovery_best_score = score
             self._fall_recovery_last_progress_tick = self.tick
+            self._genome_stand_phase = 0
+            self._genome_stand_phase_tick = self.tick
+            try:
+                from engine.genome.priors import get_stand_program
+                self._genome_stand_program = get_stand_program()
+            except Exception:
+                self._genome_stand_program = []
             self._add_event(
-                f"🦿 Recovery window ({max_ticks} ticks)", "#ffbb66", "value"
+                f"🦿 Recovery: genome stand program ({len(self._genome_stand_program)} phases)",
+                "#ffbb66", "value",
             )
+
+        # Execute genome stand program phases
+        prog = getattr(self, "_genome_stand_program", [])
+        phase_idx = getattr(self, "_genome_stand_phase", 0)
+        if prog and phase_idx < len(prog):
+            phase = prog[phase_idx]
+            phase_elapsed = self.tick - getattr(self, "_genome_stand_phase_tick", self.tick)
+            if phase_elapsed >= phase["ticks"]:
+                self._genome_stand_phase = phase_idx + 1
+                self._genome_stand_phase_tick = self.tick
+                phase_idx = self._genome_stand_phase
+            if phase_idx < len(prog):
+                base = self._unwrap_base_env(self.agent.env)
+                burst_fn = getattr(base, "intervene_burst", None)
+                if callable(burst_fn):
+                    pairs = [(k, v) for k, v in prog[phase_idx]["intents"].items()]
+                    try:
+                        burst_fn(pairs, count_intervention=False)
+                    except Exception:
+                        pass
 
         elapsed = self.tick - self._fall_recovery_start_tick
         if score > self._fall_recovery_best_score + min_gain:
