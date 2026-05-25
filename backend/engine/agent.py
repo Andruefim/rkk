@@ -2272,6 +2272,10 @@ class RKKAgent:
         var   = chosen["variable"]
         value = chosen["value"]
 
+        # Global safety cap: motor intents stay near neutral to prevent falling
+        if _is_motor_intent_var(var):
+            value = float(np.clip(value, 0.35, 0.65))
+
         if is_read_only_macro_var(var):
             _report_if_slow_tick()
             return {
