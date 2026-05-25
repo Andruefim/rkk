@@ -144,18 +144,15 @@ def _custom_humanoid_mass_vector() -> list[float]:
 
 def _hip_euler_xyz(real_pos: float, var_name: str) -> tuple[float, float, float]:
     """
-    Сферический тазобедренный: целевой quaternion из псевдо-Эйлера по нормализованной команде.
-    Увеличенный AY даёт сильнее сгибание «бёдра к груди» (вставание); настраивается env.
+    Hip joint: flexion/extension only (Y-axis rotation).
+    No cross-axis coupling to prevent leg crossing.
     """
     try:
-        ax = float(os.environ.get("RKK_HIP_EULER_AX", "0.50"))
-        ay = float(os.environ.get("RKK_HIP_EULER_AY", "1.14"))
-        az = float(os.environ.get("RKK_HIP_EULER_AZ", "0.02"))
+        ay = float(os.environ.get("RKK_HIP_EULER_AY", "1.0"))
     except ValueError:
-        ax, ay, az = 0.50, 1.14, 0.02
-    if var_name == "rhip":
-        return (ax * real_pos, -ay * real_pos, -az * real_pos)
-    return (ax * real_pos, ay * real_pos, az * real_pos)
+        ay = 1.0
+    sign = -1.0 if var_name == "rhip" else 1.0
+    return (0.0, sign * ay * real_pos, 0.0)
 
 
 def _recovery_pose_motor_multiplier(com_z: float, lfoot_z: float, rfoot_z: float) -> float:

@@ -267,14 +267,13 @@ class LocomotionController:
             "phi_r": phi_r,
         }
 
-        knee_base = 0.45
         targets: dict[str, float] = {
-            "lhip":   float(np.clip(0.50 + 0.17 * (float(cpg_out[0].item())*2 - 1), 0.05, 0.95)),
-            "rhip":   float(np.clip(0.50 + 0.17 * (float(cpg_out[1].item())*2 - 1), 0.05, 0.95)),
-            "lknee":  float(np.clip(knee_base + 0.14 * (float(cpg_out[2].item())*2 - 1), 0.05, 0.95)),
-            "rknee":  float(np.clip(knee_base + 0.14 * (float(cpg_out[3].item())*2 - 1), 0.05, 0.95)),
-            "lankle": float(np.clip(0.50 + 0.09 * (float(cpg_out[4].item())*2 - 1), 0.05, 0.95)),
-            "rankle": float(np.clip(0.50 + 0.09 * (float(cpg_out[5].item())*2 - 1), 0.05, 0.95)),
+            "lhip":   float(np.clip(0.50 + 0.06 * (float(cpg_out[0].item())*2 - 1), 0.05, 0.95)),
+            "rhip":   float(np.clip(0.50 + 0.06 * (float(cpg_out[1].item())*2 - 1), 0.05, 0.95)),
+            "lknee":  float(np.clip(0.50 + 0.04 * (float(cpg_out[2].item())*2 - 1), 0.05, 0.95)),
+            "rknee":  float(np.clip(0.50 + 0.04 * (float(cpg_out[3].item())*2 - 1), 0.05, 0.95)),
+            "lankle": float(np.clip(0.50 + 0.03 * (float(cpg_out[4].item())*2 - 1), 0.05, 0.95)),
+            "rankle": float(np.clip(0.50 + 0.03 * (float(cpg_out[5].item())*2 - 1), 0.05, 0.95)),
         }
 
         # Swing phase: hip lift + knee flex (минус = сгибание колена в нормализованных целях)
@@ -302,8 +301,8 @@ class LocomotionController:
                 1.0,
             )
         )
-        hip_tuck = _env_cpg_swing_float("RKK_CPG_RECOVERY_HIP_TUCK", "0.17")
-        knee_tuck_x = _env_cpg_swing_float("RKK_CPG_RECOVERY_KNEE_FLEX_EXTRA", "0.12")
+        hip_tuck = _env_cpg_swing_float("RKK_CPG_RECOVERY_HIP_TUCK", "0.04")
+        knee_tuck_x = _env_cpg_swing_float("RKK_CPG_RECOVERY_KNEE_FLEX_EXTRA", "0.02")
         targets["lhip"] = float(np.clip(targets["lhip"] + hip_tuck * tuck_gate, 0.05, 0.95))
         targets["rhip"] = float(np.clip(targets["rhip"] + hip_tuck * tuck_gate, 0.05, 0.95))
         targets["lknee"] = float(np.clip(targets["lknee"] - knee_tuck_x * tuck_gate, 0.05, 0.95))
