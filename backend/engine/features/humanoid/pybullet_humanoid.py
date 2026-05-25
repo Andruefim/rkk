@@ -150,9 +150,9 @@ def _hip_euler_xyz(real_pos: float, var_name: str) -> tuple[float, float, float]
     try:
         ax = float(os.environ.get("RKK_HIP_EULER_AX", "0.50"))
         ay = float(os.environ.get("RKK_HIP_EULER_AY", "1.14"))
-        az = float(os.environ.get("RKK_HIP_EULER_AZ", "0.12"))
+        az = float(os.environ.get("RKK_HIP_EULER_AZ", "0.02"))
     except ValueError:
-        ax, ay, az = 0.50, 1.14, 0.12
+        ax, ay, az = 0.50, 1.14, 0.02
     if var_name == "rhip":
         return (ax * real_pos, -ay * real_pos, -az * real_pos)
     return (ax * real_pos, ay * real_pos, az * real_pos)

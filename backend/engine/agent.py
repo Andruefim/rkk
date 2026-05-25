@@ -1407,6 +1407,7 @@ class RKKAgent:
             )
         )
         stable_stance = posture_now > 0.70 and min(foot_l, foot_r) > 0.56
+        very_stable = posture_now > 0.85 and min(foot_l, foot_r) > 0.70
 
         try:
             _sparse_min_unc = float(os.environ.get("RKK_SPARSE_EIG_MIN_UNC", "0.15"))
@@ -1424,14 +1425,16 @@ class RKKAgent:
             if _sparse_min_unc > 0 and unc_k < _sparse_min_unc and not is_motor:
                 return None
             if is_motor:
-                if stable_stance:
-                    lo, hi = 0.30, 0.72
+                if very_stable:
+                    lo, hi = 0.35, 0.65
+                elif stable_stance:
+                    lo, hi = 0.40, 0.60
                 else:
-                    lo, hi = 0.35, 0.68
+                    lo, hi = 0.42, 0.58
                 if str(vf).endswith("stride"):
-                    hi = min(hi, 0.62 if stable_stance else 0.56)
+                    hi = min(hi, 0.58 if very_stable else 0.54)
                 if str(vf).endswith("stop_recover"):
-                    lo, hi = (0.55, 0.80) if not stable_stance else (0.40, 0.65)
+                    lo, hi = (0.55, 0.72) if not stable_stance else (0.45, 0.60)
                 rand_val = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
             else:
                 rand_val = float(np.clip(rng.uniform(0.15, 0.85), 0.06, 0.94))
@@ -1616,6 +1619,7 @@ class RKKAgent:
             )
         )
         stable_stance = posture > 0.70 and min(foot_l, foot_r) > 0.56
+        very_stable = posture > 0.85 and min(foot_l, foot_r) > 0.70
 
         nodes_arr = np.array(
             [float(self.graph.nodes.get(v, 0.5)) for v in var_ids],
@@ -1668,12 +1672,13 @@ class RKKAgent:
                 discovery_rate=disc_clip,
             )
 
-            # Generate random values vectorized
             vals_non_motor = rng.uniform(0.15, 0.85, size=n_sel).astype(np.float64)
-            if stable_stance:
-                vals_motor = rng.uniform(0.30, 0.72, size=n_sel).astype(np.float64)
+            if very_stable:
+                vals_motor = rng.uniform(0.35, 0.65, size=n_sel).astype(np.float64)
+            elif stable_stance:
+                vals_motor = rng.uniform(0.40, 0.60, size=n_sel).astype(np.float64)
             else:
-                vals_motor = rng.uniform(0.35, 0.68, size=n_sel).astype(np.float64)
+                vals_motor = rng.uniform(0.42, 0.58, size=n_sel).astype(np.float64)
             vals = np.where(sel_motor, vals_motor, vals_non_motor)
             vals = np.clip(vals, 0.06, 0.94)
 
@@ -1686,10 +1691,10 @@ class RKKAgent:
                 if sel_motor[idx_k]:
                     vf_s = str(vf)
                     if vf_s.endswith("stride"):
-                        hi_lim = 0.62 if stable_stance else 0.56
+                        hi_lim = 0.58 if very_stable else (0.54 if stable_stance else 0.52)
                         vals[idx_k] = min(vals[idx_k], hi_lim)
                     if vf_s.endswith("stop_recover"):
-                        lo, hi = (0.55, 0.80) if not stable_stance else (0.40, 0.65)
+                        lo, hi = (0.55, 0.72) if not stable_stance else (0.45, 0.60)
                         vals[idx_k] = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
                 candidates.append(
                     {
@@ -1741,11 +1746,16 @@ class RKKAgent:
                     intervention_count=0,
                     discovery_rate=disc_clip,
                 )
-                lo, hi = (0.30, 0.72) if stable_stance else (0.35, 0.68)
+                if very_stable:
+                    lo, hi = 0.35, 0.65
+                elif stable_stance:
+                    lo, hi = 0.40, 0.60
+                else:
+                    lo, hi = 0.42, 0.58
                 if str(mv).endswith("stride"):
-                    hi = min(hi, 0.62 if stable_stance else 0.56)
+                    hi = min(hi, 0.58 if very_stable else 0.54)
                 if str(mv).endswith("stop_recover"):
-                    lo, hi = (0.55, 0.80) if not stable_stance else (0.40, 0.65)
+                    lo, hi = (0.55, 0.72) if not stable_stance else (0.45, 0.60)
                 val = float(np.clip(rng.uniform(lo, hi), 0.06, 0.94))
                 candidates.append(
                     {
