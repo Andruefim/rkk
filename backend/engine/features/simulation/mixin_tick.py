@@ -167,28 +167,28 @@ class SimulationTickMixin:
             return
         self._genome_walk_active_tick = True
         try:
-            from engine.genome.priors import walk_burst_pairs, walk_intents_at_tick
+            from engine.genome.priors import compute_walk_residuals, walk_intents_at_tick
         except Exception:
             return
         base = self._unwrap_base_env(self.agent.env)
         if getattr(base, "_intero_control_lost", False):
             return
-        intents = walk_intents_at_tick(self.tick)
         ms = getattr(base, "_motor_state", None)
-        if isinstance(ms, dict) and intents:
-            for k, v in intents.items():
-                ms[k] = float(v)
-        for k, v in intents.items():
+        if not isinstance(ms, dict):
+            return
+        targets = walk_intents_at_tick(self.tick)
+        residuals = compute_walk_residuals(ms, self.tick)
+        fn = getattr(base, "apply_motor_intent_residuals", None)
+        if callable(fn) and residuals:
+            try:
+                fn(residuals)
+            except Exception:
+                pass
+        for k, v in targets.items():
             if k in self.agent.graph.nodes:
-                self.agent.graph.nodes[k] = float(v)
-        burst_fn = getattr(base, "intervene_burst", None)
-        if callable(burst_fn):
-            pairs = walk_burst_pairs(self.tick)
-            if pairs:
-                try:
-                    burst_fn(pairs, count_intervention=False)
-                except Exception:
-                    pass
+                self.agent.graph.nodes[k] = float(
+                    getattr(base, "_motor_state", {}).get(k, v)
+                )
 
     def _apply_genome_walk_leg_pose(self, is_fallen: bool) -> None:
         if is_fallen or not getattr(self, "_genome_walk_active_tick", False):

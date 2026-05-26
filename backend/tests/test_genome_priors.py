@@ -8,6 +8,7 @@ from engine.genome.priors import (
     WALK_PHASE_JOINTS,
     apply_reflexes,
     genome_walk_eligible,
+    genome_walk_innate_enabled,
     walk_burst_pairs,
     walk_intents_at_tick,
     walk_leg_joints_at_tick,
@@ -43,6 +44,19 @@ def test_walk_burst_intents_only():
     pairs = dict(walk_burst_pairs(10))
     assert "intent_stride" in pairs
     assert "lhip" not in pairs
+
+
+def test_genome_walk_eligible_innate_when_stable():
+    obs = {
+        "com_z": 0.55,
+        "posture_stability": 0.62,
+        "foot_contact_l": 0.55,
+        "foot_contact_r": 0.55,
+    }
+    assert genome_walk_innate_enabled()
+    assert genome_walk_eligible(
+        obs, goal_walk=False, is_fallen=False, fixed_root=False
+    )
 
 
 def test_genome_walk_eligible_when_forced():

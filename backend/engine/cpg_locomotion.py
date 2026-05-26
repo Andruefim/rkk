@@ -340,7 +340,8 @@ class LocomotionController:
 
             if genome_walk_enabled():
                 stride_raw = float(self._node(agent_nodes, "intent_stride"))
-                if stride_raw > 0.54:
+                posture = float(self._node(agent_nodes, "posture_stability"))
+                if stride_raw > 0.54 and posture > 0.52:
                     boost = genome_walk_cpg_boost()
                     for leg in ("lhip", "rhip", "lknee", "rknee", "lankle", "rankle"):
                         targets[leg] = float(

@@ -205,20 +205,20 @@ WALK_PROGRAM: list[dict] = [
     {
         "phase": "left_heel_strike",
         "intents": {
-            "intent_stride": 0.58,
-            "intent_torso_forward": 0.63,
+            "intent_stride": 0.56,
+            "intent_torso_forward": 0.58,
             "intent_support_left": 0.62,
             "intent_support_right": 0.40,
             "intent_gait_coupling": 0.88,
-            "intent_stop_recover": 0.52,
+            "intent_stop_recover": 0.54,
             "intent_arm_counterbalance": 0.56,
         },
     },
     {
         "phase": "left_mid_stance",
         "intents": {
-            "intent_stride": 0.60,
-            "intent_torso_forward": 0.64,
+            "intent_stride": 0.57,
+            "intent_torso_forward": 0.59,
             "intent_support_left": 0.68,
             "intent_support_right": 0.36,
             "intent_gait_coupling": 0.90,
@@ -229,8 +229,8 @@ WALK_PROGRAM: list[dict] = [
     {
         "phase": "left_push_off",
         "intents": {
-            "intent_stride": 0.61,
-            "intent_torso_forward": 0.65,
+            "intent_stride": 0.58,
+            "intent_torso_forward": 0.60,
             "intent_support_left": 0.64,
             "intent_support_right": 0.38,
             "intent_gait_coupling": 0.90,
@@ -241,8 +241,8 @@ WALK_PROGRAM: list[dict] = [
     {
         "phase": "right_swing",
         "intents": {
-            "intent_stride": 0.62,
-            "intent_torso_forward": 0.64,
+            "intent_stride": 0.58,
+            "intent_torso_forward": 0.59,
             "intent_support_left": 0.36,
             "intent_support_right": 0.68,
             "intent_gait_coupling": 0.88,
@@ -253,8 +253,8 @@ WALK_PROGRAM: list[dict] = [
     {
         "phase": "right_heel_strike",
         "intents": {
-            "intent_stride": 0.58,
-            "intent_torso_forward": 0.63,
+            "intent_stride": 0.56,
+            "intent_torso_forward": 0.58,
             "intent_support_left": 0.40,
             "intent_support_right": 0.62,
             "intent_gait_coupling": 0.88,
@@ -265,8 +265,8 @@ WALK_PROGRAM: list[dict] = [
     {
         "phase": "right_mid_stance",
         "intents": {
-            "intent_stride": 0.60,
-            "intent_torso_forward": 0.64,
+            "intent_stride": 0.57,
+            "intent_torso_forward": 0.59,
             "intent_support_left": 0.36,
             "intent_support_right": 0.68,
             "intent_gait_coupling": 0.90,
@@ -277,8 +277,8 @@ WALK_PROGRAM: list[dict] = [
     {
         "phase": "right_push_off",
         "intents": {
-            "intent_stride": 0.61,
-            "intent_torso_forward": 0.65,
+            "intent_stride": 0.58,
+            "intent_torso_forward": 0.60,
             "intent_support_left": 0.38,
             "intent_support_right": 0.64,
             "intent_gait_coupling": 0.90,
@@ -289,8 +289,8 @@ WALK_PROGRAM: list[dict] = [
     {
         "phase": "left_swing",
         "intents": {
-            "intent_stride": 0.62,
-            "intent_torso_forward": 0.64,
+            "intent_stride": 0.58,
+            "intent_torso_forward": 0.59,
             "intent_support_left": 0.68,
             "intent_support_right": 0.36,
             "intent_gait_coupling": 0.88,
@@ -368,6 +368,13 @@ def walk_intents_at_tick(tick: int, cycle_ticks: int | None = None) -> dict[str,
 
 def genome_walk_enabled() -> bool:
     return os.environ.get("RKK_GENOME_WALK", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def genome_walk_innate_enabled() -> bool:
+    """Innate gait when upright — does not wait for curriculum walk goal."""
+    return os.environ.get("RKK_GENOME_WALK_INNATE", "1").strip().lower() not in (
         "0", "false", "no", "off",
     )
 
@@ -500,8 +507,13 @@ def genome_walk_eligible(
     cz = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
     if cz < 0.42 or posture < 0.52:
         return False
+    foot_l = float(obs.get("foot_contact_l", obs.get("phys_foot_contact_l", 0.5)))
+    foot_r = float(obs.get("foot_contact_r", obs.get("phys_foot_contact_r", 0.5)))
+    grounded = min(foot_l, foot_r) >= 0.48
+    if not grounded:
+        return False
+    if genome_walk_innate_enabled() and posture >= 0.55 and cz >= 0.40:
+        return True
     if genome_walk_force() or goal_walk:
-        foot_l = float(obs.get("foot_contact_l", obs.get("phys_foot_contact_l", 0.5)))
-        foot_r = float(obs.get("foot_contact_r", obs.get("phys_foot_contact_r", 0.5)))
-        return min(foot_l, foot_r) >= 0.48
+        return True
     return False
