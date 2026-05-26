@@ -635,6 +635,7 @@ class SimulationTickMixin:
         if self.current_world == "humanoid" and not self._fixed_root_active:
             self._maybe_post_release_stabilize_intents()
             self._apply_hardcoded_reflexes(fallen_pre)
+            self._apply_genome_walk_nudge(fallen_pre)
         if self.current_world == "humanoid":
             base_env = self._unwrap_base_env(self.agent.env)
             cpg_on = bool(getattr(base_env, "cpg_owns_legs", False))
