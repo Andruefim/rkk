@@ -129,8 +129,16 @@ class SimulationTickMixin:
         return st
 
     def _genome_walk_active(self, is_fallen: bool) -> bool:
-        if is_fallen or self._fixed_root_active or self.current_world != "humanoid":
+        if is_fallen or self.current_world != "humanoid":
             return False
+        if self._fixed_root_active:
+            try:
+                from engine.genome.priors import genome_walk_during_fixed_root_enabled
+
+                if not genome_walk_during_fixed_root_enabled():
+                    return False
+            except Exception:
+                return False
         if getattr(self, "_fall_recovery_active", False):
             return False
         s2 = getattr(self, "_system2", None)
@@ -721,10 +729,10 @@ class SimulationTickMixin:
         # Re-use ``fallen`` from the early check (after optional recovery): no extra
         # ``is_fallen()`` here — duplicate calls would double-advance debounce streak.
         fallen_pre = bool(fallen)
-        if self.current_world == "humanoid" and not self._fixed_root_active:
+        if self.current_world == "humanoid":
             self._apply_genome_walk_intents(fallen_pre)
         self._maybe_apply_cpg_locomotion(fallen_pre)
-        if self.current_world == "humanoid" and not self._fixed_root_active:
+        if self.current_world == "humanoid":
             self._apply_genome_walk_leg_pose(fallen_pre)
         self._publish_cpg_node_snapshot()
         if self.current_world == "humanoid" and not self._fixed_root_active:

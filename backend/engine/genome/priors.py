@@ -379,6 +379,13 @@ def genome_walk_innate_enabled() -> bool:
     )
 
 
+def genome_walk_during_fixed_root_enabled() -> bool:
+    """In-place anthropomorphic gait while pelvis is pinned (CPG + genome intents)."""
+    return os.environ.get("RKK_GENOME_WALK_FIXED_ROOT", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def genome_walk_gain() -> float:
     try:
         g = float(os.environ.get("RKK_GENOME_WALK_GAIN", "0.14"))
@@ -501,7 +508,9 @@ def genome_walk_eligible(
     is_fallen: bool,
     fixed_root: bool,
 ) -> bool:
-    if not genome_walk_enabled() or is_fallen or fixed_root:
+    if not genome_walk_enabled() or is_fallen:
+        return False
+    if fixed_root and not genome_walk_during_fixed_root_enabled():
         return False
     posture = float(obs.get("posture_stability", obs.get("phys_posture_stability", 0.5)))
     cz = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
