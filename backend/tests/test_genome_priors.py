@@ -39,18 +39,18 @@ def test_walk_joints_per_phase():
         assert "lhip" in jt and "rknee" in jt
 
 
-def test_walk_burst_includes_legs():
+def test_walk_burst_intents_only():
     pairs = dict(walk_burst_pairs(10))
     assert "intent_stride" in pairs
-    assert "lhip" in pairs
+    assert "lhip" not in pairs
 
 
 def test_genome_walk_eligible_when_forced():
     obs = {
         "com_z": 0.55,
-        "posture_stability": 0.5,
-        "foot_contact_l": 0.4,
-        "foot_contact_r": 0.4,
+        "posture_stability": 0.55,
+        "foot_contact_l": 0.5,
+        "foot_contact_r": 0.5,
     }
     import os
 
