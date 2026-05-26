@@ -120,6 +120,51 @@ class SimulationTickMixin:
         if residuals:
             fn(residuals)
 
+    def _apply_genome_walk_nudge(self, is_fallen: bool) -> None:
+        """Innate bipedal gait prior: rhythmic intent nudges when upright and walking."""
+        if is_fallen or self._fixed_root_active:
+            return
+        if getattr(self, "_fall_recovery_active", False):
+            return
+        if self.current_world != "humanoid":
+            return
+        try:
+            from engine.genome.priors import (
+                compute_walk_residuals,
+                genome_walk_enabled,
+            )
+        except Exception:
+            return
+        if not genome_walk_enabled():
+            return
+
+        obs = dict(self.agent.env.observe())
+        st = {**obs}
+        for k, v in list(obs.items()):
+            if isinstance(k, str) and k.startswith("phys_"):
+                st.setdefault(k[5:], v)
+
+        goal = self._skill_goal_hint(st)
+        if goal != "walk":
+            return
+
+        cz = float(st.get("com_z", st.get("phys_com_z", 0.5)))
+        posture = float(st.get("posture_stability", st.get("phys_posture_stability", 0.5)))
+        foot_l = float(st.get("foot_contact_l", st.get("phys_foot_contact_l", 0.5)))
+        foot_r = float(st.get("foot_contact_r", st.get("phys_foot_contact_r", 0.5)))
+        if cz < 0.38 or posture < 0.62 or min(foot_l, foot_r) < 0.52:
+            return
+
+        base = self._unwrap_base_env(self.agent.env)
+        fn = getattr(base, "apply_motor_intent_residuals", None)
+        if not callable(fn) or getattr(base, "_intero_control_lost", False):
+            return
+
+        ms = dict(getattr(base, "_motor_state", {}))
+        residuals = compute_walk_residuals(ms, self.tick)
+        if residuals:
+            fn(residuals)
+
     def _fr_curriculum_finalize_release(self, *, reason: str) -> None:
         """Снять fixed_root в симуляции + VL, выставить окно stabilize (после мягкой физики)."""
         self._curriculum_auto_fr_released = True
@@ -635,7 +680,6 @@ class SimulationTickMixin:
         if self.current_world == "humanoid" and not self._fixed_root_active:
             self._maybe_post_release_stabilize_intents()
             self._apply_hardcoded_reflexes(fallen_pre)
-            self._apply_genome_walk_nudge(fallen_pre)
         if self.current_world == "humanoid":
             base_env = self._unwrap_base_env(self.agent.env)
             cpg_on = bool(getattr(base_env, "cpg_owns_legs", False))
