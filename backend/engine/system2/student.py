@@ -24,6 +24,22 @@ def choose_macro_from_obs(obs: dict[str, float]) -> str:
     fr = float(obs.get("foot_contact_r", obs.get("phys_foot_contact_r", 0.5)))
 
     grounded = min(fl, fr)
+    import os
+
+    if os.environ.get("RKK_GENOME_WALK_BIAS_S2", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        if (
+            cz >= 0.50
+            and ps >= 0.55
+            and grounded >= 0.48
+            and os.environ.get("RKK_GENOME_WALK", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+        ):
+            return "LOCOMOTE_DELIVERY"
     if cz < 0.48 or ps < 0.40 or grounded < 0.35:
         return "RECOVER_POSTURE"
     if td > 0.52 and ps > 0.42:

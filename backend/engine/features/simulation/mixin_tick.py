@@ -120,50 +120,96 @@ class SimulationTickMixin:
         if residuals:
             fn(residuals)
 
-    def _apply_genome_walk_nudge(self, is_fallen: bool) -> None:
-        """Innate bipedal gait prior: rhythmic intent nudges when upright and walking."""
-        if is_fallen or self._fixed_root_active:
-            return
-        if getattr(self, "_fall_recovery_active", False):
-            return
-        if self.current_world != "humanoid":
-            return
-        try:
-            from engine.genome.priors import (
-                compute_walk_residuals,
-                genome_walk_enabled,
-            )
-        except Exception:
-            return
-        if not genome_walk_enabled():
-            return
-
+    def _genome_walk_obs_state(self) -> dict:
         obs = dict(self.agent.env.observe())
         st = {**obs}
         for k, v in list(obs.items()):
             if isinstance(k, str) and k.startswith("phys_"):
                 st.setdefault(k[5:], v)
+        return st
 
-        goal = self._skill_goal_hint(st)
-        if goal != "walk":
-            return
-
-        cz = float(st.get("com_z", st.get("phys_com_z", 0.5)))
+    def _genome_walk_active(self, is_fallen: bool) -> bool:
+        if is_fallen or self._fixed_root_active or self.current_world != "humanoid":
+            return False
+        if getattr(self, "_fall_recovery_active", False):
+            return False
+        s2 = getattr(self, "_system2", None)
+        if s2 is not None and getattr(s2, "_s2_override_active", False):
+            return False
+        try:
+            from engine.genome.priors import genome_walk_eligible
+        except Exception:
+            return False
+        st = self._genome_walk_obs_state()
         posture = float(st.get("posture_stability", st.get("phys_posture_stability", 0.5)))
-        foot_l = float(st.get("foot_contact_l", st.get("phys_foot_contact_l", 0.5)))
-        foot_r = float(st.get("foot_contact_r", st.get("phys_foot_contact_r", 0.5)))
-        if cz < 0.38 or posture < 0.62 or min(foot_l, foot_r) < 0.52:
-            return
+        if posture >= 0.62:
+            self._genome_walk_stand_streak = int(getattr(self, "_genome_walk_stand_streak", 0)) + 1
+        else:
+            self._genome_walk_stand_streak = 0
+        try:
+            warm = int(os.environ.get("RKK_GENOME_WALK_WARMUP_TICKS", "24"))
+        except ValueError:
+            warm = 24
+        warm = max(0, min(warm, 200))
+        if warm > 0 and self._genome_walk_stand_streak < warm:
+            return False
+        goal = self._skill_goal_hint(st)
+        return genome_walk_eligible(
+            st,
+            goal_walk=(goal == "walk"),
+            is_fallen=is_fallen,
+            fixed_root=bool(self._fixed_root_active),
+        )
 
+    def _apply_genome_walk_intents(self, is_fallen: bool) -> None:
+        if not self._genome_walk_active(is_fallen):
+            self._genome_walk_active_tick = False
+            return
+        self._genome_walk_active_tick = True
+        try:
+            from engine.genome.priors import walk_burst_pairs, walk_intents_at_tick
+        except Exception:
+            return
         base = self._unwrap_base_env(self.agent.env)
-        fn = getattr(base, "apply_motor_intent_residuals", None)
-        if not callable(fn) or getattr(base, "_intero_control_lost", False):
+        if getattr(base, "_intero_control_lost", False):
             return
+        intents = walk_intents_at_tick(self.tick)
+        ms = getattr(base, "_motor_state", None)
+        if isinstance(ms, dict) and intents:
+            for k, v in intents.items():
+                ms[k] = float(v)
+        for k, v in intents.items():
+            if k in self.agent.graph.nodes:
+                self.agent.graph.nodes[k] = float(v)
+        burst_fn = getattr(base, "intervene_burst", None)
+        if callable(burst_fn):
+            pairs = walk_burst_pairs(self.tick)
+            if pairs:
+                try:
+                    burst_fn(pairs, count_intervention=False)
+                except Exception:
+                    pass
 
-        ms = dict(getattr(base, "_motor_state", {}))
-        residuals = compute_walk_residuals(ms, self.tick)
-        if residuals:
-            fn(residuals)
+    def _apply_genome_walk_leg_pose(self, is_fallen: bool) -> None:
+        if is_fallen or not getattr(self, "_genome_walk_active_tick", False):
+            return
+        if self.tick % 2 != 0:
+            return
+        st = self._genome_walk_obs_state()
+        posture = float(st.get("posture_stability", st.get("phys_posture_stability", 0.5)))
+        if posture < 0.60:
+            return
+        base = self._unwrap_base_env(self.agent.env)
+        is_fn = getattr(base, "is_fallen", None)
+        if callable(is_fn) and is_fn():
+            return
+        fn = getattr(base, "apply_genome_walk_physics_at_tick", None)
+        if callable(fn):
+            try:
+                fn(self.tick)
+            except Exception:
+                pass
+
 
     def _fr_curriculum_finalize_release(self, *, reason: str) -> None:
         """Снять fixed_root в симуляции + VL, выставить окно stabilize (после мягкой физики)."""
@@ -675,7 +721,11 @@ class SimulationTickMixin:
         # Re-use ``fallen`` from the early check (after optional recovery): no extra
         # ``is_fallen()`` here — duplicate calls would double-advance debounce streak.
         fallen_pre = bool(fallen)
+        if self.current_world == "humanoid" and not self._fixed_root_active:
+            self._apply_genome_walk_intents(fallen_pre)
         self._maybe_apply_cpg_locomotion(fallen_pre)
+        if self.current_world == "humanoid" and not self._fixed_root_active:
+            self._apply_genome_walk_leg_pose(fallen_pre)
         self._publish_cpg_node_snapshot()
         if self.current_world == "humanoid" and not self._fixed_root_active:
             self._maybe_post_release_stabilize_intents()

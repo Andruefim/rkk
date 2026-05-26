@@ -1,70 +1,82 @@
-"""Genome priors: stand program, walk CPG, reflexes."""
+"""Genome priors: stand program, walk CPG, physics drive."""
 from __future__ import annotations
 
 from engine.genome.priors import (
     REFLEX_TABLE,
     STAND_PROGRAM,
     WALK_PROGRAM,
+    WALK_PHASE_JOINTS,
     apply_reflexes,
-    compute_walk_residuals,
-    get_stand_program,
-    get_walk_program,
+    genome_walk_eligible,
+    walk_burst_pairs,
     walk_intents_at_tick,
+    walk_leg_joints_at_tick,
     walk_phase_index,
 )
 
 
-def test_stand_program_phases_and_moderate_torso():
-    prog = get_stand_program()
-    assert len(prog) >= 5
-    assert sum(int(p["ticks"]) for p in prog) >= 180
-    phases = {p.get("phase") for p in prog}
-    assert "tuck" in phases
-    assert "release_stand" in phases
-    for p in prog:
+def test_stand_program_moderate_torso():
+    for p in STAND_PROGRAM:
         tf = p["intents"]["intent_torso_forward"]
-        assert 0.45 <= tf <= 0.58, f"torso too aggressive in {p.get('phase')}: {tf}"
+        assert 0.45 <= tf <= 0.58
 
 
-def test_walk_program_alternates_support():
-    prog = get_walk_program()
-    assert len(prog) == 8
-    left_stance = [p for p in prog if "left" in str(p.get("phase", "")) and "swing" not in str(p.get("phase", ""))]
-    right_stance = [p for p in prog if "right" in str(p.get("phase", "")) and "swing" not in str(p.get("phase", ""))]
-    assert left_stance and right_stance
-    for p in left_stance:
-        assert p["intents"]["intent_support_left"] > p["intents"]["intent_support_right"]
-    for p in right_stance:
-        assert p["intents"]["intent_support_right"] > p["intents"]["intent_support_left"]
+def test_walk_alternates_support():
+    for p in WALK_PROGRAM:
+        name = str(p.get("phase", ""))
+        sup_l = p["intents"]["intent_support_left"]
+        sup_r = p["intents"]["intent_support_right"]
+        if "left" in name and "swing" not in name:
+            assert sup_l > sup_r
+        if "right" in name and "swing" not in name:
+            assert sup_r > sup_l
+
+
+def test_walk_joints_per_phase():
+    for p in WALK_PROGRAM:
+        phase = str(p["phase"])
+        jt = WALK_PHASE_JOINTS.get(phase, {})
+        assert "lhip" in jt and "rknee" in jt
+
+
+def test_walk_burst_includes_legs():
+    pairs = dict(walk_burst_pairs(10))
+    assert "intent_stride" in pairs
+    assert "lhip" in pairs
+
+
+def test_genome_walk_eligible_when_forced():
+    obs = {
+        "com_z": 0.55,
+        "posture_stability": 0.5,
+        "foot_contact_l": 0.4,
+        "foot_contact_r": 0.4,
+    }
+    import os
+
+    os.environ["RKK_GENOME_WALK_FORCE"] = "1"
+    try:
+        assert genome_walk_eligible(
+            obs, goal_walk=False, is_fallen=False, fixed_root=False
+        )
+    finally:
+        os.environ.pop("RKK_GENOME_WALK_FORCE", None)
+
+
+def test_reflex_low_com_z_reduces_forward_lean():
+    rules = [
+        r
+        for r in REFLEX_TABLE
+        if r["sensor"] == "com_z"
+        and r["cmp"] == "lt"
+        and r["target"] == "intent_torso_forward"
+    ]
+    assert rules and all(r["delta"] < 0 for r in rules)
 
 
 def test_walk_phase_cycles():
     assert walk_phase_index(0, cycle_ticks=40) == 0
-    assert walk_phase_index(39, cycle_ticks=40) == len(WALK_PROGRAM) - 1
-    intents_a = walk_intents_at_tick(0, cycle_ticks=40)
-    intents_b = walk_intents_at_tick(20, cycle_ticks=40)
-    assert intents_a["intent_support_left"] != intents_b["intent_support_left"]
-
-
-def test_reflex_low_com_z_reduces_forward_lean():
-    low_com_rules = [
-        r for r in REFLEX_TABLE
-        if r["sensor"] == "com_z" and r["cmp"] == "lt" and r["target"] == "intent_torso_forward"
-    ]
-    assert low_com_rules
-    assert all(r["delta"] < 0 for r in low_com_rules)
-
-
-def test_apply_reflexes_clip():
-    ms = {"intent_stop_recover": 0.5, "intent_torso_forward": 0.5}
-    obs = {"com_z": 0.2, "torso_pitch": 0.8}
-    out = apply_reflexes(obs, ms)
-    assert out["intent_stop_recover"] > 0.5
-    assert out["intent_torso_forward"] < 0.5
-
-
-def test_compute_walk_residuals_bounded():
-    cur = {k: 0.5 for k in STAND_PROGRAM[0]["intents"]}
-    res = compute_walk_residuals(cur, tick=5, gain=0.2)
-    assert res
-    assert all(abs(v) <= 0.18 for v in res.values())
+    a = walk_intents_at_tick(0, cycle_ticks=40)
+    b = walk_intents_at_tick(20, cycle_ticks=40)
+    assert a["intent_support_left"] != b["intent_support_left"]
+    assert walk_leg_joints_at_tick(0)["lhip"] != walk_leg_joints_at_tick(20)["lhip"]

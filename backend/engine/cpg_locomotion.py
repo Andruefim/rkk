@@ -335,6 +335,20 @@ class LocomotionController:
         targets["lknee"] = float(np.clip(targets["lknee"] - knee_from_torso, 0.05, 0.95))
         targets["rknee"] = float(np.clip(targets["rknee"] - knee_from_torso, 0.05, 0.95))
 
+        try:
+            from engine.genome.priors import genome_walk_cpg_boost, genome_walk_enabled
+
+            if genome_walk_enabled():
+                stride_raw = float(self._node(agent_nodes, "intent_stride"))
+                if stride_raw > 0.54:
+                    boost = genome_walk_cpg_boost()
+                    for leg in ("lhip", "rhip", "lknee", "rknee", "lankle", "rankle"):
+                        targets[leg] = float(
+                            np.clip(0.5 + (targets[leg] - 0.5) * boost, 0.05, 0.95)
+                        )
+        except Exception:
+            pass
+
         self._step_count += 1
         self._last_command = dict(targets)
         return targets

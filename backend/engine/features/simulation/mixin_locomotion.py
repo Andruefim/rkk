@@ -104,6 +104,17 @@ class SimulationLocomotionMixin:
             from engine.features.humanoid.constants import LEG_VARS
 
             nodes = dict(self.agent.graph.nodes)
+            if (
+                not fallen
+                and not self._fixed_root_active
+                and getattr(self, "_genome_walk_active_tick", False)
+            ):
+                try:
+                    from engine.genome.priors import walk_intents_at_tick
+
+                    nodes.update(walk_intents_at_tick(self.tick))
+                except Exception:
+                    pass
 
             cb = self._ensure_cerebellum()
             use_cb = cb is not None and cb.ready_for_control()

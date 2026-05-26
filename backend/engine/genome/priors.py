@@ -210,7 +210,7 @@ WALK_PROGRAM: list[dict] = [
             "intent_support_left": 0.62,
             "intent_support_right": 0.40,
             "intent_gait_coupling": 0.88,
-            "intent_stop_recover": 0.58,
+            "intent_stop_recover": 0.52,
             "intent_arm_counterbalance": 0.56,
         },
     },
@@ -222,19 +222,19 @@ WALK_PROGRAM: list[dict] = [
             "intent_support_left": 0.68,
             "intent_support_right": 0.36,
             "intent_gait_coupling": 0.90,
-            "intent_stop_recover": 0.56,
+            "intent_stop_recover": 0.52,
             "intent_arm_counterbalance": 0.58,
         },
     },
     {
         "phase": "left_push_off",
         "intents": {
-            "intent_stride": 0.64,
+            "intent_stride": 0.61,
             "intent_torso_forward": 0.65,
             "intent_support_left": 0.64,
             "intent_support_right": 0.38,
             "intent_gait_coupling": 0.90,
-            "intent_stop_recover": 0.55,
+            "intent_stop_recover": 0.52,
             "intent_arm_counterbalance": 0.62,
         },
     },
@@ -246,7 +246,7 @@ WALK_PROGRAM: list[dict] = [
             "intent_support_left": 0.36,
             "intent_support_right": 0.68,
             "intent_gait_coupling": 0.88,
-            "intent_stop_recover": 0.56,
+            "intent_stop_recover": 0.52,
             "intent_arm_counterbalance": 0.64,
         },
     },
@@ -258,7 +258,7 @@ WALK_PROGRAM: list[dict] = [
             "intent_support_left": 0.40,
             "intent_support_right": 0.62,
             "intent_gait_coupling": 0.88,
-            "intent_stop_recover": 0.58,
+            "intent_stop_recover": 0.52,
             "intent_arm_counterbalance": 0.56,
         },
     },
@@ -270,19 +270,19 @@ WALK_PROGRAM: list[dict] = [
             "intent_support_left": 0.36,
             "intent_support_right": 0.68,
             "intent_gait_coupling": 0.90,
-            "intent_stop_recover": 0.56,
+            "intent_stop_recover": 0.52,
             "intent_arm_counterbalance": 0.58,
         },
     },
     {
         "phase": "right_push_off",
         "intents": {
-            "intent_stride": 0.64,
+            "intent_stride": 0.61,
             "intent_torso_forward": 0.65,
             "intent_support_left": 0.38,
             "intent_support_right": 0.64,
             "intent_gait_coupling": 0.90,
-            "intent_stop_recover": 0.55,
+            "intent_stop_recover": 0.52,
             "intent_arm_counterbalance": 0.62,
         },
     },
@@ -294,7 +294,7 @@ WALK_PROGRAM: list[dict] = [
             "intent_support_left": 0.68,
             "intent_support_right": 0.36,
             "intent_gait_coupling": 0.88,
-            "intent_stop_recover": 0.56,
+            "intent_stop_recover": 0.52,
             "intent_arm_counterbalance": 0.64,
         },
     },
@@ -401,3 +401,107 @@ def compute_walk_residuals(
         if abs(delta) >= 0.008:
             residuals[k] = float(np.clip(delta, -0.18, 0.18))
     return residuals
+
+
+# Direct leg/torso targets per gait phase (anthropomorphic alternating stance/swing).
+WALK_PHASE_JOINTS: dict[str, dict[str, float]] = {
+    "left_heel_strike": {
+        "lhip": 0.50, "rhip": 0.56, "lknee": 0.52, "rknee": 0.60,
+        "lankle": 0.50, "rankle": 0.48, "spine_pitch": 0.60,
+    },
+    "left_mid_stance": {
+        "lhip": 0.48, "rhip": 0.58, "lknee": 0.50, "rknee": 0.62,
+        "lankle": 0.51, "rankle": 0.47, "spine_pitch": 0.61,
+    },
+    "left_push_off": {
+        "lhip": 0.46, "rhip": 0.60, "lknee": 0.48, "rknee": 0.64,
+        "lankle": 0.52, "rankle": 0.46, "spine_pitch": 0.62,
+    },
+    "right_swing": {
+        "lhip": 0.56, "rhip": 0.50, "lknee": 0.60, "rknee": 0.52,
+        "lankle": 0.48, "rankle": 0.50, "spine_pitch": 0.61,
+    },
+    "right_heel_strike": {
+        "lhip": 0.56, "rhip": 0.50, "lknee": 0.60, "rknee": 0.52,
+        "lankle": 0.47, "rankle": 0.50, "spine_pitch": 0.60,
+    },
+    "right_mid_stance": {
+        "lhip": 0.58, "rhip": 0.48, "lknee": 0.62, "rknee": 0.50,
+        "lankle": 0.47, "rankle": 0.51, "spine_pitch": 0.61,
+    },
+    "right_push_off": {
+        "lhip": 0.60, "rhip": 0.46, "lknee": 0.64, "rknee": 0.48,
+        "lankle": 0.46, "rankle": 0.52, "spine_pitch": 0.62,
+    },
+    "left_swing": {
+        "lhip": 0.50, "rhip": 0.56, "lknee": 0.52, "rknee": 0.60,
+        "lankle": 0.50, "rankle": 0.48, "spine_pitch": 0.61,
+    },
+}
+
+
+
+def walk_phase_name_at_tick(tick: int, cycle_ticks: int | None = None) -> str:
+    prog = WALK_PROGRAM
+    if not prog:
+        return ""
+    idx = walk_phase_index(tick, cycle_ticks)
+    return str(prog[idx].get("phase") or f"phase_{idx}")
+
+
+def genome_walk_physics_enabled() -> bool:
+    return os.environ.get("RKK_GENOME_WALK_PHYSICS", "0").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def genome_walk_force() -> bool:
+    return os.environ.get("RKK_GENOME_WALK_FORCE", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def genome_walk_leg_blend() -> float:
+    try:
+        b = float(os.environ.get("RKK_GENOME_WALK_LEG_BLEND", "0.52"))
+    except ValueError:
+        b = 0.78
+    return float(np.clip(b, 0.20, 0.90))
+
+
+def genome_walk_cpg_boost() -> float:
+    try:
+        b = float(os.environ.get("RKK_GENOME_WALK_CPG_BOOST", "2.4"))
+    except ValueError:
+        b = 2.4
+    return float(np.clip(b, 1.0, 4.0))
+
+
+def walk_leg_joints_at_tick(tick: int, cycle_ticks: int | None = None) -> dict[str, float]:
+    name = walk_phase_name_at_tick(tick, cycle_ticks)
+    return dict(WALK_PHASE_JOINTS.get(name, {}))
+
+
+def walk_burst_pairs(tick: int, cycle_ticks: int | None = None) -> list[tuple[str, float]]:
+    """Intent-only burst; leg joints applied separately after CPG."""
+    return [(k, float(v)) for k, v in walk_intents_at_tick(tick, cycle_ticks).items()]
+
+
+def genome_walk_eligible(
+    obs: dict,
+    *,
+    goal_walk: bool,
+    is_fallen: bool,
+    fixed_root: bool,
+) -> bool:
+    if not genome_walk_enabled() or is_fallen or fixed_root:
+        return False
+    posture = float(obs.get("posture_stability", obs.get("phys_posture_stability", 0.5)))
+    cz = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
+    if cz < 0.42 or posture < 0.52:
+        return False
+    if genome_walk_force() or goal_walk:
+        foot_l = float(obs.get("foot_contact_l", obs.get("phys_foot_contact_l", 0.5)))
+        foot_r = float(obs.get("foot_contact_r", obs.get("phys_foot_contact_r", 0.5)))
+        return min(foot_l, foot_r) >= 0.48
+    return False
