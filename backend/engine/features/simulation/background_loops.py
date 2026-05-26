@@ -119,6 +119,25 @@ class BackgroundLoopService:
                             nodes[_k] = float(obs_live[_k])
                 except Exception:
                     obs_reflex = dict(nodes)
+                try:
+                    from engine.genome.priors import (
+                        genome_walk_eligible,
+                        genome_walk_enabled,
+                        walk_intents_at_tick,
+                    )
+
+                    if genome_walk_enabled():
+                        is_fn = getattr(base, "is_fallen", None)
+                        fallen_bg = bool(is_fn()) if callable(is_fn) else False
+                        if genome_walk_eligible(
+                            obs_reflex,
+                            goal_walk=False,
+                            is_fallen=fallen_bg,
+                            fixed_root=bool(s._fixed_root_active),
+                        ):
+                            nodes.update(walk_intents_at_tick(int(s.tick)))
+                except Exception:
+                    pass
                 targets = s._locomotion_controller.get_joint_targets(nodes, dt=dt)
                 cb = getattr(s, "_cerebellum", None)
                 if cb is None:

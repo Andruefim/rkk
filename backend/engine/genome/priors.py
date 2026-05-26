@@ -491,6 +491,15 @@ def genome_walk_cpg_boost() -> float:
     return float(np.clip(b, 1.0, 4.0))
 
 
+def genome_walk_joint_amp_scale() -> float:
+    """Scale normalized leg target excursion (visual + physical gait visibility)."""
+    try:
+        s = float(os.environ.get("RKK_GENOME_WALK_JOINT_AMP", "2.2"))
+    except ValueError:
+        s = 2.2
+    return float(np.clip(s, 1.0, 3.5))
+
+
 def walk_leg_joints_at_tick(tick: int, cycle_ticks: int | None = None) -> dict[str, float]:
     name = walk_phase_name_at_tick(tick, cycle_ticks)
     return dict(WALK_PHASE_JOINTS.get(name, {}))
