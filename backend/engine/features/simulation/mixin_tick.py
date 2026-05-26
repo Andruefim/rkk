@@ -899,6 +899,15 @@ class SimulationTickMixin:
 
             if _sleep_reason and not self._sleep_ctrl.is_sleeping:
                 self._sleep_ctrl.begin_sleep(self.tick, _sleep_reason, sim=self)
+                if not self._fixed_root_active and self.current_world == "humanoid":
+                    try:
+                        base = self._unwrap_base_env(self.agent.env)
+                        fr_fn = getattr(base, "enable_fixed_root", None)
+                        if callable(fr_fn):
+                            fr_fn()
+                            self._sleep_pinned = True
+                    except Exception:
+                        pass
                 self._add_event(
                     f"😴 Sleep: {_sleep_reason} (falls={self._sleep_ctrl._falls_since_sleep})",
                     "#9988ff",
@@ -908,6 +917,15 @@ class SimulationTickMixin:
             if self._sleep_ctrl.is_sleeping:
                 self._sleep_ctrl.tick(self.tick, self)
                 if not self._sleep_ctrl.is_sleeping:
+                    if getattr(self, "_sleep_pinned", False):
+                        try:
+                            base = self._unwrap_base_env(self.agent.env)
+                            fr_fn = getattr(base, "disable_fixed_root", None)
+                            if callable(fr_fn):
+                                fr_fn()
+                        except Exception:
+                            pass
+                        self._sleep_pinned = False
                     self._add_event(
                         f"🌅 Woke up (sleep #{self._sleep_ctrl.sleep_count})",
                         "#ffff88",
