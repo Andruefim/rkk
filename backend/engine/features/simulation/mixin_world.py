@@ -329,6 +329,38 @@ class SimulationWorldMixin:
                 "seeds_injected": result.get("injected", 0),
             }
 
+    def _sleep_attach_fixed_root(self) -> bool:
+        """
+        Pin pelvis for sleep consolidation (REM/lesson/prune).
+        Uses Simulation.enable_fixed_root — not HumanoidEnvironment/PyBullet directly.
+        """
+        if self.current_world != "humanoid":
+            return False
+        self._sleep_prev_fixed_root = bool(self._fixed_root_active)
+        if self._fixed_root_active:
+            return False
+        r = self.enable_fixed_root()
+        ok = bool(r.get("fixed_root")) and bool(self._fixed_root_active)
+        if ok:
+            self._sleep_pinned = True
+        return ok
+
+    def _sleep_detach_fixed_root(self) -> None:
+        """Restore pelvis state from before sleep if we enabled fixed_root for sleep."""
+        if not getattr(self, "_sleep_pinned", False):
+            return
+        self._sleep_pinned = False
+        if not getattr(self, "_sleep_prev_fixed_root", False):
+            self.disable_fixed_root()
+
+    def _sleep_ensure_fixed_root_while_sleeping(self) -> None:
+        """Re-attach if something released fixed_root mid-sleep."""
+        if self.current_world != "humanoid" or self._fixed_root_active:
+            return
+        if not getattr(self, "_sleep_ctrl", None) or not self._sleep_ctrl.is_sleeping:
+            return
+        self._sleep_attach_fixed_root()
+
     # ── Seeds ─────────────────────────────────────────────────────────────────
     def agent_seed_context(self, agent_id: int) -> dict | None:
         """
