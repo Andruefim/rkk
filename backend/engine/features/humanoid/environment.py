@@ -780,6 +780,74 @@ class EnvironmentHumanoid:
             self._sim.step(self.steps_per_do)
         self._update_interoception()
 
+    def apply_genome_walk_physics_at_tick(self, sim_tick: int) -> None:
+        """
+        Direct anthropomorphic gait joint drive (same pattern as scripted get-up).
+        Only effective when upright; caller must gate on fallen/fixed_root.
+        """
+        if os.environ.get("RKK_GENOME_WALK_PHYSICS", "1").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return
+        if self._intero_control_lost or self._fixed_root:
+            return
+        is_fn = getattr(self, "is_fallen", None)
+        if callable(is_fn) and is_fn():
+            return
+        try:
+            from engine.genome.priors import (
+                genome_walk_leg_blend,
+                walk_intents_at_tick,
+                walk_leg_joints_at_tick,
+            )
+        except Exception:
+            return
+
+        targets = walk_leg_joints_at_tick(sim_tick)
+        intents = walk_intents_at_tick(sim_tick)
+        if not targets:
+            return
+
+        for k, v in intents.items():
+            if k in MOTOR_INTENT_VARS:
+                self._motor_state[k] = float(np.clip(v, 0.05, 0.95))
+
+        blend = genome_walk_leg_blend()
+        state = self._sim.get_state() if hasattr(self._sim, "get_state") else {}
+        blended: dict[str, float] = {}
+        for jname, tgt in targets.items():
+            if jname not in LEG_VARS and jname not in (
+                "spine_pitch",
+                "lshoulder",
+                "rshoulder",
+            ):
+                continue
+            cur = float(state.get(jname, 0.5)) if isinstance(state, dict) else 0.5
+            blended[jname] = float(
+                np.clip((1.0 - blend) * cur + blend * float(tgt), 0.05, 0.95)
+            )
+        if not blended:
+            return
+
+        try:
+            n_sub = int(os.environ.get("RKK_GENOME_WALK_PHYS_SUBSTEPS", "4"))
+        except ValueError:
+            n_sub = 4
+        n_sub = int(np.clip(n_sub, 1, 12))
+
+        prev_cpg = bool(getattr(self, "cpg_owns_legs", False))
+        self.cpg_owns_legs = False
+        self.set_joint_targets(blended)
+        if not self._intero_control_lost:
+            self._apply_motor_intents()
+        self.cpg_owns_legs = prev_cpg
+        for _ in range(n_sub):
+            self._sim.step(self.steps_per_do)
+        self._update_interoception()
+
     def apply_motor_intent_residuals(self, residuals: dict[str, float]) -> None:
         """
         Add small deltas to motor intents without an extra PyBullet step (L0 reflex).

@@ -120,6 +120,105 @@ class SimulationTickMixin:
         if residuals:
             fn(residuals)
 
+    def _genome_walk_obs_state(self) -> dict:
+        obs = dict(self.agent.env.observe())
+        st = {**obs}
+        for k, v in list(obs.items()):
+            if isinstance(k, str) and k.startswith("phys_"):
+                st.setdefault(k[5:], v)
+        return st
+
+    def _genome_walk_active(self, is_fallen: bool) -> bool:
+        if is_fallen or self.current_world != "humanoid":
+            return False
+        if self._fixed_root_active:
+            try:
+                from engine.genome.priors import genome_walk_during_fixed_root_enabled
+
+                if not genome_walk_during_fixed_root_enabled():
+                    return False
+            except Exception:
+                return False
+        if getattr(self, "_fall_recovery_active", False):
+            return False
+        s2 = getattr(self, "_system2", None)
+        if s2 is not None and getattr(s2, "_s2_override_active", False):
+            return False
+        try:
+            from engine.genome.priors import genome_walk_eligible
+        except Exception:
+            return False
+        st = self._genome_walk_obs_state()
+        posture = float(st.get("posture_stability", st.get("phys_posture_stability", 0.5)))
+        if posture >= 0.62:
+            self._genome_walk_stand_streak = int(getattr(self, "_genome_walk_stand_streak", 0)) + 1
+        else:
+            self._genome_walk_stand_streak = 0
+        try:
+            warm = int(os.environ.get("RKK_GENOME_WALK_WARMUP_TICKS", "24"))
+        except ValueError:
+            warm = 24
+        warm = max(0, min(warm, 200))
+        if warm > 0 and self._genome_walk_stand_streak < warm:
+            return False
+        goal = self._skill_goal_hint(st)
+        return genome_walk_eligible(
+            st,
+            goal_walk=(goal == "walk"),
+            is_fallen=is_fallen,
+            fixed_root=bool(self._fixed_root_active),
+        )
+
+    def _apply_genome_walk_intents(self, is_fallen: bool) -> None:
+        if not self._genome_walk_active(is_fallen):
+            self._genome_walk_active_tick = False
+            return
+        self._genome_walk_active_tick = True
+        try:
+            from engine.genome.priors import compute_walk_residuals, walk_intents_at_tick
+        except Exception:
+            return
+        base = self._unwrap_base_env(self.agent.env)
+        if getattr(base, "_intero_control_lost", False):
+            return
+        ms = getattr(base, "_motor_state", None)
+        if not isinstance(ms, dict):
+            return
+        targets = walk_intents_at_tick(self.tick)
+        residuals = compute_walk_residuals(ms, self.tick)
+        fn = getattr(base, "apply_motor_intent_residuals", None)
+        if callable(fn) and residuals:
+            try:
+                fn(residuals)
+            except Exception:
+                pass
+        for k, v in targets.items():
+            if k in self.agent.graph.nodes:
+                self.agent.graph.nodes[k] = float(
+                    getattr(base, "_motor_state", {}).get(k, v)
+                )
+
+    def _apply_genome_walk_leg_pose(self, is_fallen: bool) -> None:
+        if is_fallen or not getattr(self, "_genome_walk_active_tick", False):
+            return
+        if self.tick % 2 != 0:
+            return
+        st = self._genome_walk_obs_state()
+        posture = float(st.get("posture_stability", st.get("phys_posture_stability", 0.5)))
+        if posture < 0.60:
+            return
+        base = self._unwrap_base_env(self.agent.env)
+        is_fn = getattr(base, "is_fallen", None)
+        if callable(is_fn) and is_fn():
+            return
+        fn = getattr(base, "apply_genome_walk_physics_at_tick", None)
+        if callable(fn):
+            try:
+                fn(self.tick)
+            except Exception:
+                pass
+
+
     def _fr_curriculum_finalize_release(self, *, reason: str) -> None:
         """Снять fixed_root в симуляции + VL, выставить окно stabilize (после мягкой физики)."""
         self._curriculum_auto_fr_released = True
@@ -630,7 +729,11 @@ class SimulationTickMixin:
         # Re-use ``fallen`` from the early check (after optional recovery): no extra
         # ``is_fallen()`` here — duplicate calls would double-advance debounce streak.
         fallen_pre = bool(fallen)
+        if self.current_world == "humanoid":
+            self._apply_genome_walk_intents(fallen_pre)
         self._maybe_apply_cpg_locomotion(fallen_pre)
+        if self.current_world == "humanoid":
+            self._apply_genome_walk_leg_pose(fallen_pre)
         self._publish_cpg_node_snapshot()
         if self.current_world == "humanoid" and not self._fixed_root_active:
             self._maybe_post_release_stabilize_intents()
@@ -898,16 +1001,8 @@ class SimulationTickMixin:
             )
 
             if _sleep_reason and not self._sleep_ctrl.is_sleeping:
+                self._sleep_attach_fixed_root()
                 self._sleep_ctrl.begin_sleep(self.tick, _sleep_reason, sim=self)
-                if not self._fixed_root_active and self.current_world == "humanoid":
-                    try:
-                        base = self._unwrap_base_env(self.agent.env)
-                        fr_fn = getattr(base, "enable_fixed_root", None)
-                        if callable(fr_fn):
-                            fr_fn()
-                            self._sleep_pinned = True
-                    except Exception:
-                        pass
                 self._add_event(
                     f"😴 Sleep: {_sleep_reason} (falls={self._sleep_ctrl._falls_since_sleep})",
                     "#9988ff",
@@ -915,17 +1010,10 @@ class SimulationTickMixin:
                 )
 
             if self._sleep_ctrl.is_sleeping:
+                self._sleep_ensure_fixed_root_while_sleeping()
                 self._sleep_ctrl.tick(self.tick, self)
                 if not self._sleep_ctrl.is_sleeping:
-                    if getattr(self, "_sleep_pinned", False):
-                        try:
-                            base = self._unwrap_base_env(self.agent.env)
-                            fr_fn = getattr(base, "disable_fixed_root", None)
-                            if callable(fr_fn):
-                                fr_fn()
-                        except Exception:
-                            pass
-                        self._sleep_pinned = False
+                    self._sleep_detach_fixed_root()
                     self._add_event(
                         f"🌅 Woke up (sleep #{self._sleep_ctrl.sleep_count})",
                         "#ffff88",

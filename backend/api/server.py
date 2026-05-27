@@ -710,6 +710,27 @@ async def fixed_root_disable():
     return get_sim().disable_fixed_root()
 
 
+@app.post("/humanoid/reset-stance")
+def humanoid_reset_stance():
+    """Reset humanoid to default standing pose (for walk/recovery testing)."""
+    sim = get_sim()
+    if sim.current_world != "humanoid":
+        return {"ok": False, "error": "not_humanoid"}
+    sim.disable_fixed_root()
+    base = sim.agent.env
+    for _ in range(8):
+        nxt = getattr(base, "base_env", None)
+        if nxt is None or nxt is base:
+            break
+        base = nxt
+    fn = getattr(base, "reset_stance", None)
+    if not callable(fn):
+        return {"ok": False, "error": "no_reset_stance"}
+    fn()
+    fallen = bool(getattr(base, "is_fallen", lambda: False)())
+    return {"ok": True, "fallen": fallen, "tick": sim.tick}
+
+
 @app.get("/fixed-root/status")
 def fixed_root_status():
     """Статус fixed_root mode и текущего Value Layer."""
@@ -776,9 +797,7 @@ def force_sleep():
             "error": "Already sleeping",
             "phase": sleep_ctrl.current_phase.name,
         }
-    sim._sleep_prev_fixed_root = sim._fixed_root_active
-    if not sim._fixed_root_active:
-        sim.enable_fixed_root()
+    sim._sleep_attach_fixed_root()
     sleep_ctrl.begin_sleep(sim.tick, "manual", sim=sim)
     return {
         "ok": True,

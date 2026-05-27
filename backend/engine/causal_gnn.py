@@ -165,6 +165,35 @@ def _mlp(in_dim: int, hidden: int, out_dim: int, act=nn.ReLU) -> nn.Sequential:
     )
 
 
+class MechanismMLP(nn.Module):
+    """
+    Independent predictor for a single node's mechanism.
+    Takes the node's embedding and the aggregated embeddings of its parents.
+    """
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU()
+        )
+        self.out_1 = nn.Linear(hidden, 1)
+        self.out_5 = nn.Linear(hidden, 1)
+        self.out_20 = nn.Linear(hidden, 1)
+        self.latent_predictor = nn.Linear(hidden, hidden)
+        
+        # Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, h_i: torch.Tensor, agg_i: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        c = self.net(torch.cat([h_i, agg_i], dim=-1))
+        return self.out_1(c).squeeze(-1), self.latent_predictor(c), self.out_5(c).squeeze(-1), self.out_20(c).squeeze(-1)
+
+
 # ─── CausalGNNCore ────────────────────────────────────────────────────────────
 class CausalGNNCore(nn.Module):
     """
@@ -211,18 +240,10 @@ class CausalGNNCore(nn.Module):
             nn.Tanh(),
         )
 
-        # Message function: j→i сообщение по ребру с весом W[j,i]
-        self.msg_fn = _mlp(hidden * 2, hidden, hidden, nn.ReLU)
-
-        # JEPA latent predictor: concat(h, agg); action already in h via encode_latent (no duplicate path)
-        self.latent_predictor = _mlp(hidden * 2, hidden, hidden, nn.ReLU)
-
-        # Output decoder: предсказываем x_i из h_i + агрегированных сообщений
-        self.out_dec = _mlp(hidden * 2, hidden, 1, nn.ReLU)
-        
-        # Multi-scale decoders (t+5, t+20)
-        self.out_dec_5 = _mlp(hidden * 2, hidden, 1, nn.ReLU)
-        self.out_dec_20 = _mlp(hidden * 2, hidden, 1, nn.ReLU)
+        # Модульные механизмы: свой независимый MLP для каждой переменной
+        self.mechanisms = nn.ModuleList([
+            MechanismMLP(hidden) for _ in range(d)
+        ])
         
         # JEPA Target Encoder (EMA from node_enc after each train step)
         self.target_enc = nn.Sequential(
@@ -230,8 +251,8 @@ class CausalGNNCore(nn.Module):
             nn.Tanh(),
         )
 
-        # Xavier initialization
-        for m in [self.node_enc, self.action_enc, self.msg_fn, self.latent_predictor, self.out_dec, self.out_dec_5, self.out_dec_20]:
+        # Xavier initialization for shared encoders
+        for m in [self.node_enc, self.action_enc]:
             for layer in m:
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight, gain=0.5)
@@ -272,52 +293,39 @@ class CausalGNNCore(nn.Module):
         h: torch.Tensor,
         return_latent: bool = False,
         return_multiscale: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """h: (B, d, hidden) → (B, d) scalars; latent head uses concat(h, agg) only."""
+    ) -> torch.Tensor | tuple:
+        """h: (B, d, hidden) → (B, d) scalars; passes through independent mechanisms."""
         B, d, _hd = h.shape
         A = self.W_masked()
 
-        if torch.is_grad_enabled():
-            # Dense mode: required for training to pass gradients through A=0
-            h_src = h.unsqueeze(1).expand(B, d, d, self.hidden)
-            h_dst = h.unsqueeze(2).expand(B, d, d, self.hidden)
-            msg = self.msg_fn(torch.cat([h_src, h_dst], dim=-1))
-            weights = A.t().unsqueeze(0).unsqueeze(-1)
-            agg = (msg * weights).sum(dim=2)
-        else:
-            # Sparse mode: massive speedup & memory reduction during inference (EIG scoring)
-            active_edges = (A.abs() > 1e-4).nonzero(as_tuple=False)
-            if active_edges.numel() == 0:
-                agg = torch.zeros_like(h)
-            else:
-                j = active_edges[:, 0]
-                i = active_edges[:, 1]
-                h_src_sparse = h[:, j, :]  # (B, E, hidden)
-                h_dst_sparse = h[:, i, :]  # (B, E, hidden)
-                
-                msg = self.msg_fn(torch.cat([h_src_sparse, h_dst_sparse], dim=-1))
-                weights = A[j, i].unsqueeze(0).unsqueeze(-1)  # (1, E, 1)
-                weighted_msg = msg * weights
+        # Vectorized aggregation of parent embeddings: agg_i = \sum_j A[j, i] * h_j
+        agg = torch.einsum('ji, bjh -> bih', A, h)
 
-                agg = torch.zeros_like(h)
-                # Scatter add across the node dimension
-                idx = i.unsqueeze(0).unsqueeze(2).expand(B, len(i), _hd)
-                agg.scatter_add_(1, idx, weighted_msg)
+        out_1_list = []
+        latent_list = []
+        out_5_list = []
+        out_20_list = []
 
-        h_next = torch.cat([h, agg], dim=-1)
-        out = self.out_dec(h_next).squeeze(-1)
+        for i in range(d):
+            o1, lat, o5, o20 = self.mechanisms[i](h[:, i, :], agg[:, i, :])
+            out_1_list.append(o1)
+            latent_list.append(lat)
+            out_5_list.append(o5)
+            out_20_list.append(o20)
+
+        out = torch.stack(out_1_list, dim=1)
 
         if return_multiscale:
-            out_5 = self.out_dec_5(h_next).squeeze(-1)
-            out_20 = self.out_dec_20(h_next).squeeze(-1)
+            out_5 = torch.stack(out_5_list, dim=1)
+            out_20 = torch.stack(out_20_list, dim=1)
             if return_latent:
-                h_pred = self.latent_predictor(h_next)
-                return out, h_pred, out_5, out_20
+                latent = torch.stack(latent_list, dim=1)
+                return out, latent, out_5, out_20
             return out, out_5, out_20
 
         if return_latent:
-            h_pred = self.latent_predictor(h_next)
-            return out, h_pred
+            latent = torch.stack(latent_list, dim=1)
+            return out, latent
         return out
 
     def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
@@ -445,11 +453,17 @@ class CausalGNNCore(nn.Module):
         int_var_idx: int,
         int_val:     float,
     ) -> torch.Tensor:
-        """L_intervention: после do(var=val) предсказание совпадает с наблюдением."""
+        """L_intervention: после do(var=val) предсказание совпадает с наблюдением.
+        Модуль узла X изолируется от получения градиентов."""
         a = torch.zeros_like(X_obs)
         a[:, int_var_idx] = int_val
         predicted = self.forward_dynamics(X_obs, a)
-        return F.mse_loss(predicted, X_int)
+        
+        # Mask out the intervened variable so its MechanismMLP gets no gradients
+        mask = torch.ones_like(predicted)
+        mask[:, int_var_idx] = 0.0
+        
+        return F.mse_loss(predicted * mask, X_int * mask)
 
     def l1_reg(self) -> torch.Tensor:
         """L1 на веса → разреженность → MDL."""
@@ -492,18 +506,11 @@ class CausalGNNCore(nn.Module):
             w[:old_d, :old_d] = self.W.detach()
             new_core.W.copy_(w)
 
-        # Переносим обученные MLP (архитектура не изменилась)
+        # Переносим обученные модульные механизмы
         new_core.node_enc.load_state_dict(self.node_enc.state_dict())
         new_core.action_enc.load_state_dict(self.action_enc.state_dict())
-        new_core.msg_fn.load_state_dict(self.msg_fn.state_dict())
-        try:
-            new_core.latent_predictor.load_state_dict(self.latent_predictor.state_dict(), strict=True)
-        except Exception:
-            for layer in new_core.latent_predictor:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight, gain=0.5)
-                    nn.init.zeros_(layer.bias)
-        new_core.out_dec.load_state_dict(self.out_dec.state_dict())
+        for i in range(old_d):
+            new_core.mechanisms[i].load_state_dict(self.mechanisms[i].state_dict())
         # Preserve slow target branch (EMA history); do not reset to fresh node_enc
         try:
             new_core.target_enc.load_state_dict(self.target_enc.state_dict(), strict=True)

@@ -80,6 +80,7 @@ class RSSMLiteCore(nn.Module):
 
     def __init__(self, d: int, device: torch.device, hidden: int = 64, gnn_core=None):
         super().__init__()
+        warnings.warn("RSSMLiteCore is deprecated in favor of Modular CausalGNNCore.", DeprecationWarning)
         self.d = d
         self.device = device
         self.hidden = hidden
@@ -89,38 +90,15 @@ class RSSMLiteCore(nn.Module):
         mask = 1.0 - torch.eye(d, device=device)
         self.register_buffer("mask", mask)
 
-        # RSSM components
+        # We keep the old parameters to avoid loading errors but they are deprecated
         rssm_h = _env_int("RKK_WM_RSSM_HIDDEN", 64)
         self.rssm_hidden = rssm_h
-
-        # Input encoder: [X; a] → z
-        self.input_enc = nn.Sequential(
-            nn.Linear(d * 2, rssm_h),
-            nn.Tanh(),
-        )
-
-        # Recurrent core
+        self.input_enc = nn.Sequential(nn.Linear(d * 2, rssm_h), nn.Tanh())
         self.gru = nn.GRUCell(rssm_h, rssm_h)
-
-        # State decoder: h → X_next
-        self.state_dec = nn.Sequential(
-            nn.Linear(rssm_h, rssm_h),
-            nn.Tanh(),
-            nn.Linear(rssm_h, d),
-        )
-
-        # Action encoder for quick GNN-style forward (used when h not available)
-        self.action_enc = nn.Sequential(
-            nn.Linear(1, 16),
-            nn.Tanh(),
-        )
-        self.node_enc = nn.Sequential(
-            nn.Linear(1, 16),
-            nn.Tanh(),
-        )
-        self.out_dec_quick = nn.Sequential(
-            nn.Linear(16 * 2 + d, d),
-        )
+        self.state_dec = nn.Sequential(nn.Linear(rssm_h, rssm_h), nn.Tanh(), nn.Linear(rssm_h, d))
+        self.action_enc = nn.Sequential(nn.Linear(1, 16), nn.Tanh())
+        self.node_enc = nn.Sequential(nn.Linear(1, 16), nn.Tanh())
+        self.out_dec_quick = nn.Sequential(nn.Linear(16 * 2 + d, d))
 
         # Initialize
         for m in self.modules():
@@ -188,39 +166,21 @@ class RSSMLiteCore(nn.Module):
         predicted = self.forward_dynamics(X_obs, a)
         return F.mse_loss(predicted, X_int)
 
-    # ── Core forward dynamics ──────────────────────────────────────────────────
     def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         """
-        World model step with recurrent state.
-
-        X: (B, d) current state
-        a: (B, d) action (sparse, do(var)=val)
-        Returns: X_next (B, d)
-
-        Note: maintains internal hidden state self._h.
-        For batched imagination rollouts, use forward_dynamics_stateless().
+        Deprecated. Use CausalGNNCore directly.
         """
         B = X.shape[0]
-
-        # Expand hidden state to batch size if needed
         if self._h.shape[0] != B:
             h = self._h.expand(B, -1).contiguous()
         else:
             h = self._h
 
-        # Encode input
-        xa = torch.cat([X, a], dim=1)  # (B, 2d)
-        z = self.input_enc(xa)          # (B, rssm_h)
-
-        # GRU step
-        h_next = self.gru(z, h)         # (B, rssm_h)
-
-        # Update internal state (use first batch element for consistency)
+        xa = torch.cat([X, a], dim=1)
+        z = self.input_enc(xa)
+        h_next = self.gru(z, h)
         self._h = h_next[:1].detach()
-
-        # Decode next state
-        X_next = self.state_dec(h_next)  # (B, d)
-        return X_next
+        return self.state_dec(h_next)
 
     def forward_dynamics_stateless(
         self,
@@ -228,10 +188,7 @@ class RSSMLiteCore(nn.Module):
         a: torch.Tensor,
         h: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Stateless version for imagination rollouts.
-        Returns (X_next, h_next) without updating self._h.
-        """
+        """Deprecated."""
         B = X.shape[0]
         if h is None:
             h = torch.zeros(B, self.rssm_hidden, device=self.device)
@@ -261,14 +218,12 @@ class RSSMLiteCore(nn.Module):
 # ── Long-horizon imagination ──────────────────────────────────────────────────
 class RSSMImagination:
     """
-    Long-horizon imagination rollouts using RSSM.
-
-    Используется в agent.score_interventions() и motor cortex planning.
-    Заменяет CausalGraph.rollout_step_free() для RSSM.
+    Long-horizon imagination rollouts using modular CausalGNN.
+    (Name kept for compatibility, but no longer uses RSSM).
     """
 
-    def __init__(self, rssm: RSSMLiteCore, device: torch.device):
-        self.rssm = rssm
+    def __init__(self, rssm, device: torch.device):
+        self.rssm = rssm  # Can be CausalGNNCore or the deprecated RSSMLiteCore
         self.device = device
 
     @torch.no_grad()
@@ -298,21 +253,25 @@ class RSSMImagination:
             dtype=torch.float32, device=self.device,
         )
 
-        # Start with current RSSM hidden state
-        h = self.rssm._h.expand(1, -1).contiguous()
-
+        # No more hidden state. Purely Markovian causal rollout.
         states: list[dict[str, float]] = []
         x = x0
 
+        # Support both modular GNN and deprecated RSSM
+        is_gnn = not hasattr(self.rssm, "forward_dynamics_stateless")
+
         for step in range(horizon):
-            # Build action vector
             a = torch.zeros(1, d, device=self.device)
             if step < len(actions):
                 var, val = actions[step]
                 if var in node_ids:
                     a[0, node_ids.index(var)] = float(val)
 
-            x_next, h = self.rssm.forward_dynamics_stateless(x, a, h)
+            if is_gnn:
+                x_next = self.rssm.forward_dynamics(x, a)
+            else:
+                x_next, _ = self.rssm.forward_dynamics_stateless(x, a)
+                
             state_dict = {
                 node_ids[i]: float(x_next[0, i].item())
                 for i in range(d)
@@ -445,34 +404,10 @@ class RSSMTrainer:
 # ── Integration with CausalGraph ──────────────────────────────────────────────
 def maybe_upgrade_graph_to_rssm(graph, device: torch.device) -> tuple[bool, Any]:
     """
-    Upgrade existing CausalGraph._core to RSSMLiteCore.
-    Preserves W matrix from GNN.
-    Returns (upgraded: bool, trainer: RSSMTrainer | None)
+    Deprecated. World model is now modular via CausalGNNCore.
+    This function returns False to keep using the standard Modular GNN.
     """
-    if not rssm_enabled():
-        return False, None
-
-    core = graph._core
-    if core is None:
-        return False, None
-
-    # Already RSSM
-    base = getattr(core, "_orig_mod", core)
-    if isinstance(base, RSSMLiteCore):
-        return True, None
-
-    d = graph._d
-    print(f"[RSSM] Upgrading GNN (d={d}) to RSSM-lite hidden={_env_int('RKK_WM_RSSM_HIDDEN', 64)}")
-
-    rssm = RSSMLiteCore(d=d, device=device, gnn_core=core)
-    trainer = RSSMTrainer(rssm, device)
-
-    # Replace core and optim in graph
-    graph._core = rssm
-    graph._optim = torch.optim.Adam(rssm.parameters(), lr=5e-3)
-    graph._invalidate_cache()
-
-    return True, trainer
+    return False, None
 
 
 def integrate_world_model_step_rssm(
