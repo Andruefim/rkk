@@ -83,6 +83,23 @@ CAUSAL_PRIORS: list[dict] = [
     {"from": "intent_arm_counterbalance", "to": "rshoulder", "weight": -0.25, "alpha": 0.60},
     {"from": "intent_arm_counterbalance", "to": "torso_roll", "weight": -0.28, "alpha": 0.65},
     {"from": "support_bias", "to": "intent_arm_counterbalance", "weight": 0.20, "alpha": 0.62},
+
+    # === Arms / manipulation (fixed_root curriculum) ===
+    {"from": "lshoulder", "to": "cube0_x", "weight": 0.28, "alpha": 0.72},
+    {"from": "lelbow", "to": "cube0_x", "weight": 0.24, "alpha": 0.68},
+    {"from": "rshoulder", "to": "cube1_x", "weight": 0.28, "alpha": 0.72},
+    {"from": "relbow", "to": "cube1_x", "weight": 0.24, "alpha": 0.68},
+    {"from": "lshoulder", "to": "lelbow", "weight": 0.32, "alpha": 0.75},
+    {"from": "rshoulder", "to": "relbow", "weight": 0.32, "alpha": 0.75},
+    {"from": "spine_yaw", "to": "cube2_x", "weight": 0.22, "alpha": 0.68},
+    {"from": "self_intention_larm", "to": "lshoulder", "weight": 0.26, "alpha": 0.65},
+    {"from": "self_intention_rarm", "to": "rshoulder", "weight": 0.26, "alpha": 0.65},
+
+    # === Interoception (embodied cognition, no LLM) ===
+    {"from": "intero_energy", "to": "lshoulder", "weight": 0.18, "alpha": 0.70},
+    {"from": "intero_energy", "to": "rshoulder", "weight": 0.18, "alpha": 0.70},
+    {"from": "intero_stress", "to": "posture_stability", "weight": -0.22, "alpha": 0.75},
+    {"from": "intero_stress", "to": "intero_energy", "weight": -0.15, "alpha": 0.72},
 ]
 
 
@@ -309,6 +326,76 @@ def apply_causal_priors(graph) -> int:
         if fr in graph._node_ids and to in graph._node_ids:
             graph.set_edge(fr, to, float(p["weight"]), alpha=float(p["alpha"]))
             count += 1
+    return count
+
+
+def genome_bootstrap_enabled() -> bool:
+    return os.environ.get("RKK_GENOME_BOOTSTRAP", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def bootstrap_innate_genome(graph, agent=None) -> int:
+    """
+    Phase 3 roadmap: innate DNA at sim start — no Ollama.
+    1) optional compressed_prior.npz (offline SVD) into W
+    2) CAUSAL_PRIORS (strong alpha)
+    3) humanoid_hardcoded_seeds as weak text priors (discovery layer)
+    """
+    if not genome_bootstrap_enabled():
+        return 0
+    n = int(load_compressed_genome(graph))
+    if agent is not None:
+        try:
+            from engine.environment_humanoid import humanoid_hardcoded_seeds
+
+            r = agent.inject_text_priors(humanoid_hardcoded_seeds())
+            n += int(r.get("injected", 0) or 0)
+        except Exception:
+            pass
+    return n
+
+
+def load_compressed_genome(graph, path: str | None = None) -> int:
+    """
+    Load low-rank compressed prior into executive W and merge with CAUSAL_PRIORS.
+    Returns number of edges seeded from compressed genome.
+    """
+    from pathlib import Path
+
+    from engine.genome.compressor import load_compressed_genome as _load_npz
+
+    if path is None:
+        path = str(
+            Path(__file__).resolve().parent / "compressed_prior.npz"
+        )
+    p = Path(path)
+    if not p.is_file():
+        return apply_causal_priors(graph)
+
+    data = _load_npz(p)
+    count = 0
+    ids = list(graph._node_ids)
+    d = min(len(ids), data["d"])
+    if graph._core is not None and hasattr(graph._core, "W"):
+        import torch
+
+        W = data["W_reconstructed"]
+        with torch.no_grad():
+            for i in range(d):
+                for j in range(d):
+                    if i != j and abs(float(W[i, j])) >= 0.05:
+                        if i < len(ids) and j < len(ids):
+                            graph.set_edge(ids[i], ids[j], float(W[i, j]), alpha=0.75)
+                            count += 1
+    if hasattr(graph, "_maybe_init_ensemble"):
+        graph._maybe_init_ensemble()
+        if graph._ensemble is not None:
+            graph._ensemble.sync_from_executive(graph._core.W[:d, :d], idx=0)
+    count += apply_causal_priors(graph)
     return count
 
 

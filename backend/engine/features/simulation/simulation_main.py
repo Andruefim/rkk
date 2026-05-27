@@ -129,6 +129,8 @@ class Simulation(
         self.demon = AdversarialDemon(n_agents=1, device=self.device)
 
         self.tick = 0
+        self._cached_scene: dict = {}
+        self._cached_scene_tick = -1
         self.phase = 1
         self.max_phase = 1
 
@@ -253,8 +255,11 @@ class Simulation(
         self._llm_teacher: "LLMVoiceTeacher | None" = None
         if _INNER_VOICE_AVAILABLE:
             self._inner_voice = InnerVoiceController(device=self.device)
-            self._llm_teacher = LLMVoiceTeacher()
-            self._llm_teacher.add_callback(self._on_teacher_annotation)
+            from engine.llm_voice_teacher import teacher_enabled
+
+            if teacher_enabled():
+                self._llm_teacher = LLMVoiceTeacher()
+                self._llm_teacher.add_callback(self._on_teacher_annotation)
 
         self._sleep_ctrl: "SleepController | None" = None
         self._physical_curriculum: "PhysicalCurriculum | None" = None
@@ -342,6 +347,21 @@ class Simulation(
         apply_llm_mediator_patch(self)
         apply_motor_primitives_patch(self)
         apply_intrinsic_patch(self)
+
+        if self.current_world == "humanoid":
+            try:
+                from engine.genome.priors import bootstrap_innate_genome
+
+                n_g = bootstrap_innate_genome(self.agent.graph, self.agent)
+                print(
+                    f"[Genome] Innate bootstrap (no LLM): {n_g} edges/priors on d={self.agent.graph._d}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[Genome] Innate bootstrap failed: {type(e).__name__}: {e}",
+                    flush=True,
+                )
 
         # ── Variable Registry: dynamic ontology ──────────────────────────────
         try:

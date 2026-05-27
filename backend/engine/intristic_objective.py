@@ -89,6 +89,16 @@ def _ei(key: str, default: int) -> int:
     try: return max(1, int(os.environ.get(key, str(default))))
     except ValueError: return default
 
+
+def intrinsic_eig_enabled() -> bool:
+    return os.environ.get("RKK_INTRINSIC_EIG", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _intrinsic_mi_samples() -> int:
+    return _ei("RKK_INTRINSIC_MI_SAMPLES", 8)
+
 # ─── CausalSurprise ───────────────────────────────────────────────────────────
 class CausalSurprise:
     """
@@ -607,6 +617,32 @@ class IntrinsicObjective:
             graph_mdl_after=mdl_after,
             n_interventions=int(agent._total_interventions),
         )
+
+        # --- Ensemble EIG curiosity (Phase 5/7) ---
+        if intrinsic_eig_enabled():
+            try:
+                from engine.hypothesis_testing import eig_for_action
+
+                obs_e = dict(agent.env.observe())
+                ids = [
+                    n for n in graph._node_ids
+                    if str(n).startswith("intent_")
+                ][:8]
+                candidates = [(v, float(obs_e.get(v, 0.5))) for v in ids]
+                eig = eig_for_action(graph, obs_e, candidates)
+                lambda_eig = _ef("RKK_INTRINSIC_EIG_LAMBDA", 0.5)
+                r = r + lambda_eig * float(np.clip(eig, 0.0, 2.0))
+                # Monte Carlo MI proxy via ensemble disagreement on rollouts
+                n_mi = _intrinsic_mi_samples()
+                if n_mi > 1 and getattr(graph, "_ensemble", None) is not None:
+                    mi_bonus = eig * (1.0 + 0.1 * n_mi)
+                    r = r + 0.05 * mi_bonus
+            except Exception:
+                pass
+        elif os.environ.get("RKK_INTRINSIC_EMPOWERMENT", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            r = r + 0.05 * float(prediction_error)
 
         # Гомеостаз: при низкой осанке подавляем EIG (implementation_plan Phase 3).
         if os.environ.get("RKK_INTRINSIC_HOMEOSTASIS_GATE", "1").strip().lower() not in (

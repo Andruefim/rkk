@@ -88,11 +88,26 @@ def sz_split_enabled() -> bool:
 from engine.wm_locomotion_gating import locomotion_wm_scales
 from engine.wm_neural_ode import integrate_world_model_step
 
+try:
+    from engine.graph_ensemble import WeightedGraphEnsemble, ensemble_enabled, ensemble_size
+except ImportError:
+    WeightedGraphEnsemble = None  # type: ignore
+    ensemble_enabled = lambda: False  # type: ignore
+    ensemble_size = lambda: 1  # type: ignore
+
 # ── Переключение ядра ─────────────────────────────────────────────────────────
 USE_GNN = True   # False → NOTEARS (откат к фазам 1-9)
 
 # Фаза 1: пары для freeze; dict { (f,t): {alpha_trust} } — см. environment_humanoid.URDF_FROZEN_EDGES
 URDF_FROZEN_EDGE_LIST: list[tuple[str, str]] = list(HUMANOID_KINEMATIC_EDGE_PRIORS)
+
+
+@dataclass
+class CausalNode:
+    """Node metadata including molecular tag for structure-learning constraints."""
+    id_: str
+    value: float = 0.5
+    node_kind: str = "latent"  # sensor | motor | latent
 
 
 # ─── Edge ─────────────────────────────────────────────────────────────────────
@@ -196,6 +211,7 @@ class CausalGraph:
     def __init__(self, device: torch.device):
         self.device     = device
         self.nodes:     dict[str, float] = {}
+        self._node_meta: dict[str, CausalNode] = {}
         self._node_ids: list[str]        = []
         self._d         = 0
         self.MAX_D      = int(os.environ.get("RKK_GNN_MAX_D", "256"))
@@ -241,13 +257,93 @@ class CausalGraph:
         self._traj_segments: list[TrajectorySegment] = []
         self._traj_head: TrajectoryHead | None = None
         self._traj_max_segments = 100
+        self._ensemble: WeightedGraphEnsemble | None = None
+        self._structure_learn_tick: int = 0
+
+    @staticmethod
+    def infer_node_kind(node_id: str) -> str:
+        """Molecular tag: sensor (exogenous), motor (intent_*), else latent."""
+        if node_id.startswith("intent_"):
+            return "motor"
+        if node_id.startswith("slot_") or node_id.startswith("phys_"):
+            return "sensor"
+        exogenous = {"com_x", "com_y", "com_z", "foot_contact_l", "foot_contact_r"}
+        if node_id in exogenous or node_id.startswith("proprio_"):
+            return "sensor"
+        return "latent"
+
+    def get_node_kind(self, node_id: str) -> str:
+        meta = self._node_meta.get(node_id)
+        if meta is not None:
+            return meta.node_kind
+        return self.infer_node_kind(node_id)
+
+    def get_world_model_core(self):
+        """Single entry point for executive WM — always CausalGNNCore (not RSSM)."""
+        core = self._core
+        if core is None:
+            return None
+        base = getattr(core, "_orig_mod", core)
+        return base
+
+    def _maybe_init_ensemble(self) -> None:
+        if not ensemble_enabled() or WeightedGraphEnsemble is None:
+            self._ensemble = None
+            return
+        if self._d < 1:
+            return
+        seed = None
+        if self._core is not None and hasattr(self._core, "W"):
+            seed = self._core.W.detach()[: self._d, : self._d]
+        if self._ensemble is None or self._ensemble.d != self._d:
+            self._ensemble = WeightedGraphEnsemble(
+                self._d, self.device, n=ensemble_size(), seed_W=seed
+            )
+        elif seed is not None:
+            self._ensemble.sync_from_executive(seed, idx=0)
+
+    def sync_executive_W_from_ensemble(self) -> None:
+        """Copy MAP/mixture W from ensemble into executive core."""
+        if self._ensemble is None or self._core is None:
+            return
+        use_map = os.environ.get("RKK_GRAPH_ENSEMBLE_MAP", "1").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        W_exec = self._ensemble.map_graph() if use_map else self._ensemble.posterior_mean()
+        with torch.no_grad():
+            d = min(self._d, W_exec.shape[0])
+            self._core.W[:d, :d].copy_(W_exec[:d, :d])
+
+    def update_ensemble_posterior(
+        self,
+        obs_before: dict,
+        obs_after: dict,
+        var: str,
+        val: float,
+    ) -> None:
+        if self._ensemble is None:
+            return
+        try:
+            from engine.hypothesis_testing import ensemble_log_likelihood
+
+            ll = ensemble_log_likelihood(
+                self, obs_before, obs_after, var, val, self._ensemble
+            )
+            self._ensemble.update_posterior(ll)
+        except Exception:
+            pass
 
     def set_node(self, id_: str, value: float = 0.0) -> None:
         self._invalidate_cache()
         if id_ not in self.nodes:
             self._node_ids.append(id_)
             self._d += 1
+            self._node_meta[id_] = CausalNode(
+                id_, float(value), self.infer_node_kind(id_)
+            )
         self.nodes[id_] = value
+        if id_ in self._node_meta:
+            self._node_meta[id_].value = float(value)
         if self._core is None or self._core.d != self._d:
             self._rebuild_core()
 
@@ -533,6 +629,7 @@ class CausalGraph:
         self._optim = torch.optim.Adam(self._core.parameters(), lr=5e-3)
         self._invalidate_cache()
         self._sync_frozen_W_into_core()
+        self._maybe_init_ensemble()
 
     def _pad(self, x: torch.Tensor) -> torch.Tensor:
         return self._pad_to(x, self.MAX_D)
@@ -631,6 +728,45 @@ class CausalGraph:
             max_seqs = max(8, self.BUFFER_SIZE // T)
             if len(self._seq_buffer) > max_seqs * 2:
                 self._seq_buffer = self._seq_buffer[-max_seqs:]
+
+        self._maybe_structure_learn(engine_tick=len(self._obs_buffer))
+
+    def _maybe_structure_learn(self, engine_tick: int = 0) -> None:
+        """Periodic v-structure / Meek orientation → ensemble W proposals."""
+        for key in ("self_fixed_root", "fixed_root"):
+            if key in self.nodes:
+                try:
+                    if float(self.nodes[key]) > 0.5:
+                        return
+                except (TypeError, ValueError):
+                    pass
+        try:
+            every = int(os.environ.get("RKK_STRUCTURE_LEARN_EVERY", "0"))
+        except ValueError:
+            every = 0
+        if every <= 0 or self._ensemble is None or self._d < 4:
+            return
+        if engine_tick > 0 and engine_tick % every != 0:
+            return
+        if len(self._obs_buffer) < 20:
+            return
+        try:
+            from engine.structure_learning import structure_learn_step
+
+            data = np.array(self._obs_buffer[-min(200, len(self._obs_buffer)) :], dtype=np.float64)
+            kinds = {i: self.get_node_kind(self._node_ids[i]) for i in range(self._d)}
+            edges = structure_learn_step(data, node_kinds=kinds)
+            if not edges:
+                return
+            with torch.no_grad():
+                for ei, e in enumerate(edges[: min(8, self._ensemble.n)]):
+                    if e.from_idx >= self._d or e.to_idx >= self._d:
+                        continue
+                    Wk = self._ensemble.W_stack[ei % self._ensemble.n]
+                    Wk[e.from_idx, e.to_idx] = float(e.confidence) * 0.5
+            self._structure_learn_tick = int(engine_tick)
+        except Exception:
+            pass
 
     def set_locomotion_train_context(
         self, *, reward_ema: float, cpg_active: bool, fallen: bool = False

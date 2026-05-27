@@ -1,37 +1,16 @@
 """
-temporal_world_model.py — Level 2-F: Temporal World Model (RSSM-lite).
+temporal_world_model.py — DEPRECATED legacy RSSM path (Level 2-F).
 
-Проблема: GNN rollout использует только текущий X_t для предсказания X_{t+1}.
-Это memoryless — не учитывает инерцию тела, историю падений, фазу походки.
+@deprecated Use CausalGraph.get_world_model_core() → CausalGNNCore instead.
+RSSM-lite is isolated here for backward compatibility only.
+Do NOT enable RKK_WM_RSSM=1 in production — Modular CausalGNNCore is the executive WM.
 
-RSSM-lite (Recurrent State Space Model, упрощённый):
-  h_t = GRU(h_{t-1}, concat(X_t, a_t))    ← детерминированный hidden
-  X_{t+1} ≈ decode(h_t)                   ← предсказание следующего состояния
-
-Преимущества vs текущего GNN rollout:
-  - Imagination 4 → 20+ шагов без накопления ошибки
-  - Motor cortex может планировать шаги наперёд
-  - Агент «помнит» что нога была в воздухе 3 тика назад
-
-Интеграция:
-  - RSSMLiteCore заменяет integrate_world_model_step() когда включён
-  - causal_graph.train_step() дополнительно обновляет GRU через TBPTT
-  - agent.score_interventions(): imagination horizon 4→20 шагов через RSSM
-
-Совместимость:
-  - Все интерфейсы NOTEARSCore/CausalGNNCore сохранены
-  - .W nn.Parameter сохранён для EIG/gradient-based exploration
-  - RKK_WM_RSSM=1 включает; RKK_WM_RSSM=0 → прежний путь
-
-RKK_WM_RSSM=1                   — включить (default 0, пока Motor Cortex не обучен)
-RKK_WM_RSSM_HIDDEN=64           — размер GRU hidden
-RKK_WM_RSSM_IMAGINATION=12      — горизонт imagination (шаги)
-RKK_WM_RSSM_TBPTT=8             — TBPTT unroll length
-RKK_WM_RSSM_LR=3e-4             — learning rate GRU (отдельный от Adam GNN)
+See causal_graph.get_world_model_core() and engine/causal_gnn.py (Phase 1 ADR).
 """
 from __future__ import annotations
 
 import os
+import warnings
 from collections import deque
 from typing import Any
 

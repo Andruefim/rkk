@@ -47,6 +47,7 @@ from engine.rag_seeder import RAGSeeder, HARDCODED_SEEDS
 _sim:    Simulation | None = None
 _seeder: RAGSeeder  | None = None
 _rag_status = {"last_run": None, "results": [], "running": False}
+_causal_stream_ws: WebSocket | None = None
 
 
 def get_sim() -> Simulation:
@@ -241,6 +242,26 @@ async def _startup_phase3_teacher() -> None:
 
 async def _startup_post_boot_pipeline() -> None:
     """Порядок: LLM приоры → зрение → VLM → фаза 3 teacher (фон после yield сервера)."""
+    if _env_flag("RKK_SKIP_LLM_BOOTSTRAP") or _env_flag("RKK_SKIP_ALL_LLM"):
+        print(
+            "[RKK] LLM bootstrap pipeline skipped "
+            "(RKK_SKIP_LLM_BOOTSTRAP / RKK_SKIP_ALL_LLM); innate genome from Simulation.__init__"
+        )
+        if not _env_flag("RKK_SKIP_AUTO_VISION"):
+            try:
+                sim = get_sim()
+                if sim.current_world == "humanoid":
+                    n_slots = int(os.environ.get("RKK_AUTO_VISION_N_SLOTS", "8"))
+                    mode = (os.environ.get("RKK_AUTO_VISION_MODE", "hybrid") or "hybrid").strip()
+                    out = sim.enable_visual(n_slots=n_slots, mode=mode)
+                    if not out.get("error"):
+                        print(
+                            f"[RKK] Auto vision ON (no LLM): n_slots={out.get('n_slots')}, "
+                            f"gnn_d={out.get('gnn_d')}"
+                        )
+            except Exception as e:
+                print(f"[RKK] Auto vision (no LLM) error: {e}")
+        return
     await _startup_humanoid_llm_bootstrap()
     await _startup_auto_vision_and_one_vlm()
     await _startup_phase3_teacher()
@@ -277,9 +298,19 @@ def _hardware_label() -> str:
 @app.get("/health")
 def health():
     sim = get_sim()
+    sleeping = False
+    sleep_phase = ""
+    sc = getattr(sim, "_sleep_ctrl", None)
+    if sc is not None and sc.is_sleeping:
+        sleeping = True
+        sleep_phase = getattr(sc.current_phase(), "name", "") or ""
+    from engine.features.simulation.snapshot import humanoid_curriculum_step
+
+    cur_step, cur_stab = humanoid_curriculum_step(sim)
     return {
         "status":        "ok",
         "singleton":     True,
+        "tick":          int(getattr(sim, "tick", 0)),
         "device":        str(sim.device),
         "gpu":           _hardware_label(),
         "current_world": sim.current_world,
@@ -288,6 +319,10 @@ def health():
         "fall_count":    sim._fall_count,
         "visual_mode":   sim._visual_mode,
         "fixed_root":    sim._fixed_root_active,
+        "curriculum_step": cur_step,
+        "curriculum_stabilize_until": cur_stab,
+        "sleeping":      sleeping,
+        "sleep_phase":   sleep_phase,
     }
 
 @app.get("/state")
@@ -844,7 +879,15 @@ def concept_subgraph(cid: str):
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 @app.websocket("/ws/causal-stream")
 async def causal_stream(websocket: WebSocket):
+    global _causal_stream_ws
+    if _causal_stream_ws is not None:
+        try:
+            await _causal_stream_ws.close(code=1000, reason="replaced by new client")
+        except Exception:
+            pass
+        _causal_stream_ws = None
     await websocket.accept()
+    _causal_stream_ws = websocket
     sim   = get_sim()
     speed = 1
     print(f"[WS] Humanoid+Vision Singleton connected. d={sim.agent.graph._d}")
@@ -992,6 +1035,9 @@ async def causal_stream(websocket: WebSocket):
     except Exception as e:
         print(f"[WS] Error: {e}")
         traceback.print_exc()
+    finally:
+        if _causal_stream_ws is websocket:
+            _causal_stream_ws = None
 
 
 if __name__ == "__main__":

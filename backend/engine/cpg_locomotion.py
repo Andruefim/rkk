@@ -113,9 +113,9 @@ class LocomotionController:
             self.cpg.phase_bias[0, 2] = math.pi * 0.25
             self.cpg.phase_bias[1, 3] = math.pi * 0.25
             self.cpg.frequency.data[:] = 0.3
-            self.cpg.amplitude.data[:] = -1.5
+            self.cpg.amplitude.data[:] = 0.0  # Increased from -1.5 so it can actually move
 
-        self.optim = torch.optim.Adam(self.cpg.parameters(), lr=3e-4)
+        self.optim = torch.optim.Adam(self.cpg.parameters(), lr=1e-2)
         self._step_count = 0
         self._last_com_x: float = 0.5
         self._last_com_z: float = 0.5
@@ -268,12 +268,12 @@ class LocomotionController:
         }
 
         targets: dict[str, float] = {
-            "lhip":   float(np.clip(0.50 + 0.06 * (float(cpg_out[0].item())*2 - 1), 0.05, 0.95)),
-            "rhip":   float(np.clip(0.50 + 0.06 * (float(cpg_out[1].item())*2 - 1), 0.05, 0.95)),
-            "lknee":  float(np.clip(0.50 + 0.04 * (float(cpg_out[2].item())*2 - 1), 0.05, 0.95)),
-            "rknee":  float(np.clip(0.50 + 0.04 * (float(cpg_out[3].item())*2 - 1), 0.05, 0.95)),
-            "lankle": float(np.clip(0.50 + 0.03 * (float(cpg_out[4].item())*2 - 1), 0.05, 0.95)),
-            "rankle": float(np.clip(0.50 + 0.03 * (float(cpg_out[5].item())*2 - 1), 0.05, 0.95)),
+            "lhip":   float(np.clip(0.50 + 0.18 * (float(cpg_out[0].item())*2 - 1), 0.05, 0.95)),
+            "rhip":   float(np.clip(0.50 + 0.18 * (float(cpg_out[1].item())*2 - 1), 0.05, 0.95)),
+            "lknee":  float(np.clip(0.50 + 0.15 * (float(cpg_out[2].item())*2 - 1), 0.05, 0.95)),
+            "rknee":  float(np.clip(0.50 + 0.15 * (float(cpg_out[3].item())*2 - 1), 0.05, 0.95)),
+            "lankle": float(np.clip(0.50 + 0.10 * (float(cpg_out[4].item())*2 - 1), 0.05, 0.95)),
+            "rankle": float(np.clip(0.50 + 0.10 * (float(cpg_out[5].item())*2 - 1), 0.05, 0.95)),
         }
 
         # Swing phase: hip lift + knee flex (минус = сгибание колена в нормализованных целях)

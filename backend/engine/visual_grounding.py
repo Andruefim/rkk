@@ -369,13 +369,38 @@ class VisualGroundingController:
 
         if physics_client is not None and robot_id is not None:
             ln = link_names or []
-            vm, pm = get_camera_matrices_from_pybullet_humanoid(
-                physics_client, robot_id, ln, image_width, image_height
-            )
-            if vm is not None and pm is not None:
-                joint_projections = project_joints_to_camera(
-                    physics_client, robot_id, ln, vm, pm, image_width, image_height
+            phys_lock = getattr(visual_env, "_physics_lock", None)
+            if phys_lock is None:
+                base = getattr(visual_env, "base_env", None)
+                sim_ph = getattr(base, "_sim", None) if base is not None else None
+                phys_lock = getattr(sim_ph, "_physics_lock", None)
+
+            def _camera_and_project() -> None:
+                nonlocal joint_projections
+                vm, pm = get_camera_matrices_from_pybullet_humanoid(
+                    physics_client, robot_id, ln, image_width, image_height
                 )
+                if vm is not None and pm is not None:
+                    joint_projections = project_joints_to_camera(
+                        physics_client,
+                        robot_id,
+                        ln,
+                        vm,
+                        pm,
+                        image_width,
+                        image_height,
+                    )
+
+            if phys_lock is not None:
+                acquired = phys_lock.acquire(timeout=0.12)
+                if not acquired:
+                    return result
+                try:
+                    _camera_and_project()
+                finally:
+                    phys_lock.release()
+            else:
+                _camera_and_project()
 
         # Fallback: use approximate skeleton from agent graph nodes
         if not joint_projections:

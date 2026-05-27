@@ -11,6 +11,11 @@ class SimulationVisualGroundingMixin:
             return
         if not self._visual_mode or self._visual_env is None:
             return
+        # fixed_root curriculum: PyBullet camera + overlap — дорого; не блокировать тик ~270–300.
+        if getattr(self, "_fixed_root_active", False) and os.environ.get(
+            "RKK_GROUNDING_DURING_FIXED_ROOT", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
+            return
         if not self._visual_grounding_ctrl.should_run(self.tick):
             return
 
@@ -89,6 +94,10 @@ class SimulationVisualGroundingMixin:
         if not _PHASE_M_AVAILABLE or self._slot_labeler is None:
             return
         if not self._visual_mode or self._visual_env is None:
+            return
+        if getattr(self, "_fixed_root_active", False) and os.environ.get(
+            "RKK_PHASE_M_DURING_FIXED_ROOT", "0"
+        ).strip().lower() not in ("1", "true", "yes", "on"):
             return
         vis = self._visual_env
         lex = getattr(vis, "_slot_lexicon", None) or {}

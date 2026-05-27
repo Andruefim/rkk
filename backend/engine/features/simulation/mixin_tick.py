@@ -1104,7 +1104,16 @@ class SimulationTickMixin:
             self._rssm_train_step(obs_pre_rssm, _var, _val, obs_post)
 
         # Фаза 2 ч.3: L4 concept mining (sync fallback или async worker + single-writer apply)
-        if self._visual_env is not None and self.tick % self._concept_inject_every == 0:
+        _l4_ok = not (
+            getattr(self, "_fixed_root_active", False)
+            and os.environ.get("RKK_L4_DURING_FIXED_ROOT", "0").strip().lower()
+            not in ("1", "true", "yes", "on")
+        )
+        if (
+            _l4_ok
+            and self._visual_env is not None
+            and self.tick % self._concept_inject_every == 0
+        ):
             vis = self._visual_env.get_slot_visualization()
             slot_vecs = self._visual_env._last_slot_vecs
             if slot_vecs is not None:
@@ -1284,9 +1293,20 @@ class SimulationTickMixin:
                 )
                 self._sync_temporal_blankets_to_graph()
 
-        # Scene
+        # Scene (кэш: get_full_scene = PyBullet lock + skeleton; не на каждый agent-тик)
+        try:
+            scene_every = max(1, int(os.environ.get("RKK_SCENE_CACHE_EVERY", "4")))
+        except ValueError:
+            scene_every = 4
         scene_fn = getattr(self.agent.env, "get_full_scene", None)
-        scene    = scene_fn() if callable(scene_fn) else {}
+        if (
+            not hasattr(self, "_cached_scene")
+            or self._cached_scene_tick < 0
+            or (self.tick - int(self._cached_scene_tick)) >= scene_every
+        ):
+            self._cached_scene = scene_fn() if callable(scene_fn) else {}
+            self._cached_scene_tick = int(self.tick)
+        scene = dict(getattr(self, "_cached_scene", {}) or {})
 
         # Vision state (кэш для /vision/slots endpoint)
         if self._visual_mode and self._visual_env is not None:

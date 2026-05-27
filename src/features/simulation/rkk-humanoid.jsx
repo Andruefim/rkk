@@ -7,7 +7,8 @@ import NovaChatWidget from "./NovaChatWidget";
 const API = import.meta.env.VITE_RKK_API_URL ?? "http://localhost:8000";
 const WS_CAUSAL_URL =
   API.replace(/^http/i, "ws").replace(/\/$/, "") + "/ws/causal-stream";
-const CAMERA_PREVIEW_MS = 500;
+// PyBullet JPEG render blocks sim lock — keep in sync with RKK_CAMERA_MIN_INTERVAL_SEC (~1s).
+const CAMERA_PREVIEW_MS = 1200;
 const CAM_VIEW = "fp";
 
 const HUMANOID_WORLD_COLOR = "#cc44ff";
@@ -138,7 +139,9 @@ function normFrame(raw) {
     visualMode:raw.visual_mode??false,
     visionTicks:raw.vision_ticks??0,
     vision:raw.vision??null,
-    fixedRoot:raw.fixed_root??false,  // НОВОЕ
+    fixedRoot:raw.fixed_root??false,
+    curriculumStep:raw.curriculum_step??(raw.fixed_root?1:3),
+    curriculumStabilizeUntil:raw.curriculum_stabilize_until??0,
     system2: raw.system2 ?? null,
   };
 }
@@ -218,7 +221,7 @@ export default function RKKHumanoid() {
         const d = await fetch(`${API}/vision/slots`).then(r=>r.json());
         if (d.visual_mode !== false) setVisionData(d);
       } catch {}
-    }, 800);
+    }, 1500);
     return () => clearInterval(iv);
   }, [connected, visionEnabled, activePanel]);
 
@@ -1005,8 +1008,14 @@ export default function RKKHumanoid() {
   const fallen=ui.fallen||a.fallen;
   const isVis=ui.visualMode;
   const isFR=fixedRoot;
+  const curStep=ui.curriculumStep??(isFR?1:3);
+  const curStabUntil=ui.curriculumStabilizeUntil??0;
+  const stabLeft=curStep===2?Math.max(0,curStabUntil-ui.tick):0;
   const visColor="#44ffcc";
   const frColor="#ffcc44";
+  const curActive="#00cc88";
+  const curDone="#445566";
+  const curIdle="#224433";
 
   return(
     <div style={{position:"relative",width:"100%",height:"100vh",background:"#e8f2fa",overflow:"hidden",...mono}}>
@@ -1262,15 +1271,20 @@ export default function RKKHumanoid() {
 
         <div style={{...sep,marginBottom:6}}>
           <div style={{fontSize:8,color:"#333344",marginBottom:4}}>CURRICULUM PATH:</div>
-          <div style={{fontSize:8,color:isFR?frColor:"#445566",fontWeight:isFR?"bold":"normal",marginBottom:2}}>
-            {isFR?"● ":"→ "}Step 1: Fixed Base (arms only)
-            {isFR&&<span style={{color:"#665500"}}> · active</span>}
+          <div style={{fontSize:8,color:curStep===1?frColor:curDone,fontWeight:curStep===1?"bold":"normal",marginBottom:2}}>
+            {curStep===1?"● ":"→ "}Step 1: Fixed Base (arms only)
+            {curStep===1&&<span style={{color:"#665500"}}> · active</span>}
+            {curStep>1&&<span style={{color:curDone}}> · done</span>}
           </div>
-          <div style={{fontSize:8,color:!isFR&&ui.currentWorld==="humanoid"?"#00cc88":"#224433",marginBottom:2}}>
-            → Step 2: Balance assist
+          <div style={{fontSize:8,color:curStep===2?curActive:curStep>2?curDone:curIdle,fontWeight:curStep===2?"bold":"normal",marginBottom:2}}>
+            {curStep===2?"● ":"→ "}Step 2: Balance assist
+            {curStep===2&&stabLeft>0&&<span style={{color:"#338866"}}> · ~{stabLeft} ticks</span>}
+            {curStep===2&&<span style={{color:"#338866"}}> · active</span>}
+            {curStep>2&&<span style={{color:curDone}}> · done</span>}
           </div>
-          <div style={{fontSize:8,color:"#224433",marginBottom:2}}>
-            → Step 3: Free locomotion
+          <div style={{fontSize:8,color:curStep===3?curActive:curIdle,fontWeight:curStep===3?"bold":"normal",marginBottom:2}}>
+            {curStep===3?"● ":"→ "}Step 3: Free locomotion
+            {curStep===3&&<span style={{color:"#338866"}}> · active (CPG + walk)</span>}
           </div>
         </div>
 

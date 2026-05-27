@@ -523,6 +523,10 @@ class RKKAgent:
         # Phase T: Progressive variable scope
         self._prog_scope = ProgressiveScope()
 
+        # Phase 6: causal-surprise replay + genome EMA
+        self._replay_buffer: deque[dict] = deque(maxlen=512)
+        self._genome_ema_W: torch.Tensor | None = None
+
         self._bootstrap()
 
     def set_system2_candidate(self, candidate: dict | None) -> None:
@@ -1870,6 +1874,8 @@ class RKKAgent:
     def _schedule_score_refresh(self, engine_tick: int) -> None:
         if not _score_bg_refresh_enabled():
             return
+        if _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(self.graph.nodes):
+            return
         if self._score_thread is not None and self._score_thread.is_alive():
             return
         if engine_tick - self._score_refresh_tick < max(
@@ -1908,6 +1914,59 @@ class RKKAgent:
                     continue
             acc += r.bonus * w
         return min(0.28, acc)
+
+    def _push_causal_replay(
+        self,
+        var: str,
+        val: float,
+        obs_before: dict,
+        obs_after: dict,
+        *,
+        compression_delta: float,
+        prediction_error: float,
+    ) -> None:
+        """Priority replay by causal_surprise × structural_importance."""
+        structural = 1.0
+        try:
+            structural = float(self.graph.alpha_mean)
+        except Exception:
+            pass
+        priority = abs(prediction_error) * (1.0 + abs(compression_delta)) * max(0.1, structural)
+        self._replay_buffer.append({
+            "var": var,
+            "val": val,
+            "obs_before": dict(obs_before),
+            "obs_after": dict(obs_after),
+            "priority": priority,
+            "tick": int(self._last_engine_tick),
+        })
+
+    def sample_replay_batch(self, k: int = 4) -> list[dict]:
+        """Sample top-priority transitions for consolidation replay."""
+        if not self._replay_buffer:
+            return []
+        ranked = sorted(self._replay_buffer, key=lambda x: -x.get("priority", 0.0))
+        return ranked[: max(1, k)]
+
+    def _genome_ema_update(self) -> None:
+        """Slow EMA of executive W into genome prior (RKK_GENOME_EMA_TAU)."""
+        try:
+            tau = float(os.environ.get("RKK_GENOME_EMA_TAU", "0.001"))
+        except ValueError:
+            tau = 0.001
+        if tau <= 0 or self.graph._core is None:
+            return
+        W = self.graph._core.W.detach()
+        d = self.graph._d
+        if d < 1:
+            return
+        block = W[:d, :d].clone()
+        if self._genome_ema_W is None or self._genome_ema_W.shape != block.shape:
+            self._genome_ema_W = block.clone()
+            return
+        self._genome_ema_W.mul_(1.0 - tau).add_(block, alpha=tau)
+        if getattr(self.graph, "_ensemble", None) is not None:
+            self.graph._ensemble.sync_from_executive(self._genome_ema_W, idx=0)
 
     # ── Один шаг с Value Layer ────────────────────────────────────────────────
     def step(self, engine_tick: int = 0, *, enable_l3: bool = True) -> dict:
@@ -1975,7 +2034,15 @@ class RKKAgent:
             _t_score = time.perf_counter()
             _score_mode = "?"
             # #endregion
-            if cache_fresh:
+            _fr_score_only = bool(
+                _env_fixed_root_flag(self.env)
+                or _graph_fixed_root_flag(self.graph.nodes)
+            )
+            if _fr_score_only and self._score_cache:
+                scores = list(self._score_cache)
+                _score_mode = "fixed_root_cache_only"
+                # Не фоновый score_interventions при fixed_root — гонка с train_step вешает ~280.
+            elif cache_fresh:
                 scores = list(self._score_cache)
                 _score_mode = "cache"
             elif cache_stale_ok and _score_stale_only() and due_recompute:
@@ -2013,9 +2080,31 @@ class RKKAgent:
             elif due_recompute and (
                 not self._score_cache or engine_tick % max(1, sce) == 0
             ):
-                with torch.no_grad():
-                    scores = self.score_interventions()
-                _score_mode = "sync_refresh"
+                cap_ms = 0.0
+                try:
+                    cap_ms = float(os.environ.get("RKK_SCORE_SYNC_CAP_MS", "400"))
+                except ValueError:
+                    cap_ms = 400.0
+                if (
+                    cap_ms > 0
+                    and _score_stale_only()
+                    and self._score_cache
+                ):
+                    scores = list(self._score_cache)
+                    _score_mode = "sync_cap_stale"
+                    self._schedule_score_refresh(engine_tick)
+                else:
+                    _t_cap = time.perf_counter()
+                    with torch.no_grad():
+                        scores = self.score_interventions()
+                    if cap_ms > 0 and (time.perf_counter() - _t_cap) * 1000.0 > cap_ms:
+                        if self._score_cache:
+                            scores = list(self._score_cache)
+                            _score_mode = "sync_cap_fallback"
+                        else:
+                            _score_mode = "sync_refresh_slow"
+                    else:
+                        _score_mode = "sync_refresh"
                 if sce > 1:
                     self._score_cache = list(scores)
                     self._score_cache_tick = engine_tick
@@ -2372,6 +2461,22 @@ class RKKAgent:
         mdl_after         = self.graph.mdl_size
         compression_delta = mdl_before - mdl_after
         self._cg_history.append(compression_delta)
+
+        pe_mean = float(
+            np.mean([
+                abs(float(predicted.get(k, 0.5)) - float(observed_full.get(k, 0.5)))
+                for k in self.graph._node_ids[:32]
+            ]) if self.graph._node_ids else 0.0
+        )
+        self._push_causal_replay(
+            var, value, obs_before_full, observed_full,
+            compression_delta=compression_delta,
+            prediction_error=pe_mean,
+        )
+        self.graph.update_ensemble_posterior(
+            obs_before_full, observed_full, var, value
+        )
+        self._genome_ema_update()
 
         # System 1: IG по физике; slot_* и self_* не доминируют метрику (self — прямое задание агентом).
         nids = self.graph._node_ids
@@ -2839,4 +2944,21 @@ class RKKAgent:
             pos_fn = getattr(self.env, "object_positions_world", None)
             if callable(pos_fn):
                 snap["physics_objects"] = pos_fn()
+        core = self.graph.get_world_model_core()
+        if core is not None:
+            snap["wm"] = {
+                "mechanism_hidden": int(getattr(core, "hidden", 24)),
+                "type": "gnn",
+            }
+        ens = getattr(self.graph, "_ensemble", None)
+        if ens is not None:
+            snap["graph_ensemble"] = ens.snapshot()
+        try:
+            from engine.hypothesis_testing import snapshot_eig_top
+
+            obs = dict(self.env.observe())
+            snap["eig"] = snapshot_eig_top(self.graph, obs)
+        except Exception:
+            pass
+        snap["replay_buffer_len"] = len(getattr(self, "_replay_buffer", []))
         return snap

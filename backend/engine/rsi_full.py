@@ -80,10 +80,15 @@ def _migrate_gnn_expand_hidden(old: CausalGNNCore, new_hidden: int) -> CausalGNN
 
     copy_linear(old.node_enc[0], new.node_enc[0])
     copy_linear(old.action_enc[0], new.action_enc[0])
-    copy_linear(old.msg_fn[0], new.msg_fn[0])
-    copy_linear(old.msg_fn[2], new.msg_fn[2])
-    copy_linear(old.out_dec[0], new.out_dec[0])
-    copy_linear(old.out_dec[2], new.out_dec[2])
+    for i in range(d):
+        old_m = old.mechanisms[i]
+        new_m = new.mechanisms[i]
+        copy_linear(old_m.net[0], new_m.net[0])
+        copy_linear(old_m.net[2], new_m.net[2])
+        copy_linear(old_m.out_1, new_m.out_1)
+        copy_linear(old_m.out_5, new_m.out_5)
+        copy_linear(old_m.out_20, new_m.out_20)
+        copy_linear(old_m.latent_predictor, new_m.latent_predictor)
 
     if nh > oh:
         with torch.no_grad():
@@ -109,15 +114,18 @@ def _migrate_gnn_expand_hidden(old: CausalGNNCore, new_hidden: int) -> CausalGNN
             for seq in (new.node_enc, new.action_enc):
                 xavier_rows(seq[0].weight, oh, nh)
                 zero_bias_rows(seq[0].bias, oh, nh)
-            xavier_rows(new.msg_fn[0].weight, oh, nh)
-            zero_bias_rows(new.msg_fn[0].bias, oh, nh)
-            xavier_rows(new.msg_fn[2].weight, oh, nh)
-            xavier_cols(new.msg_fn[2].weight, oh, nh)
-            zero_bias_rows(new.msg_fn[2].bias, oh, nh)
-            xavier_rows(new.out_dec[0].weight, oh, nh)
-            zero_bias_rows(new.out_dec[0].bias, oh, nh)
-            xavier_cols(new.out_dec[2].weight, oh, nh)
+            for i in range(d):
+                m = new.mechanisms[i]
+                xavier_rows(m.net[0].weight, oh, nh)
+                zero_bias_rows(m.net[0].bias, oh, nh)
+                xavier_cols(m.net[0].weight, oh, nh)
+                xavier_rows(m.net[2].weight, oh, nh)
+                xavier_cols(m.net[2].weight, oh, nh)
+                zero_bias_rows(m.net[2].bias, oh, nh)
 
+    new.target_enc.load_state_dict(new.node_enc.state_dict())
+    for p in new.target_enc.parameters():
+        p.requires_grad = False
     return new
 
 

@@ -336,8 +336,15 @@ class MultiscaleTimeController:
         }
         self._tick_count: int = 0
         self._context_cache: dict[int, dict[str, float]] = {}
+        self._pe_boundary = PEBoundaryDetector()
 
-    def tick(self, tick: int, obs: dict[str, float]) -> dict[int, dict[str, float]]:
+    def tick(
+        self,
+        tick: int,
+        obs: dict[str, float],
+        *,
+        prediction_error: float | None = None,
+    ) -> dict[int, dict[str, float]]:
         """
         Update all level buffers with current obs.
         Returns dict of level → aggregates for this tick.
@@ -346,6 +353,16 @@ class MultiscaleTimeController:
             return {}
 
         self._tick_count += 1
+
+        pe = prediction_error
+        if pe is None:
+            pe = float(obs.get("prediction_error", obs.get("phys_prediction_error", 0.0)))
+        if self._pe_boundary.update(pe, tick):
+            dyn = self._pe_boundary.macro_period(self.dispatcher._periods[LEVEL_MOTOR])
+            self.dispatcher._periods[LEVEL_MOTOR] = dyn
+            self.dispatcher._periods[LEVEL_COGNIT] = max(
+                dyn * 2, self._pe_boundary.macro_period(self.dispatcher._periods[LEVEL_COGNIT])
+            )
 
         # Push obs to each level's buffer on its schedule
         for level, buf in self.buffers.items():
@@ -412,8 +429,56 @@ class MultiscaleTimeController:
             "tick_count": self._tick_count,
             "dispatcher": self.dispatcher.snapshot(),
             "propagator": self.propagator.snapshot(),
+            "pe_boundary": self._pe_boundary.snapshot(),
             "buffers": {
                 LEVEL_NAMES[l]: buf.snapshot()
                 for l, buf in self.buffers.items()
             },
+        }
+
+
+# ─── Learned macro ticks via PE boundary detection (Phase 4) ─────────────────
+
+class PEBoundaryDetector:
+    """
+    Dynamic macro-tick: when prediction_error spikes, emit a new temporal boundary
+    instead of fixed τ1=30 / τ2=300 constants.
+    """
+
+    def __init__(self):
+        self._pe_ema: float = 0.0
+        self._alpha = 0.12
+        try:
+            self._spike_thresh = float(os.environ.get("RKK_MACRO_PE_SPIKE", "0.08"))
+        except ValueError:
+            self._spike_thresh = 0.08
+        self._boundaries: list[int] = []
+        self._dynamic_period: int | None = None
+
+    def update(self, prediction_error: float, tick: int) -> bool:
+        """Returns True if this tick is a learned macro boundary."""
+        pe = float(prediction_error)
+        prev = self._pe_ema
+        self._pe_ema = (1.0 - self._alpha) * self._pe_ema + self._alpha * pe
+        spike = pe - prev > self._spike_thresh
+        if spike:
+            self._boundaries.append(tick)
+            if len(self._boundaries) >= 2:
+                gaps = [
+                    self._boundaries[i] - self._boundaries[i - 1]
+                    for i in range(1, len(self._boundaries))
+                ]
+                self._dynamic_period = max(5, int(np.median(gaps)))
+        return spike
+
+    def macro_period(self, default: int) -> int:
+        if self._dynamic_period is not None:
+            return self._dynamic_period
+        return default
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "pe_ema": round(self._pe_ema, 5),
+            "dynamic_period": self._dynamic_period,
+            "n_boundaries": len(self._boundaries),
         }

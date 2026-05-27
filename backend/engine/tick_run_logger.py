@@ -183,6 +183,32 @@ def _phys_from_sim_raw(base: Any) -> dict[str, float]:
     return out
 
 
+def _wm_snapshot(agent: Any, result: dict[str, Any]) -> dict[str, Any]:
+    """World model + graph ensemble diagnostics for tick log."""
+    out: dict[str, Any] = {}
+    graph = getattr(agent, "graph", None)
+    core = graph.get_world_model_core() if graph is not None and hasattr(graph, "get_world_model_core") else None
+    if core is not None:
+        out["mechanism_hidden"] = int(getattr(core, "hidden", 0))
+        out["gnn_d"] = int(getattr(core, "d", 0))
+    ens = getattr(graph, "_ensemble", None) if graph is not None else None
+    if ens is not None:
+        try:
+            out["ensemble"] = ens.snapshot()
+        except Exception:
+            pass
+    try:
+        from engine.hypothesis_testing import snapshot_eig_top
+
+        obs = dict(getattr(agent.env, "observe", lambda: {})() or {})
+        out["eig"] = snapshot_eig_top(graph, obs)
+    except Exception:
+        pe = result.get("prediction_error")
+        if pe is not None:
+            out["prediction_error"] = round(float(pe), 5)
+    return out
+
+
 class TickRunLogger:
     def __init__(self) -> None:
         self._path = _log_path()
@@ -340,6 +366,7 @@ class TickRunLogger:
                 "rsi_lite": result.get("rsi_lite"),
                 "system1_mean_loss": (snap.get("system1") or {}).get("mean_loss"),
             },
+            "wm": _wm_snapshot(agent, result),
             "sleep": _sleep_snapshot(sim),
             "locomotion": _locomotion_snapshot(sim),
         }

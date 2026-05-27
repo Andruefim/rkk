@@ -152,6 +152,13 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
     if prev is None:
         return {"enabled": True, "warmup": True}
 
+    elbo_q: dict[str, float] = {}
+    if _hai_elbo_steps() > 0:
+        try:
+            elbo_q = hai_elbo_step(obs, prior_mean=dict(obs))
+        except Exception:
+            elbo_q = {}
+
     actual_delta = float(cx - prev)
 
     gnn_delta = _gnn_prior_com_x_delta(graph, obs)
@@ -238,6 +245,7 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
 
     return {
         "enabled": True,
+        "elbo_q": {k: round(v, 4) for k, v in elbo_q.items()} if elbo_q else None,
         "prior_source": prior_source,
         "expected_fwd": round(expected_fwd, 5),
         "actual_delta": round(actual_delta, 5),
@@ -251,3 +259,40 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
         "w_plan": round(w_plan, 4),
         "w_prop": round(w_prop, 4),
     }
+
+
+def _hai_elbo_steps() -> int:
+    try:
+        return max(1, min(4, int(os.environ.get("RKK_HAI_ELBO_STEPS", "2"))))
+    except ValueError:
+        return 2
+
+
+def _elbo_gaussian_nll(obs: float, mean: float, log_prec: float) -> float:
+    prec = float(np.exp(np.clip(log_prec, -6.0, 6.0)))
+    return 0.5 * prec * (obs - mean) ** 2 - 0.5 * log_prec
+
+
+def hai_elbo_step(
+    obs: dict[str, float],
+    *,
+    prior_mean: dict[str, float] | None = None,
+    log_precision: float = 0.0,
+) -> dict[str, float]:
+    """
+    ELBO gradient-ascent for sensorimotor q(s_0); replaces hand-tuned PID when
+    RKK_HAI_ELBO_STEPS>0. Returns updated posterior means for motor vars.
+    """
+    if not hierarchical_pe_enabled():
+        return {}
+    prior_mean = prior_mean or {}
+    lr = _env_f("RKK_HAI_ELBO_LR", 0.04)
+    steps = _hai_elbo_steps()
+    keys = ["com_x", "com_z", "intent_stride", "intent_gait_coupling"]
+    q: dict[str, float] = {k: float(prior_mean.get(k, obs.get(k, 0.5))) for k in keys}
+    for _ in range(steps):
+        for k in keys:
+            o = float(obs.get(k, q[k]))
+            grad = float(np.exp(np.clip(log_precision, -6.0, 6.0))) * (q[k] - o)
+            q[k] = float(np.clip(q[k] - lr * grad, 0.05, 0.95))
+    return q

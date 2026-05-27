@@ -23,6 +23,25 @@ from engine.features.simulation.imports import (
 )
 
 
+def humanoid_curriculum_step(sim: Any) -> tuple[int, int]:
+    """
+    UI curriculum path (distinct from progressive_scope phases):
+      1 — fixed_root (pelvis pinned)
+      2 — post-release balance assist (stabilize_until)
+      3 — free locomotion (pelvis free, CPG + genome walk)
+    Returns (step 0..3, stabilize_until tick; 0 if not humanoid).
+    """
+    if getattr(sim, "current_world", None) != "humanoid":
+        return 0, 0
+    until = int(getattr(sim, "_curriculum_stabilize_until", 0) or 0)
+    if getattr(sim, "_fixed_root_active", False):
+        return 1, until
+    tick = int(getattr(sim, "tick", 0))
+    if until > tick:
+        return 2, until
+    return 3, until
+
+
 def build_simulation_snapshot(
     sim: Any,
     snap: dict,
@@ -31,6 +50,7 @@ def build_simulation_snapshot(
     scene: dict,
 ) -> dict:
     winfo = WORLDS.get(sim.current_world, {"color": "#cc44ff", "label": sim.current_world})
+    cur_step, cur_stab_until = humanoid_curriculum_step(sim)
 
     vision_summary = None
     if sim._visual_mode and sim._visual_env is not None:
@@ -74,6 +94,8 @@ def build_simulation_snapshot(
             "best_score": round(float(sim._fall_recovery_best_score), 4),
         },
         "fixed_root": sim._fixed_root_active,
+        "curriculum_step": cur_step,
+        "curriculum_stabilize_until": cur_stab_until,
         "scene": scene,
         "visual_mode": sim._visual_mode,
         "vision_ticks": sim._vision_ticks,

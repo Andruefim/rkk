@@ -447,10 +447,15 @@ def proposal_from_llm_network_fetch(
 
 
 def recovery_llm_enabled() -> bool:
-    """Multi-step motor recovery JSON (requires ``RKK_SYSTEM2_LLM``)."""
-    if not llm_teacher_enabled():
+    """Multi-step motor recovery JSON (``RKK_S2_RECOVERY_LLM``, independent of macro-plan LLM)."""
+    if os.environ.get("RKK_SKIP_ALL_LLM", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
         return False
-    return os.environ.get("RKK_S2_RECOVERY_LLM", "1").strip().lower() not in (
+    return os.environ.get("RKK_S2_RECOVERY_LLM", "0").strip().lower() not in (
         "0",
         "false",
         "no",

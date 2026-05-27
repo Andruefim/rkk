@@ -1,17 +1,27 @@
 """
-causal_gnn.py — GNN-based Causal Structure Learner (Фаза 10+).
+causal_gnn.py — Modular Causal GNN World Model (AGI Phase 1).
 
 Drop-in замена NOTEARSCore в causal_graph.py.
+
+ADR — modular vs shared (Pearl semantics):
+  Modular (per-node): ``MechanismMLP`` in ``self.mechanisms[i]`` — each variable
+  has an independent 2-layer MLP (hidden=RKK_MECHANISM_HIDDEN, default 24).
+  Intervention ``do(X)``: only descendants of X are re-evaluated; mechanism X gets
+  no gradient (see ``forward_dynamics_under_do``, RKK_DO_DESCENDANT_ONLY=1).
+
+  Shared (intentional compromise): adjacency ``W``, ``node_enc``, ``action_enc``,
+  global ``sz_head_z``. These are NOT per-mechanism; ensemble structure learning
+  (Phase 2) holds multiple ``W_k`` hypotheses while one executive WM runs fast.
 
 Ключевые отличия от NOTEARS:
   NOTEARS:  X_pred = X @ W           — линейный SCM, O(d²) forward
             h(W) = tr(exp(W∘W)) - d  — O(d³) из-за matrix_exp
             W: nn.Parameter (d×d)
 
-  CausalGNN: Message Passing forward — нелинейный, O(d² · hidden)
+  CausalGNN: Per-node MechanismMLP + parent aggregation — нелинейный, O(d² · hidden)
              h(W) — та же формула (совместимость с Epistemic Annealing)
              W: nn.Parameter (d×d)   — та же структура (.grad совместим)
-             + node_enc / msg_fn / out_dec — обучаются параллельно
+             + node_enc / action_enc / mechanisms[i] — обучаются параллельно
 
 Совместимость интерфейса (1:1 с NOTEARSCore):
   .W                   → nn.Parameter (d×d), имеет .grad
@@ -52,6 +62,19 @@ import torch.nn.functional as F
 import numpy as np
 
 _DAG_TAYLOR_WARNED: bool = False
+
+
+def _mechanism_hidden_dim() -> int:
+    try:
+        return max(8, min(128, int(os.environ.get("RKK_MECHANISM_HIDDEN", "24"))))
+    except ValueError:
+        return 24
+
+
+def _do_descendant_only() -> bool:
+    return os.environ.get("RKK_DO_DESCENDANT_ONLY", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 def _warn_dag_taylor_order4_if_large(d: int) -> None:
@@ -197,31 +220,23 @@ class MechanismMLP(nn.Module):
 # ─── CausalGNNCore ────────────────────────────────────────────────────────────
 class CausalGNNCore(nn.Module):
     """
-    GNN-based каузальный граф. Drop-in замена NOTEARSCore.
+    Modular causal GNN. Drop-in замена NOTEARSCore.
 
     Архитектура:
-      1. node_enc:   scalar → hidden embedding  (кодируем значение переменной)
-      2. msg_fn:     (h_from, h_to) → message   (создаём сообщение по ребру j→i)
-      3. out_dec:    (h_i, agg_i)   → x_i_pred  (декодируем предсказание)
+      1. node_enc / action_enc: shared scalar → hidden encoders
+      2. mechanisms[i]: independent MechanismMLP per node i
+      3. agg_i = Σ_j W[j,i] · h_j  (vectorized parent aggregation)
+      4. x_i_pred = mechanisms[i](h_i, agg_i)
 
-    Adjacency W:
-      nn.Parameter (d×d), совместим с NOTEARSCore.
-      Все каузальные рёбра кодируются в W, как и раньше.
-      Градиенты по W используются в System 1 (grad_norm).
-
-    Message Passing:
-      agg_i = Σ_j W[j,i] · msg_fn(h_j, h_i)
-      x_i_pred = out_dec(concat(h_i, agg_i))
-
-    DAG Constraint:
-      h(W) = tr(exp(W∘W)) - d   ← та же формула что в NOTEARS
+    Adjacency W: nn.Parameter (d×d), shared across mechanisms.
+    DAG Constraint: h(W) = tr(exp(W∘W)) - d (Taylor order 4).
     """
 
-    def __init__(self, d: int, device: torch.device, hidden: int = 24):
+    def __init__(self, d: int, device: torch.device, hidden: int | None = None):
         super().__init__()
         self.d      = d
         self.device = device
-        self.hidden = hidden
+        self.hidden = hidden if hidden is not None else _mechanism_hidden_dim()
 
         # ── Adjacency matrix (совместимость с NOTEARSCore) ───────────────────
         # Small random init: all-zeros + sparse inference ⇒ zero agg ⇒ no gradient into W.
@@ -229,25 +244,26 @@ class CausalGNNCore(nn.Module):
 
         # ── GNN компоненты ────────────────────────────────────────────────────
         # Node encoder: кодируем скалярное значение переменной
+        hdim = self.hidden
         self.node_enc = nn.Sequential(
-            nn.Linear(1, hidden),
+            nn.Linear(1, hdim),
             nn.Tanh(),
         )
 
         # Action encoder: то же измерение, что и состояние (a_t[i] — воздействие на i-ю ось)
         self.action_enc = nn.Sequential(
-            nn.Linear(1, hidden),
+            nn.Linear(1, hdim),
             nn.Tanh(),
         )
 
         # Модульные механизмы: свой независимый MLP для каждой переменной
         self.mechanisms = nn.ModuleList([
-            MechanismMLP(hidden) for _ in range(d)
+            MechanismMLP(hdim) for _ in range(d)
         ])
         
         # JEPA Target Encoder (EMA from node_enc after each train step)
         self.target_enc = nn.Sequential(
-            nn.Linear(1, hidden),
+            nn.Linear(1, hdim),
             nn.Tanh(),
         )
 
@@ -271,7 +287,7 @@ class CausalGNNCore(nn.Module):
             self._sz_dim = max(4, min(128, int(os.environ.get("RKK_SZ_DIM", "16"))))
         except ValueError:
             self._sz_dim = 16
-        self.sz_head_z = nn.Linear(d * hidden, self._sz_dim)
+        self.sz_head_z = nn.Linear(d * hdim, self._sz_dim)
         nn.init.xavier_uniform_(self.sz_head_z.weight, gain=0.12)
         nn.init.zeros_(self.sz_head_z.bias)
 
@@ -346,6 +362,91 @@ class CausalGNNCore(nn.Module):
         (например подача предсказания в visual cortex).
         """
         return self.forward_dynamics(X, torch.zeros_like(X))
+
+    def _adjacency_bool(self) -> torch.Tensor:
+        """Directed edges j→i when |W[j,i]| > ε."""
+        return self.W_masked().abs() > 1e-8
+
+    def _topological_order(self) -> list[int]:
+        """Kahn topological sort on DAG from W (parents before children)."""
+        A = self._adjacency_bool().detach().cpu().numpy()
+        d = self.d
+        in_deg = A.sum(axis=0).astype(int)
+        order: list[int] = []
+        ready = [i for i in range(d) if in_deg[i] == 0]
+        while ready:
+            u = ready.pop(0)
+            order.append(u)
+            for v in range(d):
+                if A[u, v] > 0:
+                    in_deg[v] -= 1
+                    if in_deg[v] == 0:
+                        ready.append(v)
+        seen = set(order)
+        for i in range(d):
+            if i not in seen:
+                order.append(i)
+        return order
+
+    def descendants_mask(self, int_var_idx: int) -> torch.Tensor:
+        """Boolean mask (d,) — nodes reachable from int_var_idx following W edges."""
+        A = self._adjacency_bool().detach().cpu().numpy()
+        d = self.d
+        mask = torch.zeros(d, dtype=torch.bool, device=self.device)
+        stack = [int(int_var_idx)]
+        visited = {int(int_var_idx)}
+        while stack:
+            u = stack.pop()
+            for v in range(d):
+                if A[u, v] > 0 and v not in visited:
+                    visited.add(v)
+                    mask[v] = True
+                    stack.append(v)
+        return mask
+
+    def forward_dynamics_under_do(
+        self,
+        X: torch.Tensor,
+        a: torch.Tensor,
+        int_var_idx: int,
+        int_val: float,
+    ) -> torch.Tensor:
+        """
+        Pearl-style do(X=x): fix node X, recompute only descendants(X).
+        Non-descendants return X unchanged (no mechanism gradient path).
+        """
+        B, d = X.shape
+        am = torch.sigmoid(torch.abs(a) * 1000.0).unsqueeze(-1)
+        h_a = self.action_enc(a.unsqueeze(-1))
+        h = self.node_enc(X.unsqueeze(-1)) + am * h_a
+
+        int_col = torch.full((B, 1), float(int_val), device=X.device, dtype=X.dtype)
+        h_fixed = self.node_enc(int_col.unsqueeze(-1)).squeeze(1)
+
+        desc = self.descendants_mask(int_var_idx)
+        A = self.W_masked()
+        out = X.clone()
+        out[:, int_var_idx] = float(int_val)
+
+        h_enc = self.node_enc(X.unsqueeze(-1)) + am * h_a
+        h_list = [h_enc[:, j, :].detach() for j in range(d)]
+        h_list[int_var_idx] = h_fixed.detach()
+
+        for i in self._topological_order():
+            if i == int_var_idx or not desc[i]:
+                continue
+            agg_i = torch.zeros(B, self.hidden, device=X.device, dtype=X.dtype)
+            for j in range(d):
+                w = A[j, i]
+                if w.abs() > 1e-8:
+                    agg_i = agg_i + w * h_list[j]
+            o1, _, _, _ = self.mechanisms[i](h_list[i], agg_i)
+            out[:, i] = o1
+            h_list[i] = self.node_enc(
+                out[:, i].unsqueeze(-1).unsqueeze(-1)
+            ).squeeze(1).detach()
+
+        return out
 
     # ── LeWM: Latent encoding + parallel sequence forward ─────────────────────
     def encode_latent(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
@@ -453,17 +554,30 @@ class CausalGNNCore(nn.Module):
         int_var_idx: int,
         int_val:     float,
     ) -> torch.Tensor:
-        """L_intervention: после do(var=val) предсказание совпадает с наблюдением.
-        Модуль узла X изолируется от получения градиентов."""
+        """L_intervention: after do(var=val) prediction matches observation.
+        Mechanism of intervened node receives no gradients."""
         a = torch.zeros_like(X_obs)
         a[:, int_var_idx] = int_val
-        predicted = self.forward_dynamics(X_obs, a)
-        
-        # Mask out the intervened variable so its MechanismMLP gets no gradients
+
+        mech = self.mechanisms[int_var_idx]
+        saved_rg = [p.requires_grad for p in mech.parameters()]
+        for p in mech.parameters():
+            p.requires_grad = False
+
+        if _do_descendant_only():
+            predicted = self.forward_dynamics_under_do(
+                X_obs, a, int_var_idx, int_val
+            )
+        else:
+            predicted = self.forward_dynamics(X_obs, a)
+
         mask = torch.ones_like(predicted)
         mask[:, int_var_idx] = 0.0
-        
-        return F.mse_loss(predicted * mask, X_int * mask)
+        loss = F.mse_loss(predicted * mask, X_int * mask)
+
+        for p, rg in zip(mech.parameters(), saved_rg):
+            p.requires_grad = rg
+        return loss
 
     def l1_reg(self) -> torch.Tensor:
         """L1 на веса → разреженность → MDL."""
@@ -492,10 +606,8 @@ class CausalGNNCore(nn.Module):
     # ── Динамическое изменение размера (для PyBullet с переменным n_objects) ──
     def resize_to(self, new_d: int) -> "CausalGNNCore":
         """
-        Создаём новый GNN для большего d.
-        Мигрируем существующие веса W (каузальные связи сохраняются).
-        MLP-веса (node_enc, msg_fn, out_dec) копируются полностью —
-        они не зависят от d и переиспользуются.
+        Resize to new_d. Migrates W, shared encoders, and per-node mechanisms.
+        New mechanism indices are Xavier-initialized (MechanismMLP default).
         """
         new_core = CausalGNNCore(new_d, self.device, self.hidden)
         old_d = self.d

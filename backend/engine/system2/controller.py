@@ -425,6 +425,14 @@ def _recovery_llm_timeout_ticks() -> int:
         return 60
 
 
+def _system2_llm_timeout_ticks() -> int:
+    """После стольких тиков ожидания async-плана — сброс future и план от student."""
+    try:
+        return max(16, int(os.environ.get("RKK_SYSTEM2_LLM_TIMEOUT_TICKS", "72")))
+    except ValueError:
+        return 72
+
+
 def _recovery_replan_empty_schedule_ticks() -> int:
     """Если шаги так и не пришли (или пустой JSON), повторить запрос не раньше этого age сессии."""
     try:
@@ -1378,6 +1386,65 @@ class System2Controller:
             except Exception:
                 pass
 
+    def _maybe_timeout_system2_llm(
+        self,
+        sim_tick: int,
+        agent: Any,
+        obs_f: dict[str, float],
+        base: Any,
+        graph: Any,
+        node_keys: frozenset[str],
+        sim: Any | None,
+    ) -> dict[str, Any] | None:
+        """Если Ollama/VLM зависли — не блокировать макрос бесконечно: student-only replan."""
+        fut = self._llm_future
+        if fut is None or fut.done():
+            return None
+        if self._llm_submit_tick < 0:
+            return None
+        waited = int(sim_tick) - int(self._llm_submit_tick)
+        if waited < _system2_llm_timeout_ticks():
+            return None
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+        self._llm_future = None
+        self._llm_slot_lexicon_frame = None
+        logging.getLogger(__name__).warning(
+            "System2 LLM timeout after %s ticks (submit=%s); student fallback",
+            waited,
+            self._llm_submit_tick,
+        )
+        diag = self._apply_planning_step(
+            sim_tick,
+            agent,
+            obs_f,
+            base,
+            graph,
+            node_keys,
+            sim,
+            None,
+            plan_tick_bump=True,
+        )
+        diag = dict(diag)
+        diag["llm_timeout"] = True
+        diag["llm_wait_ticks"] = waited
+        diag["llm_inflight"] = False
+        diag["llm_submit_tick"] = None
+        diag["source"] = str(diag.get("source", "student")) + "+llm_timeout"
+        if sim is not None and hasattr(sim, "_add_event"):
+            try:
+                sim._add_event(
+                    f"⏱ S2 LLM timeout ({waited} ticks) → student plan",
+                    "#ff8844",
+                    "system2",
+                )
+            except Exception:
+                pass
+        self._last_diag = diag
+        return diag
+
     def _drain_completed_llm_future(
         self,
         sim_tick: int,
@@ -1969,6 +2036,12 @@ class System2Controller:
         if drained_early is not None:
             self._last_diag = drained_early
             return self._last_diag
+
+        timed_out = self._maybe_timeout_system2_llm(
+            sim_tick, agent, obs_f, base, graph, node_keys, sim
+        )
+        if timed_out is not None:
+            return timed_out
 
         ending_macro = self._active_macro
         ending_source = self._last_source

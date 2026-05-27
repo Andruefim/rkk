@@ -72,11 +72,41 @@ def sleep_enabled() -> bool:
 
 def mocap_dreams_enabled() -> bool:
     """REM MoCap replay + inverse dynamics; disable to save CPU/GPU while keeping sleep."""
+    if os.environ.get("RKK_SKIP_ALL_LLM", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return False
     return os.environ.get("RKK_SLEEP_MOCAP_DREAMS", "1").strip().lower() not in (
         "0",
         "false",
         "no",
         "off",
+    )
+
+
+def _sleep_min_tick() -> int:
+    try:
+        return max(0, int(os.environ.get("RKK_SLEEP_MIN_TICKS", "2000")))
+    except ValueError:
+        return 2000
+
+
+def _compression_sleep_cooldown() -> int:
+    try:
+        return max(500, int(os.environ.get("RKK_SLEEP_COMPRESSION_COOLDOWN", "2000")))
+    except ValueError:
+        return 2000
+
+
+def _all_llm_disabled() -> bool:
+    return os.environ.get("RKK_SKIP_ALL_LLM", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -765,6 +795,8 @@ class SleepController:
             return None
         if self.is_sleeping:
             return None
+        if tick < _sleep_min_tick():
+            return None
 
         if force:
             return "manual"
@@ -772,8 +804,8 @@ class SleepController:
         # Data-driven trigger: мозг перестал учиться → пора спать
         compression_reason = self.should_sleep(intrinsic_objective)
         if compression_reason is not None:
-            # Не чаще чем раз в 500 тиков для compression-driven сна
-            if (tick - self.last_sleep_tick) >= 500:
+            cooldown = _compression_sleep_cooldown()
+            if (tick - self.last_sleep_tick) >= cooldown:
                 return compression_reason
 
         if self._falls_since_sleep >= self._fall_threshold:
@@ -994,10 +1026,45 @@ class SleepController:
             },
         }
 
+    def _schedule_innate_lesson(self, tick: int, sim) -> None:
+        """Genome/text priors instead of Ollama during sleep LESSON phase."""
+        from engine.environment_humanoid import humanoid_hardcoded_seeds
+        from engine.llm_voice_teacher import TeacherAnnotation
+
+        seeds = list(humanoid_hardcoded_seeds())
+        concepts: list[str] = []
+        for s in seeds:
+            c = str(s.get("concept") or "").strip()
+            if c and c not in concepts:
+                concepts.append(c)
+        self._lesson_result = TeacherAnnotation(
+            tick=tick,
+            timestamp=time.time(),
+            mode="lesson",
+            verbal="Innate sleep lesson (no LLM)",
+            primary_concepts=concepts[:8] or ["balance", "locomotion"],
+            lesson_text="fixed_root curriculum consolidation",
+            lesson_concepts=concepts[:8],
+            seeds=seeds[:16],
+            confidence=0.85,
+        )
+        self._lesson_scheduled = True
+        print(
+            f"[Sleep] Innate lesson scheduled: {len(seeds[:16])} seeds, "
+            f"{len(self._lesson_result.primary_concepts)} concepts"
+        )
+
     def _schedule_lesson(self, tick: int, sim) -> None:
-        """Fire async LLM lesson (non-blocking)."""
+        """Fire async LLM lesson (non-blocking), or innate priors when LLM off."""
+        from engine.llm_voice_teacher import teacher_enabled
+
+        if _all_llm_disabled() or not teacher_enabled():
+            self._schedule_innate_lesson(tick, sim)
+            return
+
         teacher = getattr(sim, "_llm_teacher", None)
         if teacher is None:
+            self._schedule_innate_lesson(tick, sim)
             return
 
         obs = {}
