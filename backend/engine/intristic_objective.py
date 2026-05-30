@@ -51,6 +51,10 @@ _DBG_LOG_F7_IVO = Path(__file__).resolve().parents[2] / "debug-f7a777.log"
 
 
 def _dbg_ivo(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
+    if os.environ.get("RKK_DBG_AGENT", "0").strip().lower() not in (
+        "1", "true", "yes", "on",
+    ):
+        return
     try:
         with _DBG_LOG_F7_IVO.open("a", encoding="utf-8") as _df:
             _df.write(
@@ -98,6 +102,62 @@ def intrinsic_eig_enabled() -> bool:
 
 def _intrinsic_mi_samples() -> int:
     return _ei("RKK_INTRINSIC_MI_SAMPLES", 8)
+
+
+def _posture_from_obs(obs: dict[str, Any]) -> float:
+    return float(
+        obs.get(
+            "posture_stability",
+            obs.get("phys_posture_stability", 0.5),
+        )
+    )
+
+
+def _fallen_posture_threshold() -> float:
+    return _ef("RKK_INTRINSIC_FALLEN_POSTURE_TH", 0.4)
+
+
+# Fix 4: обучаемый recovery — приоритетные intent при падении
+_RECOVERY_GOAL_PRIORS: tuple[tuple[str, float], ...] = (
+    ("intent_stop_recover", 0.80),
+    ("intent_torso_forward", 0.55),
+)
+
+
+def _intent_vars_in_graph(graph: Any) -> list[str]:
+    """Motor intent nodes: intent_* or phys_intent_* (progressive scope uses phys_ prefix)."""
+    ids = list(getattr(graph, "_node_ids", []) or [])
+    return [
+        str(n)
+        for n in ids
+        if str(n).startswith("intent_") or str(n).startswith("phys_intent_")
+    ]
+
+
+def _resolve_graph_intent_var(graph: Any, logical_name: str) -> str | None:
+    """intent_* или phys_intent_* в node_ids графа."""
+    ids = list(getattr(graph, "_node_ids", []))
+    key = str(logical_name)
+    if key in ids:
+        return key
+    if key.startswith("intent_"):
+        phys = "phys_" + key
+        if phys in ids:
+            return phys
+    if key.startswith("phys_intent_"):
+        short = key[len("phys_") :]
+        if short in ids:
+            return short
+    return None
+
+
+def _recovery_goal_candidates(graph: Any) -> list[tuple[str, float]]:
+    out: list[tuple[str, float]] = []
+    for logical, val in _RECOVERY_GOAL_PRIORS:
+        resolved = _resolve_graph_intent_var(graph, logical)
+        if resolved is not None:
+            out.append((resolved, float(val)))
+    return out
 
 # ─── CausalSurprise ───────────────────────────────────────────────────────────
 class CausalSurprise:
@@ -304,29 +364,36 @@ class GoalImagination:
         except Exception:
             return None
 
-        # Собираем все intent_* узлы как кандидаты
-        ids = list(getattr(graph, "_node_ids", []))
-        intent_vars = [v for v in ids if str(v).startswith("intent_")]
-        if not intent_vars:
-            return None
+        is_fallen = _posture_from_obs(obs) < _fallen_posture_threshold()
 
-        # Сэмплируем K пар (var, val) — несколько значений на каждый узел
-        rng = np.random.default_rng()
-        candidates: list[tuple[str, float]] = []
-        vals_to_try = [0.2, 0.5, 0.8]  # низкий / средний / высокий
-        for var in intent_vars:
-            for v in vals_to_try:
-                candidates.append((var, float(v)))
+        # Fix 4: при падении — только recovery-кандидаты с фиксированными priors
+        recovery_candidates = _recovery_goal_candidates(graph)
+        if is_fallen and recovery_candidates:
+            candidates = list(recovery_candidates)
+        else:
+            intent_vars = _intent_vars_in_graph(graph)
+            if not intent_vars:
+                return None
 
-        # Ограничиваем до K_candidates
-        if len(candidates) > self._k_candidates:
-            idxs = rng.choice(len(candidates), self._k_candidates, replace=False)
-            candidates = [candidates[i] for i in idxs]
+            rng = np.random.default_rng()
+            candidates = []
+            vals_to_try = [0.2, 0.5, 0.8]
+            for var in intent_vars:
+                for v in vals_to_try:
+                    candidates.append((var, float(v)))
+
+            # Recovery intents в пуле даже вне падения (низкий приоритет через EIG)
+            for var, val in recovery_candidates:
+                if (var, val) not in candidates:
+                    candidates.append((var, val))
+
+            if len(candidates) > self._k_candidates:
+                idxs = rng.choice(len(candidates), self._k_candidates, replace=False)
+                candidates = [candidates[i] for i in idxs]
 
         if not candidates:
             return None
 
-        # Ищем интервенцию с максимальным EIG
         best_var: str | None = None
         best_val: float = 0.5
         best_eig: float = -1.0
@@ -341,8 +408,13 @@ class GoalImagination:
             except Exception:
                 continue
 
+        # Fix 4: при падении всегда ставим recovery-цель, даже если EIG≈0
         if best_var is None or best_eig <= 0.0:
-            return None
+            if is_fallen and recovery_candidates:
+                best_var, best_val = recovery_candidates[0]
+                best_eig = 0.0
+            else:
+                return None
 
         goal: dict[str, Any] = {
             "target_var": best_var,
@@ -424,7 +496,12 @@ class VariableDiscovery:
         self._node_errors: dict[str, deque[float]] = {}
         self._window = 30
         self._last_discovery_tick: int = -9999
-        self._discovery_cooldown: int = 500
+        try:
+            self._discovery_cooldown: int = max(
+                500, int(os.environ.get("RKK_NEURO_COOLDOWN", "2000"))
+            )
+        except ValueError:
+            self._discovery_cooldown = 2000
         self.total_discoveries: int = 0
         self._discovery_log: deque[dict[str, Any]] = deque(maxlen=20)
 
@@ -471,30 +548,38 @@ class VariableDiscovery:
         agent,
         tick: int,
         causal_surprise: CausalSurprise,
+        *,
+        sim=None,
     ) -> dict[str, Any] | None:
         """
-        Проверяет нужен ли нейрогенез и запускает его.
-        Возвращает событие если новый узел был создан.
+        Проверяет нужен ли нейрогенез и ставит заявку в coordinator.
+        Возвращает событие pending или applied.
         """
         if not intrinsic_enabled():
             return None
         if (tick - self._last_discovery_tick) < self._discovery_cooldown:
             return None
         if not causal_surprise.compression_is_stagnant():
-            return None  # Граф ещё учится — нейрогенез преждевременен
+            return None
 
         high_error = self.find_high_error_nodes()
         if len(high_error) < 2:
             return None
 
-        # Пытаемся создать медиирующий узел между двумя проблемными
-        from engine.rsi_structural import NeurogenesisEngine
-        neuro = getattr(agent, "_neuro_engine", NeurogenesisEngine(
-            min_interventions=200,
-            error_threshold=self._eig_threshold,
-        ))
+        coordinator = getattr(sim, "neuro_coordinator", None) if sim is not None else None
+        if coordinator is None:
+            from engine.rsi_structural import NeurogenesisEngine
 
-        result = neuro.scan_and_grow(agent, tick)
+            neuro = getattr(agent, "_neuro_engine", NeurogenesisEngine())
+            result = neuro.scan_and_queue(agent, tick)
+        else:
+            result = coordinator.request_growth(
+                sim,
+                tick=int(tick),
+                trigger="discovery",
+                high_error_nodes=high_error,
+            )
+
         if result is None:
             return None
 
@@ -506,6 +591,7 @@ class VariableDiscovery:
             "new_node": result.get("new_node"),
             "triggered_by": [nid for nid, _ in high_error[:2]],
             "error_scores": [round(s, 4) for _, s in high_error[:2]],
+            "pending": result.get("type") == "neurogenesis_pending" or "tick_requested" in result,
         }
         self._discovery_log.append(event)
         return event
@@ -594,6 +680,7 @@ class IntrinsicObjective:
         Дополнительные цели для HomeostaticController (Система 2 → приоры).
 
         Порядок приоритетов:
+          0. Recovery priors при posture < 0.4 (Fix 4)
           1. Цель от GoalImagination (EIG-based) — если есть активная цель
           2. Nav prior (RKK_INTRINSIC_NAV_PRIORS=1) — хардкод вперёд для диагностики
           3. {} — нет активной цели
@@ -608,6 +695,13 @@ class IntrinsicObjective:
             )
         )
         self._posture_hist.append(ps)
+
+        # --- Fix 4: recovery priors при падении (выше GoalImagination) ---
+        if ps < _fallen_posture_threshold():
+            return {
+                logical: float(val)
+                for logical, val in _RECOVERY_GOAL_PRIORS
+            }
 
         # --- Приоритет 1: EIG-based goal от GoalImagination ---
         active_goal = self.goal_imagination._current_goal
@@ -641,6 +735,7 @@ class IntrinsicObjective:
         tick: int,
         locomotion_ctrl=None,
         motor_cortex=None,
+        sim=None,
     ) -> float:
         """
         Главный вызов: вычисляет интринсивную награду и применяет её.
@@ -694,32 +789,68 @@ class IntrinsicObjective:
         )
 
         # --- Ensemble EIG curiosity (Phase 5/7) ---
+        best_eig_var: str | None = None
+        best_eig_val: float = 0.5
         if intrinsic_eig_enabled():
             try:
-                from engine.hypothesis_testing import eig_for_action
+                eig_every = max(1, int(os.environ.get("RKK_INTRINSIC_EIG_EVERY", "12")))
+            except ValueError:
+                eig_every = 12
+            if int(agent._total_interventions) % eig_every == 0:
+                try:
+                    from engine.hypothesis_testing import eig_for_action
 
-                obs_e = dict(agent.env.observe())
-                ids = [
-                    n for n in graph._node_ids
-                    if str(n).startswith("intent_")
-                ][:8]
-                candidates = [(v, float(obs_e.get(v, 0.5))) for v in ids]
-                eig = eig_for_action(graph, obs_e, candidates)
-                lambda_eig = _ef("RKK_INTRINSIC_EIG_LAMBDA", 0.5)
-                r = r + lambda_eig * float(np.clip(eig, 0.0, 2.0))
-                # Monte Carlo MI proxy via ensemble disagreement on rollouts
-                n_mi = _intrinsic_mi_samples()
-                if n_mi > 1 and getattr(graph, "_ensemble", None) is not None:
-                    mi_bonus = eig * (1.0 + 0.1 * n_mi)
-                    r = r + 0.05 * mi_bonus
-            except Exception:
-                pass
+                    obs_e = dict(agent.env.observe())
+                    ids = _intent_vars_in_graph(graph)[:8]
+                    candidates = [(v, float(obs_e.get(v, 0.5))) for v in ids]
+                    eig = eig_for_action(graph, obs_e, candidates)
+                    lambda_eig = _ef("RKK_INTRINSIC_EIG_LAMBDA", 0.5)
+                    r = r + lambda_eig * float(np.clip(eig, 0.0, 2.0))
+
+                    n_mi = _intrinsic_mi_samples()
+                    if n_mi > 1 and getattr(graph, "_ensemble", None) is not None:
+                        mi_bonus = eig * (1.0 + 0.1 * n_mi)
+                        r = r + 0.05 * mi_bonus
+                except Exception:
+                    pass
         elif os.environ.get("RKK_INTRINSIC_EMPOWERMENT", "0").strip().lower() in (
             "1", "true", "yes", "on",
         ):
             r = r + 0.05 * float(prediction_error)
 
-        # Гомеостаз: при низкой осанке подавляем EIG (implementation_plan Phase 3).
+        # --- Fix 3: split walk / recovery / transitional reward paths ---
+        try:
+            obs_fwd = dict(agent.env.observe())
+            com_y_now = float(obs_fwd.get("com_y", obs_fwd.get("phys_com_y", 0.5)))
+            com_x_now = float(obs_fwd.get("com_x", obs_fwd.get("phys_com_x", 0.5)))
+            fwd_now = com_y_now if abs(com_y_now - 0.5) >= abs(com_x_now - 0.5) else com_x_now
+            posture_fwd = float(
+                obs_fwd.get("posture_stability", obs_fwd.get("phys_posture_stability", 0.5))
+            )
+            foot_l = float(obs_fwd.get("foot_contact_l", obs_fwd.get("phys_foot_contact_l", 0.5)))
+            foot_r = float(obs_fwd.get("foot_contact_r", obs_fwd.get("phys_foot_contact_r", 0.5)))
+            prev_fwd = getattr(self, "_prev_com_x", fwd_now)
+            com_x_vel = fwd_now - prev_fwd
+            self._prev_com_x = fwd_now
+
+            if posture_fwd >= 0.6:
+                fwd_bonus_scale = _ef("RKK_INTRINSIC_FWD_BONUS", 0.4)
+                fwd_bonus = float(np.clip(com_x_vel * 40.0, -0.1, 1.0)) * fwd_bonus_scale
+                r = r + fwd_bonus
+            elif posture_fwd < 0.4:
+                ps_delta = posture_fwd - (
+                    float(np.mean(list(self._posture_hist)[-5:]))
+                    if len(self._posture_hist) >= 5
+                    else posture_fwd
+                )
+                recovery_r = 0.35 * float(np.clip(ps_delta * 8.0, -0.2, 1.0))
+                recovery_r += 0.15 * float(np.clip(min(foot_l, foot_r), 0.0, 1.0))
+                r = r * 0.25 + recovery_r
+            # transitional 0.4–0.6: intrinsic only, no homeostasis gate below
+        except Exception:
+            posture_fwd = 0.5
+
+        # Гомеостаз: подавляем EIG только в walk band (posture >= 0.6).
         if os.environ.get("RKK_INTRINSIC_HOMEOSTASIS_GATE", "1").strip().lower() not in (
             "0",
             "false",
@@ -727,12 +858,9 @@ class IntrinsicObjective:
             "off",
         ):
             try:
-                obs_h = dict(agent.env.observe())
-                posture = float(
-                    obs_h.get("posture_stability", obs_h.get("phys_posture_stability", 0.5))
-                )
-                hf = float(np.clip((posture - 0.30) / 0.62, 0.05, 1.0))
-                r *= hf
+                if posture_fwd >= 0.6:
+                    hf = float(np.clip((posture_fwd - 0.30) / 0.62, 0.05, 1.0))
+                    r *= hf
             except Exception:
                 pass
 
@@ -783,6 +911,7 @@ class IntrinsicObjective:
                 agent=agent,
                 tick=tick,
                 causal_surprise=self.causal_surprise,
+                sim=sim,
             )
         except Exception:
             neuro_event = None
@@ -833,10 +962,27 @@ class IntrinsicObjective:
     ) -> None:
         """
         Полная замена: ТОЛЬКО интринсивная награда идёт в все learners.
-        Никаких posture, symmetry, forward_bonus.
+        Никаких posture, symmetry, forward_bonus — только intrinsic + fwd momentum.
         """
+        # --- Fix 3: извлекаем com_x_vel и добавляем к CPG reward ---
+        fwd_r = r
+        try:
+            obs_r = dict(agent.env.observe())
+            posture_r = float(obs_r.get("posture_stability", obs_r.get("phys_posture_stability", 0.5)))
+            if posture_r >= 0.4:
+                com_y_r = float(obs_r.get("com_y", obs_r.get("phys_com_y", 0.5)))
+                com_x_r = float(obs_r.get("com_x", obs_r.get("phys_com_x", 0.5)))
+                fwd_r_now = com_y_r if abs(com_y_r - 0.5) >= abs(com_x_r - 0.5) else com_x_r
+                prev_r = getattr(self, "_prev_com_x_reward", fwd_r_now)
+                self._prev_com_x_reward = fwd_r_now
+                vel_r = (fwd_r_now - prev_r) * 40.0
+                fwd_bonus_r = float(np.clip(vel_r, -0.1, 1.0)) * _ef("RKK_INTRINSIC_FWD_BONUS", 0.4)
+                fwd_r = r + fwd_bonus_r
+        except Exception:
+            pass
+
         if locomotion_ctrl is not None:
-            locomotion_ctrl._reward_history.append(r)
+            locomotion_ctrl._reward_history.append(fwd_r)
             train_fn = getattr(locomotion_ctrl, "train_cpg_from_intrinsic_history", None)
             if callable(train_fn):
                 train_fn()
@@ -916,6 +1062,7 @@ def apply_intrinsic_patch(sim) -> bool:
                     tick=engine_tick,
                     locomotion_ctrl=getattr(sim, "_locomotion_controller", None),
                     motor_cortex=getattr(sim, "_motor_cortex", None),
+                    sim=sim,
                 )
                 # #region agent log
                 _dbg_ivo(

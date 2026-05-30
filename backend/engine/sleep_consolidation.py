@@ -781,6 +781,7 @@ class SleepController:
         total_falls: int,
         force: bool = False,
         intrinsic_objective=None,
+        sim: Any | None = None,
     ) -> str | None:
         """
         Check if sleep should be triggered. Returns reason or None.
@@ -788,8 +789,9 @@ class SleepController:
         Приоритет триггеров:
           1. manual (force=True)
           2. compression_stagnant (data-driven, главный)
-          3. fall_threshold (аварийный, слишком много падений)
-          4. periodic (fallback, если ничего не сработало)
+          3. edge_spike / behavioral_drop (Fix 7)
+          4. fall_threshold (аварийный, слишком много падений)
+          5. periodic (fallback, если ничего не сработало)
         """
         if not sleep_enabled():
             return None
@@ -801,17 +803,40 @@ class SleepController:
         if force:
             return "manual"
 
-        # Data-driven trigger: мозг перестал учиться → пора спать
         compression_reason = self.should_sleep(intrinsic_objective)
         if compression_reason is not None:
             cooldown = _compression_sleep_cooldown()
             if (tick - self.last_sleep_tick) >= cooldown:
                 return compression_reason
 
+        if sim is not None:
+            hist = getattr(sim, "_edge_delta_hist", None)
+            if hist:
+                try:
+                    thr = int(os.environ.get("RKK_SLEEP_EDGE_DELTA_THRESHOLD", "500"))
+                    window = int(os.environ.get("RKK_EDGE_DELTA_WINDOW", "100"))
+                except ValueError:
+                    thr, window = 500, 100
+                recent = list(hist)[-window:]
+                if len(recent) >= window and sum(int(x) for x in recent) > thr:
+                    if (tick - self.last_sleep_tick) >= _compression_sleep_cooldown():
+                        return "edge_spike"
+            bt = getattr(sim, "behavioral_tracker", None)
+            if bt is not None and len(getattr(bt, "_posture", [])) >= 40:
+                snap = bt.snapshot()
+                score = float(snap.get("behavioral_score", 0.5))
+                prev = float(getattr(sim, "_prev_behavioral_score", score))
+                sim._prev_behavioral_score = score
+                try:
+                    drop_thr = float(os.environ.get("RKK_SLEEP_BEHAVIORAL_DROP", "0.2"))
+                except ValueError:
+                    drop_thr = 0.2
+                if prev - score > drop_thr and (tick - self.last_sleep_tick) >= _compression_sleep_cooldown():
+                    return "behavioral_drop"
+
         if self._falls_since_sleep >= self._fall_threshold:
             return "fall_threshold"
 
-        # Periodic consolidation (docstring): long runs without falls/stagnation still get REM.
         if self._every_ticks > 0 and tick > 0:
             if (tick - int(self.last_sleep_tick)) >= int(self._every_ticks):
                 return "periodic"
@@ -1012,6 +1037,14 @@ class SleepController:
                 session.edges_after = after
                 print(f"[Sleep] Prune: {before}→{after} edges ({before-after} pruned)")
                 _memory_diag_log(sim, "sleep_after_prune")
+                coord = getattr(sim, "neuro_coordinator", None)
+                if coord is not None:
+                    try:
+                        applied = coord.apply_after_sleep(sim, tick=tick)
+                        if applied is not None:
+                            print(f"[Sleep] Applied pending neurogenesis: {applied.get('new_node')}")
+                    except Exception as e:
+                        print(f"[Sleep] neuro apply failed: {e}")
 
             if ticks_in_phase >= self._prune_ticks:
                 self._end_sleep(tick, sim)

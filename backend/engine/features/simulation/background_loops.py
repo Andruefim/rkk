@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from engine.core.constants import cpg_during_fixed_root_enabled
 from engine.core.constants import cpg_loop_hz_from_env as _cpg_loop_hz_from_env
+from engine.json_util import sanitize_for_json
 
 if TYPE_CHECKING:
     from engine.simulation import Simulation
@@ -233,7 +234,15 @@ class BackgroundLoopService:
                 result = None
                 with s._sim_step_lock:
                     result = s._run_single_agent_timestep_inner()
-                s._agent_step_response = result
+                if result is not None:
+                    payload = sanitize_for_json(result)
+                    if isinstance(payload, dict):
+                        payload["_json_sanitized"] = True
+                    s._agent_step_response = payload
+                    s._public_state_cache = payload
+                    s._public_state_cache_at = time.monotonic()
+                else:
+                    s._agent_step_response = None
             except Exception as e:
                 print(f"[Simulation] Agent loop: {e}")
                 if (

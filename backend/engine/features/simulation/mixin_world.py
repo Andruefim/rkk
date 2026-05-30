@@ -73,6 +73,7 @@ class SimulationWorldMixin:
             self.agent.graph.rebind_variables(new_vars, init_obs)
 
             self.agent.env = vis_env
+            self._wire_rkk_sim_ref(vis_env)
 
             # Пересоздаём Temporal для нового d
             from engine.temporal import TemporalBlankets
@@ -115,6 +116,7 @@ class SimulationWorldMixin:
             return
         if self._base_env_ref is not None:
             self.agent.env = self._base_env_ref
+            self._wire_rkk_sim_ref(self._base_env_ref)
             base_ids = list(self._base_env_ref.variable_ids)
             base_obs = self._base_env_ref.observe()
             self.agent.graph.rebind_variables(base_ids, base_obs)

@@ -51,6 +51,8 @@ from engine.agent import RKKAgent
 from engine.demon import AdversarialDemon
 from engine.visual_concept_store import VisualConceptStore
 from engine.hierarchical_graph import HierarchicalGraph
+from engine.behavioral_tracker import BehavioralTracker
+from engine.neurogenesis_coordinator import NeurogenesisCoordinator
 from engine.rsi_structural import NeurogenesisEngine
 
 from engine.config.runtime import RKKRuntimeConfig
@@ -124,6 +126,7 @@ class Simulation(
             device=self.device,
             bounds=bounds,
         )
+        self._wire_rkk_sim_ref(self.agent.env)
 
         self.switcher = WorldSwitcher(self.agent, self.device)
         self.demon = AdversarialDemon(n_agents=1, device=self.device)
@@ -210,6 +213,8 @@ class Simulation(
         self._l1_last_credit_tick = 0
         self._sim_step_lock = threading.RLock()
         self._agent_step_response: dict | None = None
+        self._public_state_cache: dict | None = None
+        self._public_state_cache_at: float = 0.0
         self._skill_library = None
         self._skill_exec: dict | None = None
         self._llm_loop_stats: dict = {
@@ -220,6 +225,14 @@ class Simulation(
         }
         self._rsi_full = None
         self.neuro_engine = NeurogenesisEngine()
+        self.neuro_coordinator = NeurogenesisCoordinator(self.neuro_engine)
+        self.behavioral_tracker = BehavioralTracker()
+        self._edge_delta_hist: deque[int] = deque(maxlen=256)
+        self._wm_warmup_until: int = 0
+        self._neuro_pending: bool = False
+        self._edge_growth_blocked: bool = False
+        self._tick_log_prev_edges: int = 0
+        self._prev_behavioral_score: float = 0.5
         self._embodied_reward_ctrl = None
         self._verbal_reward_total: float = 0.0
         self._visual_grounding_ctrl = (
@@ -370,3 +383,16 @@ class Simulation(
         except Exception as e:
             self._variable_registry = None
             print(f"[Simulation] VariableRegistry skipped: {type(e).__name__}: {e}")
+
+    def _wire_rkk_sim_ref(self, env: Any) -> None:
+        """Back-ref so RKKAgent can reach Simulation.behavioral_tracker."""
+        try:
+            env._rkk_sim = self
+        except Exception:
+            pass
+        base = getattr(env, "base_env", None)
+        if base is not None:
+            try:
+                base._rkk_sim = self
+            except Exception:
+                pass

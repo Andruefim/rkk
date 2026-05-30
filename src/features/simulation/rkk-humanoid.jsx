@@ -115,7 +115,8 @@ function normAgent(a) {
     phi:a.phi??0.1, nodeCount:a.node_count??0, edgeCount:a.edge_count??0,
     totalInterventions:a.total_interventions??0, totalBlocked:a.total_blocked??0,
     lastDo:a.last_do??"—", lastBlockedReason:a.last_blocked_reason??"",
-    discoveryRate:a.discovery_rate??0, hW:a.h_W??0,
+    discoveryRate:a.discovery_rate??0, structuralDiscovery:a.structural_discovery??a.discovery_rate??0,
+    behavioralScore:a.behavioral_score??null, hW:a.h_W??0,
     notears:a.notears??null, valueLayer:a.value_layer??null, edges:a.edges??[],
     fallen:a.fallen??false, fallCount:a.fall_count??0,
     progressiveScope:a.progressive_scope??null, trajectory:a.trajectory??null,
@@ -141,6 +142,8 @@ function normFrame(raw) {
     vision:raw.vision??null,
     fixedRoot:raw.fixed_root??false,
     curriculumStep:raw.curriculum_step??(raw.fixed_root?1:3),
+    curriculumStep3Substate:raw.curriculum_step_3_substate??null,
+    behavioral:raw.behavioral??null,
     curriculumStabilizeUntil:raw.curriculum_stabilize_until??0,
     system2: raw.system2 ?? null,
   };
@@ -743,6 +746,9 @@ export default function RKKHumanoid() {
     const camTarget=new THREE.Vector3(0,0.42,0);
     let camAzim=0,camElev=0.32,camRadius=7.8;
     let camDrag=false,camPtrX=0,camPtrY=0;
+    const displayJointPos=[];
+    const SK_LERP=0.42;
+    const SK_SNAP_DIST=0.85;
 
     function updateBone(b,a,bp){
       const mid=new THREE.Vector3().addVectors(a,bp).multiplyScalar(0.5);
@@ -786,13 +792,28 @@ export default function RKKHumanoid() {
 
       // Skeleton
       const jointPositions=[];
+      const ankleQuats=ds.scene?.ankleQuats;
       if(sk&&sk.length>=3){
         sk.slice(0,JOINT_COUNT).forEach((pt,i)=>{
-          const v=new THREE.Vector3(pt.x??0,pt.z??0,pt.y??0);
+          const target=new THREE.Vector3(pt.x??0,pt.z??0,pt.y??0);
+          if(!displayJointPos[i]) displayJointPos[i]=target.clone();
+          else if(displayJointPos[i].distanceTo(target)>SK_SNAP_DIST) displayJointPos[i].copy(target);
+          else displayJointPos[i].lerp(target,SK_LERP);
+          const v=displayJointPos[i];
           jointPositions.push(v);
           if(i<jointMeshes.length){
             jointMeshes[i].position.copy(v);
             if(i<16) jointMeshes[i].visible=true;
+            if(i===14||i===15){
+              const qd=ankleQuats?.[i===14?0:1];
+              if(qd&&typeof qd.w==="number"){
+                jointMeshes[i].quaternion.set(qd.x??0,qd.y??0,qd.z??0,qd.w??1);
+              }else{
+                jointMeshes[i].quaternion.identity();
+              }
+            }else if(jointMeshes[i].quaternion){
+              jointMeshes[i].quaternion.identity();
+            }
             if(i===0){
               jointMeshes[i].material.emissiveIntensity=0.1+(ag.phi??0.1)*0.2+Math.sin(frame*.08)*.05;
               jointMeshes[i].material.emissive.setHex(fallen?0x660800:isFR?0x443300:isVis?0x114433:0x111115);
@@ -803,6 +824,7 @@ export default function RKKHumanoid() {
         for(let i=jointPositions.length;i<JOINT_COUNT;i++)
           jointPositions.push(jointMeshes[Math.max(0,i-1)]?.position?.clone()??new THREE.Vector3());
       } else {
+        displayJointPos.length=0;
         const t=frame*.025;
         const comH=0.7+(fallen?-.5:0);
         const poses=[
@@ -1235,7 +1257,8 @@ export default function RKKHumanoid() {
               ["Edges",      a.edgeCount??0],
               ["do()/blk",   `${a.totalInterventions??0}/${a.totalBlocked??0}`],
               ["block%",     <span style={{color:blkC(blkR)}}>{(blkR*100).toFixed(1)}%</span>],
-              ["Discovery",  <span style={{color:(a.discoveryRate??0)>0.2?"#00ff99":"#aabbcc"}}>{((a.discoveryRate??0)*100).toFixed(0)}%</span>],
+              ["Struct disc.",  <span style={{color:(a.structuralDiscovery??0)>0.2?"#668899":"#556677"}}>{((a.structuralDiscovery??0)*100).toFixed(0)}%</span>],
+              ["Behavior",  <span style={{color:(a.behavioralScore??ui.behavioral?.behavioral_score??0)>0.35?"#00ff99":"#ffaa44"}}>{(((a.behavioralScore??ui.behavioral?.behavioral_score)??0)*100).toFixed(0)}%</span>],
             ].map(([l,v],k)=>(
               <tr key={k}><td style={{color:"#2a4466",paddingRight:8,paddingBottom:2}}>{l}</td><td style={{color:"#aabbcc",textAlign:"right"}}>{v}</td></tr>
             ))}

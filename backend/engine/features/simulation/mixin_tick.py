@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
 
 from engine.features.simulation.mixin_imports import *
@@ -11,6 +13,10 @@ _DBG_LOG_F7 = Path(__file__).resolve().parents[4] / "debug-f7a777.log"
 
 
 def _dbg_tick(hypothesis_id: str, location: str, message: str, data: dict | None = None) -> None:
+    if os.environ.get("RKK_DBG_AGENT", "0").strip().lower() not in (
+        "1", "true", "yes", "on",
+    ):
+        return
     try:
         with _DBG_LOG_F7.open("a", encoding="utf-8") as _df:
             _df.write(
@@ -522,9 +528,17 @@ class SimulationTickMixin:
         n = max(0, int(n))
         if n == 0:
             return
+        from engine.json_util import sanitize_for_json
+
         with self._sim_step_lock:
             for _ in range(n):
-                self._agent_step_response = self._run_single_agent_timestep_inner()
+                raw = self._run_single_agent_timestep_inner()
+                payload = sanitize_for_json(raw)
+                if isinstance(payload, dict):
+                    payload["_json_sanitized"] = True
+                self._agent_step_response = payload
+                self._public_state_cache = payload
+                self._public_state_cache_at = time.monotonic()
 
     def _run_single_agent_timestep_inner(self) -> dict:
         # #region agent log
@@ -637,9 +651,11 @@ class SimulationTickMixin:
 
         # Fallen check + автосброс физики (иначе VL и block_rate залипают)
         fallen = False
+        fallen_raw = False
         is_fn  = getattr(self.agent.env, "is_fallen", None)
         if callable(is_fn) and not self._fixed_root_active:
-            fallen = is_fn()
+            fallen_raw = bool(is_fn())
+            fallen = fallen_raw
             prev_f = bool(getattr(self, "_prev_fallen", False))
             fallen_edge = bool(fallen and not prev_f)
             if self._fall_recovery_active and not fallen:
@@ -671,10 +687,11 @@ class SimulationTickMixin:
                     and callable(getattr(s2, "defer_sim_fall_hard_reset", None))
                     and s2.defer_sim_fall_hard_reset()
                 )
+                use_genome_recovery = self._genome_fall_recovery_enabled()
                 if defer_fall_reset:
                     if self._fall_recovery_active:
                         self._clear_fall_recovery()
-                elif self._maybe_recover_or_reset_after_fall(obs_fall):
+                elif use_genome_recovery and self._maybe_recover_or_reset_after_fall(obs_fall):
                     obs = self.agent.env.observe()
                     self._sync_motor_state(obs, source="reset", tick=self.tick)
                     for nid in self.agent.graph._node_ids:
@@ -685,7 +702,8 @@ class SimulationTickMixin:
                     fallen = is_fn()
                 if not fallen:
                     self._pending_fall_obs_for_memory = None
-                    self._fr_fallen_ticks_accum = 0
+                    if not (s2 is not None and getattr(s2, "fallen_override_active", False)):
+                        self._fr_fallen_ticks_accum = 0
                 if fallen_edge and self._fall_count % 20 == 1:
                     self._add_event(
                         f"💀 [FALLEN] Nova упал! (×{self._fall_count})",
@@ -698,6 +716,16 @@ class SimulationTickMixin:
             self._prev_fallen = False
             self._pending_fall_obs_for_memory = None
             self._fr_fallen_ticks_accum = 0
+
+        obs_s2_fall = dict(self.agent.env.observe())
+        if self._fixed_root_active:
+            fallen_for_s2 = False
+        else:
+            fallen_for_s2 = self._fallen_signal_for_s2(
+                obs_s2_fall, fallen_debounced=bool(fallen_raw or fallen)
+            )
+            if getattr(self, "_fall_recovery_active", False):
+                fallen_for_s2 = True
 
         # Фаза 12: передаём GNN prediction в visual env (не каждый тик — см. VISION_GNN_FEED_EVERY)
         if self._visual_mode and self._visual_env is not None:
@@ -770,20 +798,30 @@ class SimulationTickMixin:
                         agent=self.agent,
                         obs=obs_s2,
                         sim=self,
-                        fallen=bool(fallen),
+                        fallen=bool(fallen_for_s2),
                     )
                     fn_ctx = getattr(self._system2, "planning_context_for_wm", None)
                     if callable(fn_ctx):
                         self.agent.set_s2_planning_context(
-                            fn_ctx(fallen=bool(fallen), sim_tick=int(self.tick))
+                            fn_ctx(fallen=bool(fallen_for_s2), sim_tick=int(self.tick))
                         )
                     else:
                         self.agent.set_s2_planning_context(None)
                 else:
                     self._system2_last = None
                     self.agent.set_s2_planning_context(None)
-            except Exception:
-                self._system2_last = {"enabled": False, "error": "system2_tick"}
+            except Exception as _s2_ex:
+                logging.getLogger(__name__).warning(
+                    "system2_tick failed at tick %s: %s",
+                    self.tick,
+                    _s2_ex,
+                    exc_info=True,
+                )
+                self._system2_last = {
+                    "enabled": False,
+                    "error": "system2_tick",
+                    "error_detail": f"{type(_s2_ex).__name__}: {_s2_ex}",
+                }
                 self.agent.set_s2_planning_context(None)
         else:
             self._system2_last = None
@@ -797,6 +835,15 @@ class SimulationTickMixin:
                     # Start gentle, increase force
                     force = 60.0 + min(100.0, self.tick * 0.2)
                     fn_perturb(max_force=force)
+        elif self.current_world == "humanoid" and not self._fixed_root_active:
+            from engine.features.simulation.snapshot import humanoid_curriculum_step
+
+            _cur_step, _ = humanoid_curriculum_step(self)
+            if _cur_step >= 3 and self.tick % 50 == 0 and not fallen_pre:
+                base_p = self._unwrap_base_env(self.agent.env)
+                fn_perturb = getattr(base_p, "apply_random_perturbation", None)
+                if callable(fn_perturb):
+                    fn_perturb(max_force=85.0 + min(140.0, max(0, self.tick - 900) * 0.1))
 
         obs_pre_rssm = dict(self.agent.graph.snapshot_vec_dict())
         _t_phase = time.perf_counter()
@@ -998,6 +1045,7 @@ class SimulationTickMixin:
             _sleep_reason = self._sleep_ctrl.check_trigger(
                 self.tick, _total_falls,
                 intrinsic_objective=getattr(self, "_intrinsic", None),
+                sim=self,
             )
 
             if _sleep_reason and not self._sleep_ctrl.is_sleeping:
@@ -1034,7 +1082,14 @@ class SimulationTickMixin:
             except ValueError:
                 phys_every = 50
             if self.tick % phys_every == 0:
-                self._physical_curriculum.inject_into_scheduler(self._curriculum)
+                bt = getattr(self, "behavioral_tracker", None)
+                beh_ok = True
+                if bt is not None:
+                    beh_ok = float(bt.snapshot().get("behavioral_score", 0.0)) >= float(
+                        os.environ.get("RKK_PHYS_CURRICULUM_BEH_MIN", "0.2")
+                    )
+                if beh_ok:
+                    self._physical_curriculum.inject_into_scheduler(self._curriculum)
 
         # Phase L: Verbal Action (async in background thread)
         if _VERBAL_AVAILABLE and self._verbal is not None:
@@ -1276,22 +1331,51 @@ class SimulationTickMixin:
         graph_deltas = {}
         cnt = self.agent.graph.edge_count
         if cnt != self._prev_edge_count:
-            # Не материализовать десятки тысяч Edge — тот же capped payload, что и в agent.snapshot (WS/UI).
+            edge_delta = cnt - self._prev_edge_count
+            self._edge_delta_hist.append(int(edge_delta))
+            try:
+                max_delta = max(1, int(os.environ.get("RKK_MAX_EDGE_DELTA_PER_WINDOW", "200")))
+                window = max(1, int(os.environ.get("RKK_EDGE_DELTA_WINDOW", "100")))
+            except ValueError:
+                max_delta, window = 200, 100
+            recent = list(self._edge_delta_hist)[-window:]
+            self._edge_growth_blocked = (
+                len(recent) >= window and sum(int(x) for x in recent) > max_delta
+            )
+            try:
+                max_edges = int(os.environ.get("RKK_MAX_EDGE_COUNT", "8000"))
+            except ValueError:
+                max_edges = 8000
+            if cnt > max_edges:
+                try:
+                    self.agent.graph.prune_weak_W()
+                except Exception:
+                    pass
             _, el_list = self.agent._snapshot_edges_payload()
             graph_deltas[0] = el_list
             self._prev_edge_count = cnt
 
-        # Neurogenesis
-        # Structural ASI: Neurogenesis
-        if self.current_world == "humanoid" and not self._fixed_root_active:
-            neuro_event = self.neuro_engine.scan_and_grow(self.agent, self.tick)
+        if self.current_world == "humanoid":
+            from engine.features.simulation.snapshot import humanoid_curriculum_step
+
+            cur_step, _ = humanoid_curriculum_step(self)
+            if cur_step >= 3:
+                self.neuro_coordinator.note_step3_entry(self.tick)
+                bt = getattr(self, "behavioral_tracker", None)
+                if bt is not None:
+                    bt.note_step3_entry(self.tick)
+            neuro_event = self.neuro_coordinator.request_or_apply(self, tick=self.tick)
             if neuro_event is not None:
-                self._add_event(
-                    f"🧬 Neurogenesis: {neuro_event['new_node']} allocated", 
-                    "#ff44cc", 
-                    "phase"
-                )
-                self._sync_temporal_blankets_to_graph()
+                if neuro_event.get("type") == "structural_asi_growth":
+                    self._add_event(
+                        f"🧬 Neurogenesis: {neuro_event['new_node']} allocated",
+                        "#ff44cc",
+                        "phase",
+                    )
+                    self._sync_temporal_blankets_to_graph()
+                    self.agent._wm_warmup_until = int(getattr(self, "_wm_warmup_until", 0))
+                elif neuro_event.get("type") == "neurogenesis_pending":
+                    self._neuro_pending = True
 
         # Scene (кэш: get_full_scene = PyBullet lock + skeleton; не на каждый agent-тик)
         try:
@@ -1307,13 +1391,22 @@ class SimulationTickMixin:
             self._cached_scene = scene_fn() if callable(scene_fn) else {}
             self._cached_scene_tick = int(self.tick)
         scene = dict(getattr(self, "_cached_scene", {}) or {})
+        self._patch_scene_dynamics(scene)
 
-        # Vision state (кэш для /vision/slots endpoint)
+        # Vision state (кэш для /vision/slots; не на каждый agent-тик)
         if self._visual_mode and self._visual_env is not None:
             try:
-                self._last_vision_state = self._visual_env.get_slot_visualization()
-            except Exception:
-                pass
+                vis_every = max(1, int(os.environ.get("RKK_VISION_STATE_EVERY", "6")))
+            except ValueError:
+                vis_every = 6
+            if (
+                not getattr(self, "_last_vision_state", None)
+                or self.tick % vis_every == 0
+            ):
+                try:
+                    self._last_vision_state = self._visual_env.get_slot_visualization()
+                except Exception:
+                    pass
 
         self._maybe_schedule_llm_loop(result, snap)
 
@@ -1343,6 +1436,34 @@ class SimulationTickMixin:
             {"tick": self.tick, "ms": _inner_ms},
         )
         # #endregion
+        bt = getattr(self, "behavioral_tracker", None)
+        if bt is not None and self.current_world == "humanoid":
+            from engine.features.simulation.snapshot import humanoid_curriculum_step
+
+            cur_step, _ = humanoid_curriculum_step(self)
+            loco_r = 0.0
+            intr = getattr(self, "_intrinsic", None)
+            if intr is not None:
+                loco_r = float(intr.recent_reward(8))
+            s2 = getattr(self, "_system2_last", None) or {}
+            learned_ok = None
+            if s2.get("override_recovered") and s2.get("motor_owner") == "s1_learned":
+                learned_ok = True
+            obs_bt = dict(_obs_for_d_e if _obs_for_d_e else {})
+            rf = self._raw_com_forward_m()
+            if rf is not None:
+                obs_bt["com_forward_raw_m"] = rf
+            rx = self._raw_com_x_m()
+            if rx is not None:
+                obs_bt["com_x_raw_m"] = rx
+            bt.record_tick(
+                tick=self.tick,
+                obs=obs_bt,
+                fallen=fallen,
+                locomotion_reward=loco_r,
+                recovery_learned_success=learned_ok,
+                in_step3=cur_step >= 3,
+            )
         try:
             from engine.tick_run_logger import record_sim_tick
 
@@ -1358,6 +1479,54 @@ class SimulationTickMixin:
         except Exception as e:
             print(f"[TickRunLog] hook: {e}")
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)
+
+    def _patch_scene_dynamics(self, scene: dict) -> None:
+        """Обновить позу/объекты каждый тик; static_geometry остаётся в кэше сцены."""
+        env = getattr(self.agent, "env", None)
+        if env is None:
+            return
+        try:
+            sk_fn = getattr(env, "get_joint_positions_world", None)
+            if callable(sk_fn):
+                scene["skeleton"] = sk_fn()
+        except Exception:
+            pass
+        sim = getattr(env, "_sim", None)
+        try:
+            aq_fn = getattr(sim, "get_ankle_quaternions_three_js", None)
+            if callable(aq_fn):
+                scene["ankleQuats"] = aq_fn()
+        except Exception:
+            pass
+        try:
+            cp_fn = getattr(env, "get_cube_positions", None)
+            if callable(cp_fn):
+                scene["cubes"] = cp_fn()
+        except Exception:
+            pass
+        try:
+            fallen_fn = getattr(env, "_fallen_z_below_threshold", None)
+            if callable(fallen_fn):
+                scene["fallen"] = bool(fallen_fn())
+        except Exception:
+            pass
+        try:
+            extras_fn = getattr(sim, "get_sandbox_scene_extras", None)
+            if callable(extras_fn):
+                extras = extras_fn()
+                for key in ("ball", "lever", "delivery_target", "props"):
+                    val = extras.get(key)
+                    if val is not None:
+                        scene[key] = val
+        except Exception:
+            pass
+        try:
+            if not getattr(env, "_fixed_root", False):
+                obs_fn = getattr(env, "observe", None)
+                if callable(obs_fn):
+                    scene["com_z"] = float(obs_fn().get("com_z", scene.get("com_z", 0.5)))
+        except Exception:
+            pass
 
     def _apply_topological_self_priors(self) -> None:
         """Фаза 3: Топологическое Я. Если найден [EGO] слот, добавляем замороженные/запрещенные связи."""

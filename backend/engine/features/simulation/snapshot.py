@@ -51,6 +51,15 @@ def build_simulation_snapshot(
 ) -> dict:
     winfo = WORLDS.get(sim.current_world, {"color": "#cc44ff", "label": sim.current_world})
     cur_step, cur_stab_until = humanoid_curriculum_step(sim)
+    behavioral = None
+    bt = getattr(sim, "behavioral_tracker", None)
+    if bt is not None:
+        behavioral = bt.snapshot()
+
+    beh_score = float((behavioral or {}).get("behavioral_score", 0.0))
+    entropy_from_behavior = round((1.0 - beh_score) * 100.0, 1) if behavioral else round(
+        (1 - snap.get("peak_discovery_rate", 0)) * 100, 1
+    )
 
     vision_summary = None
     if sim._visual_mode and sim._visual_env is not None:
@@ -60,7 +69,11 @@ def build_simulation_snapshot(
         "tick": sim.tick,
         "phase": sim.phase,
         "max_phase": sim.max_phase,
-        "entropy": round((1 - snap.get("peak_discovery_rate", 0)) * 100, 1),
+        "entropy": entropy_from_behavior,
+        "behavioral": behavioral,
+        "curriculum_step_3_substate": (
+            (behavioral or {}).get("step_3_substate") if cur_step >= 3 else None
+        ),
         "smoothed_dr": round(smoothed, 3),
         "agents": [snap],
         "n_agents": 1,

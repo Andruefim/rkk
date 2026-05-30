@@ -293,6 +293,11 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
   }, [system2, tick, feedMode]);
 
   useEffect(() => {
+    if (feedMode === "system2") {
+      setStatusColor("#9b7ed9");
+      return undefined;
+    }
+
     const fetchStats = async () => {
       try {
         const r = await fetch(AGENT_URL + "/api/snapshot");

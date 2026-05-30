@@ -537,6 +537,17 @@ class RKKAgent:
         """Контекст System2 для S2-gated WM planner (после system2.tick)."""
         self._s2_planning_context = ctx
 
+    def _resolve_rkk_sim(self) -> Any | None:
+        """Simulation back-ref (not PyBullet _sim)."""
+        env = self.env
+        sim = getattr(env, "_rkk_sim", None)
+        if sim is not None:
+            return sim
+        base = getattr(env, "base_env", None)
+        if base is not None:
+            return getattr(base, "_rkk_sim", None)
+        return None
+
     # ── Bootstrap + LLM seed interface ───────────────────────────────────────
     def _bootstrap(self):
         for var_id, val in self.env.variables.items():
@@ -610,6 +621,17 @@ class RKKAgent:
         if self.graph._core is None:
             return 0.0
         return float(self.graph._core.dag_constraint().item())
+
+    def _refresh_h_W_cache_if_needed(self) -> None:
+        """dag_constraint on d=256 is costly — share cache with score_interventions window."""
+        sce = self._effective_score_cache_every(self._last_engine_tick)
+        if self._last_engine_tick - self._h_W_cache_tick >= max(1, sce):
+            self._h_W_cache = float(abs(self._get_h_W()))
+            self._h_W_cache_tick = self._last_engine_tick
+
+    def _cached_h_W_abs(self) -> float:
+        self._refresh_h_W_cache_if_needed()
+        return float(self._h_W_cache)
 
     @staticmethod
     def _marginal_node_uncertainty(unc_m: np.ndarray) -> np.ndarray:
@@ -835,7 +857,7 @@ class RKKAgent:
 
     def _features_for_intervention_pair(self, v_from: str, v_to: str) -> list[float]:
         """Один вектор признаков System1 для пары (в_from→в_to), как в score_interventions."""
-        h_W_norm = min(abs(self._get_h_W()) / max(self.graph._d, 1), 1.0)
+        h_W_norm = min(self._cached_h_W_abs() / max(self.graph._d, 1), 1.0)
         disc_rate = self._discovery_rate_for_tick(self._last_engine_tick)
         nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
         core = self.graph._core
@@ -1516,10 +1538,7 @@ class RKKAgent:
         bticks = _intervention_bootstrap_ticks()
 
         # Cache dag_constraint (4× d×d matmuls) — reuse across score cache window
-        sce = self._effective_score_cache_every(self._last_engine_tick)
-        if abs(self._last_engine_tick - self._h_W_cache_tick) >= max(1, sce):
-            self._h_W_cache = float(abs(self._get_h_W()))
-            self._h_W_cache_tick = self._last_engine_tick
+        self._refresh_h_W_cache_if_needed()
         h_W_norm = min(self._h_W_cache / max(self.graph._d, 1), 1.0)
         h_clip = float(np.clip(h_W_norm, 0.0, 1.0))
         disc_rate = self._discovery_rate_for_tick(self._last_engine_tick)
@@ -2437,7 +2456,24 @@ class RKKAgent:
 
         # NOTEARS train
         notears_result = None
-        if self._total_interventions % _notears_every() == 0:
+        sim_ref = self._resolve_rkk_sim()
+        wm_warmup = int(getattr(self, "_wm_warmup_until", 0) or 0)
+        edge_blocked = bool(getattr(sim_ref, "_edge_growth_blocked", False)) if sim_ref else False
+        skip_notears = (
+            (wm_warmup > 0 and engine_tick <= wm_warmup)
+            or edge_blocked
+        )
+        if sim_ref is not None:
+            cnt = int(self.graph.edge_count)
+            prev = int(getattr(sim_ref, "_prev_edge_count", cnt))
+            try:
+                single_cap = max(10, int(os.environ.get("RKK_MAX_EDGE_DELTA_SINGLE", "120")))
+            except ValueError:
+                single_cap = 120
+            if cnt - prev > single_cap:
+                skip_notears = True
+                sim_ref._edge_growth_blocked = True
+        if self._total_interventions % _notears_every() == 0 and not skip_notears:
             # #region agent log
             _t_ts = time.perf_counter()
             # #endregion
@@ -2474,7 +2510,11 @@ class RKKAgent:
             prediction_error=pe_mean,
         )
         self.graph.update_ensemble_posterior(
-            obs_before_full, observed_full, var, value
+            obs_before_full,
+            observed_full,
+            var,
+            value,
+            intervention_index=int(self._total_interventions),
         )
         self._genome_ema_update()
 
@@ -2860,8 +2900,29 @@ class RKKAgent:
         if cur_dr > self._peak_discovery_rate:
             self._peak_discovery_rate = cur_dr
 
-        h_W     = self._get_h_W()
+        h_W     = self._cached_h_W_abs()
         tb_info = self.temporal.slow_state_summary()
+        phi_raw = self.phi_approx()
+        fallen_penalty = 0.0
+        try:
+            obs_ph = dict(self.graph.snapshot_vec_dict())
+            ps_ph = float(
+                obs_ph.get("posture_stability", obs_ph.get("phys_posture_stability", 0.5))
+            )
+            cz_ph = float(obs_ph.get("com_z", obs_ph.get("phys_com_z", 0.5)))
+            fn_f = getattr(self.env, "is_fallen", None)
+            env_fallen = bool(fn_f()) if callable(fn_f) else False
+            if env_fallen or ps_ph < 0.42 or cz_ph < 0.38:
+                fallen_penalty = 0.5
+        except Exception:
+            pass
+        phi_eff = phi_raw * (1.0 - fallen_penalty)
+        behavioral_score = None
+        sim_ref = self._resolve_rkk_sim()
+        if sim_ref is not None:
+            bt = getattr(sim_ref, "behavioral_tracker", None)
+            if bt is not None:
+                behavioral_score = bt.snapshot().get("behavioral_score")
         s1_info = {
             "buffer_size": len(self.system1.buffer),
             "mean_loss":   round(self.system1.mean_loss, 6),
@@ -2878,13 +2939,21 @@ class RKKAgent:
                 "l_int":  self._last_notears_loss.get("l_int", 0),
             }
 
-        h_W_edge_entropy = None
+        h_W_edge_entropy = getattr(self, "_h_W_edge_entropy_cache", None)
         core = self.graph._core
-        if core is not None:
+        try:
+            alpha_every = max(1, int(os.environ.get("RKK_SNAPSHOT_ALPHA_EVERY", "40")))
+        except ValueError:
+            alpha_every = 40
+        if core is not None and (
+            h_W_edge_entropy is None
+            or self._last_engine_tick % alpha_every == 0
+        ):
             with torch.no_grad():
                 A = core.alpha_trust_matrix().detach().float().cpu().numpy()
             p = np.clip(A, 1e-7, 1.0 - 1e-7)
             h_W_edge_entropy = float(-(p * np.log(p) + (1.0 - p) * np.log(1.0 - p)).sum())
+            self._h_W_edge_entropy_cache = h_W_edge_entropy
 
         _lr = getattr(self, "_last_result", None) or {}
         snap: dict = {
@@ -2895,7 +2964,8 @@ class RKKAgent:
             "graph_mdl":             round(self.graph.mdl_size, 3),
             "compression_gain":      round(self.compression_gain, 4),
             "alpha_mean":            round(self.graph.alpha_mean, 3),
-            "phi":                   round(self.phi_approx(), 4),
+            "phi":                   round(phi_eff, 4),
+            "phi_raw":               round(phi_raw, 4),
             "node_count":            len(self.graph.nodes),
             "total_interventions":   self._total_interventions,
             "total_blocked":         self._total_blocked,
@@ -2903,6 +2973,8 @@ class RKKAgent:
             "from_system2":          bool(_lr.get("from_system2", False)),
             "last_blocked_reason":   self._last_blocked_reason,
             "discovery_rate":        round(cur_dr, 3),
+            "structural_discovery":  round(cur_dr, 3),
+            "behavioral_score":      behavioral_score,
             "peak_discovery_rate":   round(self._peak_discovery_rate, 3),
             "h_W":                   round(h_W, 4),
             "notears":               notears_info,
@@ -2954,11 +3026,16 @@ class RKKAgent:
         if ens is not None:
             snap["graph_ensemble"] = ens.snapshot()
         try:
-            from engine.hypothesis_testing import snapshot_eig_top
+            eig_every = int(os.environ.get("RKK_SNAPSHOT_EIG_EVERY", "0"))
+        except ValueError:
+            eig_every = 0
+        if eig_every > 0 and self._last_engine_tick % eig_every == 0:
+            try:
+                from engine.hypothesis_testing import snapshot_eig_top
 
-            obs = dict(self.env.observe())
-            snap["eig"] = snapshot_eig_top(self.graph, obs)
-        except Exception:
-            pass
+                obs = dict(self.graph.snapshot_vec_dict())
+                snap["eig"] = snapshot_eig_top(self.graph, obs)
+            except Exception:
+                pass
         snap["replay_buffer_len"] = len(getattr(self, "_replay_buffer", []))
         return snap

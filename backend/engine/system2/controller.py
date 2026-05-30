@@ -370,9 +370,9 @@ def _s2_override_enabled() -> bool:
 
 def _s2_override_fallen_ticks_need() -> int:
     try:
-        return max(1, int(os.environ.get("RKK_S2_OVERRIDE_FALLEN_TICKS", "8")))
+        return max(1, int(os.environ.get("RKK_S2_OVERRIDE_FALLEN_TICKS", "4")))
     except ValueError:
-        return 8
+        return 4
 
 
 def _s2_override_max_ticks() -> int:
@@ -380,6 +380,31 @@ def _s2_override_max_ticks() -> int:
         return max(8, int(os.environ.get("RKK_S2_OVERRIDE_MAX_TICKS", "420")))
     except ValueError:
         return 420
+
+
+def _s2_learned_recovery_enabled() -> bool:
+    return os.environ.get("RKK_S2_LEARNED_RECOVERY", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _s2_learned_window_ticks() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_S2_LEARNED_WINDOW", "120")))
+    except ValueError:
+        return 120
+
+
+def _s2_scripted_fallback_enabled() -> bool:
+    return os.environ.get("RKK_S2_SCRIPTED_FALLBACK", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def _recovery_llm_calls_max() -> int:
@@ -489,6 +514,7 @@ class System2Controller:
         self._recovery_llm_latency_ticks: int = -1
         self._recovery_best_com_z: float = 0.0
         self._recovery_ticks_since_com_z_gain: int = 0
+        self._learned_recovery_active: bool = False
         self._last_override_distill_sample_tick: int = -10**9
         self._episode_plan_distill_extra: dict[str, Any] = {}
         self._distill_health = DistillHealthTracker()
@@ -499,9 +525,11 @@ class System2Controller:
 
     def defer_sim_fall_hard_reset(self) -> bool:
         """
-        Пока S2 fallen_override ведёт recovery, mixin_fall не должен вызывать reset_stance:
-        иначе поза сбрасывается до ответа recovery LLM (см. mixin_tick, до system2.tick).
+        Пока S2 fallen_override ведёт recovery, mixin_fall не должен вызывать reset_stance.
+        При learned recovery — defer и до активации override (genome recovery отключён).
         """
+        if _s2_learned_recovery_enabled() and system2_enabled():
+            return True
         if not self._s2_override_active:
             return False
         return os.environ.get("RKK_S2_DEFER_FALL_HARD_RESET", "1").strip().lower() not in (
@@ -593,6 +621,11 @@ class System2Controller:
             "macro": macro,
             "fallen": bool(fallen),
             "fallen_override_active": bool(self._s2_override_active),
+            "learned_recovery_active": bool(
+                self._learned_recovery_active
+                and self._recovery_schedule_source == "learned"
+            ),
+            "motor_owner": self._motor_owner_for_tick(int(sim_tick)),
             "expected_state": dict(spec.expected_state or {}),
             "max_prediction_error": spec.max_prediction_error,
             "skill_id": spec.skill_id,
@@ -809,8 +842,43 @@ class System2Controller:
         self._recovery_steps_remediated = False
         self._recovery_best_com_z = 0.0
         self._recovery_ticks_since_com_z_gain = 0
+        self._learned_recovery_active = False
 
-    def _obs_com_z(self, obs_f: dict[str, float]) -> float:
+    def _in_learned_recovery_phase(self, sim_tick: int) -> bool:
+        if not self._s2_override_active or not self._learned_recovery_active:
+            return False
+        if self._recovery_schedule_source != "learned":
+            return False
+        age = int(sim_tick) - int(self._s2_override_start_tick)
+        return age < _s2_learned_window_ticks()
+
+    def _maybe_transition_learned_to_scripted(self, sim_tick: int) -> None:
+        if self._in_learned_recovery_phase(sim_tick):
+            return
+        if (
+            not self._learned_recovery_active
+            or self._recovery_schedule_source != "learned"
+            or not _s2_scripted_fallback_enabled()
+        ):
+            return
+        age = int(sim_tick) - int(self._s2_override_start_tick)
+        if age < _s2_learned_window_ticks():
+            return
+        if not self._apply_scripted_recovery_schedule(sim_tick) and recovery_fallback_enabled():
+            self._apply_fallback_recovery_schedule(sim_tick)
+        self._learned_recovery_active = False
+
+    def _motor_owner_for_tick(self, sim_tick: int) -> str:
+        if not self._s2_override_active:
+            return "cpg"
+        if self._in_learned_recovery_phase(sim_tick):
+            return "s1_learned"
+        if self._recovery_schedule_source in ("scripted", "fallback", "library", "llm"):
+            return "s2_scripted"
+        return "cpg"
+
+    @staticmethod
+    def _obs_com_z(obs_f: dict[str, float]) -> float:
         return float(obs_f.get("com_z", obs_f.get("phys_com_z", 0.5)))
 
     def _maybe_refresh_override_obs0(self, obs_f: dict[str, float], *, fallen: bool) -> None:
@@ -1260,6 +1328,8 @@ class System2Controller:
             self._recovery_steps_from_llm and self._recovery_steps
         )
         ex["recovery_schedule_source"] = str(self._recovery_schedule_source)
+        if self._learned_recovery_active and self._recovery_schedule_source == "learned":
+            ex["distill_source"] = "learned_recovery"
         ex["recovery_llm_fail_count"] = int(self._recovery_llm_fail_count)
         if self._recovery_steps_remediated:
             ex["recovery_steps_remediated"] = True
@@ -1514,6 +1584,8 @@ class System2Controller:
         base_diag: dict[str, Any] = {
             "enabled": True,
             "fallen_override_active": True,
+            "learned_recovery_active": self._in_learned_recovery_phase(sim_tick),
+            "motor_owner": self._motor_owner_for_tick(sim_tick),
             "fallen_override_ticks": int(max(0, age)) + 1,
             "fallen_override_max_ticks": int(max_age),
             "s2_fallen_streak": int(self._s2_fallen_streak_override),
@@ -1661,8 +1733,12 @@ class System2Controller:
             self._recovery_llm_dispatch_count = 0
             self._recovery_best_com_z = self._obs_com_z(obs_f)
             self._recovery_ticks_since_com_z_gain = 0
+            self._learned_recovery_active = _s2_learned_recovery_enabled()
             loaded_schedule = False
-            if self._apply_scripted_recovery_schedule(sim_tick):
+            if self._learned_recovery_active:
+                self._recovery_schedule_source = "learned"
+                self._recovery_episode_spec = EpisodeSuccessSpec(skill_id="learned_recovery")
+            elif self._apply_scripted_recovery_schedule(sim_tick):
                 loaded_schedule = True
             elif recovery_library_enabled():
                 lib_hit = get_recovery_library().lookup(obs_f)
@@ -1680,13 +1756,21 @@ class System2Controller:
                         skill_id=str(skill),
                     )
                     loaded_schedule = True
-            if recovery_fallback_enabled() and not self._recovery_steps:
+            if (
+                recovery_fallback_enabled()
+                and not self._recovery_steps
+                and not self._learned_recovery_active
+            ):
                 self._apply_fallback_recovery_schedule(sim_tick)
                 loaded_schedule = bool(self._recovery_steps)
             llm_on_entry = (
-                recovery_scripted_llm_on_entry()
-                if self._recovery_schedule_source == "scripted"
-                else True
+                False
+                if self._learned_recovery_active
+                else (
+                    recovery_scripted_llm_on_entry()
+                    if self._recovery_schedule_source == "scripted"
+                    else True
+                )
             )
             if (
                 llm_on_entry
@@ -1701,28 +1785,27 @@ class System2Controller:
             self._recovery_track_com_z_progress(obs_f)
             age = int(sim_tick) - int(self._s2_override_start_tick)
             max_age = _s2_override_max_ticks()
-            if not fallen:
-                ok, pe_diag, exit_note = self._override_episode_eval(
-                    obs_f, fallen=False
+            ok, pe_diag, exit_note = self._override_episode_eval(
+                obs_f, fallen=False
+            )
+            if exit_note:
+                self._record_override_distill_neuro(
+                    sim_tick=sim_tick,
+                    agent=agent,
+                    obs_f=obs_f,
+                    success=ok,
+                    source_note=exit_note,
+                    pe_diag=pe_diag,
                 )
-                if exit_note:
-                    self._record_override_distill_neuro(
-                        sim_tick=sim_tick,
-                        agent=agent,
-                        obs_f=obs_f,
-                        success=ok,
-                        source_note=exit_note,
-                        pe_diag=pe_diag,
-                    )
-                    diag = self._build_override_diag(
-                        sim_tick,
-                        fallen,
-                        age,
-                        max_age,
-                        recovered=True,
-                    )
-                    self._clear_override_session()
-                    return diag
+                diag = self._build_override_diag(
+                    sim_tick,
+                    fallen,
+                    age,
+                    max_age,
+                    recovered=True,
+                )
+                self._clear_override_session()
+                return diag
             if age >= max_age:
                 self._force_reset_stance_base(base)
                 self._record_override_distill_neuro(
@@ -1757,21 +1840,24 @@ class System2Controller:
             )
             self._maybe_distill_override_sample(sim_tick, obs_f, fallen=fallen)
 
+        self._maybe_transition_learned_to_scripted(sim_tick)
+
         extra = self._recovery_extra_residuals(sim_tick)
-        applied = self._apply_recover_bundle_no_candidate(
-            sim_tick,
-            agent,
-            base,
-            graph,
-            node_keys,
-            extra if extra else None,
-        )
-        self._apply_scripted_getup_physics(base, sim_tick)
+        applied = False
+        in_learned = self._in_learned_recovery_phase(sim_tick)
+        if not in_learned:
+            applied = self._apply_recover_bundle_no_candidate(
+                sim_tick,
+                agent,
+                base,
+                graph,
+                node_keys,
+                extra if extra else None,
+            )
+            self._apply_scripted_getup_physics(base, sim_tick)
         age = int(sim_tick) - int(self._s2_override_start_tick)
         max_age = _s2_override_max_ticks()
-        pe_diag_live: dict[str, Any] = {}
-        if not fallen:
-            _, pe_diag_live, _ = self._override_episode_eval(obs_f, fallen=False)
+        _, pe_diag_live, _ = self._override_episode_eval(obs_f, fallen=False)
         return self._build_override_diag(
             sim_tick,
             fallen,

@@ -320,18 +320,54 @@ class CausalGraph:
         obs_after: dict,
         var: str,
         val: float,
+        *,
+        intervention_index: int | None = None,
     ) -> None:
         if self._ensemble is None:
             return
+        n_iv = int(intervention_index if intervention_index is not None else 0)
         try:
-            from engine.hypothesis_testing import ensemble_log_likelihood
-
-            ll = ensemble_log_likelihood(
-                self, obs_before, obs_after, var, val, self._ensemble
+            every = max(1, int(os.environ.get("RKK_ENSEMBLE_UPDATE_EVERY", "1")))
+        except ValueError:
+            every = 1
+        if n_iv % every != 0:
+            return
+        try:
+            full_every = max(
+                0, int(os.environ.get("RKK_ENSEMBLE_GNN_LL_EVERY", "0"))
             )
+        except ValueError:
+            full_every = 0
+        use_gnn = full_every > 0 and (n_iv % full_every == 0)
+        try:
+            from engine.hypothesis_testing import (
+                ensemble_log_likelihood,
+                ensemble_log_likelihood_fast,
+            )
+
+            if use_gnn:
+                ll = ensemble_log_likelihood(
+                    self,
+                    obs_before,
+                    obs_after,
+                    var,
+                    val,
+                    ensemble=self._ensemble,
+                )
+            else:
+                ll = ensemble_log_likelihood_fast(
+                    self,
+                    obs_before,
+                    obs_after,
+                    ensemble=self._ensemble,
+                )
             self._ensemble.update_posterior(ll)
-        except Exception:
-            pass
+        except Exception as ex:
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "update_ensemble_posterior failed: %s", ex, exc_info=True
+            )
 
     def set_node(self, id_: str, value: float = 0.0) -> None:
         self._invalidate_cache()

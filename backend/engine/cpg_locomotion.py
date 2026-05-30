@@ -118,6 +118,7 @@ class LocomotionController:
         self.optim = torch.optim.Adam(self.cpg.parameters(), lr=1e-2)
         self._step_count = 0
         self._last_com_x: float = 0.5
+        self._last_com_x_vel: float = 0.0
         self._last_com_z: float = 0.5
         self._reward_history: list[float] = []
         self._last_command: dict[str, float] = {}
@@ -154,7 +155,12 @@ class LocomotionController:
         recover = float(self._node(agent_nodes, "intent_stop_recover") - 0.5)
         energy = float(np.clip(self._node(agent_nodes, "self_energy"), 0.0, 1.0))
         com_x = float(self._node(agent_nodes, "com_x"))
+        com_y = float(self._node(agent_nodes, "com_y"))
         com_z = float(self._node(agent_nodes, "com_z"))
+        fwd_pos = com_y if abs(com_y - 0.5) >= abs(com_x - 0.5) else com_x
+        self._last_com_x_vel = fwd_pos - float(getattr(self, "_last_com_x", fwd_pos))
+        self._last_com_x = fwd_pos
+        self._last_com_z = com_z
 
         # === FORWARD LEAN FIX ===
         # При stride > 0 агент должен лидировать корпусом — иначе падает назад
@@ -375,9 +381,16 @@ class LocomotionController:
             return
 
         r_mean = float(np.mean(self._reward_history[-win:]))
+        com_x_vel = float(getattr(self, "_last_com_x_vel", 0.0))
+        try:
+            fwd_scale = float(os.environ.get("RKK_CPG_FWD_BONUS", "0.4"))
+        except ValueError:
+            fwd_scale = 0.4
+        fwd = fwd_scale * float(np.clip(com_x_vel - 0.01, 0.0, 1.0))
+        r_total = r_mean + fwd
         self.optim.zero_grad()
         dev = next(self.cpg.parameters()).device
-        scale = torch.tensor(r_mean, device=dev, dtype=torch.float32)
+        scale = torch.tensor(r_total, device=dev, dtype=torch.float32)
         loss = -scale * (
             0.35 * self.cpg.amplitude.mean()
             + 0.15 * self.cpg.frequency.mean()
@@ -399,6 +412,7 @@ class LocomotionController:
             "amplitude_mean": round(amp_m, 4),
             "frequency_mean_hz": round(fr_m, 3),
             "reward_recent_mean": round(float(np.mean(rh)), 4) if rh else 0.0,
+            "com_x_vel": round(float(getattr(self, "_last_com_x_vel", 0.0)), 5),
             "last_command_size": len(self._last_command),
             "last_intent_stride": round(float(self._last_motor_state.get("intent_stride", 0.5)), 4) if self._last_motor_state else 0.5,
             "cpg_com_lag": round(lag, 4),

@@ -39,6 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from engine.core.constants import agent_loop_hz_from_env
 from engine.json_util import sanitize_for_json
 from engine.ollama_env import get_ollama_generate_url, get_ollama_model
 from engine.simulation import Simulation
@@ -48,6 +49,37 @@ _sim:    Simulation | None = None
 _seeder: RAGSeeder  | None = None
 _rag_status = {"last_run": None, "results": [], "running": False}
 _causal_stream_ws: WebSocket | None = None
+_causal_stream_gen: int = 0
+
+
+def _ws_conn_active(websocket: WebSocket, conn_gen: int) -> bool:
+    return _causal_stream_ws is websocket and _causal_stream_gen == conn_gen
+
+
+async def _ws_send_json(websocket: WebSocket, conn_gen: int, payload: dict) -> None:
+    if not _ws_conn_active(websocket, conn_gen):
+        raise WebSocketDisconnect(code=1000)
+    try:
+        await websocket.send_json(payload)
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "send" in msg and "close" in msg:
+            raise WebSocketDisconnect(code=1000) from e
+        raise
+
+
+def _ws_hello_payload(sim: Simulation) -> dict:
+    """Лёгкий кадр сразу после accept — UI не ждёт полный public_state()."""
+    return {
+        "tick": int(getattr(sim, "tick", 0)),
+        "phase": int(getattr(sim, "phase", 1)),
+        "entropy": 100.0,
+        "singleton": True,
+        "_ws_hello": True,
+        "agents": [],
+        "events": [],
+        "graph_deltas": {},
+    }
 
 
 def get_sim() -> Simulation:
@@ -332,11 +364,16 @@ def state():
 
 @app.get("/api/snapshot")
 def api_snapshot():
-    """Alias для UI-виджетов: тот же снимок + поле world."""
+    """Alias для UI-виджетов: кэш фонового тика (без повторного PyBullet snapshot)."""
     sim = get_sim()
     ps = sim.public_state()
-    ps["world"] = ps.get("current_world", "humanoid")
-    return sanitize_for_json(ps)
+    if not isinstance(ps, dict):
+        ps = {}
+    if not ps.get("_json_sanitized"):
+        ps = sanitize_for_json(ps)
+    out = dict(ps)
+    out["world"] = out.get("current_world", "humanoid")
+    return out
 
 
 @app.get("/api/agent/messages")
@@ -879,7 +916,9 @@ def concept_subgraph(cid: str):
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 @app.websocket("/ws/causal-stream")
 async def causal_stream(websocket: WebSocket):
-    global _causal_stream_ws
+    global _causal_stream_ws, _causal_stream_gen
+    _causal_stream_gen += 1
+    conn_gen = _causal_stream_gen
     if _causal_stream_ws is not None:
         try:
             await _causal_stream_ws.close(code=1000, reason="replaced by new client")
@@ -890,48 +929,24 @@ async def causal_stream(websocket: WebSocket):
     _causal_stream_ws = websocket
     sim   = get_sim()
     speed = 1
+    agent_hz = agent_loop_hz_from_env()
+    ws_period = 0.05 if agent_hz <= 0 else max(1.0 / agent_hz, 0.033)
     print(f"[WS] Humanoid+Vision Singleton connected. d={sim.agent.graph._d}")
 
     try:
-        # Первый JSON сразу после accept — UI ставит ONLINE до тяжёлого tick_step / sanitize.
-        try:
-            loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
+        sim._bg.ensure_rkk_agent_loop()
+        await _ws_send_json(websocket, conn_gen, sanitize_for_json(_ws_hello_payload(sim)))
 
-            def _initial_snap():
-                return sanitize_for_json(sim.public_state())
-
-            payload0 = await loop.run_in_executor(None, _initial_snap)
-            await websocket.send_json(payload0)
-        except WebSocketDisconnect:
-            raise
-        except Exception as e:
-            print(
-                f"[WS] Initial snapshot send failed: {type(e).__name__}: {e!s}",
-                flush=True,
-            )
-            traceback.print_exc()
-            try:
-                await websocket.send_json(
-                    sanitize_for_json(
-                        {
-                            "tick": int(getattr(sim, "tick", 0)),
-                            "phase": int(getattr(sim, "phase", 1)),
-                            "entropy": 100.0,
-                            "singleton": True,
-                            "events": [
-                                {
-                                    "tick": int(getattr(sim, "tick", 0)),
-                                    "text": f"[WS] Initial snapshot fallback ({type(e).__name__})",
-                                    "color": "#ff8844",
-                                    "type": "error",
-                                }
-                            ],
-                            "_ws_recovery": True,
-                        }
-                    )
-                )
-            except (WebSocketDisconnect, RuntimeError):
-                raise
+        for _ in range(80):
+            if not _ws_conn_active(websocket, conn_gen):
+                raise WebSocketDisconnect(code=1000)
+            with sim._sim_step_lock:
+                payload0 = sim._agent_step_response
+            if payload0 is not None:
+                await _ws_send_json(websocket, conn_gen, payload0)
+                break
+            await asyncio.sleep(0.025)
 
         while True:
             try:
@@ -978,34 +993,41 @@ async def causal_stream(websocket: WebSocket):
             except Exception:
                 pass
 
+            if not _ws_conn_active(websocket, conn_gen):
+                raise WebSocketDisconnect(code=1000)
+
             try:
-                # tick_step() — тяжёлый sync (PyBullet, GNN); в async-цикле он блокирует весь
-                # event loop → WebSocket не шлёт кадры, ping не обрабатывается, UI «мёртв».
-                loop = asyncio.get_running_loop()
+                if agent_hz > 0:
+                    with sim._sim_step_lock:
+                        payload = sim._agent_step_response
+                    if payload is not None:
+                        await _ws_send_json(websocket, conn_gen, payload)
+                else:
+                    def _run_ticks() -> dict:
+                        out: dict | None = None
+                        for _ in range(max(1, speed)):
+                            out = sim.tick_step()
+                        raw = out or {}
+                        if isinstance(raw, dict) and raw.get("_json_sanitized"):
+                            return raw
+                        return sanitize_for_json(raw)
 
-                def _run_ticks() -> dict:
-                    out: dict | None = None
-                    for _ in range(max(1, speed)):
-                        out = sim.tick_step()
-                    # Санитизация здесь же — иначе огромный dict копируется на главном потоке
-                    # между executor и send_json и снова даёт пики RAM + секундные зависания UI.
-                    return sanitize_for_json(out or {})
-
-                payload = await loop.run_in_executor(None, _run_ticks)
-                await websocket.send_json(payload)
+                    payload = await loop.run_in_executor(None, _run_ticks)
+                    if not _ws_conn_active(websocket, conn_gen):
+                        raise WebSocketDisconnect(code=1000)
+                    await _ws_send_json(websocket, conn_gen, payload)
             except WebSocketDisconnect:
-                raise
-            except RuntimeError as e:
-                # Клиент закрыл сокет — иногда Starlette даёт RuntimeError вместо WebSocketDisconnect.
-                if "send" in str(e).lower() and "close" in str(e).lower():
-                    raise WebSocketDisconnect() from e
                 raise
             except Exception as e:
                 # Один плохой тик / сериализация не должны ронять весь uvicorn.
                 print(f"[WS] tick/send failed: {e}")
                 traceback.print_exc()
+                if not _ws_conn_active(websocket, conn_gen):
+                    raise WebSocketDisconnect(code=1000) from e
                 try:
-                    await websocket.send_json(
+                    await _ws_send_json(
+                        websocket,
+                        conn_gen,
                         {
                             "tick": getattr(sim, "tick", 0),
                             "phase": getattr(sim, "phase", 1),
@@ -1022,13 +1044,15 @@ async def causal_stream(websocket: WebSocket):
                             "graph_deltas": {},
                             "singleton": True,
                             "_ws_recovery": True,
-                        }
+                        },
                     )
+                except WebSocketDisconnect:
+                    raise
                 except Exception as send_exc:
                     print(f"[WS] recovery send failed: {send_exc}")
                 await asyncio.sleep(0.15)
 
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(ws_period)
 
     except WebSocketDisconnect:
         print("[WS] Disconnected")

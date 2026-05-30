@@ -100,6 +100,8 @@ _TICK_LOG_SYSTEM2_KEYS: frozenset[str] = frozenset(
         "distill_recover_conf_median",
         "distill_blend_ready",
         "distill_quality_warn",
+        "motor_owner",
+        "learned_recovery_active",
     }
 )
 
@@ -282,6 +284,10 @@ class TickRunLogger:
         inner_phases = dict(getattr(sim, "_inner_phase_ms", {}) or {})
         sim_post_ms = round(max(0.0, inner_ms - agent_total), 2)
 
+        bt = getattr(sim, "behavioral_tracker", None)
+        beh_score = snap.get("behavioral_score")
+        if beh_score is None and bt is not None:
+            beh_score = bt.snapshot().get("behavioral_score")
         record: dict[str, Any] = {
             "type": "tick",
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -309,6 +315,8 @@ class TickRunLogger:
                 "blocked_total": snap.get("total_blocked"),
                 "block_rate": vl.get("block_rate"),
                 "discovery_rate": snap.get("discovery_rate"),
+                "structural_discovery": snap.get("structural_discovery", snap.get("discovery_rate")),
+                "behavioral_score": beh_score,
                 "peak_discovery_rate": snap.get("peak_discovery_rate"),
                 "phase": getattr(sim, "phase", 0),
                 "smoothed_dr": (
@@ -374,6 +382,35 @@ class TickRunLogger:
         s2snap = _system2_tick_log_snapshot(sim)
         if s2snap is not None:
             record["system2"] = s2snap
+
+        bt = getattr(sim, "behavioral_tracker", None)
+        if bt is not None:
+            record["behavioral"] = bt.snapshot()
+        record["motor_owner"] = (s2snap or {}).get("motor_owner")
+        record["neuro"] = {
+            "pending": bool(getattr(sim, "_neuro_pending", False)),
+            "warmup_until": int(getattr(sim, "_wm_warmup_until", 0) or 0),
+        }
+        ens = getattr(agent.graph, "_ensemble", None)
+        if ens is not None:
+            es = ens.snapshot()
+            record.setdefault("wm", {})
+            if isinstance(record["wm"], dict):
+                record["wm"]["ensemble"] = {
+                    "weights": es.get("weights"),
+                    "entropy": es.get("entropy"),
+                }
+        from engine.features.simulation.snapshot import humanoid_curriculum_step
+
+        cstep, _ = humanoid_curriculum_step(sim)
+        record.setdefault("curriculum", {})
+        if isinstance(record["curriculum"], dict):
+            record["curriculum"]["step"] = cstep
+            record["curriculum"]["step_3_substate"] = (
+                (record.get("behavioral") or {}).get("step_3_substate")
+                if cstep >= 3
+                else None
+            )
 
         if _env_flag("RKK_TICK_RUN_LOG_PHYS", True) and obs:
             record["phys"] = _phys_snapshot(obs, agent, sim=sim)

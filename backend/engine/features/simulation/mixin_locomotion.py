@@ -75,6 +75,9 @@ class SimulationLocomotionMixin:
             return
         if self.current_world != "humanoid" or self._cpg_blocked_by_fixed_root():
             return
+        s2 = getattr(self, "_system2_last", None) or {}
+        if str(s2.get("motor_owner", "")) == "s2_scripted":
+            return
 
         if not self._agi_substrate_blend_enabled():
             # Только intent из WM (без ритма ног): хрупко для долгого обучения.

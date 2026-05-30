@@ -34,6 +34,65 @@ class SimulationFallMixin:
         self._fall_recovery_last_progress_tick = 0
         self._fall_recovery_best_score = 0.0
 
+    def _genome_fall_recovery_enabled(self) -> bool:
+        raw = os.environ.get("RKK_GENOME_FALL_RECOVERY")
+        if raw is not None:
+            return raw.strip().lower() not in ("0", "false", "no", "off")
+        try:
+            from engine.system2.controller import (
+                _s2_learned_recovery_enabled,
+                system2_enabled,
+            )
+
+            if system2_enabled() and _s2_learned_recovery_enabled():
+                return False
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _fallen_signal_for_s2(obs: dict, *, fallen_debounced: bool) -> bool:
+        """S2 streak: debounced fallen OR low posture/com_z (survives reset_stance)."""
+        if fallen_debounced:
+            return True
+        ps = float(
+            obs.get("posture_stability", obs.get("phys_posture_stability", 1.0))
+        )
+        cz = float(obs.get("com_z", obs.get("phys_com_z", 1.0)))
+        try:
+            ps_th = float(os.environ.get("RKK_S2_FALLEN_POSTURE_TH", "0.42"))
+            cz_th = float(os.environ.get("RKK_S2_FALLEN_COM_Z_TH", "0.38"))
+        except ValueError:
+            ps_th, cz_th = 0.42, 0.38
+        return ps < ps_th or cz < cz_th
+
+    def _raw_com_x_m(self) -> float | None:
+        base = self._unwrap_base_env(self.agent.env)
+        sim = getattr(base, "_sim", None)
+        if sim is None or not hasattr(sim, "get_state"):
+            return None
+        try:
+            st = sim.get_state()
+            if isinstance(st, dict) and "com_x" in st:
+                return float(st["com_x"])
+        except Exception:
+            pass
+        return None
+
+    def _raw_com_forward_m(self) -> float | None:
+        """World forward axis (PyBullet com[1] / com_y)."""
+        base = self._unwrap_base_env(self.agent.env)
+        sim = getattr(base, "_sim", None)
+        if sim is None or not hasattr(sim, "get_state"):
+            return None
+        try:
+            st = sim.get_state()
+            if isinstance(st, dict) and "com_y" in st:
+                return float(st["com_y"])
+        except Exception:
+            pass
+        return None
+
     def _maybe_recover_or_reset_after_fall(self, obs: dict) -> bool:
         """
         Recovery-first policy:

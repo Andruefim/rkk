@@ -62,6 +62,13 @@ class SimulationSkillsMixin:
             and self.tick < walk_min
         ):
             return "stand"
+        bt = getattr(self, "behavioral_tracker", None)
+        if bt is not None:
+            snap = bt.snapshot()
+            if float(snap.get("com_x_vel_ema", 0.0)) < float(
+                os.environ.get("RKK_STEP3_COM_X_VEL_MIN", "0.08")
+            ):
+                return "stand"
         g = os.environ.get("RKK_SKILL_GOAL", "walk").strip().lower()
         return g if g else "walk"
 
@@ -428,7 +435,23 @@ class SimulationSkillsMixin:
         }
 
     def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
-        """Curiosity-driven exploration for all environments including humanoid."""
+        """Curiosity-driven exploration; optional Active Inference every K ticks."""
+        ai_on = os.environ.get("RKK_ACTIVE_INFERENCE", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        s2_strict = os.environ.get("RKK_S2_WM_GATE_STRICT", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if ai_on and not s2_strict:
+            try:
+                every = max(1, int(os.environ.get("RKK_ACTIVE_INFERENCE_EVERY", "4")))
+            except ValueError:
+                every = 4
+            if engine_tick % every == 0:
+                try:
+                    return self._run_active_inference_step(engine_tick)
+                except Exception:
+                    pass
         return self.agent.step(
             engine_tick=engine_tick,
             enable_l3=self._l3_planning_due(),
