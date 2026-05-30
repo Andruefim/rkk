@@ -43,7 +43,7 @@ class WeightedGraphEnsemble(nn.Module):
         if seed_W is not None:
             base = seed_W.detach().clone().to(device)
             W_stack = base.unsqueeze(0).expand(self.n, -1, -1).clone()
-            noise = torch.randn_like(W_stack) * 0.01
+            noise = torch.randn_like(W_stack) * 0.15
             W_stack = W_stack + noise
         else:
             W_stack = torch.randn(self.n, d, d, device=device) * 0.02

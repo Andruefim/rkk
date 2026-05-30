@@ -286,11 +286,75 @@ class GoalImagination:
         causal_surprise: CausalSurprise,
     ) -> dict[str, Any] | None:
         """
-        Генерирует следующую цель через GNN imagination rollout.
-        Отключено: базовый контроль идёт через Active Inference + гомеостаз;
-        Система 2 (curiosity) будет включаться после стабилизации (см. implementation_plan).
+        Генерирует следующую цель через EIG-поиск по кандидатам интервенций.
+
+        Алгоритм:
+          1. Берём текущее наблюдение
+          2. Сэмплируем K случайных интервенций на intent_* узлах
+          3. Вычисляем EIG каждой через ensemble disagreement
+          4. Возвращаем интервенцию с макс. EIG как цель для HomeostaticController
         """
-        return None
+        try:
+            from engine.hypothesis_testing import eig_for_action
+        except ImportError:
+            return None
+
+        try:
+            obs = dict(agent_env.observe())
+        except Exception:
+            return None
+
+        # Собираем все intent_* узлы как кандидаты
+        ids = list(getattr(graph, "_node_ids", []))
+        intent_vars = [v for v in ids if str(v).startswith("intent_")]
+        if not intent_vars:
+            return None
+
+        # Сэмплируем K пар (var, val) — несколько значений на каждый узел
+        rng = np.random.default_rng()
+        candidates: list[tuple[str, float]] = []
+        vals_to_try = [0.2, 0.5, 0.8]  # низкий / средний / высокий
+        for var in intent_vars:
+            for v in vals_to_try:
+                candidates.append((var, float(v)))
+
+        # Ограничиваем до K_candidates
+        if len(candidates) > self._k_candidates:
+            idxs = rng.choice(len(candidates), self._k_candidates, replace=False)
+            candidates = [candidates[i] for i in idxs]
+
+        if not candidates:
+            return None
+
+        # Ищем интервенцию с максимальным EIG
+        best_var: str | None = None
+        best_val: float = 0.5
+        best_eig: float = -1.0
+
+        for var, val in candidates:
+            try:
+                eig = eig_for_action(graph, obs, [(var, val)])
+                if eig > best_eig:
+                    best_eig = eig
+                    best_var = var
+                    best_val = val
+            except Exception:
+                continue
+
+        if best_var is None or best_eig <= 0.0:
+            return None
+
+        goal: dict[str, Any] = {
+            "target_var": best_var,
+            "target_val": float(best_val),
+            "expected_gain": float(best_eig),
+            "n_interventions_at_gen": n_interventions,
+        }
+        self._current_goal = goal
+        self._goal_age = 0
+        self.total_goals_generated += 1
+        self._goal_history.append(goal)
+        return goal
 
     def tick_goal(self, actual_compression: float) -> dict[str, Any] | None:
         """
@@ -528,11 +592,15 @@ class IntrinsicObjective:
     def get_target_priors(self, snapshot_vec: dict[str, float]) -> dict[str, float]:
         """
         Дополнительные цели для HomeostaticController (Система 2 → приоры).
-        Пока любопытство отключено в GoalImagination, возвращаем пустой словарь;
-        история осанки используется для будущего гейтинга навигационных приоров.
+
+        Порядок приоритетов:
+          1. Цель от GoalImagination (EIG-based) — если есть активная цель
+          2. Nav prior (RKK_INTRINSIC_NAV_PRIORS=1) — хардкод вперёд для диагностики
+          3. {} — нет активной цели
         """
         if not intrinsic_enabled():
             return {}
+
         ps = float(
             snapshot_vec.get(
                 "phys_posture_stability",
@@ -540,23 +608,30 @@ class IntrinsicObjective:
             )
         )
         self._posture_hist.append(ps)
-        if os.environ.get("RKK_INTRINSIC_NAV_PRIORS", "0").strip().lower() not in (
-            "1",
-            "true",
-            "yes",
-            "on",
+
+        # --- Приоритет 1: EIG-based goal от GoalImagination ---
+        active_goal = self.goal_imagination._current_goal
+        if active_goal is not None:
+            var = active_goal.get("target_var")
+            val = active_goal.get("target_val")
+            if var and val is not None:
+                # Гейтинг: не даём любопытству гнать агента когда он падает
+                if len(self._posture_hist) < 10 or float(np.mean(list(self._posture_hist)[-10:])) >= 0.45:
+                    return {str(var): float(val)}
+
+        # --- Приоритет 2: хардкод nav prior (только если явно включён) ---
+        if os.environ.get("RKK_INTRINSIC_NAV_PRIORS", "0").strip().lower() in (
+            "1", "true", "yes", "on",
         ):
-            return {}
-        if len(self._posture_hist) < 25:
-            return {}
-        if float(np.mean(list(self._posture_hist)[-40:])) < 0.72:
-            return {}
-        try:
-            vx = float(os.environ.get("RKK_NAV_PRIOR_COM_X_VEL", "0.18"))
-        except ValueError:
-            vx = 0.18
-        if any(k.endswith("com_x_vel") for k in snapshot_vec):
-            return {"phys_com_x_vel": vx}
+            if len(self._posture_hist) >= 25:
+                if float(np.mean(list(self._posture_hist)[-40:])) >= 0.72:
+                    try:
+                        vx = float(os.environ.get("RKK_NAV_PRIOR_COM_X_VEL", "0.18"))
+                    except ValueError:
+                        vx = 0.18
+                    if any(k.endswith("com_x_vel") for k in snapshot_vec):
+                        return {"phys_com_x_vel": vx}
+
         return {}
 
     def step(
