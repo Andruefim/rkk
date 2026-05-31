@@ -452,7 +452,12 @@ class SimulationSkillsMixin:
                     return self._run_active_inference_step(engine_tick)
                 except Exception:
                     pass
+        fallen = False
+        if self.current_world == "humanoid" and not self._fixed_root_active:
+            is_fn = getattr(self.agent.env, "is_fallen", None)
+            fallen = bool(is_fn()) if callable(is_fn) else False
         return self.agent.step(
             engine_tick=engine_tick,
             enable_l3=self._l3_planning_due(),
+            fallen=fallen,
         )

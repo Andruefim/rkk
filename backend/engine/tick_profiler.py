@@ -181,13 +181,20 @@ class TickProfiler:
             items = [(n, s) for n, s in items if n.startswith(scope_prefix)]
         if not items:
             return []
-        total_avg = sum(s.ema_ms if use_ema else s.avg_ms for _, s in items)
-        if total_avg <= 0:
-            total_avg = 1.0
+        wall_st = self._stats.get("sim.wall") or self._stats.get("bg.agent_loop")
+        denom = (
+            (wall_st.ema_ms if use_ema else wall_st.avg_ms)
+            if wall_st is not None and wall_st.count > 0
+            else 0.0
+        )
+        if denom <= 0:
+            denom = sum(s.ema_ms if use_ema else s.avg_ms for _, s in items)
+        if denom <= 0:
+            denom = 1.0
         ranked_list: list[dict[str, Any]] = []
         for name, st in items:
             avg = st.ema_ms if use_ema else st.avg_ms
-            pct = 100.0 * avg / total_avg
+            pct = 100.0 * avg / denom
             if pct < self._min_pct and st.count > 3:
                 continue
             ranked_list.append(

@@ -132,17 +132,22 @@ class SimulationPhaseHierarchyMixin:
         """
         Разрешение запуска L3 (goal_planning + imagination horizon) в текущем тике.
         Single-writer: только флаг для agent.step, без фоновых мутаций graph/env.
+
+        По тикам движка (не wall-clock): иначе при медленном agent loop (>250ms)
+        L3=4Hz срабатывает почти каждый шаг → imagination в VL ~1s/тик.
         """
         hz = _l3_loop_hz_from_env()
         if hz <= 0.0:
             self._l3_last_tick = self.tick
             return True
-        now = time.perf_counter()
-        if now >= self._l3_next_due_ts:
-            self._l3_next_due_ts = now + (1.0 / hz)
+        nominal = _agent_loop_hz_from_env()
+        if nominal <= 0.0:
+            nominal = 15.0
+        every = max(1, int(round(nominal / hz)))
+        due = int(self.tick) % every == 0
+        if due:
             self._l3_last_tick = self.tick
-            return True
-        return False
+        return due
 
     def _ensure_l4_worker(self) -> None:
         if self._l4_thread is not None and self._l4_thread.is_alive():

@@ -42,6 +42,15 @@ def humanoid_curriculum_step(sim: Any) -> tuple[int, int]:
     return 3, until
 
 
+def _tick_profile_payload() -> dict[str, Any]:
+    try:
+        from engine.tick_profiler import profile_snapshot
+
+        return profile_snapshot()
+    except Exception:
+        return {"enabled": False}
+
+
 def build_simulation_snapshot(
     sim: Any,
     snap: dict,
@@ -263,6 +272,7 @@ def build_simulation_snapshot(
             if getattr(sim, "_variable_registry", None) is not None
             else None
         ),
+        "tick_profile": _tick_profile_payload(),
     }
     # Санитизация (nan/inf/torch) — один раз на границе send_json/HTTP, не здесь
     # (двойной sanitize дублировал весь payload и раздувал RAM на каждый WS-кадр).

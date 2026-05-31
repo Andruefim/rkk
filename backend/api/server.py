@@ -376,6 +376,14 @@ def api_snapshot():
     return out
 
 
+@app.get("/api/tick_profile")
+def api_tick_profile():
+    """Ranked per-feature tick timings (RKK_TICK_PROFILE)."""
+    from engine.tick_profiler import profile_snapshot
+
+    return sanitize_for_json(profile_snapshot())
+
+
 @app.get("/api/agent/messages")
 def api_agent_messages(last_n: int = Query(default=50, ge=1, le=200)):
     """Phase L: история речи агента для чата."""

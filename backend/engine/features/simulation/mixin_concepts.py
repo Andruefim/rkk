@@ -69,6 +69,8 @@ class SimulationConceptsMixin:
                 )
 
     def _maybe_refresh_concepts_cache(self) -> None:
+        if getattr(self, "_prev_fallen", False):
+            return
         if getattr(self, "_fixed_root_active", False) and os.environ.get(
             "RKK_CONCEPT_DETECT_DURING_FIXED_ROOT", "0"
         ).strip().lower() not in ("1", "true", "yes", "on"):

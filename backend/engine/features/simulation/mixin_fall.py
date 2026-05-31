@@ -11,6 +11,18 @@ class SimulationFallMixin:
         self._tick_phys_state_tick = -1
         self._bt_snap_tick = -1
         self._bt_snap_payload = None
+        self._tick_graph_vec = None
+
+    def _graph_vec_cached(self) -> dict[str, float]:
+        """One snapshot_vec_dict per sim tick (invalidated after agent.step)."""
+        cached = getattr(self, "_tick_graph_vec", None)
+        if cached is not None:
+            return cached
+        g = self.agent.graph
+        g.set_snapshot_vec_engine_tick(int(self.tick))
+        vec = g.snapshot_vec_dict()
+        self._tick_graph_vec = vec
+        return vec
 
     def _env_observe_cached(self) -> dict:
         """Один env.observe() на тик (PyBullet)."""

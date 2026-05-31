@@ -583,10 +583,10 @@ class ValueLayer:
         )
         if (
             _fast_fr
-            and fixed_root
             and imagination_horizon == 0
             and is_intent_action
             and precomputed_s1 is None
+            and (fixed_root or recovery_override)
         ):
             S1 = dict(current_nodes)
             S1[variable] = float(value)

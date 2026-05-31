@@ -14,8 +14,16 @@ PHASE_NAMES = [
     "Open Reality",
 ]
 
-# Visual mode: полный GNN→cortex на каждом тике дорог; предсказание для PC обновляем реже
-VISION_GNN_FEED_EVERY = 2
+def vision_gnn_feed_every_from_env() -> int:
+    """GNN→visual predictive-coding feed (integrate_world_model_step); default 8 ticks."""
+    try:
+        return max(1, int(os.environ.get("RKK_VISION_GNN_FEED_EVERY", "8")))
+    except ValueError:
+        return 8
+
+
+# Back-compat alias (prefer vision_gnn_feed_every_from_env()).
+VISION_GNN_FEED_EVERY = 8
 
 
 def cpg_loop_hz_from_env() -> float:
@@ -55,6 +63,13 @@ def l3_loop_hz_from_env() -> float:
     except ValueError:
         hz = 0.0
     return max(0.0, min(hz, 30.0))
+
+
+def topological_self_every_from_env() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_TOPOLOGICAL_SELF_EVERY", "40")))
+    except ValueError:
+        return 40
 
 
 def l4_worker_enabled() -> bool:

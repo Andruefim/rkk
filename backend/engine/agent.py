@@ -379,6 +379,19 @@ def _notears_every() -> int:
         return 8
 
 
+def _wm_train_due(engine_tick: int, total_interventions: int) -> bool:
+    """
+    WM train_step cadence. RKK_WM_TRAIN_EVERY>0 → по engine tick; иначе по интервенциям (legacy).
+    """
+    try:
+        te = int(os.environ.get("RKK_WM_TRAIN_EVERY", "0"))
+    except ValueError:
+        te = 0
+    if te > 0:
+        return int(engine_tick) > 0 and int(engine_tick) % te == 0
+    return int(total_interventions) % _notears_every() == 0
+
+
 _score_async_win_warned = False
 
 
@@ -415,6 +428,50 @@ def _vl_fast_fixed_root_intents_enabled() -> bool:
     return os.environ.get("RKK_VL_FAST_FIXED_ROOT", "1").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def _vl_fast_fallen_intents_enabled() -> bool:
+    return os.environ.get("RKK_VL_FAST_FALLEN", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _vl_fast_intent_enabled() -> bool:
+    """Upright walk: skip WM propagate_from_batch when all VL candidates are intents."""
+    return os.environ.get("RKK_VL_FAST_INTENT", "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _filter_intent_scores(scores: list[dict]) -> list[dict]:
+    return [
+        c
+        for c in scores
+        if str(c.get("variable", "")).startswith(("intent_", "phys_intent_"))
+    ]
+
+
+def _nodes_low_posture_for_fast_vl(nodes: dict[str, float]) -> bool:
+    if os.environ.get("RKK_VL_FAST_LOW_POSTURE", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return False
+    ps = float(
+        nodes.get("posture_stability", nodes.get("phys_posture_stability", 0.5))
+    )
+    cz = float(nodes.get("com_z", nodes.get("phys_com_z", 0.5)))
+    try:
+        ps_th = float(os.environ.get("RKK_VL_FAST_POSTURE_TH", "0.48"))
+    except ValueError:
+        ps_th = 0.48
+    try:
+        cz_th = float(os.environ.get("RKK_VL_FAST_COM_Z_TH", "0.40"))
+    except ValueError:
+        cz_th = 0.40
+    return ps < ps_th or cz < cz_th
 
 
 def _cheap_vl_s1_intent_batch(
@@ -536,6 +593,15 @@ class RKKAgent:
     def set_s2_planning_context(self, ctx: dict[str, Any] | None) -> None:
         """Контекст System2 для S2-gated WM planner (после system2.tick)."""
         self._s2_planning_context = ctx
+
+    def _observe_env(self) -> dict[str, float]:
+        """One PyBullet observe per sim tick when Simulation cache is available."""
+        sim = self._resolve_rkk_sim()
+        if sim is not None:
+            fn = getattr(sim, "_env_observe_cached", None)
+            if callable(fn):
+                return dict(fn())
+        return dict(self.env.observe())
 
     def _resolve_rkk_sim(self) -> Any | None:
         """Simulation back-ref (not PyBullet _sim)."""
@@ -1988,8 +2054,9 @@ class RKKAgent:
             self.graph._ensemble.sync_from_executive(self._genome_ema_W, idx=0)
 
     # ── Один шаг с Value Layer ────────────────────────────────────────────────
-    def step(self, engine_tick: int = 0, *, enable_l3: bool = True) -> dict:
+    def step(self, engine_tick: int = 0, *, enable_l3: bool = True, fallen: bool = False) -> dict:
         _step_t0 = time.perf_counter()
+        _fallen_fast = bool(fallen)
         _slow_t = {
             "observe": 0.0,
             "score_interventions": 0.0,
@@ -2030,7 +2097,7 @@ class RKKAgent:
         _t0 = time.perf_counter()
         try:
             self.graph.apply_env_observation(
-                dict(self.env.observe()), engine_tick=engine_tick
+                self._observe_env(), engine_tick=engine_tick
             )
         except Exception:
             pass
@@ -2043,6 +2110,17 @@ class RKKAgent:
         if _use_s2_wm_strict:
             scores = []
             _score_mode = "s2_wm_strict"
+            _slow_t["score_interventions"] = 0.0
+            _t_score = time.perf_counter()
+        elif _fallen_fast and self._score_cache:
+            scores = _filter_intent_scores(self._score_cache)
+            if not scores:
+                s2c = getattr(self, "_system2_candidate", None)
+                if s2c is not None:
+                    scores = [s2c]
+                else:
+                    scores = list(self._score_cache)[: _max_fallback_tries_from_env()]
+            _score_mode = "fallen_score_cache"
             _slow_t["score_interventions"] = 0.0
             _t_score = time.perf_counter()
         else:
@@ -2163,7 +2241,9 @@ class RKKAgent:
         )
 
         wm_cand: dict | None = None
-        if enable_l3 and s2_ctx is not None:
+        if enable_l3 and s2_ctx is not None and not (
+            _fallen_fast and not s2_ctx.get("fallen_override_active")
+        ):
             wm_cand = self._maybe_s2_wm_candidate(
                 enable_l3=enable_l3,
                 fixed_root=fr_for_plan,
@@ -2208,14 +2288,22 @@ class RKKAgent:
                     scores[0] = {**v0, "value": alt, "s2_wm_stuck_nudge": True}
                     self._repeat_same_top_scores = 0
         else:
-            gp = self._maybe_goal_planned_candidate() if enable_l3 else None
+            gp = (
+                self._maybe_goal_planned_candidate()
+                if enable_l3 and not _fallen_fast
+                else None
+            )
             if gp is not None and not (
                 symbolic_verifier_enabled() and self._symbolic_prediction_bad
             ):
                 scores.insert(0, gp)
 
             _t0_cem = time.perf_counter()
-            cem_cand = self._maybe_cem_candidate(engine_tick) if enable_l3 else None
+            cem_cand = (
+                self._maybe_cem_candidate(engine_tick)
+                if enable_l3 and not _fallen_fast
+                else None
+            )
             _slow_t["cem"] = time.perf_counter() - _t0_cem
             if cem_cand is not None:
                 scores.insert(0, cem_cand)
@@ -2280,6 +2368,21 @@ class RKKAgent:
                 "from_system2": False,
             }
 
+        _nodes_now = dict(self.graph.nodes)
+        _vl_fast = bool(_fallen_fast)
+        if not _vl_fast and _vl_fast_fallen_intents_enabled():
+            _vl_fast = _nodes_low_posture_for_fast_vl(_nodes_now)
+        if isinstance(s2_ctx, dict) and s2_ctx.get("fallen_override_active"):
+            _vl_fast = True
+        if _vl_fast:
+            _intent_scores = _filter_intent_scores(scores)
+            if _intent_scores:
+                scores = _intent_scores
+        elif _vl_fast_intent_enabled():
+            _intent_scores = _filter_intent_scores(scores)
+            if _intent_scores:
+                scores = _intent_scores
+
         current_phi = self.phi_approx()
         chosen      = None
         check_result = None
@@ -2304,21 +2407,30 @@ class RKKAgent:
                 _recovery_vl = True
                 _pfr_vl = 1.0
 
-        vl_horizon = self._effective_imagination_horizon(enable_l3)
+        vl_horizon = (
+            0
+            if (_fallen_fast or _vl_fast)
+            else self._effective_imagination_horizon(enable_l3)
+        )
         vl_tries = min(_max_fallback_tries_from_env(), len(scores))
+        if _fallen_fast or _vl_fast:
+            try:
+                vl_tries = max(1, min(vl_tries, int(os.environ.get("RKK_VL_FALLBACK_TRIES_FALLEN", "1"))))
+            except ValueError:
+                vl_tries = 1
         vl_batch = scores[:vl_tries]
-        current_nodes = dict(self.graph.nodes)
+        current_nodes = _nodes_now
         _t0_vl = time.perf_counter()
         cheap: list[dict] | None = None
-        if (
-            _vl_fast_fixed_root_intents_enabled()
-            and vl_horizon == 0
-            and (
-                _env_fixed_root_flag(self.env)
-                or _graph_fixed_root_flag(self.graph.nodes)
+        if vl_horizon == 0 and _vl_fast_fixed_root_intents_enabled():
+            _fr_vl = _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(
+                self.graph.nodes
             )
-        ):
-            cheap = _cheap_vl_s1_intent_batch(current_nodes, vl_batch)
+            _use_cheap = _fr_vl or (
+                _vl_fast and _vl_fast_fallen_intents_enabled()
+            ) or _vl_fast_intent_enabled()
+            if _use_cheap:
+                cheap = _cheap_vl_s1_intent_batch(current_nodes, vl_batch)
         if cheap is not None:
             s1_batch = cheap
         else:
@@ -2328,6 +2440,7 @@ class RKKAgent:
             )
 
         # Перебираем кандидатов пока не найдём допустимое действие
+        chosen_pre_s1: dict[str, float] | None = None
         for i, candidate in enumerate(vl_batch):
             var   = candidate["variable"]
             value = candidate["value"]
@@ -2350,6 +2463,7 @@ class RKKAgent:
 
             if check_result.allowed:
                 chosen = candidate
+                chosen_pre_s1 = pre_s1
                 break
             else:
                 # Штрафуем System 1 за предложение опасного действия
@@ -2405,11 +2519,17 @@ class RKKAgent:
                 "from_system2": False,
             }
 
-        mdl_before = self.graph.mdl_size
-        obs_before_env = dict(self.env.observe())
+        if _fallen_fast:
+            mdl_before = 0.0
+        else:
+            mdl_before = self.graph.mdl_size
+        obs_before_env = self._observe_env()
         self.graph.apply_env_observation(obs_before_env)
         obs_before_full = self.graph.snapshot_vec_dict()
-        predicted  = self.graph.propagate(var, value)
+        if (_fallen_fast or _vl_fast) and chosen_pre_s1 is not None:
+            predicted = dict(chosen_pre_s1)
+        else:
+            predicted = self.graph.propagate(var, value)
         _fixed_root_now = bool(
             getattr(self.value_layer.bounds, "fixed_root_mode", False)
             or _env_fixed_root_flag(self.env)
@@ -2477,7 +2597,17 @@ class RKKAgent:
             if cnt - prev > single_cap:
                 skip_notears = True
                 sim_ref._edge_growth_blocked = True
-        if self._total_interventions % _notears_every() == 0 and not skip_notears:
+        _train_due = _wm_train_due(engine_tick, self._total_interventions)
+        if _fallen_fast:
+            try:
+                fe = int(os.environ.get("RKK_WM_TRAIN_EVERY_FALLEN", "0"))
+            except ValueError:
+                fe = 0
+            if fe > 0:
+                _train_due = int(engine_tick) > 0 and int(engine_tick) % fe == 0
+            else:
+                _train_due = False
+        if _train_due and not skip_notears:
             # #region agent log
             _t_ts = time.perf_counter()
             # #endregion
@@ -2498,7 +2628,10 @@ class RKKAgent:
                 self._notears_steps += 1
                 self._last_notears_loss = notears_result
 
-        mdl_after         = self.graph.mdl_size
+        if _fallen_fast:
+            mdl_after = mdl_before
+        else:
+            mdl_after = self.graph.mdl_size
         compression_delta = mdl_before - mdl_after
         self._cg_history.append(compression_delta)
 
@@ -2508,19 +2641,20 @@ class RKKAgent:
                 for k in self.graph._node_ids[:32]
             ]) if self.graph._node_ids else 0.0
         )
-        self._push_causal_replay(
-            var, value, obs_before_full, observed_full,
-            compression_delta=compression_delta,
-            prediction_error=pe_mean,
-        )
-        self.graph.update_ensemble_posterior(
-            obs_before_full,
-            observed_full,
-            var,
-            value,
-            intervention_index=int(self._total_interventions),
-        )
-        self._genome_ema_update()
+        if not _fallen_fast:
+            self._push_causal_replay(
+                var, value, obs_before_full, observed_full,
+                compression_delta=compression_delta,
+                prediction_error=pe_mean,
+            )
+            self.graph.update_ensemble_posterior(
+                obs_before_full,
+                observed_full,
+                var,
+                value,
+                intervention_index=int(self._total_interventions),
+            )
+            self._genome_ema_update()
 
         # System 1: IG по физике; slot_* и self_* не доминируют метрику (self — прямое задание агентом).
         nids = self.graph._node_ids
@@ -2654,7 +2788,8 @@ class RKKAgent:
             dtype=torch.float32,
             device=self.device,
         )
-        self.temporal.train_step(u_next)
+        if not _fallen_fast:
+            self.temporal.train_step(u_next)
 
         self._total_interventions += 1
         self._last_applied_do_key = (str(var), round(float(value), 4))
@@ -2666,7 +2801,7 @@ class RKKAgent:
         self._last_blocked_reason = ""
 
         # Phase T: feed trajectory collector + progressive scope
-        if trajectory_enabled():
+        if trajectory_enabled() and not _fallen_fast:
             is_env_fallen = False
             try:
                 fn_fallen = getattr(self.env, 'is_fallen', None)
@@ -2688,7 +2823,7 @@ class RKKAgent:
                 self.graph._traj_segments.append(completed_seg)
                 if len(self.graph._traj_segments) > self.graph._traj_max_segments:
                     self.graph._traj_segments = self.graph._traj_segments[-self.graph._traj_max_segments:]
-        if progressive_scope_enabled():
+        if progressive_scope_enabled() and not _fallen_fast:
             tq = self._traj_collector.recent_quality() if trajectory_enabled() else None
             self._prog_scope.tick(
                 is_fallen=is_fallen,
@@ -2713,7 +2848,17 @@ class RKKAgent:
             )
 
         _t0_dr = time.perf_counter()
-        cur_dr = self._discovery_rate_for_tick(engine_tick)
+        if _fallen_fast:
+            try:
+                dr_every = max(1, int(os.environ.get("RKK_DISCOVERY_RATE_EVERY_FALLEN", "8")))
+            except ValueError:
+                dr_every = 8
+            if engine_tick % dr_every == 0 or self._disc_rate_tick < 0:
+                cur_dr = self._discovery_rate_for_tick(engine_tick)
+            else:
+                cur_dr = float(self._disc_rate_val)
+        else:
+            cur_dr = self._discovery_rate_for_tick(engine_tick)
         _slow_t["discovery_rate"] = time.perf_counter() - _t0_dr
         if cur_dr > self._peak_discovery_rate:
             self._peak_discovery_rate = cur_dr

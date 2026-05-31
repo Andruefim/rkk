@@ -190,6 +190,12 @@ class BackgroundLoopService:
             except Exception as ex:
                 print(f"[Simulation] CPG loop: {ex}")
             elapsed = time.perf_counter() - t0
+            try:
+                from engine.tick_profiler import get_tick_profiler
+
+                get_tick_profiler().record("bg.cpg_loop", elapsed * 1000.0)
+            except Exception:
+                pass
             wait = dt - elapsed
             if wait > 0:
                 self._cpg_stop.wait(timeout=wait)
@@ -230,17 +236,29 @@ class BackgroundLoopService:
         s = self._sim
         while not self._agent_stop.is_set():
             t0 = time.perf_counter()
+            t_inner = t0
             try:
                 result = None
                 with s._sim_step_lock:
+                    t_inner = time.perf_counter()
                     result = s._run_single_agent_timestep_inner()
+                t_after_inner = time.perf_counter()
                 if result is not None:
                     payload = sanitize_for_json(result)
                     if isinstance(payload, dict):
                         payload["_json_sanitized"] = True
+                    t_after_sanitize = time.perf_counter()
                     s._agent_step_response = payload
                     s._public_state_cache = payload
                     s._public_state_cache_at = time.monotonic()
+                    try:
+                        from engine.tick_profiler import get_tick_profiler
+
+                        p = get_tick_profiler()
+                        p.record("bg.agent_inner", (t_after_inner - t_inner) * 1000.0)
+                        p.record("bg.sanitize", (t_after_sanitize - t_after_inner) * 1000.0)
+                    except Exception:
+                        pass
                 else:
                     s._agent_step_response = None
             except Exception as e:
@@ -253,4 +271,10 @@ class BackgroundLoopService:
                     traceback.print_exc()
                     BackgroundLoopService._agent_loop_traceback_once = False
             elapsed = time.perf_counter() - t0
+            try:
+                from engine.tick_profiler import get_tick_profiler
+
+                get_tick_profiler().record("bg.agent_loop", elapsed * 1000.0)
+            except Exception:
+                pass
             self._agent_stop.wait(timeout=max(0.0, dt - elapsed))

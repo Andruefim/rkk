@@ -42,6 +42,14 @@ def _dbg_tick(hypothesis_id: str, location: str, message: str, data: dict | None
 
 
 class SimulationTickMixin:
+    """Humanoid tick orchestration.
+
+    Phase C₁ (temporal contracts): reflex / CPG / stabilizers run without invoking imagination,
+    LLM loops, or L3 goal-planning; those live in ``_run_agent_or_skill_step`` and async teachers.
+    Leg commands owned by CPG must not receive conflicting high-rate ``do()`` on the same joints
+    (enforced in locomotion / EIG paths — see ``mixin_locomotion``).
+    """
+
     def _prof_mark(self, name: str, t0: list[float]) -> None:
         """Record elapsed ms since previous mark (RKK_TICK_PROFILE)."""
         from engine.tick_profiler import get_tick_profiler
@@ -51,14 +59,6 @@ class SimulationTickMixin:
         if p.enabled():
             p.record(name, (now - t0[0]) * 1000.0)
         t0[0] = now
-
-    """Humanoid tick orchestration.
-
-    Phase C₁ (temporal contracts): reflex / CPG / stabilizers run without invoking imagination,
-    LLM loops, or L3 goal-planning; those live in ``_run_agent_or_skill_step`` and async teachers.
-    Leg commands owned by CPG must not receive conflicting high-rate ``do()`` on the same joints
-    (enforced in locomotion / EIG paths — see ``mixin_locomotion``).
-    """
 
     def _sync_temporal_blankets_to_graph(self) -> None:
         """Rebuild TemporalBlankets when |graph nodes| changes (inner_voice, concepts, neurogenesis)."""
@@ -749,13 +749,20 @@ class SimulationTickMixin:
                 fallen_for_s2 = True
 
         self._prof_mark("sim.fall_curriculum", _pt)
-        # Фаза 12: передаём GNN prediction в visual env (не каждый тик — см. VISION_GNN_FEED_EVERY)
+        # Фаза 12: передаём GNN prediction в visual env (не каждый тик — RKK_VISION_GNN_FEED_EVERY)
         if self._visual_mode and self._visual_env is not None:
+            from engine.core.constants import (
+                topological_self_every_from_env,
+                vision_gnn_feed_every_from_env,
+            )
+
             self._vision_ticks += 1
-            if self._vision_ticks % VISION_GNN_FEED_EVERY == 0:
+            _gnn_every = vision_gnn_feed_every_from_env()
+            if self._vision_ticks % _gnn_every == 0:
                 self._feed_gnn_prediction_to_visual()
             # Фаза 3: Топологическое Я
-            if self._vision_ticks % 10 == 0:
+            _topo_every = topological_self_every_from_env()
+            if self._vision_ticks % _topo_every == 0:
                 self._apply_topological_self_priors()
 
         # Фаза 3: annealing teacher_weight; VL-overlay только пока не истёк TTL и weight>0
@@ -816,7 +823,7 @@ class SimulationTickMixin:
                         from engine.system2 import System2Controller
 
                         self._system2 = System2Controller()
-                    obs_s2 = dict(self.agent.graph.snapshot_vec_dict())
+                    obs_s2 = dict(self._graph_vec_cached())
                     self._system2_last = self._system2.tick(
                         sim_tick=self.tick,
                         agent=self.agent,
@@ -850,6 +857,7 @@ class SimulationTickMixin:
         else:
             self._system2_last = None
             self.agent.set_s2_planning_context(None)
+        self._prof_mark("sim.system2", _pt)
 
         # Controlled perturbations during fixed_root to teach active balance
         if self.current_world == "humanoid" and self._fixed_root_active:
@@ -869,11 +877,15 @@ class SimulationTickMixin:
                 if callable(fn_perturb):
                     fn_perturb(max_force=85.0 + min(140.0, max(0, self.tick - 900) * 0.1))
 
-        obs_pre_rssm = dict(self.agent.graph.snapshot_vec_dict())
+        self.agent.graph.set_snapshot_vec_engine_tick(int(self.tick))
+        obs_pre_rssm = dict(self._graph_vec_cached())
         _t_phase = time.perf_counter()
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
         self._inner_phase_ms = getattr(self, "_inner_phase_ms", {})
         self._inner_phase_ms["agent"] = round((time.perf_counter() - _t_phase) * 1000.0, 2)
+        self._prof_mark("sim.agent_step", _pt)
+        self.agent.graph.invalidate_snapshot_vec_cache()
+        self._tick_graph_vec = None
 
         # Track action for episodic memory
         self._record_last_action(result)
@@ -882,7 +894,9 @@ class SimulationTickMixin:
 
         _obs_for_d_e: dict = {}
         try:
+            self.agent.graph.set_snapshot_vec_engine_tick(int(self.tick))
             _obs_for_d_e = dict(self.agent.graph.snapshot_vec_dict())
+            self._tick_graph_vec = _obs_for_d_e
         except Exception:
             pass
         _posture_now = float(
@@ -891,6 +905,7 @@ class SimulationTickMixin:
                 _obs_for_d_e.get("phys_posture_stability", 0.5),
             )
         )
+        self._prof_mark("sim.post_vec_snap", _pt)
 
         rs = getattr(self, "_reflex_stabilizer", None)
         if rs is None:
@@ -920,7 +935,12 @@ class SimulationTickMixin:
                     cb_cereb = self._ensure_cerebellum()
             except Exception:
                 cb_cereb = None
-        if cb_cereb is not None and self.current_world == "humanoid" and not self._fixed_root_active:
+        if (
+            cb_cereb is not None
+            and self.current_world == "humanoid"
+            and not self._fixed_root_active
+            and not fallen
+        ):
             if self._cerebellum_obs_prev is not None and self._last_joint_cmd_applied:
                 cb_cereb.record_transition(
                     self._cerebellum_obs_prev,
@@ -945,11 +965,13 @@ class SimulationTickMixin:
                     continue
             cb_cereb.set_desired_from_graph(dict(self.agent.graph.nodes), intents)
             self._cerebellum_obs_prev = dict(_obs_for_d_e)
+        self._prof_mark("sim.post_reflex_cereb", _pt)
 
         if (
             _MOTOR_CORTEX_AVAILABLE
             and self.current_world == "humanoid"
             and not self._fixed_root_active
+            and not fallen
         ):
             mc_fb = self._ensure_motor_cortex()
             if mc_fb is not None and len(mc_fb.programs) > 0:
@@ -990,6 +1012,7 @@ class SimulationTickMixin:
                             "phase",
                         )
                 mc_fb.sync_abstract_nodes_to_graph(self.agent.graph)
+        self._prof_mark("sim.post_motor_cortex", _pt)
 
         # Level 3-I: Multi-scale time tick (first consumer of post-step obs)
         if _TIMESCALE_AVAILABLE and self._timescale is not None:
@@ -1012,7 +1035,12 @@ class SimulationTickMixin:
         # Level 3-G: Proprioception update (after CPG + agent step; fresh obs)
         _proprio_anomaly = 0.0
         _proprio_emp_reward = 0.0
-        if _PROPRIO_AVAILABLE and self._proprio is not None and self.current_world == "humanoid":
+        if (
+            _PROPRIO_AVAILABLE
+            and self._proprio is not None
+            and self.current_world == "humanoid"
+            and not fallen
+        ):
             self._proprio.update(
                 tick=self.tick,
                 obs=_obs_for_d_e,
@@ -1049,6 +1077,7 @@ class SimulationTickMixin:
                 self._hai_pe_vert_ema = 0.0
                 self._hai_pe_lat_ema = 0.0
                 self._hai_pe_ema = 0.0
+        self._prof_mark("sim.post_cognition", _pt)
 
         # Phase K: Sleep Controller
         _t_sleep = time.perf_counter()
@@ -1115,6 +1144,7 @@ class SimulationTickMixin:
                     )
                 if beh_ok:
                     self._physical_curriculum.inject_into_scheduler(self._curriculum)
+        self._prof_mark("sim.post_sleep", _pt)
 
         # Phase L: Verbal Action (async in background thread)
         if _VERBAL_AVAILABLE and self._verbal is not None:
@@ -1174,6 +1204,7 @@ class SimulationTickMixin:
 
         # Level 2-E: Curriculum
         self._tick_curriculum(self.tick, _obs_for_d_e, fallen)
+        self._prof_mark("sim.post_episodic", _pt)
 
         # Level 2-F: RSSM upgrade + training
         self._maybe_upgrade_rssm(self.tick)
@@ -1182,6 +1213,7 @@ class SimulationTickMixin:
             _val = float(result.get("value", 0.5))
             obs_post = dict(self.agent.graph.snapshot_vec_dict())
             self._rssm_train_step(obs_pre_rssm, _var, _val, obs_post)
+        self._prof_mark("sim.post_rssm", _pt)
 
         # Фаза 2 ч.3: L4 concept mining (sync fallback или async worker + single-writer apply)
         _l4_ok = not (
@@ -1229,11 +1261,12 @@ class SimulationTickMixin:
                         )
         if _l4_worker_enabled():
             self._drain_l4_results()
+        self._prof_mark("sim.post_l4", _pt)
 
         self._log_step(result, fallen)
         self._rolling_block_bits.append(1 if result.get("blocked") else 0)
+        self._prof_mark("sim.post_tick_log", _pt)
 
-        self._prof_mark("sim.post_agent", _pt)
         _t_snap = time.perf_counter()
         snap = self.agent.snapshot()
         self._inner_phase_ms["snapshot"] = round((time.perf_counter() - _t_snap) * 1000.0, 2)
@@ -1301,6 +1334,7 @@ class SimulationTickMixin:
                         f"(posture={posture_mean:.2f}, cpg_w={mc.cpg_weight:.2f})",
                         "#ff88ff", "phase"
                     )
+        self._prof_mark("sim.post_rsi", _pt)
 
         dr = float(snap.get("discovery_rate", 0.0))
         self._tick_discovery_plateau(dr)
@@ -1344,6 +1378,7 @@ class SimulationTickMixin:
                     cortex.train_reconstruction_only(self._visual_env._last_frame)
                 except Exception:
                     pass
+        self._prof_mark("sim.post_visual_ui", _pt)
 
         # Demon
         if self.demon._last_action is not None:
@@ -1403,6 +1438,7 @@ class SimulationTickMixin:
                     self.agent._wm_warmup_until = int(getattr(self, "_wm_warmup_until", 0))
                 elif neuro_event.get("type") == "neurogenesis_pending":
                     self._neuro_pending = True
+        self._prof_mark("sim.post_neuro", _pt)
 
         # Scene: get_full_scene + _patch_scene_dynamics только при обновлении кэша
         scene_every = self._scene_cache_every()
@@ -1415,7 +1451,10 @@ class SimulationTickMixin:
         if scene_stale:
             self._cached_scene = scene_fn() if callable(scene_fn) else {}
             self._cached_scene_tick = int(self.tick)
-            self._patch_scene_dynamics(self._cached_scene)
+            from engine.tick_profiler import tick_profile
+
+            with tick_profile("sim.scene_patch"):
+                self._patch_scene_dynamics(self._cached_scene)
         scene = dict(getattr(self, "_cached_scene", {}) or {})
 
         # Vision state (кэш для /vision/slots; не на каждый agent-тик)
@@ -1432,11 +1471,13 @@ class SimulationTickMixin:
                     self._last_vision_state = self._visual_env.get_slot_visualization()
                 except Exception:
                     pass
+        self._prof_mark("sim.post_scene_vision", _pt)
 
-        self._maybe_schedule_llm_loop(result, snap)
-
-        self._maybe_refresh_concepts_cache()
-        self._maybe_autosave_memory()
+        if not fallen:
+            self._maybe_schedule_llm_loop(result, snap)
+            self._maybe_refresh_concepts_cache()
+            self._maybe_autosave_memory()
+        self._prof_mark("sim.post_persist", _pt)
 
         try:
             from engine.memory_diag import log_sim_memory, memory_diag_enabled

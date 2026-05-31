@@ -259,6 +259,9 @@ class CausalGraph:
         self._traj_max_segments = 100
         self._ensemble: WeightedGraphEnsemble | None = None
         self._structure_learn_tick: int = 0
+        self._snapshot_vec_engine_tick: int = -1
+        self._snapshot_vec_cache_tick: int = -1
+        self._snapshot_vec_cache: dict[str, float] | None = None
 
     @staticmethod
     def infer_node_kind(node_id: str) -> str:
@@ -371,6 +374,7 @@ class CausalGraph:
 
     def set_node(self, id_: str, value: float = 0.0) -> None:
         self._invalidate_cache()
+        self.invalidate_snapshot_vec_cache()
         if id_ not in self.nodes:
             self._node_ids.append(id_)
             self._d += 1
@@ -401,6 +405,7 @@ class CausalGraph:
         old_core = self._core if preserve_state else None
 
         self._invalidate_cache()
+        self.invalidate_snapshot_vec_cache()
         self.nodes = {k: float(values.get(k, 0.5)) for k in ordered_ids}
         self._node_ids = list(ordered_ids)
         self._d = len(ordered_ids)
@@ -495,8 +500,21 @@ class CausalGraph:
             vals = [float(self.nodes.get(m, 0.5)) for m in mems]
             self.nodes[cid] = float(np.clip(float(np.mean(vals)), 0.01, 0.99))
 
+    def invalidate_snapshot_vec_cache(self) -> None:
+        self._snapshot_vec_cache_tick = -1
+
     def snapshot_vec_dict(self) -> dict[str, float]:
-        return {nid: float(self.nodes.get(nid, 0.5)) for nid in self._node_ids}
+        tick = int(getattr(self, "_snapshot_vec_engine_tick", -1))
+        cached_tick = int(getattr(self, "_snapshot_vec_cache_tick", -1))
+        if cached_tick == tick and getattr(self, "_snapshot_vec_cache", None) is not None:
+            return dict(self._snapshot_vec_cache)
+        out = {nid: float(self.nodes.get(nid, 0.5)) for nid in self._node_ids}
+        self._snapshot_vec_cache = out
+        self._snapshot_vec_cache_tick = tick
+        return dict(out)
+
+    def set_snapshot_vec_engine_tick(self, engine_tick: int) -> None:
+        self._snapshot_vec_engine_tick = int(engine_tick)
 
     def materialize_concept_macro(
         self,
@@ -719,6 +737,7 @@ class CausalGraph:
         return pred[..., :self._d], h_pred[..., :self._d, :], z, p5_out, p20_out
 
     def record_observation(self, obs: dict[str, float]) -> None:
+        self.invalidate_snapshot_vec_cache()
         if not self._node_ids:
             return
         vec = [obs.get(nid, 0.0) for nid in self._node_ids]

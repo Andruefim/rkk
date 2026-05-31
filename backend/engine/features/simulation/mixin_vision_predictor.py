@@ -10,11 +10,12 @@ class SimulationVisionPredictorMixin:
         if self._visual_env is None or self.agent.graph._core is None:
             return
         try:
-            current_obs = self._visual_env.observe()
-            node_ids    = self.agent.graph._node_ids
-            slot_ids    = [f"slot_{k}" for k in range(self._visual_env.n_slots)]
-            values_list = [current_obs.get(sid, 0.5) for sid in slot_ids]
-            current_t   = torch.tensor(values_list, dtype=torch.float32, device=self.device)
+            node_ids = self.agent.graph._node_ids
+            slot_ids = [f"slot_{k}" for k in range(self._visual_env.n_slots)]
+            # Avoid full visual_env.observe() (PyBullet + encode) — slots live in graph.nodes.
+            values_list = [
+                float(self.agent.graph.nodes.get(sid, 0.5)) for sid in slot_ids
+            ]
             # Прогоняем текущие значения через GNN (опционально Neural ODE sub-steps)
             full_state = torch.tensor(
                 [self.agent.graph.nodes.get(n, 0.5) for n in node_ids],
