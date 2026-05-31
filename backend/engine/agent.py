@@ -2905,11 +2905,14 @@ class RKKAgent:
         phi_raw = self.phi_approx()
         fallen_penalty = 0.0
         try:
-            obs_ph = dict(self.graph.snapshot_vec_dict())
+            nodes = self.graph.nodes
             ps_ph = float(
-                obs_ph.get("posture_stability", obs_ph.get("phys_posture_stability", 0.5))
+                nodes.get(
+                    "posture_stability",
+                    nodes.get("phys_posture_stability", 0.5),
+                )
             )
-            cz_ph = float(obs_ph.get("com_z", obs_ph.get("phys_com_z", 0.5)))
+            cz_ph = float(nodes.get("com_z", nodes.get("phys_com_z", 0.5)))
             fn_f = getattr(self.env, "is_fallen", None)
             env_fallen = bool(fn_f()) if callable(fn_f) else False
             if env_fallen or ps_ph < 0.42 or cz_ph < 0.38:

@@ -394,19 +394,16 @@ class GoalImagination:
         if not candidates:
             return None
 
-        best_var: str | None = None
-        best_val: float = 0.5
-        best_eig: float = -1.0
-
-        for var, val in candidates:
-            try:
-                eig = eig_for_action(graph, obs, [(var, val)])
-                if eig > best_eig:
-                    best_eig = eig
-                    best_var = var
-                    best_val = val
-            except Exception:
-                continue
+        try:
+            best_eig, best_var, best_val = eig_for_action(
+                graph, obs, candidates, return_best=True
+            )
+            best_eig = float(best_eig)
+            best_val = float(best_val)
+        except Exception:
+            best_var = None
+            best_val = 0.5
+            best_eig = -1.0
 
         # Fix 4: при падении всегда ставим recovery-цель, даже если EIG≈0
         if best_var is None or best_eig <= 0.0:

@@ -344,6 +344,49 @@ class CausalGNNCore(nn.Module):
             return out, latent
         return out
 
+    def _message_pass_with_W_batch(
+        self,
+        W_batch: torch.Tensor,
+        h: torch.Tensor,
+    ) -> torch.Tensor:
+        """B parallel adjacency matrices; h (B, d, hidden) → (B, d). Does not read self.W."""
+        B, d, _hd = h.shape
+        Wm = W_batch
+        if Wm.shape[-1] != d or Wm.shape[-2] != d:
+            Wm = Wm[..., :d, :d]
+        Wm = Wm * self.mask.unsqueeze(0)
+        agg = torch.einsum("bji,bjh->bih", Wm, h)
+        out_list: list[torch.Tensor] = []
+        for i in range(d):
+            o1, _, _, _ = self.mechanisms[i](h[:, i, :], agg[:, i, :])
+            out_list.append(o1)
+        return torch.stack(out_list, dim=1)
+
+    def forward_dynamics_batched_W(
+        self,
+        W_batch: torch.Tensor,
+        a: torch.Tensor,
+        X: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        One WM step per row of W_batch without mutating self.W (ensemble EIG on GPU).
+
+        W_batch: (B, d, d), X/a: (B, d) or broadcast from (1, d).
+        """
+        B = int(W_batch.shape[0])
+        if X.shape[0] == 1 and B > 1:
+            X = X.expand(B, -1)
+        elif X.shape[0] != B:
+            X = X[:1].expand(B, -1)
+        if a.shape[0] == 1 and B > 1:
+            a = a.expand(B, -1)
+        elif a.shape[0] != B:
+            a = a[:1].expand(B, -1)
+        am = torch.sigmoid(torch.abs(a) * 1000.0).unsqueeze(-1)
+        h_a = self.action_enc(a.unsqueeze(-1))
+        h = self.node_enc(X.unsqueeze(-1)) + am * h_a
+        return self._message_pass_with_W_batch(W_batch, h)
+
     def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         """
         World model: X_{t+1} ≈ f(X_t, a_t).
