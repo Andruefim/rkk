@@ -70,23 +70,6 @@ def sleep_enabled() -> bool:
     )
 
 
-def mocap_dreams_enabled() -> bool:
-    """REM MoCap replay + inverse dynamics; disable to save CPU/GPU while keeping sleep."""
-    if os.environ.get("RKK_SKIP_ALL_LLM", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        return False
-    return os.environ.get("RKK_SLEEP_MOCAP_DREAMS", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
 def _sleep_min_tick() -> int:
     try:
         return max(0, int(os.environ.get("RKK_SLEEP_MIN_TICKS", "2000")))
@@ -490,201 +473,6 @@ class REMReplay:
             torch.cuda.empty_cache()
         return n_ok
 
-    def inject_mocap_dreams(self, graph, n_steps: int = 150, sim: Any | None = None) -> int:
-        """
-        Генерирует "идеальные" траектории (Motion Capture priors) через физику PyBullet!
-        Агент "лунатит" (sleepwalk), воспроизводя реальные MoCap клипы (CMU/MediaPipe).
-        1. Сбрасываем стойку (встает).
-        2. Проигрываем кусок реального человеческого движения через PyBullet (apply_cpg_leg_targets).
-        3. Настоящая физика (с учетом ZMP и гравитации) записывается в буфер графа.
-        4. GNN учится этому manifold'у.
-        Inverse: пошаговый Adam по каждому (X_t→X_{t+1}) с teacher-forcing-совместимым f(X_t,A_t);
-        quality gate по baseline MSE(seq, A=0); градиент только по intent_*; clamp [0.05,0.95].
-        """
-        if sim is None or not hasattr(sim, "agent"):
-            return 0
-
-        env = sim.agent.env
-        base = getattr(env, "base_env", None)
-        if base is not None:
-            env = base
-        if not callable(getattr(env, "apply_cpg_leg_targets", None)):
-            return 0
-
-        node_ids = list(graph._node_ids)
-        if not node_ids:
-            return 0
-
-        # Временное повышение LR для быстрого усвоения "снов"
-        optim = getattr(graph, "_optim", None)
-        original_lrs = []
-        if optim is not None:
-            for pg in optim.param_groups:
-                original_lrs.append(pg["lr"])
-                pg["lr"] = pg["lr"] * 3.0
-
-        print(f"[Sleep] 🧠 Dreaming of perfect walking (MoCap replay for {n_steps} ticks)...")
-
-        try:
-            from engine.core.constants import cpg_during_fixed_root_enabled
-            from engine.features.humanoid.constants import LEG_VARS
-            from engine.mocap_loader import MoCapDataLoader
-
-            loader = MoCapDataLoader()
-            clip = loader.sample_clip(n_steps)
-            actual_steps = len(clip)
-
-            def _advance_mocap_physics(targets: dict[str, float]) -> dict[str, float]:
-                fixed = bool(getattr(env, "_fixed_root", False))
-                if fixed and not cpg_during_fixed_root_enabled():
-                    ph = getattr(env, "_sim", None)
-                    if ph is None:
-                        return dict(env.observe())
-                    try:
-                        n_sub = int(os.environ.get("RKK_CPG_PHYS_SUBSTEPS", "0"))
-                    except ValueError:
-                        n_sub = 0
-                    if n_sub <= 0:
-                        n_sub = max(1, int(getattr(env, "steps_per_do", 10)) // 2)
-                    n_sub = min(max(n_sub, 1), 32)
-                    if not getattr(env, "_intero_control_lost", False):
-                        env._apply_upper_body_from_intents(cpg_sync=None)
-                        for name, val in targets.items():
-                            if name in LEG_VARS:
-                                ph.set_joint(
-                                    name, float(np.clip(float(val), 0.05, 0.95))
-                                )
-                        ph.step(int(n_sub))
-                        env._update_interoception()
-                    return dict(env.observe())
-                env.apply_cpg_leg_targets(targets)
-                return dict(env.observe())
-
-            # Поднимаем агента
-            env.reset_stance()
-
-            # Проигрываем MoCap клип через физику
-            transitions = []
-            for t in range(actual_steps):
-                # Извлекаем суставные углы из клипа:
-                # 0:lhip, 1:rhip, 2:lknee, 3:rknee, 4:lankle, 5:rankle
-                frame = clip[t]
-                targets = {
-                    "lhip": frame[0],
-                    "rhip": frame[1],
-                    "lknee": frame[2],
-                    "rknee": frame[3],
-                    "lankle": frame[4],
-                    "rankle": frame[5],
-                }
-
-                obs_raw = _advance_mocap_physics(targets)
-                transitions.append(dict(obs_raw))
-
-            # ── Inverse Dynamics (Goal-Conditioned Motor Babbling) ──
-            # Teacher-forcing stack: forward_dynamics_seq uses true X_t each step (not chain rollout).
-            # Per-timestep inverse: for each t minimize MSE(f(X_t, A_t), X_{t+1}) with Adam on intents only.
-            core = getattr(graph, "_core", None)
-            intent_indices = [i for i, nid in enumerate(node_ids) if nid.startswith("intent_")]
-            intent_set = set(intent_indices)
-            d_graph = len(node_ids)
-
-            if core is not None and intent_indices and len(transitions) > 1:
-                print(f"[Sleep] 🧠 Solving Inverse Dynamics ({actual_steps - 1} one-step problems)...")
-                dev = next(core.parameters()).device
-
-                X_list = [[float(obs.get(n, 0.5)) for n in node_ids] for obs in transitions]
-                X_seq = torch.tensor([X_list], dtype=torch.float32, device=dev)  # (1, T, d)
-                X_target = X_seq[:, 1:, :]  # (1, T-1, d)
-
-                # Quality gate: skip inverse if world model is too poor (bootstrap / negative transfer)
-                q_thresh = _env_float("RKK_SLEEP_QUALITY_THRESH", 0.15)
-                A_zero = torch.zeros(1, actual_steps, d_graph, dtype=torch.float32, device=dev)
-                with torch.no_grad():
-                    X_pred0, _, _ = graph.forward_dynamics_seq(X_seq, A_zero)
-                    baseline_mse = float(
-                        torch.nn.functional.mse_loss(X_pred0, X_target).item()
-                    )
-
-                if baseline_mse > q_thresh:
-                    print(
-                        f"[Sleep] ⏭ Inverse skipped: baseline WM MSE={baseline_mse:.4f} "
-                        f"> {q_thresh} (RKK_SLEEP_QUALITY_THRESH)"
-                    )
-                    for obs in transitions:
-                        obs.setdefault("intent_stride", 0.65)
-                        obs["intent_stride"] = 0.65
-                        obs.setdefault("intent_stop_recover", 0.3)
-                        obs["intent_stop_recover"] = 0.3
-                else:
-                    n_inner = max(8, min(256, _env_int("RKK_SLEEP_INVERSE_INNER", 72)))
-                    lr_inv = _env_float("RKK_SLEEP_INVERSE_LR", 0.08)
-                    lo, hi = 0.05, 0.95
-
-                    for p in core.parameters():
-                        p.requires_grad = False
-
-                    A_acc = np.zeros((actual_steps, d_graph), dtype=np.float32)
-
-                    for t in range(actual_steps - 1):
-                        Xt = X_seq[:, t, :].detach()  # (1, d)
-                        Xtp1 = X_seq[:, t + 1, :].detach()  # (1, d)
-                        At = torch.zeros(1, d_graph, dtype=torch.float32, device=dev, requires_grad=True)
-                        opt_t = torch.optim.Adam([At], lr=lr_inv)
-                        for _ in range(n_inner):
-                            opt_t.zero_grad()
-                            X_hat = graph.forward_dynamics(Xt, At)
-                            loss_t = torch.nn.functional.mse_loss(X_hat, Xtp1)
-                            loss_t.backward()
-                            if At.grad is not None:
-                                for j in range(d_graph):
-                                    if j not in intent_set:
-                                        At.grad[:, j].zero_()
-                            opt_t.step()
-                            with torch.no_grad():
-                                for j in intent_indices:
-                                    At.data[:, j].clamp_(lo, hi)
-                                for j in range(d_graph):
-                                    if j not in intent_set:
-                                        At.data[:, j].zero_()
-                        A_acc[t, :] = At.detach().cpu().numpy()[0]
-
-                    if actual_steps > 1:
-                        A_acc[-1, :] = A_acc[-2, :]
-
-                    for p in core.parameters():
-                        p.requires_grad = True
-
-                    for t, obs in enumerate(transitions):
-                        for idx in intent_indices:
-                            obs[node_ids[idx]] = float(
-                                np.clip(A_acc[t, idx], lo, hi)
-                            )
-            else:
-                # Fallback if inverse dynamics cannot run
-                for obs in transitions:
-                    obs["intent_stride"] = 0.65
-                    obs["intent_stop_recover"] = 0.3
-                    
-            # Record into memory buffer
-            for obs in transitions:
-                graph.record_observation(obs)
-                
-        except Exception as e:
-            print(f"[Sleep] MoCap dreaming failed: {e}")
-
-        # 2. Обучаем мировую модель на этих физических снах
-        for _ in range(15):
-            graph.train_step()
-
-        # Восстанавливаем LR
-        if optim is not None:
-            for i, pg in enumerate(optim.param_groups):
-                if i < len(original_lrs):
-                    pg["lr"] = original_lrs[i]
-
-        return n_steps
-
 
 # ── Sleep Controller ───────────────────────────────────────────────────────────
 class SleepController:
@@ -946,17 +734,6 @@ class SleepController:
             session.rem_loss_after = l_after
         print(f"[Sleep] REM: replayed {n} episodes, loss {l_before:.4f}→{l_after:.4f}")
 
-        if mocap_dreams_enabled():
-            n_mocap = self._rem_replayer.inject_mocap_dreams(
-                sim.agent.graph, n_steps=150, sim=sim
-            )
-            print(
-                f"[Sleep] REM: injected {n_mocap} steps of MoCap dreams "
-                "(Walking manifold learned)"
-            )
-        else:
-            print("[Sleep] REM: MoCap dreams skipped (RKK_SLEEP_MOCAP_DREAMS=0)")
-
         core = getattr(sim.agent.graph, "_core", None)
         if core is not None:
             with torch.no_grad():
@@ -967,33 +744,7 @@ class SleepController:
 
         _memory_diag_log(sim, "sleep_after_REM_replay")
 
-        if os.environ.get("RKK_SLEEP_GROUNDED", "0").strip().lower() in (
-            "1", "true", "yes", "on",
-        ):
-            try:
-                from engine.world_state_bridge import grounded_sleep_consolidate
-
-                gsn = grounded_sleep_consolidate(sim)
-                if session is not None and gsn.get("ok"):
-                    session.grounded_samples = int(gsn.get("samples_pushed", 0))
-                    session.grounded_loss_last = float(gsn.get("loss_last") or 0.0)
-                    print(
-                        f"[Sleep] Grounded: samples={session.grounded_samples} "
-                        f"loss={session.grounded_loss_last}"
-                    )
-            except Exception as e:
-                print(f"[Sleep] Grounded consolidate: {e}")
-            _memory_diag_log(sim, "sleep_after_grounded_inner_voice")
-        else:
-            print("[Sleep] Grounded consolidate skipped (RKK_SLEEP_GROUNDED=0)")
-
         self._schedule_lesson(tick, sim)
-        if os.environ.get("RKK_SLEEP_REM_GC", "0").strip().lower() in (
-            "1", "true", "yes", "on",
-        ):
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     def tick(self, tick: int, sim) -> dict[str, Any]:
         """
@@ -1220,10 +971,6 @@ class SleepController:
         try:
             g = sim.agent.graph
             g.deduplicate_edges_keep_strongest()
-            g.edge_duplicate_diagnostic("wake")
-            _wd = os.environ.get("RKK_W_DIAG", "0").strip().lower()
-            if _wd in ("1", "true", "yes", "on"):
-                g.log_W_threshold_stats("wake_before_prune")
             if os.environ.get("RKK_POST_SLEEP_W_PRUNE", "1").strip().lower() not in (
                 "0",
                 "false",
@@ -1236,8 +983,6 @@ class SleepController:
                     f"[Sleep] post-wake W prune: zeroed_weak_slots={nz} edge_count≥thresh={ec}",
                     flush=True,
                 )
-            if _wd in ("1", "true", "yes", "on"):
-                g.log_W_threshold_stats("wake_after_prune")
         except Exception:
             pass
 
@@ -1254,39 +999,6 @@ class SleepController:
                     setattr(ag, "_post_sleep_score_cache_relax_until", int(tick) + rel)
         except Exception:
             pass
-
-        # Post-sleep: advance curriculum if possible
-        self._post_sleep_curriculum(tick, sim)
-
-        # Post-sleep: inject physical curriculum skills if scheduler running low
-        phys = getattr(sim, "_physical_curriculum", None)
-        sched = getattr(sim, "_curriculum", None)
-        if phys is not None and sched is not None:
-            added = phys.inject_into_scheduler(sched)
-            if added > 0:
-                next_name = sched._stages[-1].name
-                sim._add_event(
-                    f"🏃 Physical skill unlocked: {next_name}",
-                    "#aaffaa", "curriculum"
-                )
-
-    def _post_sleep_curriculum(self, tick: int, sim) -> None:
-        """Check curriculum mastery after sleep."""
-        sched = getattr(sim, "_curriculum", None)
-        phys = getattr(sim, "_physical_curriculum", None)
-        if sched is None or phys is None:
-            return
-
-        cur_stage = sched.current_stage
-        # If we've been in this stage for a long time and still failing → mark failed
-        if cur_stage.ticks_in_stage > cur_stage.min_ticks * 3:
-            if phys._active_skill_id:
-                phys.mark_failed(phys._active_skill_id)
-                print(f"[Sleep] Marked {phys._active_skill_id} as failed (too long)")
-                # Try next skill
-                added = phys.inject_into_scheduler(sched)
-                if added:
-                    sched._advance_stage(tick)
 
     def snapshot(self) -> dict[str, Any]:
         sessions_summary = [

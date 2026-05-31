@@ -237,9 +237,6 @@ class _PyBulletHumanoid(InstrumentalSandbox):
     def __init__(self, fixed_root: bool = False):
         # ── PyBullet init ────────────────────────────────────────────────────
         self._physics_lock = threading.RLock()
-        self._bg_running = False
-        self._bg_thread: threading.Thread | None = None
-        self._bg_hz = 0.0
         self._mt = _humanoid_motor_torque_table()
         self._joint_target_norm: dict[str, float] = {}
         self._recovery_motor_boost_cached = 1.0
@@ -356,51 +353,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         if fixed_root:
             self.enable_fixed_root()
 
-        self._maybe_start_physics_bg()
         self._init_instrumental()
-
-    def _maybe_start_physics_bg(self) -> None:
-        """
-        Опционально: непрерывный stepSimulation в фоне (RKK_PHYSICS_BG_HZ, напр. 120).
-        Тогда step(n) на главном потоке не вызывается — физика идёт между тиками агента.
-        Все вызовы PyBullet сериализуются через _physics_lock (в т.ч. камера, reset).
-        """
-        try:
-            hz = float(os.environ.get("RKK_PHYSICS_BG_HZ", "0"))
-        except ValueError:
-            hz = 0.0
-        if hz <= 0 or hz > 480:
-            return
-        self._bg_hz = hz
-        self._bg_running = True
-        dt = 1.0 / hz
-        cid = self.client
-
-        def _loop() -> None:
-            while self._bg_running:
-                t0 = time.perf_counter()
-                with self._physics_lock:
-                    pb.stepSimulation(physicsClientId=cid)
-                    self._tick_hidden_state()
-                    self._apply_friction_to_ankle_joints()
-                elapsed = time.perf_counter() - t0
-                slp = dt - elapsed
-                if slp > 0:
-                    time.sleep(slp)
-
-        self._bg_thread = threading.Thread(
-            target=_loop, daemon=True, name="RKK-PyBullet-bg-physics"
-        )
-        self._bg_thread.start()
-        print(f"[HumanoidEnv] Background physics ~{hz:.0f} Hz (RKK_PHYSICS_BG_HZ); main step() is no-op")
-
-    def _stop_physics_bg(self) -> None:
-        self._bg_running = False
-        th = self._bg_thread
-        if th is not None and th.is_alive():
-            th.join(timeout=1.0)
-        self._bg_thread = None
-        self._bg_hz = 0.0
 
     # ── Fixed root constraint ─────────────────────────────────────────────────
     def enable_fixed_root(self) -> None:
@@ -1003,8 +956,6 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         pb.resetBaseVelocity(bid, [0, 0, 0], [0, 0, 0], physicsClientId=cid)
 
     def step(self, n: int = 10):
-        if self._bg_hz > 0:
-            return
         with self._physics_lock:
             for _ in range(n):
                 pb.stepSimulation(physicsClientId=self.client)
@@ -1734,7 +1685,6 @@ class _PyBulletHumanoid(InstrumentalSandbox):
 
     def __del__(self):
         try:
-            self._stop_physics_bg()
             with self._physics_lock:
                 pb.disconnect(self.client)
         except Exception:

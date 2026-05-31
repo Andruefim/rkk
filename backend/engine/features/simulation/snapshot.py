@@ -14,11 +14,9 @@ from engine.features.simulation.imports import (
     _INNER_VOICE_AVAILABLE,
     _PHASE_K_AVAILABLE,
     _PHASE_M_AVAILABLE,
-    _RSSM_AVAILABLE,
     _TIMESCALE_AVAILABLE,
     _VERBAL_AVAILABLE,
     _WORLD_BRIDGE_AVAILABLE,
-    rssm_enabled,
     timescale_enabled,
 )
 
@@ -161,9 +159,6 @@ def build_simulation_snapshot(
         "motor_state": sim._motor_state_snapshot(),
         "hierarchical_pe": getattr(sim, "_hai_last_diag", None),
         "skills": sim._skill_snapshot(),
-        "rsi_full": sim._rsi_full.snapshot()
-        if sim._rsi_full_enabled() and sim._rsi_full is not None
-        else None,
         "motor_cortex": (
             sim._motor_cortex.snapshot() if sim._motor_cortex is not None else None
         ),
@@ -188,14 +183,6 @@ def build_simulation_snapshot(
             sim._episodic_memory.snapshot()
             if sim._episodic_memory is not None
             else None
-        ),
-        "curriculum": (
-            sim._curriculum.snapshot() if sim._curriculum is not None else None
-        ),
-        "rssm": (
-            sim._rssm_trainer.snapshot()
-            if sim._rssm_trainer is not None
-            else {"enabled": rssm_enabled() if _RSSM_AVAILABLE else False}
         ),
         "proprioception": (
             sim._proprio.snapshot() if sim._proprio is not None else None

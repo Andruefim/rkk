@@ -269,9 +269,6 @@ def _ig_diag_enabled() -> bool:
 _LOCOMOTION_CPG_LEG_EIG_BLOCK = frozenset(
     {"lhip", "lknee", "lankle", "rhip", "rknee", "rankle"}
 )
-# CEM motor vars: intent variables that CEM planner can optimize over.
-_CEM_MOTOR_PREFIXES = ("intent_", "phys_intent_")
-
 # #region agent log
 _DBG_LOG_F7_AGENT = Path(__file__).resolve().parents[2] / "debug-f7a777.log"
 
@@ -305,12 +302,6 @@ def _dbg_agent(hypothesis_id: str, location: str, message: str, data: dict | Non
 
 def _is_motor_intent_var(name: str) -> bool:
     return str(name).startswith("intent_") or str(name).startswith("phys_intent_")
-
-
-def _hypothesis_eig_from_env() -> bool:
-    """Этап B: байесовский выбор эксперимента (EIG) вместо только System 1."""
-    v = os.environ.get("RKK_HYPOTHESIS_EIG", "1").strip().lower()
-    return v not in ("0", "false", "off", "system1", "no", "s1")
 
 
 def _eig_chunk_size() -> int:
@@ -360,16 +351,6 @@ def _score_stale_only() -> bool:
     )
 
 
-def _score_bg_refresh_enabled() -> bool:
-    """Фоновый пересчёт score между тиками (RKK_SCORE_BG_REFRESH; риск гонки с train_step)."""
-    return os.environ.get("RKK_SCORE_BG_REFRESH", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
 def _notears_every() -> int:
     """Частота graph.train_step(): RKK_NOTEAR_EVERY или legacy NOTEARS_EVERY в env (дефолт 8)."""
     try:
@@ -390,30 +371,6 @@ def _wm_train_due(engine_tick: int, total_interventions: int) -> bool:
     if te > 0:
         return int(engine_tick) > 0 and int(engine_tick) % te == 0
     return int(total_interventions) % _notears_every() == 0
-
-
-_score_async_win_warned = False
-
-
-def _score_async_enabled() -> bool:
-    """Фоновый поток для score_interventions; по умолчанию выкл. (лок на весь WM давал рывки UI)."""
-    global _score_async_win_warned
-    v = os.environ.get("RKK_SCORE_ASYNC", "0").strip().lower()
-    if v not in ("1", "true", "yes", "on"):
-        return False
-    # concurrent score_interventions vs train_step / graph mutation → undefined behavior;
-    # on Windows this showed up as native crash (e.g. 0xC0000005) under WS load.
-    if sys.platform == "win32":
-        if not _score_async_win_warned:
-            warnings.warn(
-                "RKK_SCORE_ASYNC is ignored on Windows (unsafe concurrent CausalGraph access); "
-                "use RKK_SCORE_ASYNC=0.",
-                UserWarning,
-                stacklevel=2,
-            )
-            _score_async_win_warned = True
-        return False
-    return True
 
 
 def _max_fallback_tries_from_env() -> int:
@@ -546,10 +503,6 @@ class RKKAgent:
         self._last_engine_tick = 0
         self._score_cache: list[dict] = []
         self._score_cache_tick: int = -9_999_999
-        self._score_thread: threading.Thread | None = None
-        self._score_result: list[dict] = []
-        self._score_lock = threading.Lock()
-        self._score_refresh_tick: int = -9_999_999
         # Cache for dag_constraint (4× d×d matmuls) — recompute at most once per score_cache window
         self._h_W_cache: float = 0.0
         self._h_W_cache_tick: int = -9_999_999
@@ -708,91 +661,6 @@ class RKKAgent:
         row_max = unc_m.max(axis=1)
         col_max = unc_m.max(axis=0)
         return np.maximum(row_max, col_max).astype(np.float64, copy=False)
-
-    def _batch_hypothesis_eig(
-        self,
-        candidates: list[dict],
-        X_np: np.ndarray,
-        u_node: np.ndarray,
-        nid_to_i: dict[str, int],
-        unc_m: np.ndarray,
-        node_ids: list[str],
-        env: Environment,
-    ) -> list[float]:
-        """
-        Суррогат «информативности» действия: (1) чувствительность Σ_j u(j)|ΔX_j|;
-        (2) суррогат снижения неопределённости по рёбрам после гипотетического наблюдения
-        (масштабирование unc_ij пропорционально |ΔX_i|+|ΔX_j|). Это не точный EIG по H(W).
-        """
-        core = self.graph._core
-        if core is None or not candidates:
-            return []
-        fd = getattr(self.graph, "forward_dynamics", None)
-        if not callable(fd):
-            return []
-
-        try:
-            lam = float(os.environ.get("RKK_EIG_ENTROPY_TERM", "0.22"))
-        except ValueError:
-            lam = 0.22
-        try:
-            eta = float(os.environ.get("RKK_EIG_POSTERIOR_ETA", "0.18"))
-        except ValueError:
-            eta = 0.18
-        lam = max(0.0, lam)
-        eta = max(0.0, min(0.95, eta))
-
-        d = int(X_np.shape[0])
-        if unc_m.ndim != 2 or unc_m.shape[0] < d or unc_m.shape[1] < d:
-            return []
-        if unc_m.shape[0] != d or unc_m.shape[1] != d:
-            unc_m = unc_m[:d, :d]
-        if int(u_node.shape[0]) != d:
-            return []
-        device = self.device
-        chunk = _eig_chunk_size()
-        eigs: list[float] = []
-        x0 = torch.from_numpy(X_np).to(dtype=torch.float32, device=device).unsqueeze(0)
-        uu = unc_m.reshape(1, d, d)
-
-        for start in range(0, len(candidates), chunk):
-            sub = candidates[start : start + chunk]
-            b = len(sub)
-            x_batch = x0.expand(b, -1)
-            a_batch = torch.zeros(b, d, device=device, dtype=torch.float32)
-            for bi, cand in enumerate(sub):
-                idx = nid_to_i.get(cand["variable"])
-                if idx is not None and 0 <= int(idx) < d:
-                    a_batch[bi, int(idx)] = float(cand["value"])
-            with torch.no_grad():
-                pred = fd(x_batch, a_batch)
-            d_x = int(x_batch.shape[-1])
-            if int(pred.shape[-1]) != d_x:
-                if int(pred.shape[-1]) > d_x:
-                    pred = pred[..., :d_x]
-                else:
-                    return []
-            delta = (pred - x_batch).abs().cpu().numpy()
-            ab = np.abs(delta)
-            S = np.clip(ab[:, :, None] + ab[:, None, :], 0.0, 1.0)
-            new_u = uu * (1.0 - eta * S)
-            new_u = np.maximum(new_u, 0.0)
-            reduction = (uu - new_u).sum(axis=(1, 2))
-            sens = (delta * u_node.reshape(1, -1)).sum(axis=1)
-            total = sens + lam * reduction
-            if symbolic_verifier_enabled():
-                fac = downrank_factor_for_violation()
-                d_nodes = len(node_ids)
-                for bi in range(b):
-                    pd = {
-                        node_ids[j]: float(pred[bi, j].item())
-                        for j in range(min(d_nodes, int(pred.shape[1])))
-                    }
-                    ok, _ = verify_normalized_prediction(pd, env)
-                    if not ok:
-                        total[bi] *= fac
-            eigs.extend(total.tolist())
-        return eigs
 
     def _batch_rollout_imagination_states(
         self,
@@ -1104,112 +972,6 @@ class RKKAgent:
         """Если CPG управляет ногами, EIG не должен конкурировать за суставы — только intent_* и др."""
         v = os.environ.get("RKK_LOCOMOTION_CPG", "0").strip().lower()
         return v in ("1", "true", "yes", "on")
-
-    # ── CEM planning: model-based action selection via world model ─────────────
-    def _cem_planning_enabled(self) -> bool:
-        v = os.environ.get("RKK_CEM_PLANNING", "1").strip().lower()
-        return v in ("1", "true", "yes", "on")
-
-    def _maybe_cem_candidate(self, engine_tick: int) -> dict | None:
-        """
-        CEM planner: use world model for model-based action selection.
-
-        Replaces the broken feedback loop:
-          OLD: score_interventions → numpy propagate → scalar actual_ig → System1
-          NEW: CEM samples 64 actions → forward_dynamics batch → pick best com_z
-
-        Only activates for motor intent variables (intent_stride, intent_stop_recover, etc.)
-        and only when the world model has trained enough to be informative.
-        """
-        if self._s2_wm_task_active():
-            return None
-        if not self._cem_planning_enabled():
-            return None
-        if self.graph._core is None:
-            return None
-        # Wait for world model to train a bit before trusting CEM
-        if self._notears_steps < 20:
-            return None
-        # Don't CEM every tick — every 4th tick is enough
-        try:
-            cem_every = int(os.environ.get("RKK_CEM_EVERY", "4"))
-        except ValueError:
-            cem_every = 4
-        if engine_tick % max(1, cem_every) != 0:
-            return None
-
-        # Find objective indices: com_z and posture_stability
-        nids = self.graph._node_ids
-        obj_indices = []
-        for target in ("com_z", "phys_com_z", "posture_stability", "phys_posture_stability"):
-            if target in nids:
-                obj_indices.append(nids.index(target))
-        if not obj_indices:
-            return None
-
-        # Motor intent variables that CEM can optimize
-        motor_vars = [
-            v for v in nids
-            if any(v.startswith(p) for p in _CEM_MOTOR_PREFIXES)
-        ]
-        if not motor_vars:
-            return None
-
-        # Read CEM hyperparams from env
-        try:
-            n_samples = int(os.environ.get("RKK_CEM_SAMPLES", "64"))
-        except ValueError:
-            n_samples = 64
-        try:
-            n_iters = int(os.environ.get("RKK_CEM_ITERS", "5"))
-        except ValueError:
-            n_iters = 5
-        try:
-            rollout = int(os.environ.get("RKK_CEM_ROLLOUT", "2"))
-        except ValueError:
-            rollout = 2
-
-        try:
-            result = self.graph.cem_plan(
-                objective_idx=obj_indices,
-                variable_mask=motor_vars,
-                n_samples=min(128, max(16, n_samples)),
-                n_elite=max(4, n_samples // 8),
-                n_iters=min(10, max(2, n_iters)),
-                rollout_steps=min(4, max(0, rollout)),
-                maximize=True,
-            )
-        except Exception:
-            return None
-
-        if result is None:
-            return result
-        cem_score = result.pop("_cem_score", 0.0)
-
-        # Pick the variable with highest action magnitude as the "chosen" do()
-        best_var = None
-        best_val = 0.0
-        for var, val in result.items():
-            if abs(val) > abs(best_val):
-                best_var = var
-                best_val = val
-        if best_var is None:
-            return None
-
-        # Build candidate in the same format as score_interventions
-        target_name = nids[obj_indices[0]] if obj_indices else best_var
-        feat = self._features_for_intervention_pair(best_var, target_name)
-
-        return {
-            "variable":     best_var,
-            "target":       target_name,
-            "value":        float(np.clip(best_val, 0.05, 0.95)),
-            "uncertainty":  0.5,
-            "features":     feat,
-            "expected_ig":  float(np.clip(cem_score, 0.0, 1.0)),
-            "from_cem":     True,
-            "cem_score":    cem_score,
-        }
 
     def _tier1_edge_cap_from_env(self) -> int:
         try:
@@ -1935,47 +1697,6 @@ class RKKAgent:
             return max(sce, floor)
         return sce
 
-    def _score_async_worker(self) -> None:
-        try:
-            with torch.no_grad():
-                result = self.score_interventions()
-            with self._score_lock:
-                self._score_result = result
-        except Exception as ex:
-            print(f"[RKKAgent] score_interventions (async): {ex}")
-
-    def _score_bg_refresh_worker(self, engine_tick: int) -> None:
-        try:
-            with torch.no_grad():
-                result = self.score_interventions()
-            with self._score_lock:
-                self._score_result = list(result)
-            self._score_cache = list(result)
-            self._score_cache_tick = engine_tick
-            self._score_refresh_tick = engine_tick
-        except Exception as ex:
-            print(f"[RKKAgent] score_interventions (bg_refresh): {ex}")
-
-    def _schedule_score_refresh(self, engine_tick: int) -> None:
-        if not _score_bg_refresh_enabled():
-            return
-        if _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(self.graph.nodes):
-            return
-        if self._score_thread is not None and self._score_thread.is_alive():
-            return
-        if engine_tick - self._score_refresh_tick < max(
-            1, self._effective_score_cache_every(engine_tick)
-        ):
-            return
-        self._score_refresh_tick = engine_tick
-        self._score_thread = threading.Thread(
-            target=self._score_bg_refresh_worker,
-            args=(engine_tick,),
-            name="rkk_score_refresh",
-            daemon=True,
-        )
-        self._score_thread.start()
-
     def set_teacher_state(self, rules: list[TeacherIGRule], weight: float) -> None:
         """Фаза 3: правила от LLM и текущий teacher_weight (симуляция считает annealing)."""
         self._teacher_rules = list(rules)
@@ -2149,35 +1870,6 @@ class RKKAgent:
             elif cache_stale_ok and _score_stale_only() and due_recompute:
                 scores = list(self._score_cache)
                 _score_mode = "stale"
-                self._schedule_score_refresh(engine_tick)
-            elif _score_async_enabled():
-                if self._score_thread is None or not self._score_thread.is_alive():
-                    self._score_thread = threading.Thread(
-                        target=self._score_async_worker,
-                        name="rkk_score_interventions",
-                        daemon=True,
-                    )
-                    self._score_thread.start()
-                with self._score_lock:
-                    have = list(self._score_result) if self._score_result else []
-                if have:
-                    scores = have
-                    _score_mode = "async_have"
-                elif self._score_cache:
-                    scores = list(self._score_cache)
-                    _score_mode = "async_stale_cache"
-                elif _score_stale_only():
-                    scores = []
-                    _score_mode = "async_empty_skip"
-                else:
-                    with torch.no_grad():
-                        scores = self.score_interventions()
-                    _score_mode = "async_fallback_sync"
-                    with self._score_lock:
-                        self._score_result = list(scores)
-                if scores and sce > 1:
-                    self._score_cache = list(scores)
-                    self._score_cache_tick = engine_tick
             elif due_recompute and (
                 not self._score_cache or engine_tick % max(1, sce) == 0
             ):
@@ -2193,7 +1885,6 @@ class RKKAgent:
                 ):
                     scores = list(self._score_cache)
                     _score_mode = "sync_cap_stale"
-                    self._schedule_score_refresh(engine_tick)
                 else:
                     _t_cap = time.perf_counter()
                     with torch.no_grad():
@@ -2212,8 +1903,6 @@ class RKKAgent:
             elif self._score_cache:
                 scores = list(self._score_cache)
                 _score_mode = "sync_deferred"
-                if due_recompute:
-                    self._schedule_score_refresh(engine_tick)
             else:
                 with torch.no_grad():
                     scores = self.score_interventions()
@@ -2297,16 +1986,6 @@ class RKKAgent:
                 symbolic_verifier_enabled() and self._symbolic_prediction_bad
             ):
                 scores.insert(0, gp)
-
-            _t0_cem = time.perf_counter()
-            cem_cand = (
-                self._maybe_cem_candidate(engine_tick)
-                if enable_l3 and not _fallen_fast
-                else None
-            )
-            _slow_t["cem"] = time.perf_counter() - _t0_cem
-            if cem_cand is not None:
-                scores.insert(0, cem_cand)
 
             if wm_cand is not None:
                 scores.insert(0, wm_cand)
@@ -3145,7 +2824,6 @@ class RKKAgent:
                 "weight":     round(self._teacher_weight, 4),
                 "rules":      len(self._teacher_rules),
             },
-            "hypothesis_eig": _hypothesis_eig_from_env(),
             "h_W_edge_entropy": None if h_W_edge_entropy is None else round(h_W_edge_entropy, 4),
             "rsi_lite": {
                 "enabled": rsi_lite_enabled(),
@@ -3185,17 +2863,5 @@ class RKKAgent:
         ens = getattr(self.graph, "_ensemble", None)
         if ens is not None:
             snap["graph_ensemble"] = ens.snapshot()
-        try:
-            eig_every = int(os.environ.get("RKK_SNAPSHOT_EIG_EVERY", "0"))
-        except ValueError:
-            eig_every = 0
-        if eig_every > 0 and self._last_engine_tick % eig_every == 0:
-            try:
-                from engine.hypothesis_testing import snapshot_eig_top
-
-                obs = dict(self.graph.snapshot_vec_dict())
-                snap["eig"] = snapshot_eig_top(self.graph, obs)
-            except Exception:
-                pass
         snap["replay_buffer_len"] = len(getattr(self, "_replay_buffer", []))
         return snap

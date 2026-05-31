@@ -49,13 +49,27 @@ LLM Teacher генерирует дополнительные этапы при 
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
-from engine.llm_curriculum import CurriculumStage
+
+@dataclass
+class CurriculumStage:
+    """Один этап физического навыка (метаданные для PhysicalSkill)."""
+    stage_id: int
+    name: str
+    description: str
+    intent_targets: dict[str, float] = field(default_factory=dict)
+    advance_conditions: dict[str, float] = field(default_factory=dict)
+    seeds: list[dict] = field(default_factory=list)
+    skill_goals: list[str] = field(default_factory=lambda: ["stand"])
+    min_ticks: int = 200
+    vl_warmup_override: int | None = None
+    s2_expected_state: dict[str, float] = field(default_factory=dict)
+    s2_max_prediction_error: float | None = None
+    s2_skill_id: str | None = None
 
 
 # ── Tier definitions ──────────────────────────────────────────────────────────
@@ -554,9 +568,6 @@ class PhysicalCurriculum:
     Интеграция в simulation.py:
       self._physical_curriculum = PhysicalCurriculum()
 
-    В CurriculumScheduler: при пустом предопределённом плане этапов
-    можно передавать управление PhysicalCurriculum (см. inject_into_scheduler).
-
     Unlock sequence:
       mastered = {"0.0_static_stance", "0.1_weight_shift"}
       next_skills = physical_curriculum.get_unlocked(mastered)
@@ -600,24 +611,6 @@ class PhysicalCurriculum:
 
     def mark_failed(self, skill_id: str) -> None:
         self.failed.add(skill_id)
-
-    def inject_into_scheduler(self, scheduler) -> int:
-        """
-        Inject next unlocked PhysicalSkill stages into CurriculumScheduler.
-        Returns number of stages added.
-        """
-        next_skill = self.get_next_recommended()
-        if next_skill is None:
-            return 0
-        if len(scheduler._stages) > scheduler._current_idx + 3:
-            return 0  # enough stages ahead
-
-        # Add this skill's stage to scheduler
-        stage = next_skill.stage
-        stage.stage_id = len(scheduler._stages)
-        scheduler._stages.append(stage)
-        self._active_skill_id = next_skill.skill_id
-        return 1
 
     def snapshot(self) -> dict[str, Any]:
         return {

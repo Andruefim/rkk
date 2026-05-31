@@ -214,27 +214,6 @@ class SimulationTickMixin:
                     getattr(base, "_motor_state", {}).get(k, v)
                 )
 
-    def _apply_genome_walk_leg_pose(self, is_fallen: bool) -> None:
-        if is_fallen or not getattr(self, "_genome_walk_active_tick", False):
-            return
-        if self.tick % 2 != 0:
-            return
-        st = self._genome_walk_obs_state()
-        posture = float(st.get("posture_stability", st.get("phys_posture_stability", 0.5)))
-        if posture < 0.60:
-            return
-        base = self._unwrap_base_env(self.agent.env)
-        is_fn = getattr(base, "is_fallen", None)
-        if callable(is_fn) and is_fn():
-            return
-        fn = getattr(base, "apply_genome_walk_physics_at_tick", None)
-        if callable(fn):
-            try:
-                fn(self.tick)
-            except Exception:
-                pass
-
-
     def _fr_curriculum_finalize_release(self, *, reason: str) -> None:
         """Снять fixed_root в симуляции + VL, выставить окно stabilize (после мягкой физики)."""
         self._curriculum_auto_fr_released = True
@@ -790,8 +769,6 @@ class SimulationTickMixin:
         if self.current_world == "humanoid":
             self._apply_genome_walk_intents(fallen_pre)
         self._maybe_apply_cpg_locomotion(fallen_pre)
-        if self.current_world == "humanoid":
-            self._apply_genome_walk_leg_pose(fallen_pre)
         self._publish_cpg_node_snapshot()
         if self.current_world == "humanoid" and not self._fixed_root_active:
             self._maybe_post_release_stabilize_intents()
@@ -878,7 +855,6 @@ class SimulationTickMixin:
                     fn_perturb(max_force=85.0 + min(140.0, max(0, self.tick - 900) * 0.1))
 
         self.agent.graph.set_snapshot_vec_engine_tick(int(self.tick))
-        obs_pre_rssm = dict(self._graph_vec_cached())
         _t_phase = time.perf_counter()
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
         self._inner_phase_ms = getattr(self, "_inner_phase_ms", {})
@@ -1122,28 +1098,6 @@ class SimulationTickMixin:
                     )
         self._inner_phase_ms["sleep"] = round((time.perf_counter() - _t_sleep) * 1000.0, 2)
 
-        # Phase K: Physical curriculum when scheduler runs low on stages ahead
-        if (
-            _PHASE_K_AVAILABLE
-            and self._physical_curriculum is not None
-            and self._curriculum is not None
-        ):
-            try:
-                phys_every = max(
-                    1, int(os.environ.get("RKK_PHYS_CURRICULUM_INJECT_EVERY", "50"))
-                )
-            except ValueError:
-                phys_every = 50
-            if self.tick % phys_every == 0:
-                bt = getattr(self, "behavioral_tracker", None)
-                beh_ok = True
-                if bt is not None:
-                    bs = self._behavioral_snapshot_cached() or {}
-                    beh_ok = float(bs.get("behavioral_score", 0.0)) >= float(
-                        os.environ.get("RKK_PHYS_CURRICULUM_BEH_MIN", "0.2")
-                    )
-                if beh_ok:
-                    self._physical_curriculum.inject_into_scheduler(self._curriculum)
         self._prof_mark("sim.post_sleep", _pt)
 
         # Phase L: Verbal Action (async in background thread)
@@ -1190,39 +1144,17 @@ class SimulationTickMixin:
         except Exception:
             pass
 
-        # Living Memory: непрерывная временная шкала (humanoid), до curriculum-тика
+        # Living Memory: непрерывная временная шкала (humanoid)
         if self.current_world == "humanoid" and self._episodic_memory is not None:
-            _cn = None
-            if self._curriculum is not None:
-                try:
-                    _cn = self._curriculum.current_stage.name
-                except Exception:
-                    _cn = None
             self._episodic_memory.append_timeline_tick(
-                self.tick, _obs_for_d_e, fallen, _posture_now, _cn
+                self.tick, _obs_for_d_e, fallen, _posture_now, None
             )
 
-        # Level 2-E: Curriculum
-        self._tick_curriculum(self.tick, _obs_for_d_e, fallen)
         self._prof_mark("sim.post_episodic", _pt)
 
-        # Level 2-F: RSSM upgrade + training
-        self._maybe_upgrade_rssm(self.tick)
-        if not result.get("blocked") and not result.get("skipped"):
-            _var = str(result.get("variable", ""))
-            _val = float(result.get("value", 0.5))
-            obs_post = dict(self.agent.graph.snapshot_vec_dict())
-            self._rssm_train_step(obs_pre_rssm, _var, _val, obs_post)
-        self._prof_mark("sim.post_rssm", _pt)
-
         # Фаза 2 ч.3: L4 concept mining (sync fallback или async worker + single-writer apply)
-        _l4_ok = not (
-            getattr(self, "_fixed_root_active", False)
-            and os.environ.get("RKK_L4_DURING_FIXED_ROOT", "0").strip().lower()
-            not in ("1", "true", "yes", "on")
-        )
         if (
-            _l4_ok
+            not getattr(self, "_fixed_root_active", False)
             and self._visual_env is not None
             and self.tick % self._concept_inject_every == 0
         ):
@@ -1287,31 +1219,6 @@ class SimulationTickMixin:
                 pass
         self._last_snapshot = snap
 
-        if self._rsi_full_enabled():
-            from engine.rsi_full import RSIController
-
-            if self._rsi_full is None:
-                sup = (
-                    self._ensure_skill_library
-                    if self._skill_library_enabled()
-                    else None
-                )
-                self._rsi_full = RSIController(
-                    self.agent,
-                    self._locomotion_controller,
-                    skill_library_supplier=sup,
-                    motor_cortex_supplier=self._ensure_motor_cortex,
-                )
-            rsi_ev = self._rsi_full.tick(
-                snap,
-                self._locomotion_reward_ema(),
-                tick=self.tick,
-                locomotion_ctrl=self._locomotion_controller,
-            )
-            if rsi_ev is not None:
-                t = rsi_ev.get("type", "?")
-                self._add_event(f"🔧 RSI [{t}]", "#66ccaa", "phase")
-
         # Phase D: Motor Cortex RSI check (every 50 ticks)
         if self.tick % 50 == 0:
             mc = self._ensure_motor_cortex()
@@ -1360,24 +1267,6 @@ class SimulationTickMixin:
             except Exception as e:
                 print(f"[Simulation] world_bridge.on_tick: {e}")
 
-        # Level 1-C: Standalone reconstruction training (warm up decoder early)
-        if (
-            self._visual_mode
-            and self._visual_env is not None
-            and self.tick % 5 == 0
-            and hasattr(self._visual_env, "cortex")
-        ):
-            cortex = self._visual_env.cortex
-            if (
-                hasattr(cortex, "train_reconstruction_only")
-                and hasattr(self._visual_env, "_last_frame")
-                and self._visual_env._last_frame is not None
-                and cortex.n_train == 0  # only during warmup phase
-            ):
-                try:
-                    cortex.train_reconstruction_only(self._visual_env._last_frame)
-                except Exception:
-                    pass
         self._prof_mark("sim.post_visual_ui", _pt)
 
         # Demon
@@ -1534,20 +1423,6 @@ class SimulationTickMixin:
             bs = self._behavioral_snapshot_cached()
             if bs is not None:
                 snap["behavioral_score"] = bs.get("behavioral_score")
-        try:
-            from engine.tick_run_logger import record_sim_tick
-
-            record_sim_tick(
-                self,
-                result=result,
-                snap=snap,
-                inner_ms=_inner_ms,
-                obs=_obs_for_d_e if _obs_for_d_e else None,
-                fallen=fallen,
-                posture=_posture_now,
-            )
-        except Exception as e:
-            print(f"[TickRunLog] hook: {e}")
         self._prof_mark("sim.build_response", _pt)
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)
 

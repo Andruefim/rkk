@@ -113,7 +113,7 @@ class SimulationTeacherMixin:
                 obs=obs,
                 inner_voice_controller=self._inner_voice,
                 episodic_memory=self._episodic_memory,
-                curriculum=self._curriculum,
+                curriculum=None,
                 llm_url=get_ollama_generate_url(),
                 llm_model=get_ollama_model(),
                 valid_intents=valid_intents,

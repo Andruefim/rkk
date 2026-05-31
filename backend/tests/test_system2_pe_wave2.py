@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from engine.llm_curriculum import CurriculumStage
+from engine.physical_curriculum import CurriculumStage
 from engine.system2.schema import EpisodeSuccessSpec, merge_episode_success_specs
 from engine.system2.success_predicates import (
     build_s2_detector_id,

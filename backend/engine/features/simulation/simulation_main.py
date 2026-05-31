@@ -223,7 +223,6 @@ class Simulation(
             "last_triggers": [],
             "last_level2_explanation": "",
         }
-        self._rsi_full = None
         self.neuro_engine = NeurogenesisEngine()
         self.neuro_coordinator = NeurogenesisCoordinator(self.neuro_engine)
         self.behavioral_tracker = BehavioralTracker()
@@ -243,16 +242,8 @@ class Simulation(
         self._last_fall_memory_tick: int = -999_999
         self._pending_fall_obs_for_memory: dict[str, float] | None = None
 
-        self._curriculum = CurriculumScheduler() if _CURRICULUM_AVAILABLE else None
-        self._curriculum_apply_every: int = 50
-
         self._system2: Any = None
         self._system2_last: dict | None = None
-
-        self._rssm_trainer: "RSSMTrainer | None" = None
-        self._rssm_imagination: "RSSMImagination | None" = None
-        self._rssm_upgraded: bool = False
-        self._rssm_upgrade_tick: int = -1
 
         self._proprio: "ProprioceptionStream | None" = None
         if _PROPRIO_AVAILABLE:

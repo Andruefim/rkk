@@ -433,21 +433,4 @@ def apply_llm_mediator_patch(sim) -> bool:
         teacher.process_llm_response = patched_process
         print("[LLMMediator] Hooked into phase3_teacher.process_llm_response")
 
-    # Патч llm_curriculum если есть
-    curriculum = getattr(sim, "_curriculum", None)
-    if curriculum is not None and hasattr(curriculum, "_on_llm_explanation"):
-        original_explain = curriculum._on_llm_explanation
-
-        def patched_explain(text: str, edges: list, tick: int):
-            original_explain(text, edges, tick)
-            controller.on_llm_output(
-                explanation=text,
-                edges_preview=edges,
-                next_probe=None,
-                graph=sim.agent.graph,
-                tick=tick,
-            )
-
-        curriculum._on_llm_explanation = patched_explain
-
     return True

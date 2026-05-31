@@ -28,29 +28,6 @@ except ImportError:
     _EPISODIC_MEMORY_AVAILABLE = False
     print("[Simulation] episodic_memory.py not found")
 
-# Level 2-E: LLM Curriculum Generator
-try:
-    from engine.llm_curriculum import CurriculumScheduler, curriculum_enabled
-
-    _CURRICULUM_AVAILABLE = True
-except ImportError:
-    _CURRICULUM_AVAILABLE = False
-    print("[Simulation] llm_curriculum.py not found")
-
-# Level 2-F: RSSM Temporal World Model
-try:
-    from engine.temporal_world_model import (
-        RSSMImagination,
-        RSSMTrainer,
-        maybe_upgrade_graph_to_rssm,
-        rssm_enabled,
-    )
-
-    _RSSM_AVAILABLE = True
-except ImportError:
-    _RSSM_AVAILABLE = False
-    print("[Simulation] temporal_world_model.py not found")
-
 # Level 3-G: Proprioception Stream
 try:
     from engine.proprioception import ProprioceptionStream

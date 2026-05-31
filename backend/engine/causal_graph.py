@@ -620,29 +620,6 @@ class CausalGraph:
     def _clamp_frozen_W_after_step(self) -> None:
         self._sync_frozen_W_into_core()
 
-    def _maybe_compile_gnn_core(self) -> None:
-        if not USE_GNN or self._core is None:
-            return
-        v = os.environ.get("RKK_GNN_COMPILE", "0").strip().lower()
-        if v not in ("1", "true", "yes", "on"):
-            return
-        if self.device.type not in ("cuda", "mps"):
-            return
-        if not hasattr(torch, "compile"):
-            return
-        try:
-            # dynamic=True: d меняется (neurogenesis, visual rebind) — без этого inductor
-            # может зафиксировать старую размерность и падать «expected sequence length …».
-            try:
-                self._core = torch.compile(
-                    self._core, mode="reduce-overhead", dynamic=True
-                )
-            except TypeError:
-                self._core = torch.compile(self._core, mode="reduce-overhead")
-            print(f"[CausalGraph] GNN torch.compile (d={self._d}, device={self.device.type})")
-        except Exception as e:
-            print(f"[CausalGraph] torch.compile skipped: {e}")
-
     def _unwrap_gnn_core(self):
         """Снять обёртку torch.compile — resize_to только у «сырого» CausalGNNCore."""
         c = self._core
@@ -676,7 +653,6 @@ class CausalGraph:
         if USE_GNN:
             from engine.causal_gnn import CausalGNNCore
             self._core = CausalGNNCore(self.MAX_D, self.device)
-            self._maybe_compile_gnn_core()
         else:
             self._core = NOTEARSCore(self.MAX_D, self.device)
 
@@ -783,45 +759,6 @@ class CausalGraph:
             max_seqs = max(8, self.BUFFER_SIZE // T)
             if len(self._seq_buffer) > max_seqs * 2:
                 self._seq_buffer = self._seq_buffer[-max_seqs:]
-
-        self._maybe_structure_learn(engine_tick=len(self._obs_buffer))
-
-    def _maybe_structure_learn(self, engine_tick: int = 0) -> None:
-        """Periodic v-structure / Meek orientation → ensemble W proposals."""
-        for key in ("self_fixed_root", "fixed_root"):
-            if key in self.nodes:
-                try:
-                    if float(self.nodes[key]) > 0.5:
-                        return
-                except (TypeError, ValueError):
-                    pass
-        try:
-            every = int(os.environ.get("RKK_STRUCTURE_LEARN_EVERY", "0"))
-        except ValueError:
-            every = 0
-        if every <= 0 or self._ensemble is None or self._d < 4:
-            return
-        if engine_tick > 0 and engine_tick % every != 0:
-            return
-        if len(self._obs_buffer) < 20:
-            return
-        try:
-            from engine.structure_learning import structure_learn_step
-
-            data = np.array(self._obs_buffer[-min(200, len(self._obs_buffer)) :], dtype=np.float64)
-            kinds = {i: self.get_node_kind(self._node_ids[i]) for i in range(self._d)}
-            edges = structure_learn_step(data, node_kinds=kinds)
-            if not edges:
-                return
-            with torch.no_grad():
-                for ei, e in enumerate(edges[: min(8, self._ensemble.n)]):
-                    if e.from_idx >= self._d or e.to_idx >= self._d:
-                        continue
-                    Wk = self._ensemble.W_stack[ei % self._ensemble.n]
-                    Wk[e.from_idx, e.to_idx] = float(e.confidence) * 0.5
-            self._structure_learn_tick = int(engine_tick)
-        except Exception:
-            pass
 
     def set_locomotion_train_context(
         self, *, reward_ema: float, cpg_active: bool, fallen: bool = False
@@ -1072,24 +1009,6 @@ class CausalGraph:
         l_rec_elementwise = F.mse_loss(X_pred, X_target, reduction='none')
         l_rec = (l_rec_elementwise * weights).mean()
         
-        # 2.5 Multi-scale reconstruction (skip when T small — saves ~30% seq train time)
-        try:
-            ms_rec = os.environ.get("RKK_WM_SEQ_MULTISCALE", "1").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
-        except Exception:
-            ms_rec = True
-        if ms_rec and T > 12:
-            if X_pred_5 is not None and T > 5:
-                X_target_5 = X_seq[:, 5:]
-                l_rec = l_rec + 0.5 * F.mse_loss(X_pred_5[:, :-5], X_target_5)
-            if X_pred_20 is not None and T > 20:
-                X_target_20 = X_seq[:, 20:]
-                l_rec = l_rec + 0.25 * F.mse_loss(X_pred_20[:, :-20], X_target_20)
-
         try:
             rec_coeff = float(os.environ.get("RKK_JEPA_SEQ_REC_COEFF", "0.2"))
         except ValueError:
@@ -1693,155 +1612,9 @@ class CausalGraph:
                 pred = self.forward_dynamics(pred, torch.zeros_like(pred))
         return pred
 
-    def cem_plan(
-        self,
-        objective_idx: int | list[int],
-        *,
-        variable_mask: list[str] | None = None,
-        n_samples: int = 64,
-        n_elite: int = 8,
-        n_iters: int = 5,
-        rollout_steps: int = 2,
-        maximize: bool = True,
-    ) -> dict[str, float] | None:
-        """
-        CEM (Cross-Entropy Method) planner поверх world model.
-
-        Суть (LeWM Appendix B):
-          1. Сэмплировать N кандидатов-действий из N(μ, σ)
-          2. Прогнать каждый через forward_dynamics (параллельно!)
-          3. Оценить objective по целевым узлам
-          4. Выбрать top-K elite → обновить μ, σ
-          5. Повторить → финальный μ = лучшее действие
-
-        Args:
-            objective_idx: индекс(ы) узла для оптимизации (напр. com_z)
-            variable_mask: какие переменные можно менять (None = все)
-            n_samples: число кандидатов на итерацию
-            n_elite: число лучших для обновления распределения
-            n_iters: число итераций CEM
-            rollout_steps: шаги free-rollout после действия
-            maximize: True = max objective, False = min
-
-        Returns:
-            dict {var_name: value} — best action found, or None
-        """
-        if self._core is None or not self._node_ids:
-            return None
-
-        d = self._d
-        device = self.device
-
-        # Which variables can be acted upon
-        if variable_mask is not None:
-            act_indices = [
-                self._node_ids.index(v) for v in variable_mask
-                if v in self._node_ids
-            ]
-        else:
-            act_indices = list(range(d))
-        if not act_indices:
-            return None
-        n_act = len(act_indices)
-
-        # Objective indices
-        if isinstance(objective_idx, int):
-            obj_idx = [objective_idx]
-        else:
-            obj_idx = list(objective_idx)
-
-        # CEM distribution: μ=0.5 (normalized action space), σ=0.2
-        mu = torch.full((n_act,), 0.5, device=device)
-        sigma = torch.full((n_act,), 0.2, device=device)
-
-        best_action = None
-        best_score = float('-inf') if maximize else float('inf')
-
-        for _it in range(n_iters):
-            # Sample (N, n_act) from N(μ, σ), clamp to [0.05, 0.95]
-            noise = torch.randn(n_samples, n_act, device=device)
-            samples = (mu.unsqueeze(0) + sigma.unsqueeze(0) * noise).clamp(0.05, 0.95)
-
-            # Build full action tensor (N, d) — sparse
-            actions = torch.zeros(n_samples, d, device=device)
-            for ki, ai in enumerate(act_indices):
-                actions[:, ai] = samples[:, ki]
-
-            # Parallel forward through world model
-            pred = self.propagate_batch(
-                actions, rollout_steps=rollout_steps
-            )  # (N, d)
-
-            # Evaluate objective
-            obj_vals = pred[:, obj_idx].sum(dim=-1)  # (N,)
-
-            # Select elites
-            if maximize:
-                _, elite_idx = obj_vals.topk(n_elite, largest=True)
-            else:
-                _, elite_idx = obj_vals.topk(n_elite, largest=False)
-
-            elite_samples = samples[elite_idx]  # (K, n_act)
-            elite_score = obj_vals[elite_idx[0]].item()
-
-            # Update best
-            if maximize and elite_score > best_score:
-                best_score = elite_score
-                best_action = actions[elite_idx[0]]
-            elif not maximize and elite_score < best_score:
-                best_score = elite_score
-                best_action = actions[elite_idx[0]]
-
-            # Update distribution
-            mu = elite_samples.mean(dim=0)
-            sigma = elite_samples.std(dim=0).clamp(min=0.02)
-
-        if best_action is None:
-            return None
-
-        # Convert to dict
-        result = {}
-        for ki, ai in enumerate(act_indices):
-            val = float(best_action[ai].item())
-            if abs(val) > 0.01:  # only non-trivial actions
-                result[self._node_ids[ai]] = val
-        result["_cem_score"] = best_score
-
-        return result
-
     def _invalidate_cache(self):
         self._edge_cache = None
         self._mdl_cache  = None
-
-    def edge_duplicate_diagnostic(self, tag: str = "") -> None:
-        """
-        Counter по ключам (from_, to) после materialize edges.
-        При типичном графе из матрицы W дубликатов нет — если dup_keys>0, ищи второй источник рёбер.
-
-        Вкл.: RKK_EDGE_DUP_DIAG=1 (дорого: строит полный список edges).
-        На post-sleep wake вызывается с tag «wake» — дополнительно нужен
-        RKK_EDGE_DUP_DIAG_WAKE=1, иначе no-op (избежать материализации рёбер на каждом пробуждении).
-        """
-        if os.environ.get("RKK_EDGE_DUP_DIAG", "0").strip().lower() not in (
-            "1", "true", "yes", "on",
-        ):
-            return
-        if (tag or "").lower() == "wake" and os.environ.get(
-            "RKK_EDGE_DUP_DIAG_WAKE", "0"
-        ).strip().lower() not in ("1", "true", "yes", "on"):
-            return
-        edges = self.edges
-        keys = [(e.from_, e.to) for e in edges]
-        c = Counter(keys)
-        dups = {k: v for k, v in c.items() if v > 1}
-        pref = f"[EdgeDup {tag}] " if tag else "[EdgeDup] "
-        print(
-            f"{pref}d={self._d} edge_count_property={len(keys)} unique_pairs={len(c)} "
-            f"dup_keys={len(dups)} (dense W → many edges is normal; duplicates are not)",
-            flush=True,
-        )
-        if dups:
-            print(f"{pref}sample: {list(dups.items())[:10]}", flush=True)
 
     def deduplicate_edges_keep_strongest(self) -> int:
         """
@@ -1861,37 +1634,6 @@ class CausalGraph:
             self._edge_cache = list(best.values())
             self._mdl_cache = None
         return removed
-
-    def log_W_threshold_stats(self, tag: str = "") -> None:
-        """
-        Диагностика плотности |W| на off-diagonal активном блоке d×d.
-        Вкл.: RKK_W_DIAG=1.
-        """
-        if os.environ.get("RKK_W_DIAG", "0").strip().lower() not in (
-            "1", "true", "yes", "on",
-        ):
-            return
-        if self._core is None:
-            return
-        d = self._d
-        if d <= 1:
-            return
-        with torch.no_grad():
-            wm = self._core.W_masked()[:d, :d].detach().float().cpu().numpy()
-        w = np.abs(wm).astype(np.float64, copy=False)
-        np.fill_diagonal(w, 0.0)
-        slots = max(1, d * (d - 1))
-        pref = f"[WDiag {tag}] " if tag else "[WDiag] "
-        print(
-            f"{pref}d={d} offdiag |W| mean={float(w.mean()):.4f} max={float(w.max()):.4f}",
-            flush=True,
-        )
-        for t in (0.01, 0.03, 0.05, 0.1, 0.2):
-            n = int((w > t).sum())
-            print(
-                f"{pref}|W|>{t}: {n} ({100.0 * n / slots:.1f}% of off-diagonal slots)",
-                flush=True,
-            )
 
     def prune_weak_W(self, threshold: float | None = None) -> int:
         """

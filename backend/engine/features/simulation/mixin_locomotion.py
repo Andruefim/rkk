@@ -220,10 +220,6 @@ class SimulationLocomotionMixin:
             if os.environ.get("RKK_DEBUG_CPG"):
                 traceback.print_exc()
 
-    def _rsi_full_enabled(self) -> bool:
-        v = os.environ.get("RKK_RSI_FULL", "0").strip().lower()
-        return v in ("1", "true", "yes", "on")
-
     def _ensure_motor_cortex(self):
         """Phase D: ленивая инициализация MotorCortexLibrary."""
         if not _MOTOR_CORTEX_AVAILABLE:

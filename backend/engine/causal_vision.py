@@ -1,17 +1,4 @@
-"""
-causal_vision.py — Causal Visual Cortex (Фаза 12) + Level 1-C: Reconstruction Decoder.
-
-ИЗМЕНЕНИЯ (Level 1-C: Slot Reconstruction Decoder):
-  - SlotDecoder: обратное преобразование slots → feature_map
-  - L_recon = MSE(decode(slots), encode(frame)) добавлен к predictive coding loss
-  - Без reconstruction loss SlotAttention не имеет причины кодировать
-    что-то осмысленное — он выучит тривиальное разбиение пространства
-  - С L_recon slots вынуждены представлять реальные объекты сцены
-  - RKK_VISION_RECON_WEIGHT=0.3 — вес reconstruction loss (default 0.3)
-  - RKK_VISION_RECON_ENABLED=1 — включить decoder (default)
-
-Все оригинальные методы сохранены.
-"""
+"""causal_vision.py — Causal Visual Cortex (Фаза 12): SlotAttention + predictive coding."""
 from __future__ import annotations
 
 import os
@@ -30,19 +17,6 @@ try:
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
-
-
-def _recon_enabled() -> bool:
-    return os.environ.get("RKK_VISION_RECON_ENABLED", "1").strip().lower() not in (
-        "0", "false", "no", "off"
-    )
-
-
-def _recon_weight() -> float:
-    try:
-        return float(np.clip(float(os.environ.get("RKK_VISION_RECON_WEIGHT", "0.3")), 0.0, 1.0))
-    except ValueError:
-        return 0.3
 
 
 @dataclass
@@ -145,98 +119,6 @@ class SlotAttention(nn.Module):
         return slots, last_attn
 
 
-# ── Level 1-C: Slot Reconstruction Decoder ────────────────────────────────────
-class SlotDecoder(nn.Module):
-    """
-    Decoder: slots (K, D) → reconstructed feature_map (P, F).
-
-    Архитектура:
-      Каждый slot генерирует маску alpha_k (P,) и вклад r_k (P, F).
-      Feature map = sum_k(alpha_k * r_k), где alpha_k — softmax веса.
-      
-      Это Mixture Decoder из оригинальной SlotAttention paper.
-      Reconstruction loss L_recon = MSE(decode(slots), encode(frame))
-      заставляет slots представлять реальные объекты.
-
-    Параметры:
-      slot_dim: D
-      feat_dim: F
-      n_positions: P = H'*W'
-    """
-
-    def __init__(self, slot_dim: int, feat_dim: int, n_positions: int, hidden: int = 64):
-        super().__init__()
-        self.n_positions = n_positions
-        self.feat_dim = feat_dim
-
-        # Generates (feature_contribution + alpha_logit) per slot per position
-        # Input: slot vector (D) + position embedding (2)
-        # Output: feat_dim (feature) + 1 (alpha logit)
-        self.slot_to_feat = nn.Sequential(
-            nn.Linear(slot_dim + 2, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, feat_dim + 1),  # feat_dim colors + 1 alpha
-        )
-
-        # Learnable position embeddings for decoder
-        # (P, 2) — normalized grid coords
-        self._n_pos = n_positions
-
-        # Initialize small
-        for m in self.slot_to_feat:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.3)
-                nn.init.zeros_(m.bias)
-
-    def _make_pos_grid(self, n_positions: int, device: torch.device) -> torch.Tensor:
-        """Create normalized position grid (n_positions, 2)."""
-        side = int(np.sqrt(n_positions))
-        ys = torch.linspace(-1, 1, side, device=device)
-        xs = torch.linspace(-1, 1, side, device=device)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
-        return torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)  # (P, 2)
-
-    def forward(self, slots: torch.Tensor) -> torch.Tensor:
-        """
-        slots: (B, K, D)
-        Returns: reconstructed feature_map (B, P, F)
-        """
-        B, K, D = slots.shape
-        P = self.n_positions
-        device = slots.device
-
-        # Position grid (P, 2)
-        pos_grid = self._make_pos_grid(P, device)  # (P, 2)
-
-        # For each slot and each position: concatenate slot vector with position
-        # slots: (B, K, D) → expand to (B, K, P, D)
-        slots_exp = slots.unsqueeze(2).expand(B, K, P, D)  # (B, K, P, D)
-        # pos_grid: (P, 2) → expand to (B, K, P, 2)
-        pos_exp = pos_grid.unsqueeze(0).unsqueeze(0).expand(B, K, P, 2)  # (B, K, P, 2)
-
-        # Concatenate: (B, K, P, D+2)
-        x = torch.cat([slots_exp, pos_exp], dim=-1)
-
-        # Reshape for linear: (B*K*P, D+2)
-        x_flat = x.reshape(B * K * P, D + 2)
-        out = self.slot_to_feat(x_flat)  # (B*K*P, F+1)
-        out = out.reshape(B, K, P, self.feat_dim + 1)
-
-        # Split into features and alpha
-        feat_k = out[..., :self.feat_dim]   # (B, K, P, F)
-        alpha_k = out[..., self.feat_dim:]   # (B, K, P, 1)
-
-        # Softmax over slots dimension → mixture weights
-        alpha_k = F.softmax(alpha_k, dim=1)  # (B, K, P, 1)
-
-        # Weighted sum: (B, P, F)
-        reconstructed = (alpha_k * feat_k).sum(dim=1)  # (B, P, F)
-
-        return reconstructed
-
-
 class SlotProjector(nn.Module):
     def __init__(self, slot_dim: int):
         super().__init__()
@@ -271,25 +153,12 @@ class CausalVisualCortex(nn.Module):
         self.attention = SlotAttention(cfg)
         self.projector = SlotProjector(cfg.slot_dim)
 
-        # Level 1-C: Reconstruction decoder
-        n_positions = self.encoder.n_positions
-        if _recon_enabled():
-            self.decoder = SlotDecoder(
-                slot_dim=cfg.slot_dim,
-                feat_dim=cfg.feat_dim,
-                n_positions=n_positions,
-                hidden=64,
-            )
-        else:
-            self.decoder = None
-
         self.to(device)
 
         # Single optimizer for all components (including decoder)
         self.optim = torch.optim.Adam(self.parameters(), lr=cfg.lr)
 
         self.train_losses: deque = deque(maxlen=100)
-        self.recon_losses: deque = deque(maxlen=100)  # Level 1-C
         self.pred_losses: deque = deque(maxlen=100)
         self.n_encode = 0
         self.n_train = 0
@@ -401,19 +270,7 @@ class CausalVisualCortex(nn.Module):
             + (1 - values_after) * (1 - values_after + 1e-6).log()
         ).mean()
 
-        # Level 1-C: L_recon — reconstruction loss
-        l_recon = torch.tensor(0.0, device=self.device)
-        if _recon_enabled() and self.decoder is not None:
-            try:
-                # Reconstruct feature map from slots
-                reconstructed = self.decoder(slots_after)  # (1, P, F)
-                # Compare with actual encoded features
-                l_recon = F.mse_loss(reconstructed, feats_after.detach())
-            except Exception as e:
-                pass  # decoder might fail on unusual inputs
-
-        rw = _recon_weight() if _recon_enabled() else 0.0
-        loss = l_pred + 0.05 * l_ent + rw * l_recon
+        loss = l_pred + 0.05 * l_ent
 
         self.optim.zero_grad()
         loss.backward()
@@ -422,39 +279,8 @@ class CausalVisualCortex(nn.Module):
 
         v = float(loss.item())
         self.train_losses.append(v)
-        if _recon_enabled():
-            self.recon_losses.append(float(l_recon.item()))
         self.pred_losses.append(float(l_pred.item()))
         self.n_train += 1
-        return v
-
-    def train_reconstruction_only(self, frame_rgb: np.ndarray) -> float | None:
-        """
-        Level 1-C: Standalone reconstruction training (no predictive coding target needed).
-        Can be called even without GNN predictions, e.g. during early training.
-        Used for: warming up decoder before predictive coding starts.
-        """
-        if not _recon_enabled() or self.decoder is None:
-            return None
-
-        self.train()
-        x = self.preprocess(frame_rgb)
-        feats = self.encoder(x)          # (1, P, F)
-        slots, _ = self.attention(feats)  # (1, K, D)
-
-        try:
-            reconstructed = self.decoder(slots)  # (1, P, F)
-            l_recon = F.mse_loss(reconstructed, feats.detach())
-        except Exception:
-            return None
-
-        self.optim.zero_grad()
-        l_recon.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-        self.optim.step()
-
-        v = float(l_recon.item())
-        self.recon_losses.append(v)
         return v
 
     def slot_variability(self) -> np.ndarray:
@@ -494,17 +320,13 @@ class CausalVisualCortex(nn.Module):
 
     def snapshot(self) -> dict:
         var = self.slot_variability()
-        mean_recon = float(np.mean(list(self.recon_losses))) if self.recon_losses else 0.0
         mean_pred = float(np.mean(list(self.pred_losses))) if self.pred_losses else 0.0
         return {
             "n_slots":       self.cfg.n_slots,
             "n_encode":      self.n_encode,
             "n_train":       self.n_train,
             "mean_loss":     float(np.mean(list(self.train_losses))) if self.train_losses else 0.0,
-            "mean_recon_loss": round(mean_recon, 5),  # Level 1-C
             "mean_pred_loss": round(mean_pred, 5),
-            "recon_enabled": _recon_enabled(),         # Level 1-C
-            "recon_weight":  _recon_weight(),
             "variability":   [round(float(v), 4) for v in var],
             "active_slots":  int((var > 0.03).sum()),
         }
