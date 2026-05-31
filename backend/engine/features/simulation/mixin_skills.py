@@ -64,7 +64,7 @@ class SimulationSkillsMixin:
             return "stand"
         bt = getattr(self, "behavioral_tracker", None)
         if bt is not None:
-            snap = bt.snapshot()
+            snap = self._behavioral_snapshot_cached() or {}
             if float(snap.get("com_x_vel_ema", 0.0)) < float(
                 os.environ.get("RKK_STEP3_COM_X_VEL_MIN", "0.08")
             ):

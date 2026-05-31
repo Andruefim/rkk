@@ -52,9 +52,13 @@ def build_simulation_snapshot(
     winfo = WORLDS.get(sim.current_world, {"color": "#cc44ff", "label": sim.current_world})
     cur_step, cur_stab_until = humanoid_curriculum_step(sim)
     behavioral = None
-    bt = getattr(sim, "behavioral_tracker", None)
-    if bt is not None:
-        behavioral = bt.snapshot()
+    fn = getattr(sim, "_behavioral_snapshot_cached", None)
+    if callable(fn):
+        behavioral = fn()
+    if behavioral is None:
+        bt = getattr(sim, "behavioral_tracker", None)
+        if bt is not None:
+            behavioral = bt.snapshot()
 
     beh_score = float((behavioral or {}).get("behavioral_score", 0.0))
     entropy_from_behavior = round((1.0 - beh_score) * 100.0, 1) if behavioral else round(

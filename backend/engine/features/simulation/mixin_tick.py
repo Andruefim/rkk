@@ -530,12 +530,13 @@ class SimulationTickMixin:
             return
         from engine.json_util import sanitize_for_json
 
-        with self._sim_step_lock:
-            for _ in range(n):
+        for _ in range(n):
+            with self._sim_step_lock:
                 raw = self._run_single_agent_timestep_inner()
-                payload = sanitize_for_json(raw)
-                if isinstance(payload, dict):
-                    payload["_json_sanitized"] = True
+            payload = sanitize_for_json(raw)
+            if isinstance(payload, dict):
+                payload["_json_sanitized"] = True
+            with self._sim_step_lock:
                 self._agent_step_response = payload
                 self._public_state_cache = payload
                 self._public_state_cache_at = time.monotonic()
@@ -545,6 +546,7 @@ class SimulationTickMixin:
         _t_inner0 = time.perf_counter()
         # #endregion
         self.tick += 1
+        self._reset_tick_obs_caches()
         if self.current_world != "humanoid":
             self._hai_prev_com_x = None
             self._hai_pe_fwd_ema = 0.0
@@ -662,17 +664,14 @@ class SimulationTickMixin:
                 self._clear_fall_recovery()
             if fallen:
                 self._fr_fallen_ticks_accum += 1
-                obs_fall = dict(self.agent.env.observe())
+                obs_fall = self._env_observe_cached()
                 if fallen_edge:
                     self._fall_count += 1
                     try:
                         pend = dict(obs_fall)
-                        base_b = self._unwrap_base_env(self.agent.env)
-                        sm = getattr(base_b, "_sim", None)
-                        if sm is not None and callable(getattr(sm, "get_state", None)):
-                            st = sm.get_state()
-                            if isinstance(st, dict) and "com_z" in st:
-                                pend["com_z_raw_m"] = float(st["com_z"])
+                        st = self._tick_phys_state()
+                        if isinstance(st, dict) and "com_z" in st:
+                            pend["com_z_raw_m"] = float(st["com_z"])
                         self._pending_fall_obs_for_memory = pend
                     except Exception:
                         self._pending_fall_obs_for_memory = None
@@ -692,6 +691,7 @@ class SimulationTickMixin:
                     if self._fall_recovery_active:
                         self._clear_fall_recovery()
                 elif use_genome_recovery and self._maybe_recover_or_reset_after_fall(obs_fall):
+                    self._invalidate_env_observe_cache()
                     obs = self.agent.env.observe()
                     self._sync_motor_state(obs, source="reset", tick=self.tick)
                     for nid in self.agent.graph._node_ids:
@@ -717,7 +717,7 @@ class SimulationTickMixin:
             self._pending_fall_obs_for_memory = None
             self._fr_fallen_ticks_accum = 0
 
-        obs_s2_fall = dict(self.agent.env.observe())
+        obs_s2_fall = self._env_observe_cached()
         if self._fixed_root_active:
             fallen_for_s2 = False
         else:
@@ -1085,7 +1085,8 @@ class SimulationTickMixin:
                 bt = getattr(self, "behavioral_tracker", None)
                 beh_ok = True
                 if bt is not None:
-                    beh_ok = float(bt.snapshot().get("behavioral_score", 0.0)) >= float(
+                    bs = self._behavioral_snapshot_cached() or {}
+                    beh_ok = float(bs.get("behavioral_score", 0.0)) >= float(
                         os.environ.get("RKK_PHYS_CURRICULUM_BEH_MIN", "0.2")
                     )
                 if beh_ok:
@@ -1377,21 +1378,19 @@ class SimulationTickMixin:
                 elif neuro_event.get("type") == "neurogenesis_pending":
                     self._neuro_pending = True
 
-        # Scene (кэш: get_full_scene = PyBullet lock + skeleton; не на каждый agent-тик)
-        try:
-            scene_every = max(1, int(os.environ.get("RKK_SCENE_CACHE_EVERY", "4")))
-        except ValueError:
-            scene_every = 4
+        # Scene: get_full_scene + _patch_scene_dynamics только при обновлении кэша
+        scene_every = self._scene_cache_every()
         scene_fn = getattr(self.agent.env, "get_full_scene", None)
-        if (
+        scene_stale = (
             not hasattr(self, "_cached_scene")
             or self._cached_scene_tick < 0
             or (self.tick - int(self._cached_scene_tick)) >= scene_every
-        ):
+        )
+        if scene_stale:
             self._cached_scene = scene_fn() if callable(scene_fn) else {}
             self._cached_scene_tick = int(self.tick)
+            self._patch_scene_dynamics(self._cached_scene)
         scene = dict(getattr(self, "_cached_scene", {}) or {})
-        self._patch_scene_dynamics(scene)
 
         # Vision state (кэш для /vision/slots; не на каждый agent-тик)
         if self._visual_mode and self._visual_env is not None:
@@ -1464,6 +1463,10 @@ class SimulationTickMixin:
                 recovery_learned_success=learned_ok,
                 in_step3=cur_step >= 3,
             )
+            self._refresh_behavioral_snapshot_cache()
+            bs = self._behavioral_snapshot_cached()
+            if bs is not None:
+                snap["behavioral_score"] = bs.get("behavioral_score")
         try:
             from engine.tick_run_logger import record_sim_tick
 
@@ -1480,8 +1483,14 @@ class SimulationTickMixin:
             print(f"[TickRunLog] hook: {e}")
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)
 
+    def _scene_cache_every(self) -> int:
+        try:
+            return max(1, int(os.environ.get("RKK_SCENE_CACHE_EVERY", "4")))
+        except ValueError:
+            return 4
+
     def _patch_scene_dynamics(self, scene: dict) -> None:
-        """Обновить позу/объекты каждый тик; static_geometry остаётся в кэше сцены."""
+        """PyBullet-динамика сцены; вызывать только при обновлении _cached_scene (см. RKK_SCENE_CACHE_EVERY)."""
         env = getattr(self.agent, "env", None)
         if env is None:
             return

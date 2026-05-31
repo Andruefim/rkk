@@ -5,6 +5,63 @@ from engine.features.simulation.mixin_imports import *
 
 
 class SimulationFallMixin:
+    def _reset_tick_obs_caches(self) -> None:
+        self._tick_env_obs = None
+        self._tick_phys_state_dict = None
+        self._tick_phys_state_tick = -1
+        self._bt_snap_tick = -1
+        self._bt_snap_payload = None
+
+    def _env_observe_cached(self) -> dict:
+        """Один env.observe() на тик (PyBullet)."""
+        obs = getattr(self, "_tick_env_obs", None)
+        if obs is None:
+            obs = dict(self.agent.env.observe())
+            self._tick_env_obs = obs
+        return obs
+
+    def _invalidate_env_observe_cache(self) -> None:
+        self._tick_env_obs = None
+
+    def _tick_phys_state(self) -> dict | None:
+        """Один sim.get_state() на тик для com_x / com_y."""
+        if getattr(self, "_tick_phys_state_tick", -1) == int(self.tick):
+            return getattr(self, "_tick_phys_state_dict", None)
+        self._tick_phys_state_tick = int(self.tick)
+        self._tick_phys_state_dict = None
+        base = self._unwrap_base_env(self.agent.env)
+        sim = getattr(base, "_sim", None)
+        if sim is not None and callable(getattr(sim, "get_state", None)):
+            try:
+                st = sim.get_state()
+                if isinstance(st, dict):
+                    self._tick_phys_state_dict = st
+            except Exception:
+                pass
+        return self._tick_phys_state_dict
+
+    def _refresh_behavioral_snapshot_cache(self) -> dict | None:
+        bt = getattr(self, "behavioral_tracker", None)
+        if bt is None:
+            return None
+        snap = bt.snapshot()
+        self._bt_snap_tick = int(self.tick)
+        self._bt_snap_payload = snap
+        return snap
+
+    def _behavioral_snapshot_cached(self) -> dict | None:
+        if getattr(self, "_bt_snap_tick", -1) == int(self.tick):
+            payload = getattr(self, "_bt_snap_payload", None)
+            if payload is not None:
+                return payload
+        bt = getattr(self, "behavioral_tracker", None)
+        if bt is None:
+            return None
+        snap = bt.snapshot()
+        self._bt_snap_tick = int(self.tick)
+        self._bt_snap_payload = snap
+        return snap
+
     def _try_reset_pose_after_fall(self) -> bool:
         """Сброс позы гуманоида (база PyBullet), чтобы выйти из ловушки fallen + VL block."""
         env = self.agent.env
@@ -67,30 +124,22 @@ class SimulationFallMixin:
         return ps < ps_th or cz < cz_th
 
     def _raw_com_x_m(self) -> float | None:
-        base = self._unwrap_base_env(self.agent.env)
-        sim = getattr(base, "_sim", None)
-        if sim is None or not hasattr(sim, "get_state"):
-            return None
-        try:
-            st = sim.get_state()
-            if isinstance(st, dict) and "com_x" in st:
+        st = self._tick_phys_state()
+        if isinstance(st, dict) and "com_x" in st:
+            try:
                 return float(st["com_x"])
-        except Exception:
-            pass
+            except (TypeError, ValueError):
+                pass
         return None
 
     def _raw_com_forward_m(self) -> float | None:
         """World forward axis (PyBullet com[1] / com_y)."""
-        base = self._unwrap_base_env(self.agent.env)
-        sim = getattr(base, "_sim", None)
-        if sim is None or not hasattr(sim, "get_state"):
-            return None
-        try:
-            st = sim.get_state()
-            if isinstance(st, dict) and "com_y" in st:
+        st = self._tick_phys_state()
+        if isinstance(st, dict) and "com_y" in st:
+            try:
                 return float(st["com_y"])
-        except Exception:
-            pass
+            except (TypeError, ValueError):
+                pass
         return None
 
     def _maybe_recover_or_reset_after_fall(self, obs: dict) -> bool:

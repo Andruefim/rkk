@@ -2920,9 +2920,11 @@ class RKKAgent:
         behavioral_score = None
         sim_ref = self._resolve_rkk_sim()
         if sim_ref is not None:
-            bt = getattr(sim_ref, "behavioral_tracker", None)
-            if bt is not None:
-                behavioral_score = bt.snapshot().get("behavioral_score")
+            fn = getattr(sim_ref, "_behavioral_snapshot_cached", None)
+            if callable(fn):
+                bs = fn()
+                if bs:
+                    behavioral_score = bs.get("behavioral_score")
         s1_info = {
             "buffer_size": len(self.system1.buffer),
             "mean_loss":   round(self.system1.mean_loss, 6),
