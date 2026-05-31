@@ -2001,6 +2001,10 @@ class RKKAgent:
         }
 
         def _report_if_slow_tick() -> None:
+            from engine.tick_profiler import get_tick_profiler
+
+            if get_tick_profiler().enabled():
+                return
             total = sum(_slow_t.values())
             if total <= 1.0:
                 return
@@ -2769,6 +2773,12 @@ class RKKAgent:
         self._last_step_timings["total_ms"] = round(
             (time.perf_counter() - _step_t0) * 1000.0, 2
         )
+        from engine.tick_profiler import get_tick_profiler
+
+        _prof = get_tick_profiler()
+        if _prof.enabled():
+            _prof.merge_dict_seconds(_slow_t, prefix="agent")
+            _prof.record("agent.step_total", self._last_step_timings["total_ms"])
         return self._last_result
 
     # ── Demon ─────────────────────────────────────────────────────────────────

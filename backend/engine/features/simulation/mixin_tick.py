@@ -42,6 +42,16 @@ def _dbg_tick(hypothesis_id: str, location: str, message: str, data: dict | None
 
 
 class SimulationTickMixin:
+    def _prof_mark(self, name: str, t0: list[float]) -> None:
+        """Record elapsed ms since previous mark (RKK_TICK_PROFILE)."""
+        from engine.tick_profiler import get_tick_profiler
+
+        p = get_tick_profiler()
+        now = time.perf_counter()
+        if p.enabled():
+            p.record(name, (now - t0[0]) * 1000.0)
+        t0[0] = now
+
     """Humanoid tick orchestration.
 
     Phase C₁ (temporal contracts): reflex / CPG / stabilizers run without invoking imagination,
@@ -542,10 +552,21 @@ class SimulationTickMixin:
                 self._public_state_cache_at = time.monotonic()
 
     def _run_single_agent_timestep_inner(self) -> dict:
+        from engine.tick_profiler import get_tick_profiler, tick_profile
+
         # #region agent log
         _t_inner0 = time.perf_counter()
         # #endregion
         self.tick += 1
+        _prof = get_tick_profiler()
+        _prof.begin_tick(self.tick)
+        try:
+            return self._run_single_agent_timestep_inner_profiled(_t_inner0)
+        finally:
+            _prof.end_tick()
+
+    def _run_single_agent_timestep_inner_profiled(self, _t_inner0: float) -> dict:
+        _pt = [time.perf_counter()]
         self._reset_tick_obs_caches()
         if self.current_world != "humanoid":
             self._hai_prev_com_x = None
@@ -727,6 +748,7 @@ class SimulationTickMixin:
             if getattr(self, "_fall_recovery_active", False):
                 fallen_for_s2 = True
 
+        self._prof_mark("sim.fall_curriculum", _pt)
         # Фаза 12: передаём GNN prediction в visual env (не каждый тик — см. VISION_GNN_FEED_EVERY)
         if self._visual_mode and self._visual_env is not None:
             self._vision_ticks += 1
@@ -750,6 +772,7 @@ class SimulationTickMixin:
         else:
             self.agent.value_layer.set_teacher_vl_overlay(None)
 
+        self._prof_mark("sim.teacher_vision", _pt)
         # Phase C₁: reflex path (CPG + reflex stabilizer) stays fast and LLM-free; τ2/τ3 run later.
         # CPG runs BEFORE agent step so legs are stabilized before high-level exploration
         self._ensure_cpg_background_loop()
@@ -783,6 +806,7 @@ class SimulationTickMixin:
         self._maybe_step_hierarchical_l1()
         self._sync_temporal_blankets_to_graph()
 
+        self._prof_mark("sim.cpg_prep", _pt)
         if self.current_world == "humanoid":
             try:
                 from engine.system2.controller import system2_enabled
@@ -1209,9 +1233,11 @@ class SimulationTickMixin:
         self._log_step(result, fallen)
         self._rolling_block_bits.append(1 if result.get("blocked") else 0)
 
+        self._prof_mark("sim.post_agent", _pt)
         _t_snap = time.perf_counter()
         snap = self.agent.snapshot()
         self._inner_phase_ms["snapshot"] = round((time.perf_counter() - _t_snap) * 1000.0, 2)
+        self._prof_mark("sim.agent_snapshot", _pt)
         snap["fallen"]     = fallen
         snap["fall_count"] = self._fall_count
         cp = getattr(self, "_context_posterior", None)
@@ -1481,6 +1507,7 @@ class SimulationTickMixin:
             )
         except Exception as e:
             print(f"[TickRunLog] hook: {e}")
+        self._prof_mark("sim.build_response", _pt)
         return self._build_snapshot(snap, graph_deltas, smoothed, scene)
 
     def _scene_cache_every(self) -> int:
