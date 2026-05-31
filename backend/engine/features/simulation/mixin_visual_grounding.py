@@ -83,7 +83,7 @@ class SimulationVisualGroundingMixin:
         Phase M (PATCH 4): VLM lexicon + slot masks/vectors → SlotLabeler → VisualInnerVoice.
 
         Вызывается из:
-          1) vlm_label_slots — сразу после EnvironmentVisual.set_slot_lexicon() (полный VLM batch);
+          1) set_slot_lexicon — при явной разметке слотов (grounding);
           2) _maybe_run_visual_grounding — после update(), если result['ok']
              (in-place правки _slot_lexicon из engine/visual_grounding.py);
           3) каждый тик агента после _maybe_run_visual_grounding — чтобы обновлять

@@ -124,15 +124,6 @@ def build_simulation_snapshot(
         "visual_mode": sim._visual_mode,
         "vision_ticks": sim._vision_ticks,
         "vision": vision_summary,
-        "llm_loop": {
-            "enabled": sim._llm_loop_enabled(),
-            "level2_inflight": sim._llm_level2_inflight,
-            "pending_bundle": sim._pending_llm_bundle is not None,
-            "last_schedule_tick": sim._last_level2_schedule_tick,
-            "last_dr_gain_tick": sim._last_dr_gain_tick,
-            "rolling_block_rate": round(sim._rolling_block_rate(), 4),
-            "stats": dict(sim._llm_loop_stats),
-        },
         "system2": getattr(sim, "_system2_last", None),
         "agent_loop": {
             "hz": round(_agent_loop_hz_from_env(), 1),
@@ -206,11 +197,6 @@ def build_simulation_snapshot(
             sim._inner_voice.snapshot()
             if sim._inner_voice is not None
             else {"enabled": _INNER_VOICE_AVAILABLE}
-        ),
-        "llm_teacher": (
-            sim._llm_teacher.snapshot()
-            if sim._llm_teacher is not None
-            else {"enabled": False}
         ),
         "sleep": (
             sim._sleep_ctrl.snapshot()

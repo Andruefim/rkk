@@ -366,7 +366,7 @@ class SimulationWorldMixin:
     # ── Seeds ─────────────────────────────────────────────────────────────────
     def agent_seed_context(self, agent_id: int) -> dict | None:
         """
-        Контекст для POST /bootstrap/llm, GET /variables/{id}, RAG auto-seed:
+        Контекст для POST /bootstrap/humanoid, GET /variables/{id}:
         preset (имя мира) и список имён переменных текущей среды агента.
         """
         if agent_id != 0:

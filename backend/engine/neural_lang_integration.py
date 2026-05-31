@@ -55,9 +55,6 @@ def apply_neural_lang_patch(sim) -> bool:
     sim._neural_lang = nlg
     print(f"[NeuralLang] NeuralLanguageGrounding initialized on {device}")
 
-    # Подключаем к LLM teacher callback
-    _patch_llm_teacher(sim, nlg)
-
     # Подключаем к verbal action
     _patch_verbal_action(sim, nlg)
 
@@ -68,88 +65,6 @@ def apply_neural_lang_patch(sim) -> bool:
     _patch_tick_step(sim, nlg)
 
     return True
-
-
-def _patch_llm_teacher(sim, nlg) -> None:
-    """
-    Перехватываем LLM teacher callback:
-    annotation.verbal → distill_step для CausalSpeechDecoder.
-    """
-    original_callback = getattr(sim, "_on_teacher_annotation", None)
-    if original_callback is None:
-        return
-
-    def patched_on_teacher_annotation(ann) -> None:
-        # Оригинальный callback
-        original_callback(ann)
-
-        # Дистилляция verbal текста в CausalSpeechDecoder
-        if ann.verbal and not ann.error:
-            iv = getattr(sim, "_inner_voice", None)
-            if iv is None:
-                return
-            thought = iv.get_thought_embedding()
-            if not thought:
-                return
-            thought_t = torch.tensor(thought, dtype=torch.float32)
-
-            # State vector из графа
-            graph = sim.agent.graph
-            node_ids = list(graph._node_ids)
-            state_vec = [float(graph.nodes.get(n, 0.5)) for n in node_ids]
-
-            nlg.push_distill_sample(thought_t, ann.verbal, state_vec)
-
-            # Обучаем если накопилось достаточно
-            if len(nlg._distill_buf) >= 4 and sim.tick % 4 == 0:
-                loss = nlg.distill_step(batch_size=4)
-                if loss is not None and sim.tick % 100 == 0:
-                    print(f"[NeuralLang] Distill loss: {loss:.4f} tick={sim.tick}")
-
-        # Spatial annotation: если LLM упоминает пространственные концепты,
-        # учим spatial memory их значению
-        if ann.primary_concepts:
-            _extract_spatial_from_annotation(sim, nlg, ann)
-
-    sim._on_teacher_annotation = patched_on_teacher_annotation
-
-
-def _extract_spatial_from_annotation(sim, nlg, ann) -> None:
-    """
-    Из аннотации LLM teacher извлекаем пространственные пары (neuron, concept, conf).
-    Это обучает InterventionalSpatialMemory знать значение своих нейронов.
-    """
-    SPATIAL_CONCEPTS = {
-        "OBJECT_LEFT", "OBJECT_RIGHT", "OBJECT_AHEAD", "OBJECT_VERY_CLOSE",
-        "OBJECT_FAR", "CLEAR_PATH_AHEAD", "OBJECT_BLOCKING_PATH",
-        "WALL_NEARBY", "OPEN_SCENE", "CLUTTERED_SCENE",
-    }
-    spatial_found = [c for c in ann.primary_concepts if c in SPATIAL_CONCEPTS]
-    if not spatial_found:
-        return
-
-    vis_env = getattr(sim, "_visual_env", None)
-    if vis_env is None:
-        return
-    slot_vecs = getattr(vis_env, "_last_slot_vecs", None)
-    if slot_vecs is None:
-        return
-
-    obs = {}
-    try:
-        obs = dict(sim.agent.env.observe())
-    except Exception:
-        return
-
-    # Назначаем: первый spatial концепт → нейрон 0, второй → нейрон 1, ...
-    # Это упрощение — в идеале нужен attention matching, но начнём с этого
-    pairs = [
-        (i % nlg.spatial_memory.SPATIAL_DIMS, c, 0.7)
-        for i, c in enumerate(spatial_found)
-    ]
-    # Усредняем slot vectors
-    mean_slot = slot_vecs.mean(dim=0)
-    nlg.on_llm_spatial_annotation(mean_slot, obs, pairs)
 
 
 def _patch_verbal_action(sim, nlg) -> None:

@@ -30,7 +30,6 @@ from engine.features.humanoid import (
     VAR_NAMES,
     fixed_root_seeds,
     humanoid_hardcoded_seeds,
-    merge_humanoid_golden_with_llm_edges,
 )
 
 __all__ = [
@@ -60,5 +59,4 @@ __all__ = [
     "UPPER_BODY_INTENT_VARS",
     "fixed_root_seeds",
     "humanoid_hardcoded_seeds",
-    "merge_humanoid_golden_with_llm_edges",
 ]

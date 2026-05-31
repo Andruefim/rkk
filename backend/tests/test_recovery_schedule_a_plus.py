@@ -4,8 +4,8 @@ from __future__ import annotations
 from engine.system2.recovery_schedule import (
     default_recovery_fallback_steps,
     enrich_recovery_steps,
-    llm_ticks_look_like_step_indices,
-    prepare_llm_recovery_steps,
+    ticks_look_like_step_indices,
+    prepare_recovery_steps,
     remediate_index_ticks_recovery_plan,
 )
 from engine.system2.schema import parse_recovery_motor_steps
@@ -40,16 +40,16 @@ def test_detect_index_ticks_pattern():
     index_plan = [
         {"ticks": i, "intent_deltas": {"intent_stop_recover": 0.1}} for i in range(1, 7)
     ]
-    assert llm_ticks_look_like_step_indices(index_plan)
+    assert ticks_look_like_step_indices(index_plan)
     real_plan = [{"ticks": 28, "intent_deltas": {"intent_stop_recover": 0.1}}]
-    assert not llm_ticks_look_like_step_indices(real_plan)
+    assert not ticks_look_like_step_indices(real_plan)
 
 
 def test_prepare_remediates_index_plan():
     index_plan = [
         {"ticks": i, "intent_deltas": {"intent_stop_recover": 0.1}} for i in range(1, 7)
     ]
-    ready, remediated = prepare_llm_recovery_steps(index_plan)
+    ready, remediated = prepare_recovery_steps(index_plan)
     assert remediated
     assert ready
     ticks = [s["ticks"] for s in ready]

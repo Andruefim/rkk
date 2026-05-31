@@ -8,10 +8,6 @@ simulation_singleton_v2.py — Singleton AGI с гуманоидом (Фаза 1
   - /vision/slots endpoint data через get_vision_state()
   - vision_stats в snapshot
 
-Фаза 3:
-  - refresh_phase3_teacher_llm(): LLM → правила IG + VL overlay (TTL)
-  - tick_step: teacher_weight annealing (RKK_TEACHER_T_MAX), overlay на ValueLayer
-
 Phase A (locomotion):
   - RKK_LOCOMOTION_CPG=1: CPG ноги на humanoid без fixed_root (engine.cpg_locomotion).
   - RKK_CPG_LOOP_HZ>0 (напр. 60): Low-level CPG в daemon-потоке; снимок graph.nodes после agent/skill step.
@@ -29,11 +25,6 @@ Phase C (full RSI):
   - RKK_RSI_FULL=1: engine.rsi_full — плато discovery → расширение GNN hidden; плато loco → CPG noise;
     плато walk skills → harder variants; падение phi → временное смягчение VL bounds.
 
-Этап D (LLM в петле, RKK_LLM_LOOP=1):
-  Уровень 1: каждый тик — GNN + System1 (как раньше).
-  Уровень 2: фоновый Ollama по триггерам (стагнация discovery, block_rate, VLM unknown, surprise PE).
-  Уровень 3: редко — перезапись гипотез (humanoid), в том же worker после L2 при run_level3.
-
 Класс `Simulation` собран из миксинов в `features/simulation/mixin_*.py` (композиция поведения).
 """
 from __future__ import annotations
@@ -42,7 +33,6 @@ import os
 import queue
 import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
@@ -71,7 +61,6 @@ from engine.features.simulation.mixin_concepts import SimulationConceptsMixin
 from engine.features.simulation.mixin_demon_phase import SimulationDemonPhaseMixin
 from engine.features.simulation.mixin_episodic_rssm import SimulationEpisodicRssmMixin
 from engine.features.simulation.mixin_fall import SimulationFallMixin
-from engine.features.simulation.mixin_llm import SimulationLlmLoopMixin
 from engine.features.simulation.mixin_locomotion import SimulationLocomotionMixin
 from engine.features.simulation.mixin_motor_pipeline import SimulationMotorPipelineMixin
 from engine.features.simulation.mixin_phase_hierarchy import SimulationPhaseHierarchyMixin
@@ -92,7 +81,6 @@ class Simulation(
     SimulationPhaseHierarchyMixin,
     SimulationWorldMixin,
     SimulationFallMixin,
-    SimulationLlmLoopMixin,
     SimulationLocomotionMixin,
     SimulationTeacherMixin,
     SimulationMotorPipelineMixin,
@@ -174,14 +162,6 @@ class Simulation(
         self._vision_ticks = 0
         self._last_vision_state: dict = {}
 
-        self._phase3_teacher_rules: list = []
-        self._phase3_vl_overlay = None
-
-        self._llm_loop_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rkk_llm")
-        self._pending_llm_bundle: dict | None = None
-        self._llm_level2_inflight = False
-        self._last_level2_schedule_tick = -10**9
-        self._last_level3_tick = -10**9
         self._best_discovery_rate = 0.0
         self._last_dr_gain_tick = 0
         self._rolling_block_bits: deque[int] = deque(maxlen=80)
@@ -217,12 +197,6 @@ class Simulation(
         self._public_state_cache_at: float = 0.0
         self._skill_library = None
         self._skill_exec: dict | None = None
-        self._llm_loop_stats: dict = {
-            "level2_runs": 0,
-            "level3_runs": 0,
-            "last_triggers": [],
-            "last_level2_explanation": "",
-        }
         self.neuro_engine = NeurogenesisEngine()
         self.neuro_coordinator = NeurogenesisCoordinator(self.neuro_engine)
         self.behavioral_tracker = BehavioralTracker()
@@ -256,14 +230,8 @@ class Simulation(
             self._timescale = MultiscaleTimeController()
 
         self._inner_voice: "InnerVoiceController | None" = None
-        self._llm_teacher: "LLMVoiceTeacher | None" = None
         if _INNER_VOICE_AVAILABLE:
             self._inner_voice = InnerVoiceController(device=self.device)
-            from engine.llm_voice_teacher import teacher_enabled
-
-            if teacher_enabled():
-                self._llm_teacher = LLMVoiceTeacher()
-                self._llm_teacher.add_callback(self._on_teacher_annotation)
 
         self._sleep_ctrl: "SleepController | None" = None
         self._physical_curriculum: "PhysicalCurriculum | None" = None
@@ -345,10 +313,8 @@ class Simulation(
                 print(f"[Simulation] Neural lang patch skipped: {type(e).__name__}: {e}")
 
         from engine.intristic_objective import apply_intrinsic_patch
-        from engine.llm_hint_mediator import apply_llm_mediator_patch
         from engine.learned_motor_primitives import apply_motor_primitives_patch
 
-        apply_llm_mediator_patch(self)
         apply_motor_primitives_patch(self)
         apply_intrinsic_patch(self)
 

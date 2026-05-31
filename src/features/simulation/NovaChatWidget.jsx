@@ -212,9 +212,6 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
       system2.skipped ?? "",
       String(system2.macro_horizon_expired ?? ""),
       String(system2.macro_outcome_deferred ?? ""),
-      String(system2.llm_inflight ?? ""),
-      String(system2.llm_submitted ?? ""),
-      String(system2.llm_submit_tick ?? ""),
     ].join("|");
 
     if (key === lastPlanKeyRef.current) return;
@@ -225,29 +222,7 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
       lines.push(`Пропуск: ${system2.skipped}`);
     } else if (system2.idle) {
       const st = system2.sim_tick ?? tick;
-      if (system2.llm_inflight) {
-        const sub = system2.llm_submit_tick;
-        const wt = system2.llm_wait_ticks;
-        const waitHint =
-          wt != null && wt >= 48
-            ? ` Уже ${wt} тиков — проверьте Ollama (${import.meta.env.VITE_RKK_OLLAMA_HINT ?? "localhost:11434"}) или увеличьте RKK_SYSTEM2_LLM_TIMEOUT_TICKS.`
-            : wt != null && wt > 0
-              ? ` Ожидание: ${wt} тиков.`
-              : "";
-        if (system2.macro_outcome_deferred) {
-          lines.push(
-            `Ждём ответ LLM${sub != null ? ` (запрос с тика ${sub})` : ""}. Итог текущего макроса посчитаем после ответа; новый горизонт — от тика, когда план реально применится.${waitHint}`
-          );
-        } else if (system2.macro_horizon_expired) {
-          lines.push(
-            `Ждём LLM${sub != null ? ` с тика ${sub}` : ""}. Предыдущий эпизод закрыт; следующее окно задастся от тика применения нового плана (сейчас тик ${st}).${waitHint}`
-          );
-        } else {
-          lines.push(
-            `Ждём LLM${sub != null ? ` с тика ${sub}` : ""}. Окно оценки макроса «${system2.macro ?? "—"}» до тика ${system2.until ?? "—"}.${waitHint}`
-          );
-        }
-      } else if (system2.macro_horizon_expired) {
+      if (system2.macro_horizon_expired) {
         lines.push(
           `Горизонт последнего макроса в прошлом (до тика ${system2.until ?? "—"}); сейчас тик ${st}. Следующий шаг планировщика по расписанию или при смене фазы.`
         );

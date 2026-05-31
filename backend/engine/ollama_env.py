@@ -72,7 +72,7 @@ def ollama_yield_to_system2_enabled() -> bool:
 
 
 def system2_ollama_busy(sim: Any) -> bool:
-    """True, если у симуляции активен System2 и у него незавершённый Ollama (план или recovery)."""
+    """Legacy yield hook; System2 macro/recovery Ollama paths removed — always False."""
     s2 = getattr(sim, "_system2", None)
     if s2 is None:
         return False

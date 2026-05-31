@@ -553,7 +553,6 @@ class SimulationTickMixin:
             self._hai_pe_vert_ema = 0.0
             self._hai_pe_lat_ema = 0.0
             self._hai_pe_ema = 0.0
-        self._apply_pending_llm_bundle()
         self._ensure_phase2()
 
         # Humanoid curriculum: фаза 1 — fixed_root с тика 1; снятие после RKK_AUTO_FIXED_ROOT_TICKS.
@@ -744,19 +743,8 @@ class SimulationTickMixin:
             if self._vision_ticks % _topo_every == 0:
                 self._apply_topological_self_priors()
 
-        # Фаза 3: annealing teacher_weight; VL-overlay только пока не истёк TTL и weight>0
-        try:
-            tmax = int(os.environ.get("RKK_TEACHER_T_MAX", "140"))
-        except ValueError:
-            tmax = 140
-        tmax = max(1, tmax)
-        tw = max(0.0, 1.0 - (self.agent._total_interventions / tmax))
-        self.agent.set_teacher_state(self._phase3_teacher_rules, tw)
-        ov = self._phase3_vl_overlay
-        if ov is not None and self.tick <= ov.expires_at_tick and tw > 0:
-            self.agent.value_layer.set_teacher_vl_overlay(ov)
-        else:
-            self.agent.value_layer.set_teacher_vl_overlay(None)
+        self.agent.set_teacher_state([], 0.0)
+        self.agent.value_layer.set_teacher_vl_overlay(None)
 
         self._prof_mark("sim.teacher_vision", _pt)
         # Phase C₁: reflex path (CPG + reflex stabilizer) stays fast and LLM-free; τ2/τ3 run later.
@@ -1002,11 +990,7 @@ class SimulationTickMixin:
                         except Exception:
                             pass
 
-        # Phase J: Inner Voice (τ2, fast, no LLM)
         self._tick_inner_voice(self.tick)
-
-        # Phase J: LLM teacher (τ3, async)
-        self._tick_llm_teacher(self.tick)
 
         # Level 3-G: Proprioception update (after CPG + agent step; fresh obs)
         _proprio_anomaly = 0.0
@@ -1363,7 +1347,6 @@ class SimulationTickMixin:
         self._prof_mark("sim.post_scene_vision", _pt)
 
         if not fallen:
-            self._maybe_schedule_llm_loop(result, snap)
             self._maybe_refresh_concepts_cache()
             self._maybe_autosave_memory()
         self._prof_mark("sim.post_persist", _pt)

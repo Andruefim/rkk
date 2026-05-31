@@ -286,9 +286,7 @@ class InnerVoiceController:
       3. Инжектирует concept_* узлы в GNN
       4. Предоставляет thought_embedding для RewardCoordinator
 
-    Distillation (с LLM, каждые ~60 секунд офлайн):
-      LLMVoiceTeacher.generate_annotation() → verbal + concept_labels
-      → InnerVoiceTrainer.step() → обновляет веса InnerVoiceNet
+    Distillation: push_distill_sample() из сна, visual grounding и т.п.
 
     Интеграция в simulation.py:
       self._inner_voice = InnerVoiceController(device)

@@ -174,13 +174,11 @@ export default function RKKHumanoid() {
   const [camFrame,     setCamFrame]      = useState(null);
   const [showCam,      setShowCam]       = useState(false);
   const [showCubes,    setShowCubes]     = useState(true);
-  const [ragLoading,   setRagLoading]    = useState(false);
+  const [seedLoading,  setSeedLoading]   = useState(false);
 
   // Vision
   const [visionData,    setVisionData]    = useState(null);
   const [visionLoading, setVisionLoading] = useState(false);
-  const [vlmLoading,    setVlmLoading]    = useState(false);
-  const [vlmWeakEdges,  setVlmWeakEdges]  = useState(false);
   const [selectedSlot,  setSelectedSlot]  = useState(0);
   const [attnFrame,     setAttnFrame]     = useState(null);
   const [visionEnabled, setVisionEnabled] = useState(false);
@@ -256,13 +254,13 @@ export default function RKKHumanoid() {
     } catch(e) { setStatus(`✗ ${e.message}`); }
   };
 
-  const ragSeed = async () => {
-    setRagLoading(true); setStatus("⏳ LLM generating…");
+  const seedHumanoid = async () => {
+    setSeedLoading(true);
     try {
-      const d = await fetch(`${API}/rag/auto-seed-all`,{method:"POST"}).then(r=>r.json());
-      setStatus(`✓ RAG: ${d.results?.[0]?.injected??0} edges (${d.results?.[0]?.source})`);
+      const d = await fetch(`${API}/bootstrap/humanoid`,{method:"POST"}).then(r=>r.json());
+      setStatus(`✓ Seeds: ${d.injected ?? 0} edges (${d.source ?? "humanoid"})`);
     } catch(e) { setStatus(`✗ ${e.message}`); }
-    finally { setRagLoading(false); }
+    finally { setSeedLoading(false); }
   };
 
   const enableVision = async (nSlots=8) => {
@@ -275,21 +273,6 @@ export default function RKKHumanoid() {
       else setStatus(`✗ ${d.error||"failed"}`);
     } catch(e) { setStatus(`✗ ${e.message}`); }
     finally { setVisionLoading(false); }
-  };
-
-  const runVlmSlotLabels = async () => {
-    setVlmLoading(true);
-    try {
-      const d = await fetch(`${API}/vision/vlm-label`,{method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({max_mask_images:4,text_only:false,
-          inject_weak_edges:vlmWeakEdges})}).then(r=>r.json());
-      if (d.ok) {
-        setStatus(`🔬 VLM ${d.mode}: ${d.n_slots_labeled} labels${d.warning?` (${d.warning})`:""}`);
-        try { const r2=await fetch(`${API}/vision/slots`).then(r=>r.json()); if(r2.visual_mode!==false) setVisionData(r2); } catch{}
-      } else setStatus(`✗ VLM: ${d.error||"failed"}`);
-    } catch(e) { setStatus(`✗ ${e.message}`); }
-    finally { setVlmLoading(false); }
   };
 
   const disableVision = async () => {
@@ -1128,8 +1111,8 @@ export default function RKKHumanoid() {
       {activePanel==="rag"&&(
         <div style={{position:"absolute",top:118,left:"50%",transform:"translateX(-50%)",background:"rgba(0,4,10,0.97)",border:"1px solid #003322",padding:"12px 16px",borderRadius:3,width:380,zIndex:10}}>
           <div style={{color:"#00aa66",fontSize:10,marginBottom:6}}>🌐 LLM BOOTSTRAP</div>
-          <button onClick={ragSeed} disabled={ragLoading} style={{width:"100%",padding:"5px",borderRadius:2,fontSize:9,cursor:"pointer",background:ragLoading?"#001a0a":"#002211",border:"1px solid #006633",color:ragLoading?"#225544":"#00ff88",marginBottom:6}}>
-            {ragLoading?"⏳ LLM…":"🌐 AUTO-SEED (Wikipedia + LLM)"}
+          <button onClick={seedHumanoid} disabled={seedLoading} style={{width:"100%",padding:"5px",borderRadius:2,fontSize:9,cursor:"pointer",background:seedLoading?"#001a0a":"#002211",border:"1px solid #006633",color:seedLoading?"#225544":"#00ff88",marginBottom:6}}>
+            {seedLoading?"⏳…":"🌱 Humanoid seeds (hardcoded)"}
           </button>
           <div style={{fontSize:9,color:status.startsWith("✓")?"#00ff99":"#ff4422"}}>{status}</div>
         </div>
@@ -1152,18 +1135,6 @@ export default function RKKHumanoid() {
             )}
             {isFR&&<div style={{fontSize:8,color:frColor}}>📌 fixed_root active — phys keys ограничены</div>}
           </div>
-
-          {isVis&&<div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center",marginBottom:10}}>
-            <button type="button" onClick={runVlmSlotLabels} disabled={vlmLoading}
-              style={{padding:"4px 10px",borderRadius:2,fontSize:9,cursor:vlmLoading?"wait":"pointer",
-                background:"#001828",border:`1px solid ${visColor}`,color:visColor}}>
-              {vlmLoading?"⏳ VLM…":"🔬 VLM label slots"}
-            </button>
-            <label style={{fontSize:8,color:"#336655",display:"flex",alignItems:"center",gap:4,cursor:"pointer"}}>
-              <input type="checkbox" checked={vlmWeakEdges} onChange={e=>setVlmWeakEdges(e.target.checked)}/>
-              weak edges
-            </label>
-          </div>}
 
           {isVis&&visionData&&(
             <>

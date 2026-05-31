@@ -6,34 +6,13 @@ PowerShell (из каталога репозитория rkk):
   python run.py
 
 Переменные RKK_* можно держать в файле .env в корне rkk (рядом с backend/) — подхватывается при старте.
-Без .env, только для сессии PowerShell:
-  $env:RKK_LLM_LOOP = "1"
-  cd backend; python run.py
 
-После старта API (фоном): humanoid_structured LLM-bootstrap → автоматически vision ON → один VLM.
-  Отключить LLM: RKK_SKIP_AUTO_HUMANOID_LLM=1
-  Отключить авто-зрение: RKK_SKIP_AUTO_VISION=1
-  Зрение да, без авто-VLM: RKK_SKIP_AUTO_VLM_BOOTSTRAP=1
-  Слоты/режим: RKK_AUTO_VISION_N_SLOTS=8, RKK_AUTO_VISION_MODE=hybrid
-  VLM: по умолчанию только кадр (RKK_AUTO_VLM_MAX_MASKS=0); кадр+маски как в UI: MAX_MASKS=4, при желании TEXT_ONLY=1
-  URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL (или OLLAMA_MODEL) — один раз в корневом .env
-  Парсинг JSON: RKK_OLLAMA_JSON_FORMAT (bootstrap/LLM loop); Phase3/VLM — RKK_OLLAMA_JSON_FORMAT_TEACHER_VLM (по умолч. без format=json).
+После старта API (фоном): опционально enable visual (SlotAttention).
+  RKK_SKIP_AUTO_VISION=1 — не включать зрение.
+  RKK_AUTO_VISION_N_SLOTS=8, RKK_AUTO_VISION_MODE=hybrid
 
-Фаза 3 (после VLM): LLM-учитель для System1 + мягкий VL-overlay (TTL).
-  Отключить авто: RKK_SKIP_PHASE3_LLM=1
-  Затухание бонуса: RKK_TEACHER_T_MAX (интервенций, по умолчанию 140)
-
-Ручной VLM: POST /vision/vlm-label. Повтор учителя: POST /teacher/refresh.
-
-Этап D — LLM в петле (не только bootstrap): RKK_LLM_LOOP=1
-  Уровень 2: контрфактуальная консультация при стагнации discovery (≥RKK_LLM_STAGNATION_TICKS),
-  rolling block_rate>0.4, VLM «неизвестный» слот, surprise PE>3σ.
-  Уровень 3 (humanoid): редко RKK_LLM_LEVEL3_INTERVAL тиков — перезапись гипотез.
-  Доп.: RKK_LLM_LEVEL2_COOLDOWN (по умолч. 240 тиков), RKK_LLM_MIN_INTERVENTIONS.
-  World model: RKK_WM_PASSIVE_MIX — доля пассивных переходов в train_step GNN.
-  Neural ODE (torchdiffeq): RKK_WM_NEURAL_ODE=1 — sub-step по τ; RKK_WM_ODE_METHOD, RKK_WM_ODE_TIME_POINTS.
-  Цель (Этап E): self_goal_active / self_goal_target_dist в humanoid; RKK_GOAL_PLANNING, RKK_PLAN_DEPTH, RKK_PLAN_VALUES.
-  RSI lite (Этап G): плато discovery_rate → L1/BUFFER/imagination; RKK_RSI_LITE, RKK_RSI_PLATEAU_TICKS, RKK_RSI_MIN_INTERVENTIONS.
+Ручной bootstrap графа: POST /bootstrap/humanoid
+Ручное зрение: POST /vision/enable
 
 Или через uvicorn напрямую:
   uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload

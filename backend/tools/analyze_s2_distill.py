@@ -59,7 +59,6 @@ def main() -> int:
     print(f"Distill report: {report['path']}")
     print(f"  rows (window): {report['rows']}")
     print(f"  overall success: {_pct(report.get('overall_success_rate'))}")
-    print(f"  llm share: {_pct(report.get('llm_share'))}")
     print(f"  student share: {_pct(report.get('student_share'))}")
 
     print("\nBy macro:")

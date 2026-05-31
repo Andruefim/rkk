@@ -57,9 +57,3 @@ class SimulationSnapshotShutdownMixin:
     def shutdown(self):
         self._bg.stop_rkk_agent_loop()
         self._stop_cpg_background_loop()
-        try:
-            self._llm_loop_executor.shutdown(wait=False, cancel_futures=False)
-        except TypeError:
-            self._llm_loop_executor.shutdown(wait=False)
-        except Exception:
-            pass

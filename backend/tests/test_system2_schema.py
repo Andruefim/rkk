@@ -134,10 +134,10 @@ def test_proposal_from_dict_expected_state_filters_unknown():
     assert p.skill_id == "test_skill"
 
 
-def test_parse_recovery_llm_plan_expected_state():
-    from engine.system2.schema import parse_recovery_llm_plan
+def test_parse_recovery_plan_expected_state():
+    from engine.system2.schema import parse_recovery_plan
 
-    plan = parse_recovery_llm_plan(
+    plan = parse_recovery_plan(
         {
             "steps": [{"ticks": 4, "intent_deltas": {"intent_stop_recover": 0.05}}],
             "expected_state": {"posture_stability": 0.6},

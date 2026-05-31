@@ -17,8 +17,6 @@ from engine.hierarchical_graph import HierarchicalGraph, hierarchical_graph_enab
 from engine.ollama_env import (
     get_ollama_generate_url,
     get_ollama_model,
-    ollama_yield_to_system2_enabled,
-    system2_ollama_busy,
 )
 from engine.value_layer import HomeostaticBounds
 from engine.wm_neural_ode import integrate_world_model_step

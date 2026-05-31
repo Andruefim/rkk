@@ -34,7 +34,15 @@ from typing import Callable
 
 from engine.environment_humanoid import MOTOR_INTENT_VARS, MOTOR_OBSERVABLE_VARS
 from engine.causal_vision import CausalVisualCortex, make_visual_cortex
-from engine.slot_lexicon import frame_content_hash
+
+
+def frame_content_hash(frame_b64: str | None) -> str:
+    import hashlib
+
+    if not frame_b64:
+        return ""
+    raw = frame_b64.encode("utf-8", errors="ignore")[:8192]
+    return hashlib.sha256(raw + str(len(frame_b64)).encode()).hexdigest()[:16]
 
 # Рендер камеры для слотов: меньше пикселей → быстрее PyBullet + JPEG (превью /camera — отдельно)
 VISION_PIPELINE_CAM_W = 288
@@ -529,7 +537,7 @@ class EnvironmentVisual:
     ) -> None:
         """Сохраняем последнюю VLM-разметку (метки по slot_k, не меняя порядок слотов).
 
-        Phase M: после полного батча VLM вызывается simulation.vlm_label_slots →
+        Phase M: visual grounding может обновлять лексикон через set_slot_lexicon →
         _phase_m_sync_from_vision(). In-place правки лексикона делаются в visual_grounding.
         """
         self._slot_lexicon = dict(labels)

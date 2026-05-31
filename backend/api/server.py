@@ -7,14 +7,10 @@ server.py — FastAPI для Singleton AGI Humanoid (Фаза 11 + 12).
   GET  /vision/slots               — слоты + attention masks (base64)
   GET  /vision/status              — статус кортекса
   GET  /vision/attn_frame?slot_idx — PyBullet frame с overlay маской
-  POST /vision/vlm-label          — Фаза 2: VLM-лексикон слотов (Ollama chat + images)
-  POST /teacher/refresh           — Фаза 3: LLM-учитель (правила S1 + VL overlay TTL)
-
-Авто при старте (lifespan): humanoid_structured LLM → enable visual → один VLM → фаза 3 teacher.
-  RKK_SKIP_AUTO_VISION=1, RKK_SKIP_AUTO_VLM_BOOTSTRAP=1 — отключить шаги.
+Авто при старте (lifespan): опционально enable visual (SlotAttention).
+  RKK_SKIP_AUTO_VISION=1 — не включать зрение.
   RKK_AUTO_VISION_N_SLOTS, RKK_AUTO_VISION_MODE (hybrid|visual)
 
-Этап D: RKK_LLM_LOOP=1 — фоновые L2/L3 консультации Ollama в tick_step (см. engine/simulation.py, engine/llm_loop.py).
 
 Установить для Фазы 12: pip install opencv-python scipy
 """
@@ -33,21 +29,16 @@ except ImportError:
     pass
 from contextlib import asynccontextmanager
 import traceback
-from typing import Literal
 from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from engine.core.constants import agent_loop_hz_from_env
 from engine.json_util import sanitize_for_json
-from engine.ollama_env import get_ollama_generate_url, get_ollama_model
 from engine.simulation import Simulation
-from engine.rag_seeder import RAGSeeder, HARDCODED_SEEDS
 
-_sim:    Simulation | None = None
-_seeder: RAGSeeder  | None = None
-_rag_status = {"last_run": None, "results": [], "running": False}
+_sim: Simulation | None = None
 _causal_stream_ws: WebSocket | None = None
 _causal_stream_gen: int = 0
 
@@ -92,16 +83,6 @@ def get_sim() -> Simulation:
     return _sim
 
 
-def get_seeder() -> RAGSeeder:
-    global _seeder
-    if _seeder is None:
-        _seeder = RAGSeeder(
-            llm_url=get_ollama_generate_url(),
-            llm_model=get_ollama_model(),
-        )
-    return _seeder
-
-
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -113,190 +94,36 @@ def _agent_loop_hz() -> float:
         return 0.0
 
 
-async def _startup_humanoid_llm_bootstrap() -> None:
-    """
-    После старта сервера: humanoid_structured через Ollama (как POST /bootstrap/llm).
-    Отключение: RKK_SKIP_AUTO_HUMANOID_LLM=1
-    URL/модель: RKK_OLLAMA_URL, RKK_OLLAMA_MODEL (или OLLAMA_MODEL) — см. engine/ollama_env.py
-    """
-    skip = os.environ.get("RKK_SKIP_AUTO_HUMANOID_LLM", "").strip().lower()
-    if skip in ("1", "true", "yes", "on"):
-        print("[RKK] Auto humanoid_structured LLM skipped (RKK_SKIP_AUTO_HUMANOID_LLM)")
-        return
-    try:
-        sim = get_sim()
-        if sim.current_world != "humanoid":
-            return
-        ctx = sim.agent_seed_context(0)
-        if not ctx:
-            return
-        llm_url = get_ollama_generate_url()
-        model = get_ollama_model()
-        try:
-            max_h = int(os.environ.get("RKK_HUMANOID_LLM_MAX_HYPOTHESES", "28"))
-        except ValueError:
-            max_h = 28
-        vars_ = ctx["variables"]
-        seeder = RAGSeeder(llm_url=llm_url, llm_model=model)
-        from engine.environment_humanoid import (
-            humanoid_hardcoded_seeds,
-            merge_humanoid_golden_with_llm_edges,
-        )
-
-        hyps = await seeder.generate_humanoid_structured(
-            available_vars=vars_, max_hypotheses=max_h,
-        )
-        if hyps:
-            edges = merge_humanoid_golden_with_llm_edges([h.to_dict() for h in hyps])
-            src = "llm_humanoid_merged"
-        else:
-            edges = humanoid_hardcoded_seeds()
-            src = "hardcoded_fallback"
-        res = sim.inject_seeds(agent_id=0, edges=edges)
-        print(
-            f"[RKK] Auto humanoid_structured bootstrap: source={src}, "
-            f"injected={res.get('injected', 0)}, skipped={len(res.get('skipped', []))}"
-        )
-    except Exception as e:
-        print(f"[RKK] Auto humanoid_structured bootstrap error: {e}")
-
-
-async def _startup_auto_vision_and_one_vlm() -> None:
-    """
-    После LLM-bootstrap: включить SlotAttention (hybrid) и один вызов VLM-лексикона.
-    Повтор VLM намеренно не делаем — позже можно триггерить по «запутался»
-    (высокий block_rate / fallen / стагнация фазы), см. simulation tick.
-
-    RKK_SKIP_AUTO_VISION=1 — не включать зрение (и VLM не запустится).
-    RKK_SKIP_AUTO_VLM_BOOTSTRAP=1 — зрение да, VLM один раз пропустить.
-    RKK_AUTO_VLM_WEAK_EDGES=1 — как у ручного POST: слабые slot→phys.
-    RKK_AUTO_VLM_TEXT_ONLY=1 — только текстовый режим (без картинок в chat).
-    RKK_AUTO_VLM_MAX_MASKS — маски в chat (0 = только кадр при bootstrap, быстрее; по умолчанию 0).
-    """
-    # По умолчанию теперь ВКЛЮЧЕНО при старте, если не задано RKK_SKIP_AUTO_VISION=1
+async def _startup_auto_vision() -> None:
+    """Опционально включить SlotAttention после старта API."""
     if _env_flag("RKK_SKIP_AUTO_VISION"):
         print("[RKK] Auto vision skipped (RKK_SKIP_AUTO_VISION)")
         return
     try:
         sim = get_sim()
         if sim.current_world != "humanoid":
-            print("[RKK] Auto vision: only humanoid world, skipping")
             return
         if sim._visual_mode:
-            print("[RKK] Auto vision: already enabled, skipping enable_visual")
-        else:
-            try:
-                n_slots = int(os.environ.get("RKK_AUTO_VISION_N_SLOTS", "8"))
-            except ValueError:
-                n_slots = 8
-            mode = (os.environ.get("RKK_AUTO_VISION_MODE", "hybrid") or "hybrid").strip()
-            out = sim.enable_visual(n_slots=n_slots, mode=mode)
-            if out.get("error"):
-                print(f"[RKK] Auto vision failed: {out.get('error')}")
-                return
-            print(
-                f"[RKK] Auto vision ON: n_slots={out.get('n_slots')}, "
-                f"mode={out.get('mode')}, gnn_d={out.get('gnn_d')}"
-            )
-
-        if _env_flag("RKK_SKIP_AUTO_VLM_BOOTSTRAP"):
-            print("[RKK] Auto VLM bootstrap skipped (RKK_SKIP_AUTO_VLM_BOOTSTRAP)")
             return
-
-        # PyBullet / cortex warmup: первый getCameraImage после старта может быть пустым.
-        await asyncio.sleep(3.0)
-        if _agent_loop_hz() > 0:
-            sim.advance_agent_steps(5)
-        else:
-            for _ in range(5):
-                sim.tick_step()
-        await asyncio.sleep(0.5)
-
-        llm_url = get_ollama_generate_url()
-        model = get_ollama_model()
         try:
-            max_masks = int(os.environ.get("RKK_AUTO_VLM_MAX_MASKS", "0"))
+            n_slots = int(os.environ.get("RKK_AUTO_VISION_N_SLOTS", "8"))
         except ValueError:
-            max_masks = 0
-
-        vlm_out = await sim.vlm_label_slots(
-            llm_url=llm_url,
-            llm_model=model,
-            max_mask_images=max_masks,
-            text_only=_env_flag("RKK_AUTO_VLM_TEXT_ONLY"),
-            inject_weak_edges=_env_flag("RKK_AUTO_VLM_WEAK_EDGES"),
-        )
-        if vlm_out.get("ok"):
-            w = vlm_out.get("weak_edges_injected") or 0
-            print(
-                f"[RKK] Auto VLM bootstrap: mode={vlm_out.get('mode')}, "
-                f"labels={vlm_out.get('n_slots_labeled')}, weak_edges={w}"
-            )
-            if vlm_out.get("warning"):
-                print(f"[RKK] Auto VLM note: {vlm_out.get('warning')}")
-        else:
-            print(f"[RKK] Auto VLM bootstrap failed: {vlm_out.get('error', vlm_out)}")
-    except Exception as e:
-        print(f"[RKK] Auto vision/VLM error: {e}")
-
-
-async def _startup_phase3_teacher() -> None:
-    """
-    Фаза 3 после VLM: один запрос LLM → правила для push_experience + дельты VL (TTL).
-    RKK_SKIP_PHASE3_LLM=1 — пропуск.
-    """
-    if _env_flag("RKK_SKIP_PHASE3_LLM"):
-        print("[RKK] Phase3 teacher skipped (RKK_SKIP_PHASE3_LLM)")
-        return
-    try:
-        sim = get_sim()
-        if sim.current_world != "humanoid":
-            print("[RKK] Phase3 teacher: only humanoid, skipping")
+            n_slots = 8
+        mode = (os.environ.get("RKK_AUTO_VISION_MODE", "hybrid") or "hybrid").strip()
+        out = sim.enable_visual(n_slots=n_slots, mode=mode)
+        if out.get("error"):
+            print(f"[RKK] Auto vision failed: {out.get('error')}")
             return
-        # Сразу после VLM Ollama иногда отдаёт пустой response; короткая пауза + retry в fetch.
-        await asyncio.sleep(2.5)
-        out = await sim.refresh_phase3_teacher_llm()
-        if out.get("ok"):
-            print(
-                f"[RKK] Phase3 teacher: rules={out.get('n_rules', 0)}, "
-                f"vl_overlay={out.get('vl_overlay')}, ttl_tick={out.get('expires_at_tick')}"
-            )
-            ins = (out.get("insight") or "").strip()
-            if ins:
-                print(f"[RKK] Phase3 teacher insight:\n{ins}\n")
-            if out.get("warning"):
-                print(f"[RKK] Phase3 teacher note: {out.get('warning')}")
-        else:
-            print(f"[RKK] Phase3 teacher failed: {out.get('error')}")
+        print(
+            f"[RKK] Auto vision ON: n_slots={out.get('n_slots')}, "
+            f"mode={out.get('mode')}, gnn_d={out.get('gnn_d')}"
+        )
     except Exception as e:
-        print(f"[RKK] Phase3 teacher error: {e}")
+        print(f"[RKK] Auto vision error: {e}")
 
 
 async def _startup_post_boot_pipeline() -> None:
-    """Порядок: LLM приоры → зрение → VLM → фаза 3 teacher (фон после yield сервера)."""
-    if _env_flag("RKK_SKIP_LLM_BOOTSTRAP") or _env_flag("RKK_SKIP_ALL_LLM"):
-        print(
-            "[RKK] LLM bootstrap pipeline skipped "
-            "(RKK_SKIP_LLM_BOOTSTRAP / RKK_SKIP_ALL_LLM); innate genome from Simulation.__init__"
-        )
-        if not _env_flag("RKK_SKIP_AUTO_VISION"):
-            try:
-                sim = get_sim()
-                if sim.current_world == "humanoid":
-                    n_slots = int(os.environ.get("RKK_AUTO_VISION_N_SLOTS", "8"))
-                    mode = (os.environ.get("RKK_AUTO_VISION_MODE", "hybrid") or "hybrid").strip()
-                    out = sim.enable_visual(n_slots=n_slots, mode=mode)
-                    if not out.get("error"):
-                        print(
-                            f"[RKK] Auto vision ON (no LLM): n_slots={out.get('n_slots')}, "
-                            f"gnn_d={out.get('gnn_d')}"
-                        )
-            except Exception as e:
-                print(f"[RKK] Auto vision (no LLM) error: {e}")
-        return
-    await _startup_humanoid_llm_bootstrap()
-    await _startup_auto_vision_and_one_vlm()
-    await _startup_phase3_teacher()
+    await _startup_auto_vision()
 
 
 @asynccontextmanager
@@ -518,113 +345,6 @@ def bootstrap_humanoid():
     result = get_sim().inject_seeds(agent_id=0, edges=seeds)
     return {"source": "humanoid_hardcoded", **result}
 
-class LLMBootstrapRequest(BaseModel):
-    world:          str | None = None
-    mode:           Literal["rag_wiki", "humanoid_structured"] = "humanoid_structured"
-    max_hypotheses: int        = 28
-    llm_model:      str        = Field(default_factory=get_ollama_model)
-    llm_url:        str        = Field(default_factory=get_ollama_generate_url)
-
-@app.post("/bootstrap/llm")
-async def bootstrap_llm(req: LLMBootstrapRequest):
-    sim  = get_sim()
-    ctx  = sim.agent_seed_context(0)
-    if not ctx:
-        return {"error": "no context"}
-    preset = req.world or sim.current_world
-    vars_  = ctx["variables"]
-    seeder = RAGSeeder(llm_url=req.llm_url, llm_model=req.llm_model)
-
-    if req.mode == "humanoid_structured":
-        # current_world остаётся humanoid и в visual/hybrid режиме
-        if preset != "humanoid":
-            return {"error": "humanoid_structured requires current_world humanoid"}
-        if not req.llm_url:
-            return {"error": "llm_url required for humanoid_structured"}
-        try:
-            from engine.environment_humanoid import (
-                humanoid_hardcoded_seeds,
-                merge_humanoid_golden_with_llm_edges,
-            )
-
-            hyps = await seeder.generate_humanoid_structured(
-                available_vars=vars_,
-                max_hypotheses=req.max_hypotheses,
-            )
-            if hyps:
-                edges = merge_humanoid_golden_with_llm_edges([h.to_dict() for h in hyps])
-                src = "llm_humanoid_merged"
-            else:
-                edges = humanoid_hardcoded_seeds()
-                src = "hardcoded_fallback"
-            res = sim.inject_seeds(agent_id=0, edges=edges)
-            return {"source": src, "preset": preset, **res}
-        except Exception as e:
-            return {"error": str(e)}
-
-    try:
-        hyps  = await seeder.generate(env_preset=preset, available_vars=vars_, max_hypotheses=8)
-        edges = [h.to_dict() for h in hyps] if hyps else HARDCODED_SEEDS.get(preset, [])
-        res   = sim.inject_seeds(agent_id=0, edges=edges)
-        return {"source": "llm", "preset": preset, **res}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ── RAG ───────────────────────────────────────────────────────────────────────
-@app.post("/rag/auto-seed-all")
-async def rag_auto_seed_all():
-    global _rag_status
-    sim, seeder = get_sim(), get_seeder()
-    ctx = sim.agent_seed_context(0)
-    if not ctx:
-        return {"error": "no context"}
-
-    preset = ctx["preset"]
-    _rag_status["running"] = True
-    try:
-        if preset == "humanoid" and seeder.llm_url:
-            from engine.environment_humanoid import (
-                humanoid_hardcoded_seeds,
-                merge_humanoid_golden_with_llm_edges,
-            )
-
-            hyps = await seeder.generate_humanoid_structured(
-                available_vars=ctx["variables"],
-                max_hypotheses=28,
-            )
-            if hyps:
-                edges = merge_humanoid_golden_with_llm_edges([h.to_dict() for h in hyps])
-                source = "llm_humanoid_merged"
-            else:
-                edges = humanoid_hardcoded_seeds()
-                source = "hardcoded_fallback"
-        else:
-            hyps = await seeder.generate(
-                env_preset=preset, available_vars=ctx["variables"], max_hypotheses=6
-            )
-            edges = [h.to_dict() for h in hyps] if hyps else HARDCODED_SEEDS.get(preset, [])
-            source = hyps[0].source if hyps else "hardcoded"
-    except Exception:
-        if preset == "humanoid":
-            from engine.environment_humanoid import humanoid_hardcoded_seeds
-
-            edges, source = humanoid_hardcoded_seeds(), "hardcoded_fallback"
-        else:
-            edges, source = HARDCODED_SEEDS.get(preset, []), "hardcoded"
-    finally:
-        _rag_status["running"] = False
-
-    res = sim.inject_seeds(agent_id=0, edges=edges)
-    _rag_status.update({"last_run": sim.tick,
-                          "results": [{"agent":"Nova","preset":preset,
-                                        "injected":res.get("injected",0),"source":source}]})
-    return {"status": "ok", "results": _rag_status["results"]}
-
-@app.get("/rag/status")
-def rag_status():
-    return _rag_status
-
 @app.get("/demon/stats")
 def demon_stats():
     return get_sim().demon.snapshot
@@ -638,14 +358,6 @@ class VisionEnableRequest(BaseModel):
     n_slots: int = 8
     mode:    str = "hybrid"   # "hybrid" (слоты + моторы) | "visual" (только слоты)
 
-
-class VisionVLMRequest(BaseModel):
-    """Фаза 2: разметка slot_k через Ollama (/api/chat + images или текстовый fallback)."""
-    llm_url: str = Field(default_factory=get_ollama_generate_url)
-    llm_model: str = Field(default_factory=get_ollama_model)
-    max_mask_images: int = 4
-    text_only: bool = False
-    inject_weak_edges: bool = False
 
 @app.post("/vision/enable")
 def vision_enable(req: VisionEnableRequest):
@@ -684,38 +396,11 @@ def vision_slots():
       variability: list[float] — насколько активен слот
       active_slots: int
       slot_labels: list[dict] — Фаза 2: label, likely_phys, confidence по индексу
-      slot_lexicon_tick, slot_lexicon_frame_hash — метаданные последней разметки
+      slot_lexicon_tick, slot_lexicon_frame_hash — метаданные лексикона (grounding)
       cortex:      dict — stats
     """
     sim = get_sim()
     return sim.get_vision_state()
-
-
-@app.post("/vision/vlm-label")
-async def vision_vlm_label(req: VisionVLMRequest):
-    """
-    Фаза 2: один вызов VLM (кадр + до K масок) → словарь меток на слотах.
-    При ошибке vision API — автоматический текстовый fallback (числа слотов).
-    inject_weak_edges: очень слабые рёбра slot→phys в граф (опционально).
-    """
-    sim = get_sim()
-    return await sim.vlm_label_slots(
-        llm_url=req.llm_url,
-        llm_model=req.llm_model,
-        max_mask_images=req.max_mask_images,
-        text_only=req.text_only,
-        inject_weak_edges=req.inject_weak_edges,
-    )
-
-
-# ── Фаза 3: виртуальный учитель ───────────────────────────────────────────────
-@app.post("/teacher/refresh")
-async def teacher_refresh():
-    """
-    Повторный запрос LLM: ig_rules (бонус к actual_ig при совпадении do(var)) +
-    vl_overlay с TTL. teacher_weight всё равно затухает с RKK_TEACHER_T_MAX интервенций.
-    """
-    return await get_sim().refresh_phase3_teacher_llm()
 
 
 @app.get("/vision/attn_frame")
@@ -978,11 +663,9 @@ async def causal_stream(websocket: WebSocket):
                     from engine.environment_humanoid import humanoid_hardcoded_seeds
                     sim.inject_seeds(agent_id=0, edges=humanoid_hardcoded_seeds())
                 elif cmd == "rag_auto":
-                    ctx = sim.agent_seed_context(0)
-                    if ctx:
-                        edges = HARDCODED_SEEDS.get(ctx["preset"], [])
-                        if edges:
-                            sim.inject_seeds(agent_id=0, edges=edges)
+                    from engine.environment_humanoid import humanoid_hardcoded_seeds
+
+                    sim.inject_seeds(agent_id=0, edges=humanoid_hardcoded_seeds())
                 # Фаза 12: visual cortex commands
                 elif cmd == "vision_enable":
                     n = int(msg.get("n_slots", 8))

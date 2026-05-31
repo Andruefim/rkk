@@ -12,7 +12,7 @@ RKK is a two-part AGI simulation platform: a **Python backend** (FastAPI + PyBul
   - All settings come from `.env` in the repo root — do NOT override them with command-line env vars
   - Only `RKK_DEVICE=cpu` is needed in the cloud VM (no GPU; `.env` has `cuda`)
   - Starts FastAPI/Uvicorn on port 8000
-  - Ollama-dependent features (LLM teacher, VLM labeling) will gracefully fail with ConnectError — this is expected in cloud VM
+  - Verbal speech (optional Ollama) may fail with ConnectError if Ollama is not running — expected in cloud VM
 - **Frontend**: `npm run dev` (Vite on port 5173, see `package.json` scripts)
 
 ### Lint / Type-check / Build

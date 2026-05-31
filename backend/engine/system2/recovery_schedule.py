@@ -1,5 +1,5 @@
 """
-Recovery motor schedules: LLM plans, deterministic fallback, bundle enrichment.
+Recovery motor schedules: scripted getup, fallback, bundle enrichment.
 """
 from __future__ import annotations
 
@@ -25,16 +25,6 @@ def recovery_scripted_enabled() -> bool:
         "false",
         "no",
         "off",
-    )
-
-
-def recovery_scripted_llm_on_entry() -> bool:
-    """If false, entry uses scripted only; LLM waits for replan/stagnation."""
-    return os.environ.get("RKK_S2_RECOVERY_SCRIPTED_LLM_ON_ENTRY", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
     )
 
 
@@ -112,7 +102,7 @@ def prepare_scripted_getup_steps() -> list[dict[str, Any]]:
     steps = enrich_recovery_steps(default_scripted_getup_steps())
     for st in steps:
         st["intent_deltas"] = sanitize_recovery_intent_deltas(st.get("intent_deltas"))
-    ok, reason = validate_llm_recovery_plan(steps)
+    ok, reason = validate_recovery_plan(steps)
     if not ok:
         return enrich_recovery_steps(default_recovery_fallback_steps())
     return steps
@@ -377,9 +367,9 @@ def _recovery_min_total_ticks() -> int:
         return 60
 
 
-def llm_ticks_look_like_step_indices(steps: list[dict[str, Any]]) -> bool:
+def ticks_look_like_step_indices(steps: list[dict[str, Any]]) -> bool:
     """
-    Detect LLM treating ticks as step index (1,2,3,...) instead of frame duration.
+    Detect index-style ticks (1,2,3,...) instead of frame duration.
     Does not match uniformly short steps (2,2) — those are rejected by validate.
     """
     if len(steps) < 2:
@@ -400,7 +390,7 @@ def llm_ticks_look_like_step_indices(steps: list[dict[str, Any]]) -> bool:
 def remediate_index_ticks_recovery_plan(
     steps: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Re-map index-style ticks onto fallback phase durations; keep LLM intent_deltas."""
+    """Re-map index-style ticks onto fallback phase durations; keep step intent_deltas."""
     fb = default_recovery_fallback_steps()
     fb_ticks = [int(s["ticks"]) for s in fb]
     out: list[dict[str, Any]] = []
@@ -411,7 +401,7 @@ def remediate_index_ticks_recovery_plan(
     return out
 
 
-def validate_llm_recovery_plan(steps: list[dict[str, Any]]) -> tuple[bool, str]:
+def validate_recovery_plan(steps: list[dict[str, Any]]) -> tuple[bool, str]:
     """Return (ok, reject_reason)."""
     if not steps:
         return False, "empty"
@@ -427,7 +417,7 @@ def validate_llm_recovery_plan(steps: list[dict[str, Any]]) -> tuple[bool, str]:
     return True, ""
 
 
-def prepare_llm_recovery_steps(steps: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+def prepare_recovery_steps(steps: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
     """
     Enrich, remediate index-style ticks, validate.
     Returns (steps_ready, was_remediated).
@@ -436,11 +426,11 @@ def prepare_llm_recovery_steps(steps: list[dict[str, Any]]) -> tuple[list[dict[s
     for st in enriched:
         st["intent_deltas"] = sanitize_recovery_intent_deltas(st.get("intent_deltas"))
     remediated = False
-    if llm_ticks_look_like_step_indices(enriched):
+    if ticks_look_like_step_indices(enriched):
         enriched = remediate_index_ticks_recovery_plan(enriched)
         enriched = enrich_recovery_steps(enriched)
         remediated = True
-    ok, _ = validate_llm_recovery_plan(enriched)
+    ok, _ = validate_recovery_plan(enriched)
     if not ok:
         return [], remediated
     return enriched, remediated

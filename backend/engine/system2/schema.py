@@ -240,7 +240,7 @@ def parse_recovery_motor_steps(
     return out if out else None
 
 
-def parse_recovery_llm_plan(
+def parse_recovery_plan(
     raw: dict[str, Any] | None,
     *,
     max_steps: int = 10,

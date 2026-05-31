@@ -7,7 +7,7 @@ from engine.system2.recovery_schedule import (
     recovery_scripted_lock_until_exhausted,
     scripted_getup_joint_targets,
     scripted_getup_phase_at,
-    validate_llm_recovery_plan,
+    validate_recovery_plan,
 )
 
 
@@ -17,7 +17,7 @@ def test_scripted_enabled_by_default():
 
 def test_scripted_plan_valid_and_long_enough():
     steps = prepare_scripted_getup_steps()
-    ok, _ = validate_llm_recovery_plan(steps)
+    ok, _ = validate_recovery_plan(steps)
     assert ok
     assert len(steps) >= 5
     total = sum(int(s["ticks"]) for s in steps)

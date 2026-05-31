@@ -88,7 +88,6 @@ class PersistentMeta:
 
     # Inner voice
     inner_voice_train_steps: int = 0
-    llm_teacher_calls: int = 0
 
     # Reward
     reward_total_signals: int = 0
@@ -269,8 +268,6 @@ def collect_meta_from_simulation(sim) -> PersistentMeta:
     # Inner voice
     if sim._inner_voice is not None:
         meta.inner_voice_train_steps = sim._inner_voice.train_steps
-    if sim._llm_teacher is not None:
-        meta.llm_teacher_calls = sim._llm_teacher.total_calls
 
     # Intrinsic objective steps (раньше reward coordinator)
     intr = getattr(sim, "_intrinsic", None)

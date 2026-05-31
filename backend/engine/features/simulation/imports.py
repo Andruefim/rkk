@@ -56,16 +56,14 @@ except ImportError:
     _TIMESCALE_AVAILABLE = False
     print("[Simulation] multiscale_time.py not found")
 
-# Phase J: Inner Voice (GRU) + LLM teacher (τ3 only)
+# Phase J: Inner Voice (GRU, no Ollama)
 try:
     from engine.inner_voice_net import InnerVoiceController
-    from engine.llm_voice_teacher import LLMVoiceTeacher, TeacherAnnotation
 
     _INNER_VOICE_AVAILABLE = True
 except ImportError:
     _INNER_VOICE_AVAILABLE = False
-    TeacherAnnotation = None  # type: ignore
-    print("[Simulation] inner_voice / llm_voice_teacher not found")
+    print("[Simulation] inner_voice_net not found")
 
 # Phase K: Sleep + Physical Curriculum + Persistence
 try:

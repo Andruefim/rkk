@@ -5,7 +5,7 @@ sleep_consolidation.py — Phase K: Sleep Consolidation.
 
 Три фазы сна:
   PHASE_REM:    Replay эпизодов из EpisodicMemory → offline RL (lr×10)
-  PHASE_LESSON: LLM teacher генерирует структурированный урок
+  PHASE_LESSON: врождённые priors / seeds (без Ollama)
   PHASE_PRUNE:  Synaptic pruning — обрезка слабых GNN edges
 
 Триггеры (любой из):
@@ -64,6 +64,22 @@ import numpy as np
 import torch
 
 
+@dataclass
+class SleepLessonAnnotation:
+    """Innate sleep lesson payload (no Ollama)."""
+
+    tick: int
+    timestamp: float
+    mode: str
+    verbal: str = ""
+    primary_concepts: list[str] = field(default_factory=list)
+    lesson_text: str = ""
+    lesson_concepts: list[str] = field(default_factory=list)
+    seeds: list[dict] = field(default_factory=list)
+    confidence: float = 1.0
+    error: str = ""
+
+
 def sleep_enabled() -> bool:
     return os.environ.get("RKK_SLEEP_ENABLED", "1").strip().lower() not in (
         "0", "false", "no", "off"
@@ -82,15 +98,6 @@ def _compression_sleep_cooldown() -> int:
         return max(500, int(os.environ.get("RKK_SLEEP_COMPRESSION_COOLDOWN", "2000")))
     except ValueError:
         return 2000
-
-
-def _all_llm_disabled() -> bool:
-    return os.environ.get("RKK_SKIP_ALL_LLM", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
 def _env_int(key: str, default: int) -> int:
@@ -810,10 +817,9 @@ class SleepController:
             },
         }
 
-    def _schedule_innate_lesson(self, tick: int, sim) -> None:
-        """Genome/text priors instead of Ollama during sleep LESSON phase."""
+    def _schedule_lesson(self, tick: int, sim) -> None:
+        """Innate genome/text priors during sleep LESSON phase."""
         from engine.environment_humanoid import humanoid_hardcoded_seeds
-        from engine.llm_voice_teacher import TeacherAnnotation
 
         seeds = list(humanoid_hardcoded_seeds())
         concepts: list[str] = []
@@ -821,11 +827,11 @@ class SleepController:
             c = str(s.get("concept") or "").strip()
             if c and c not in concepts:
                 concepts.append(c)
-        self._lesson_result = TeacherAnnotation(
+        self._lesson_result = SleepLessonAnnotation(
             tick=tick,
             timestamp=time.time(),
             mode="lesson",
-            verbal="Innate sleep lesson (no LLM)",
+            verbal="Innate sleep lesson",
             primary_concepts=concepts[:8] or ["balance", "locomotion"],
             lesson_text="fixed_root curriculum consolidation",
             lesson_concepts=concepts[:8],
@@ -834,81 +840,12 @@ class SleepController:
         )
         self._lesson_scheduled = True
         print(
-            f"[Sleep] Innate lesson scheduled: {len(seeds[:16])} seeds, "
+            f"[Sleep] Lesson scheduled: {len(seeds[:16])} seeds, "
             f"{len(self._lesson_result.primary_concepts)} concepts"
         )
 
-    def _schedule_lesson(self, tick: int, sim) -> None:
-        """Fire async LLM lesson (non-blocking), or innate priors when LLM off."""
-        from engine.llm_voice_teacher import teacher_enabled
-
-        if _all_llm_disabled() or not teacher_enabled():
-            self._schedule_innate_lesson(tick, sim)
-            return
-
-        teacher = getattr(sim, "_llm_teacher", None)
-        if teacher is None:
-            self._schedule_innate_lesson(tick, sim)
-            return
-
-        obs = {}
-        try:
-            obs = dict(sim.agent.env.observe())
-        except Exception:
-            pass
-
-        total_falls = getattr(sim._episodic_memory, "total_falls_recorded", 0) if sim._episodic_memory else 0
-        valid_intents = [k for k in sim.agent.graph.nodes if k.startswith("intent_")]
-        valid_vars = list(sim.agent.graph.nodes.keys())
-
-        from engine.ollama_env import get_ollama_generate_url, get_ollama_model
-
-        self._lesson_scheduled = True
-
-        def _on_lesson(ann):
-            self._lesson_result = ann
-
-        # Temporarily override teacher mode to "lesson"
-        async def _lesson_call():
-            old_count = teacher._call_count
-            teacher._call_count = (
-                teacher._lesson_every - 1
-            )  # force lesson mode
-            ann = await teacher.call_async(
-                tick=tick,
-                obs=obs,
-                inner_voice_controller=getattr(sim, "_inner_voice", None),
-                episodic_memory=getattr(sim, "_episodic_memory", None),
-                curriculum=getattr(sim, "_curriculum", None),
-                llm_url=get_ollama_generate_url(),
-                llm_model=get_ollama_model(),
-                valid_intents=valid_intents,
-                valid_graph_vars=valid_vars,
-                total_ticks=tick,
-                total_falls=total_falls,
-            )
-            teacher._call_count = old_count
-            if ann:
-                _on_lesson(ann)
-
-        # Agent tick runs in rkk-agent-loop thread — no asyncio loop there.
-        def _run_lesson_in_thread() -> None:
-            try:
-                asyncio.run(_lesson_call())
-            except Exception as e:
-                print(f"[Sleep] Lesson async error: {e}")
-
-        try:
-            threading.Thread(
-                target=_run_lesson_in_thread,
-                daemon=True,
-                name="rkk-sleep-lesson",
-            ).start()
-        except Exception as e:
-            print(f"[Sleep] Lesson schedule error: {e}")
-
     def _apply_lesson(self, tick: int, sim, ann) -> None:
-        """Apply LLM lesson annotation to InnerVoiceNet + GNN."""
+        """Apply sleep lesson to InnerVoiceNet + GNN."""
         session = self._session
         if session:
             session.lesson_verbal = ann.verbal

@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import torch
@@ -54,8 +55,19 @@ from engine.value_layer  import (
     BlockReason,
     efference_predicted_veto,
 )
-from engine.phase3_teacher import TeacherIGRule
 from engine.environment_humanoid import SELF_VARS
+
+
+@dataclass
+class TeacherIGRule:
+    """Optional IG bonus when when_var condition holds (legacy hook; rules usually empty)."""
+
+    target_var: str
+    when_var: str | None
+    when_min: float | None
+    when_max: float | None
+    bonus: float
+
 from engine.goal_planning import (
     goal_planning_globally_disabled,
     plan_max_branch_effective,

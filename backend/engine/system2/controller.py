@@ -4,11 +4,8 @@ import bisect
 import json
 import logging
 import os
-import random
 import uuid
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +16,6 @@ from engine.system2.distill_log import (
     distill_enabled,
     distill_log_path,
     pe_distill_extra,
-    proposal_distill_extra,
 )
 from engine.system2.recovery_library import (
     get_recovery_library,
@@ -28,11 +24,9 @@ from engine.system2.recovery_library import (
 from engine.system2.recovery_schedule import (
     default_recovery_fallback_steps,
     enrich_recovery_steps,
-    prepare_llm_recovery_steps,
     prepare_scripted_getup_steps,
     recovery_fallback_enabled,
     recovery_scripted_enabled,
-    recovery_scripted_llm_on_entry,
     recovery_scripted_lock_until_exhausted,
     scripted_getup_episode_spec,
     scripted_getup_phase_at,
@@ -53,21 +47,6 @@ from engine.system2.success_predicates import (
     should_attach_curriculum_pe_spec,
 )
 from engine.system2.student import MacroStudent, choose_macro_from_obs
-from engine.system2.teacher import (
-    build_compact_recovery_state,
-    collect_s2_planning_frames,
-    enrich_summary_for_s2_llm,
-    llm_plan_worker,
-    llm_teacher_enabled,
-    proposal_from_llm_cache_only,
-    recovery_llm_enabled,
-    recovery_steps_from_llm_network_fetch,
-    s2_recovery_vision_enabled,
-    s2_unified_slots_enabled,
-    s2_unified_vlm_enabled,
-    vlm_slots_from_sim,
-)
-from engine.system2.validate import validate_proposal
 
 # Must match engine.features.humanoid.constants.SELF_VARS (avoid importing humanoid package here).
 _SELF_SET = frozenset(
@@ -196,60 +175,6 @@ def _s2_concept_count(graph: Any) -> int:
     return sum(1 for k in ids if str(k).startswith("concept_s2_"))
 
 
-_S2_LLM_EXECUTOR: ThreadPoolExecutor | None = None
-_RECOVERY_LLM_EXECUTOR: ThreadPoolExecutor | None = None
-
-
-def _system2_llm_executor() -> ThreadPoolExecutor:
-    global _S2_LLM_EXECUTOR
-    if _S2_LLM_EXECUTOR is None:
-        _S2_LLM_EXECUTOR = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="rkk_s2_llm",
-        )
-    return _S2_LLM_EXECUTOR
-
-
-def _recovery_llm_executor() -> ThreadPoolExecutor:
-    global _RECOVERY_LLM_EXECUTOR
-    if _RECOVERY_LLM_EXECUTOR is None:
-        _RECOVERY_LLM_EXECUTOR = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="rkk_s2_recovery_llm",
-        )
-    return _RECOVERY_LLM_EXECUTOR
-
-
-def _recovery_llm_max_ingest_delay_ticks() -> int:
-    try:
-        return max(8, int(os.environ.get("RKK_S2_RECOVERY_LLM_MAX_INGEST_DELAY_TICKS", "200")))
-    except ValueError:
-        return 200
-
-
-def _recovery_llm_delay_first_dispatch_ticks() -> int:
-    try:
-        return max(0, int(os.environ.get("RKK_S2_RECOVERY_LLM_DELAY_FIRST_DISPATCH", "16")))
-    except ValueError:
-        return 16
-
-
-def _recovery_mid_schedule_replan_enabled() -> bool:
-    return os.environ.get("RKK_S2_RECOVERY_REPLAN_MID_SCHEDULE", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
-def _recovery_stagnation_replan_ticks() -> int:
-    try:
-        return max(20, int(os.environ.get("RKK_S2_RECOVERY_STAGNATION_REPLAN_TICKS", "50")))
-    except ValueError:
-        return 50
-
-
 def _s2_wm_override_schedule_only() -> bool:
     return os.environ.get("RKK_S2_WM_OVERRIDE_SCHEDULE_ONLY", "1").strip().lower() not in (
         "0",
@@ -257,106 +182,6 @@ def _s2_wm_override_schedule_only() -> bool:
         "no",
         "off",
     )
-
-
-def _llm_sync_forced() -> bool:
-    """RKK_SYSTEM2_LLM_SYNC=1 — блокирующий Ollama в тике (отладка)."""
-    return os.environ.get("RKK_SYSTEM2_LLM_SYNC", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
-def _s2_build_llm_plan_job(
-    *,
-    agent: Any,
-    graph: Any,
-    sim: Any | None,
-    obs_f: dict[str, float],
-    base: Any,
-    summary: dict[str, Any],
-    fallen: bool,
-    node_keys: frozenset[str],
-) -> dict[str, Any]:
-    job: dict[str, Any] = {
-        "summary": dict(summary),
-        "vlm_slots": vlm_slots_from_sim(sim),
-    }
-    if not s2_unified_vlm_enabled() or sim is None or not getattr(sim, "_visual_mode", False):
-        return job
-    from engine.slot_lexicon import allowed_target_ids
-
-    job["summary"] = enrich_summary_for_s2_llm(base, obs_f, dict(summary), fallen=fallen)
-    imgs, cap = collect_s2_planning_frames(agent, fallen=fallen)
-    vis = getattr(sim, "_visual_env", None)
-    if not imgs and vis is not None:
-        try:
-            snap = vis.get_slot_visualization()
-        except Exception:
-            snap = {}
-        fb = snap.get("frame") if isinstance(snap, dict) else None
-        if fb:
-            imgs = [str(fb)]
-            cap = "Cached visual-environment camera frame (same tick as slot masks)."
-    if not imgs and not s2_unified_slots_enabled():
-        return job
-
-    job["unified_vlm"] = True
-    job["images"] = imgs
-    job["image_caption"] = cap
-    job["include_slots"] = s2_unified_slots_enabled()
-    if vis is not None and job["include_slots"]:
-        n = int(getattr(vis, "n_slots", 0) or 0)
-        job["slot_ids"] = [f"slot_{k}" for k in range(max(0, n))]
-        job["variable_ids"] = [str(k) for k in sorted(node_keys)]
-        allowed = allowed_target_ids(job["variable_ids"])
-        alist = sorted(allowed)
-        job["allowed_csv"] = ", ".join(alist[:80]) + (" ..." if len(alist) > 80 else "")
-        try:
-            snap = vis.get_slot_visualization()
-            job["masks_b64"] = list((snap or {}).get("masks") or [])
-        except Exception:
-            job["masks_b64"] = []
-    return job
-
-
-def _s2_apply_unified_slot_lexicon(
-    sim: Any | None,
-    *,
-    labels: dict[str, dict[str, Any]] | None,
-    sim_tick: int,
-    frame_b64: str | None,
-) -> None:
-    if not labels or sim is None:
-        return
-    vis = getattr(sim, "_visual_env", None)
-    if vis is None:
-        return
-    try:
-        vis.set_slot_lexicon(labels, sim_tick, frame_b64)
-    except Exception:
-        return
-    sync = getattr(sim, "_phase_m_sync_from_vision", None)
-    if callable(sync):
-        try:
-            sync()
-        except Exception:
-            pass
-
-
-def _s2_recovery_exo_images(agent: Any) -> list[str] | None:
-    if not s2_recovery_vision_enabled():
-        return None
-    fn = getattr(getattr(agent, "env", None), "get_frame_base64", None)
-    if not callable(fn):
-        return None
-    try:
-        b = fn("exo")
-        return [str(b)] if b else None
-    except Exception:
-        return None
 
 
 def _s2_override_enabled() -> bool:
@@ -407,35 +232,6 @@ def _s2_scripted_fallback_enabled() -> bool:
     )
 
 
-def _recovery_llm_calls_max() -> int:
-    """Максимум вызовов recovery LLM за одну сессию fallen_override (включая первый)."""
-    try:
-        return max(1, int(os.environ.get("RKK_S2_RECOVERY_LLM_CALLS_MAX", "14")))
-    except ValueError:
-        return 14
-
-
-def _recovery_replan_min_interval_ticks() -> int:
-    try:
-        return max(4, int(os.environ.get("RKK_S2_RECOVERY_REPLAN_MIN_TICKS", "20")))
-    except ValueError:
-        return 20
-
-
-def _recovery_replan_after_last_step_ticks() -> int:
-    try:
-        return max(0, int(os.environ.get("RKK_S2_RECOVERY_REPLAN_AFTER_LAST_STEP_TICKS", "12")))
-    except ValueError:
-        return 12
-
-
-def _recovery_llm_fail_before_fallback() -> int:
-    try:
-        return max(1, int(os.environ.get("RKK_S2_RECOVERY_LLM_FAIL_BEFORE_FALLBACK", "1")))
-    except ValueError:
-        return 1
-
-
 def _distill_override_sample_every() -> int:
     try:
         return max(0, int(os.environ.get("RKK_S2_DISTILL_OVERRIDE_SAMPLE_EVERY", "240")))
@@ -443,32 +239,9 @@ def _distill_override_sample_every() -> int:
         return 240
 
 
-def _recovery_llm_timeout_ticks() -> int:
-    try:
-        return max(8, int(os.environ.get("RKK_S2_RECOVERY_LLM_TIMEOUT_TICKS", "60")))
-    except ValueError:
-        return 60
-
-
-def _system2_llm_timeout_ticks() -> int:
-    """После стольких тиков ожидания async-плана — сброс future и план от student."""
-    try:
-        return max(16, int(os.environ.get("RKK_SYSTEM2_LLM_TIMEOUT_TICKS", "72")))
-    except ValueError:
-        return 72
-
-
-def _recovery_replan_empty_schedule_ticks() -> int:
-    """Если шаги так и не пришли (или пустой JSON), повторить запрос не раньше этого age сессии."""
-    try:
-        return max(8, int(os.environ.get("RKK_S2_RECOVERY_REPLAN_EMPTY_SCHEDULE_TICKS", "40")))
-    except ValueError:
-        return 40
-
-
 class System2Controller:
     """
-    Медленный контур: раз в N тиков выбирает макрос (LLM или студент),
+    Медленный контур: раз в N тиков выбирает макрос (студент / эвристики),
     выставляет self_goal_* в графе, мягко сдвигает intent через residuals,
     передаёт один приоритетный кандидат в agent.step.
     """
@@ -492,26 +265,16 @@ class System2Controller:
         self._last_neuro_tick = -10**9
         self._online_buf: deque[dict[str, Any]] = deque(maxlen=384)
         self._last_neuro_node: str | None = None
-        self._llm_future: Future[System2Proposal | None] | None = None
-        self._llm_submit_tick: int = -1
-        self._llm_slot_lexicon_frame: str | None = None
         self._s2_override_active: bool = False
         self._s2_override_start_tick: int = -1
         self._s2_fallen_streak_override: int = 0
         self._recovery_steps: list[dict[str, Any]] = []
         self._recovery_cumulative: list[int] = []
-        self._recovery_llm_future: Future[Any] | None = None
         self._override_start_obs_f: dict[str, float] = {}
         self._recovery_schedule_anchor_tick: int = -1
-        self._recovery_llm_dispatch_tick: int = -1
-        self._recovery_llm_dispatch_count: int = 0
-        self._recovery_steps_from_llm: bool = False
         self._recovery_schedule_source: str = "none"
-        self._recovery_llm_fail_count: int = 0
         self._recovery_fallback_applied: bool = False
-        self._last_recovery_llm_error: str = ""
         self._recovery_steps_remediated: bool = False
-        self._recovery_llm_latency_ticks: int = -1
         self._recovery_best_com_z: float = 0.0
         self._recovery_ticks_since_com_z_gain: int = 0
         self._learned_recovery_active: bool = False
@@ -540,13 +303,8 @@ class System2Controller:
         )
 
     def ollama_busy(self) -> bool:
-        """True, если к Ollama уходит или ждётся ответ (план S2 или recovery)."""
-        plan = self._llm_future is not None and not self._llm_future.done()
-        rec = (
-            self._recovery_llm_future is not None
-            and not self._recovery_llm_future.done()
-        )
-        return plan or rec
+        """Legacy hook for Ollama yield; macro/recovery LLM paths removed."""
+        return False
 
     def _recovery_schedule_wm_candidate(
         self, sim_tick: int
@@ -657,13 +415,7 @@ class System2Controller:
         return out
 
     def _macro_outcome_deferred(self, sim_tick: int) -> bool:
-        """Номинальный горизонт вышел, но исход макроса не считаем — ждём async LLM."""
-        if not self._macro_start_obs or self._macro_until_tick < 0:
-            return False
-        if sim_tick < self._macro_until_tick:
-            return False
-        fut = self._llm_future
-        return fut is not None and not fut.done()
+        return False
 
     def _macro_horizon_expired(self, sim_tick: int) -> bool:
         ut = self._macro_until_tick
@@ -673,7 +425,7 @@ class System2Controller:
             return False
         return not self._macro_start_obs
 
-    def _merge_llm_goal_into_graph(self, graph: Any, proposal: System2Proposal) -> None:
+    def _merge_proposal_goal_into_graph(self, graph: Any, proposal: System2Proposal) -> None:
         g = proposal.goal
         nodes = getattr(graph, "nodes", None)
         if not isinstance(nodes, dict):
@@ -828,17 +580,11 @@ class System2Controller:
         self._s2_override_start_tick = -1
         self._recovery_steps = []
         self._recovery_cumulative = []
-        self._recovery_llm_future = None
         self._override_start_obs_f = {}
         self._recovery_episode_spec = EpisodeSuccessSpec()
         self._recovery_schedule_anchor_tick = -1
-        self._recovery_llm_dispatch_tick = -1
-        self._recovery_llm_dispatch_count = 0
-        self._recovery_steps_from_llm = False
         self._recovery_schedule_source = "none"
-        self._recovery_llm_fail_count = 0
         self._recovery_fallback_applied = False
-        self._last_recovery_llm_error = ""
         self._recovery_steps_remediated = False
         self._recovery_best_com_z = 0.0
         self._recovery_ticks_since_com_z_gain = 0
@@ -873,7 +619,7 @@ class System2Controller:
             return "cpg"
         if self._in_learned_recovery_phase(sim_tick):
             return "s1_learned"
-        if self._recovery_schedule_source in ("scripted", "fallback", "library", "llm"):
+        if self._recovery_schedule_source in ("scripted", "fallback", "library"):
             return "s2_scripted"
         return "cpg"
 
@@ -907,26 +653,6 @@ class System2Controller:
             self._recovery_ticks_since_com_z_gain = 0
         else:
             self._recovery_ticks_since_com_z_gain += 1
-
-    def _recovery_mid_schedule_replan_wanted(
-        self, sim_tick: int, obs_f: dict[str, float]
-    ) -> bool:
-        if not _recovery_mid_schedule_replan_enabled():
-            return False
-        if not self._recovery_steps or self._recovery_schedule_exhausted(sim_tick):
-            return False
-        age = int(sim_tick) - int(self._s2_override_start_tick)
-        if age < _recovery_stagnation_replan_ticks():
-            return False
-        if self._recovery_ticks_since_com_z_gain >= _recovery_stagnation_replan_ticks():
-            return True
-        cz0 = self._obs_com_z(self._override_start_obs_f)
-        cz1 = self._obs_com_z(obs_f)
-        try:
-            drop = float(os.environ.get("RKK_S2_RECOVERY_REPLAN_COM_Z_DROP", "0.05"))
-        except ValueError:
-            drop = 0.05
-        return cz1 < cz0 - drop and cz1 < 0.30
 
     def _capture_override_obs0_from_base(self, base: Any, obs_f: dict[str, float]) -> None:
         """Use live physics snapshot so obs0 is prone, not stale standing graph nodes."""
@@ -998,7 +724,7 @@ class System2Controller:
         steps = enrich_recovery_steps(default_recovery_fallback_steps())
         if not steps:
             return False
-        self._ingest_recovery_steps(steps, sim_tick=sim_tick, from_llm=False)
+        self._ingest_recovery_steps(steps, sim_tick=sim_tick)
         self._recovery_fallback_applied = True
         self._recovery_schedule_source = "fallback"
         self._recovery_episode_spec = EpisodeSuccessSpec(skill_id="recovery_fallback")
@@ -1010,7 +736,7 @@ class System2Controller:
         steps = prepare_scripted_getup_steps()
         if not steps:
             return False
-        self._ingest_recovery_steps(steps, sim_tick=sim_tick, from_llm=False)
+        self._ingest_recovery_steps(steps, sim_tick=sim_tick)
         self._recovery_schedule_source = "scripted"
         spec = scripted_getup_episode_spec()
         self._recovery_episode_spec = EpisodeSuccessSpec(
@@ -1020,112 +746,13 @@ class System2Controller:
         )
         return True
 
-    def _ingest_recovery_pack(
-        self,
-        pack: Any,
-        *,
-        sim_tick: int,
-    ) -> bool:
-        """Apply (steps, expected_state, max_pe) tuple from LLM worker."""
-        steps_try: list[dict[str, Any]] | None = None
-        es_rec: dict[str, float] = {}
-        mx_f: float | None = None
-        if isinstance(pack, tuple) and len(pack) >= 1:
-            st_l = pack[0]
-            steps_try = st_l if isinstance(st_l, list) else None
-            if len(pack) >= 2 and isinstance(pack[1], dict):
-                es_rec = dict(pack[1])
-            if len(pack) >= 3 and pack[2] is not None:
-                try:
-                    mx_f = float(max(0.02, min(6.0, float(pack[2]))))
-                except (TypeError, ValueError):
-                    mx_f = None
-        elif isinstance(pack, list) and pack:
-            steps_try = pack
-        if not steps_try:
-            return False
-        if self._scripted_schedule_locked(sim_tick):
-            self._last_recovery_llm_error = "scripted_locked"
-            return False
-        steps_ready, remediated = prepare_llm_recovery_steps(steps_try)
-        if not steps_ready:
-            return False
-        self._recovery_steps_remediated = remediated
-        self._ingest_recovery_steps(steps_ready, sim_tick=sim_tick, from_llm=True)
-        self._recovery_schedule_source = "llm"
-        self._recovery_llm_fail_count = 0
-        self._recovery_episode_spec = EpisodeSuccessSpec(
-            expected_state=dict(es_rec or {}),
-            max_prediction_error=mx_f,
-            skill_id="recovery_llm",
-        )
-        return True
-
-    def _maybe_timeout_recovery_llm(self, sim_tick: int) -> None:
-        fut = self._recovery_llm_future
-        if fut is None or fut.done():
-            return
-        dt = int(self._recovery_llm_dispatch_tick)
-        if dt < 0:
-            return
-        if int(sim_tick) - dt < _recovery_llm_timeout_ticks():
-            return
-        # If it is already running, we DO NOT cancel or nullify the future,
-        # to ensure that we give it time to complete and do not spawn a new one.
-        # However, we trigger the fallback recovery steps if nothing else is running yet.
-        if recovery_fallback_enabled() and not self._recovery_steps and not self._recovery_fallback_applied:
-            self._apply_fallback_recovery_schedule(sim_tick)
-            self._last_recovery_llm_error = "timeout_fallback"
-
-    def _drain_recovery_llm_future(self, sim_tick: int) -> None:
-        if self._recovery_llm_future is None or not self._recovery_llm_future.done():
-            return
-        pack: Any = None
-        err = ""
-        try:
-            pack = self._recovery_llm_future.result(timeout=0)
-        except Exception as ex:
-            err = f"exception:{type(ex).__name__}"
-            pack = None
-        self._recovery_llm_future = None
-
-        # Check if the plan arrived too late (since the physical context has changed completely)
-        dt = int(self._recovery_llm_dispatch_tick)
-        if dt >= 0 and (int(sim_tick) - dt) > _recovery_llm_max_ingest_delay_ticks():
-            self._recovery_llm_fail_count = int(self._recovery_llm_fail_count) + 1
-            self._last_recovery_llm_error = "too_late"
-            if recovery_fallback_enabled() and not self._recovery_steps and not self._recovery_fallback_applied:
-                self._apply_fallback_recovery_schedule(sim_tick)
-            return
-
-        if self._ingest_recovery_pack(pack, sim_tick=sim_tick):
-            self._last_recovery_llm_error = ""
-            if dt >= 0:
-                self._recovery_llm_latency_ticks = int(sim_tick) - dt
-            return
-        self._recovery_llm_fail_count = int(self._recovery_llm_fail_count) + 1
-        if pack is None:
-            self._last_recovery_llm_error = err or "null_response"
-        else:
-            self._last_recovery_llm_error = "invalid_steps"
-        need = _recovery_llm_fail_before_fallback()
-        if (
-            recovery_fallback_enabled()
-            and not self._recovery_fallback_applied
-            and self._recovery_llm_fail_count >= need
-        ):
-            self._apply_fallback_recovery_schedule(sim_tick)
-
     def _ingest_recovery_steps(
         self,
         steps: list[dict[str, Any]] | None,
         *,
         sim_tick: int,
-        from_llm: bool = False,
     ) -> None:
         self._recovery_steps = list(steps or [])
-        if from_llm and self._recovery_steps:
-            self._recovery_steps_from_llm = True
         acc = 0
         cums: list[int] = []
         for s in self._recovery_steps:
@@ -1159,97 +786,6 @@ class System2Controller:
         if not isinstance(d, dict):
             return {}
         return {k: float(v) / ticks * rscale for k, v in d.items()}
-
-    def _dispatch_recovery_llm_once(
-        self,
-        sim_tick: int,
-        agent: Any,
-        base: Any,
-        obs_f: dict[str, float],
-        sim: Any | None,
-    ) -> None:
-        if not recovery_llm_enabled():
-            return
-        compact = build_compact_recovery_state(base, obs_f)
-        exo_imgs = _s2_recovery_exo_images(agent)
-        vlm = vlm_slots_from_sim(sim)
-        if _llm_sync_forced():
-            sr = recovery_steps_from_llm_network_fetch(
-                compact,
-                vlm,
-                images_b64=exo_imgs,
-            )
-            if not self._ingest_recovery_pack(sr, sim_tick=sim_tick):
-                self._recovery_llm_fail_count = int(self._recovery_llm_fail_count) + 1
-                self._last_recovery_llm_error = "sync_invalid_or_null"
-                if (
-                    recovery_fallback_enabled()
-                    and not self._recovery_fallback_applied
-                    and self._recovery_llm_fail_count >= _recovery_llm_fail_before_fallback()
-                ):
-                    self._apply_fallback_recovery_schedule(sim_tick)
-        else:
-            self._recovery_llm_future = _recovery_llm_executor().submit(
-                partial(
-                    recovery_steps_from_llm_network_fetch,
-                    images_b64=exo_imgs,
-                ),
-                compact,
-                vlm,
-            )
-        self._recovery_llm_dispatch_tick = int(sim_tick)
-        self._recovery_llm_dispatch_count = int(self._recovery_llm_dispatch_count) + 1
-
-    def _maybe_dispatch_recovery_llm_replan(
-        self,
-        sim_tick: int,
-        agent: Any,
-        base: Any,
-        obs_f: dict[str, float],
-        sim: Any | None,
-    ) -> None:
-        if not recovery_llm_enabled():
-            return
-        if self._recovery_llm_future is not None:
-            return
-        if self._scripted_schedule_locked(sim_tick):
-            return
-        mid_replan = self._recovery_mid_schedule_replan_wanted(sim_tick, obs_f)
-        if (
-            self._recovery_steps
-            and not self._recovery_schedule_exhausted(sim_tick)
-            and not mid_replan
-        ):
-            return
-        if (
-            self._recovery_fallback_applied
-            and not self._recovery_schedule_exhausted(sim_tick)
-            and not mid_replan
-        ):
-            return
-        if self._recovery_llm_dispatch_count >= _recovery_llm_calls_max():
-            return
-        if (
-            self._recovery_fallback_applied
-            and self._recovery_llm_fail_count >= _recovery_llm_fail_before_fallback()
-        ):
-            return
-        dt = int(self._recovery_llm_dispatch_tick)
-        if dt >= 0 and (int(sim_tick) - dt) < _recovery_replan_min_interval_ticks():
-            return
-        rel_session = int(sim_tick) - int(self._s2_override_start_tick)
-        anc = int(self._recovery_schedule_anchor_tick)
-        if anc < 0:
-            anc = int(self._s2_override_start_tick)
-        rel_sched = max(0, int(sim_tick) - anc)
-        if self._recovery_cumulative:
-            last = int(self._recovery_cumulative[-1])
-            need = rel_sched >= last + _recovery_replan_after_last_step_ticks()
-        else:
-            need = rel_session >= _recovery_replan_empty_schedule_ticks()
-        if not need:
-            return
-        self._dispatch_recovery_llm_once(sim_tick, agent, base, obs_f, sim)
 
     def _override_episode_eval(
         self, obs_f: dict[str, float], *, fallen: bool
@@ -1324,24 +860,16 @@ class System2Controller:
         )
         if self._recovery_steps:
             ex["recovery_steps"] = compress_recovery_steps(self._recovery_steps)
-        ex["recovery_llm"] = bool(
-            self._recovery_steps_from_llm and self._recovery_steps
-        )
         ex["recovery_schedule_source"] = str(self._recovery_schedule_source)
         if self._learned_recovery_active and self._recovery_schedule_source == "learned":
             ex["distill_source"] = "learned_recovery"
-        ex["recovery_llm_fail_count"] = int(self._recovery_llm_fail_count)
         if self._recovery_steps_remediated:
             ex["recovery_steps_remediated"] = True
         if pe_diag and pe_diag.get("recover_tier") is not None:
             ex["recover_tier"] = int(pe_diag["recover_tier"])
         if pe_diag and pe_diag.get("override_exit_block"):
             ex["override_exit_block"] = str(pe_diag["override_exit_block"])
-        if int(self._recovery_llm_latency_ticks) >= 0:
-            ex["recovery_llm_latency_ticks"] = int(self._recovery_llm_latency_ticks)
         ex["distill_event"] = f"override_end:{source_note}"
-        if self._last_recovery_llm_error:
-            ex["recovery_llm_error"] = str(self._last_recovery_llm_error)
         stud_conf: float | None = None
         if self._learned.enabled():
             _, stud_conf = self._learned.predict(dict(self._override_start_obs_f))
@@ -1456,115 +984,6 @@ class System2Controller:
             except Exception:
                 pass
 
-    def _maybe_timeout_system2_llm(
-        self,
-        sim_tick: int,
-        agent: Any,
-        obs_f: dict[str, float],
-        base: Any,
-        graph: Any,
-        node_keys: frozenset[str],
-        sim: Any | None,
-    ) -> dict[str, Any] | None:
-        """Если Ollama/VLM зависли — не блокировать макрос бесконечно: student-only replan."""
-        fut = self._llm_future
-        if fut is None or fut.done():
-            return None
-        if self._llm_submit_tick < 0:
-            return None
-        waited = int(sim_tick) - int(self._llm_submit_tick)
-        if waited < _system2_llm_timeout_ticks():
-            return None
-        try:
-            fut.cancel()
-        except Exception:
-            pass
-        self._llm_future = None
-        self._llm_slot_lexicon_frame = None
-        logging.getLogger(__name__).warning(
-            "System2 LLM timeout after %s ticks (submit=%s); student fallback",
-            waited,
-            self._llm_submit_tick,
-        )
-        diag = self._apply_planning_step(
-            sim_tick,
-            agent,
-            obs_f,
-            base,
-            graph,
-            node_keys,
-            sim,
-            None,
-            plan_tick_bump=True,
-        )
-        diag = dict(diag)
-        diag["llm_timeout"] = True
-        diag["llm_wait_ticks"] = waited
-        diag["llm_inflight"] = False
-        diag["llm_submit_tick"] = None
-        diag["source"] = str(diag.get("source", "student")) + "+llm_timeout"
-        if sim is not None and hasattr(sim, "_add_event"):
-            try:
-                sim._add_event(
-                    f"⏱ S2 LLM timeout ({waited} ticks) → student plan",
-                    "#ff8844",
-                    "system2",
-                )
-            except Exception:
-                pass
-        self._last_diag = diag
-        return diag
-
-    def _drain_completed_llm_future(
-        self,
-        sim_tick: int,
-        agent: Any,
-        obs_f: dict[str, float],
-        base: Any,
-        graph: Any,
-        node_keys: frozenset[str],
-        sim: Any | None,
-    ) -> dict[str, Any] | None:
-        if self._llm_future is not None and self._llm_future.done():
-            drained_llm: System2Proposal | None
-            slot_labels: dict[str, dict[str, Any]] | None = None
-            try:
-                pack = self._llm_future.result(timeout=0)
-            except Exception as ex:
-                pack = None
-                drained_llm = None
-                logging.getLogger(__name__).warning(
-                    "System2 LLM future failed: %s", ex, exc_info=True
-                )
-            else:
-                if isinstance(pack, tuple) and len(pack) >= 1:
-                    drained_llm = pack[0]  # type: ignore[assignment]
-                    slot_labels = pack[1] if len(pack) >= 2 else None
-                else:
-                    drained_llm = pack  # type: ignore[assignment]
-            self._llm_future = None
-            fb = self._llm_slot_lexicon_frame
-            self._llm_slot_lexicon_frame = None
-            _s2_apply_unified_slot_lexicon(
-                sim, labels=slot_labels, sim_tick=sim_tick, frame_b64=fb
-            )
-            if drained_llm is not None:
-                drained_llm = validate_proposal(
-                    drained_llm, allowed_intent_keys=node_keys
-                )
-            return self._apply_planning_step(
-                sim_tick,
-                agent,
-                obs_f,
-                base,
-                graph,
-                node_keys,
-                sim,
-                drained_llm,
-                plan_tick_bump=False,
-            )
-        return None
-
     def _build_override_diag(
         self,
         sim_tick: int,
@@ -1577,10 +996,6 @@ class System2Controller:
         applied: bool | None = None,
         pe_diag: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        inflight = (
-            self._recovery_llm_future is not None
-            and not self._recovery_llm_future.done()
-        )
         base_diag: dict[str, Any] = {
             "enabled": True,
             "fallen_override_active": True,
@@ -1591,9 +1006,7 @@ class System2Controller:
             "s2_fallen_streak": int(self._s2_fallen_streak_override),
             "override_recovered": bool(recovered),
             "override_max_reset": bool(max_reset),
-            "recovery_llm_inflight": bool(inflight),
             "recovery_steps_loaded": len(self._recovery_steps),
-            "recovery_llm_dispatches": int(self._recovery_llm_dispatch_count),
             "macro": "RECOVER_POSTURE",
             "source": f"fallen_override:{self._recovery_schedule_source}" if self._recovery_schedule_source and self._recovery_schedule_source != "none" else "fallen_override",
             "sim_tick": sim_tick,
@@ -1611,8 +1024,6 @@ class System2Controller:
             and os.environ.get("RKK_S2_CPG_DURING_OVERRIDE", "1").strip().lower()
             not in ("0", "false", "no", "off")
         )
-        if self._last_recovery_llm_error:
-            base_diag["recovery_llm_error"] = str(self._last_recovery_llm_error)
         if pe_diag:
             if pe_diag.get("recover_tier") is not None:
                 base_diag["recover_tier"] = int(pe_diag["recover_tier"])
@@ -1641,14 +1052,7 @@ class System2Controller:
             "override_age_ticks": age,
             "recovery_schedule_source": str(self._recovery_schedule_source),
             "recovery_steps_loaded": len(self._recovery_steps),
-            "recovery_llm_inflight": bool(
-                self._recovery_llm_future is not None
-                and not self._recovery_llm_future.done()
-            ),
-            "recovery_llm_dispatches": int(self._recovery_llm_dispatch_count),
         }
-        if self._last_recovery_llm_error:
-            ex["recovery_llm_error"] = str(self._last_recovery_llm_error)
         if self._recovery_steps_remediated:
             ex["recovery_steps_remediated"] = True
         if self._recovery_steps:
@@ -1714,9 +1118,6 @@ class System2Controller:
         else:
             self._s2_fallen_streak_override = 0
 
-        self._maybe_timeout_recovery_llm(sim_tick)
-        self._drain_recovery_llm_future(sim_tick)
-
         if not self._s2_override_active:
             if self._s2_fallen_streak_override < _s2_override_fallen_ticks_need():
                 return None
@@ -1726,11 +1127,8 @@ class System2Controller:
             self._maybe_refresh_override_obs0(obs_f, fallen=True)
             self._recovery_steps = []
             self._recovery_cumulative = []
-            self._recovery_llm_future = None
             self._recovery_episode_spec = EpisodeSuccessSpec()
             self._recovery_schedule_anchor_tick = -1
-            self._recovery_llm_dispatch_tick = -1
-            self._recovery_llm_dispatch_count = 0
             self._recovery_best_com_z = self._obs_com_z(obs_f)
             self._recovery_ticks_since_com_z_gain = 0
             self._learned_recovery_active = _s2_learned_recovery_enabled()
@@ -1747,7 +1145,6 @@ class System2Controller:
                     self._ingest_recovery_steps(
                         enrich_recovery_steps(steps),
                         sim_tick=sim_tick,
-                        from_llm=False,
                     )
                     self._recovery_schedule_source = "library"
                     self._recovery_episode_spec = EpisodeSuccessSpec(
@@ -1763,23 +1160,6 @@ class System2Controller:
             ):
                 self._apply_fallback_recovery_schedule(sim_tick)
                 loaded_schedule = bool(self._recovery_steps)
-            llm_on_entry = (
-                False
-                if self._learned_recovery_active
-                else (
-                    recovery_scripted_llm_on_entry()
-                    if self._recovery_schedule_source == "scripted"
-                    else True
-                )
-            )
-            if (
-                llm_on_entry
-                and recovery_llm_enabled()
-                and self._recovery_llm_future is None
-                and self._recovery_llm_dispatch_count == 0
-                and _recovery_llm_delay_first_dispatch_ticks() == 0
-            ):
-                self._dispatch_recovery_llm_once(sim_tick, agent, base, obs_f, sim)
         else:
             self._maybe_refresh_override_obs0(obs_f, fallen=fallen)
             self._recovery_track_com_z_progress(obs_f)
@@ -1827,17 +1207,6 @@ class System2Controller:
                 return diag
 
         if self._s2_override_active:
-            age_active = int(sim_tick) - int(self._s2_override_start_tick)
-            if (
-                recovery_llm_enabled()
-                and self._recovery_llm_dispatch_count == 0
-                and self._recovery_llm_future is None
-                and age_active >= _recovery_llm_delay_first_dispatch_ticks()
-            ):
-                self._dispatch_recovery_llm_once(sim_tick, agent, base, obs_f, sim)
-            self._maybe_dispatch_recovery_llm_replan(
-                sim_tick, agent, base, obs_f, sim
-            )
             self._maybe_distill_override_sample(sim_tick, obs_f, fallen=fallen)
 
         self._maybe_transition_learned_to_scripted(sim_tick)
@@ -1876,14 +1245,9 @@ class System2Controller:
         graph: Any,
         node_keys: frozenset[str],
         sim: Any | None,
-        proposal_llm: System2Proposal | None,
-        *,
-        plan_tick_bump: bool = True,
     ) -> dict[str, Any]:
-        """Один цикл планирования. `plan_tick_bump=False` — ответ async-LLM: не сдвигать
-        `_last_plan_tick` (счётчик PLAN_EVERY от момента submit, как при старте старого блокирующего запроса)."""
-        if plan_tick_bump:
-            self._last_plan_tick = sim_tick
+        """Один цикл планирования (student / learned student only)."""
+        self._last_plan_tick = sim_tick
         if (
             self._learned.enabled()
             and not self._bootstrap_attempted
@@ -1893,47 +1257,16 @@ class System2Controller:
             self._learned.bootstrap_from_log(distill_log_path())
         self._bootstrap_attempted = True
 
-        p_llm = proposal_llm
-        if p_llm is not None:
-            p_llm = validate_proposal(p_llm, allowed_intent_keys=node_keys)
-
-        macro_heur = choose_macro_from_obs(obs_f)
         stud_conf = 0.0
         if self._learned.enabled():
             macro, stud_conf = self._learned.predict(obs_f)
             source = "student_learned"
         else:
-            macro = macro_heur
+            macro = choose_macro_from_obs(obs_f)
             source = "student"
 
         self._episode_plan_distill_extra = {}
         proposal_effective: System2Proposal | None = None
-        if p_llm is not None:
-            llm_m = p_llm.normalized_macro()
-            try:
-                lam = float(os.environ.get("RKK_SYSTEM2_LLM_BLEND", "0.65"))
-            except ValueError:
-                lam = 0.65
-            lam = max(0.0, min(1.0, lam))
-            use_llm = False
-            if llm_m != "IDLE":
-                if self._learned.enabled():
-                    p_use = lam + (1.0 - lam) * (1.0 - float(stud_conf))
-                    p_use = max(0.0, min(1.0, p_use))
-                    use_llm = random.random() < p_use
-                else:
-                    use_llm = random.random() < lam
-            if use_llm:
-                macro = llm_m
-                source = "llm"
-                proposal_effective = p_llm
-
-        if proposal_effective is not None:
-            self._episode_plan_distill_extra = proposal_distill_extra(
-                proposal_effective,
-                source=source,
-                llm_macro=p_llm.normalized_macro() if p_llm is not None else None,
-            )
 
         bundle = macro_bundle(macro)
         graph_patch: dict[str, float] = dict(bundle.get("graph") or {})
@@ -1951,7 +1284,7 @@ class System2Controller:
                 nodes[k] = float(max(0.05, min(0.95, float(v))))
 
         if proposal_effective:
-            self._merge_llm_goal_into_graph(agent.graph, proposal_effective)
+            self._merge_proposal_goal_into_graph(agent.graph, proposal_effective)
 
         self._sync_self_graph_to_env(base, agent.graph)
 
@@ -2013,12 +1346,8 @@ class System2Controller:
         )
         self._macro_start_obs = dict(obs_f)
 
-        inflight = self._llm_future is not None and not self._llm_future.done()
         hz_exp = self._macro_horizon_expired(sim_tick)
         defer = self._macro_outcome_deferred(sim_tick)
-        wt = None
-        if inflight and self._llm_submit_tick >= 0:
-            wt = int(sim_tick - self._llm_submit_tick)
         self._last_diag = {
             "enabled": True,
             "macro": macro,
@@ -2027,7 +1356,6 @@ class System2Controller:
             "sim_tick": sim_tick,
             "macro_horizon_expired": hz_exp,
             "macro_outcome_deferred": defer,
-            "llm_wait_ticks": wt,
             "has_candidate": candidate is not None,
             "last_candidate_var": last_var,
             "blocked": False,
@@ -2037,8 +1365,6 @@ class System2Controller:
             "neuro_streak": dict(self._neuro_streak),
             "online_buf": len(self._online_buf),
             "last_neuro_node": self._last_neuro_node,
-            "llm_inflight": bool(inflight),
-            "llm_submit_tick": self._llm_submit_tick if inflight else None,
             "recovery_steps_loaded": 0,
         }
         self._last_diag.update(self._distill_health_diag())
@@ -2116,30 +1442,12 @@ class System2Controller:
             self._last_diag = ov
             return self._last_diag
 
-        drained_early = self._drain_completed_llm_future(
-            sim_tick, agent, obs_f, base, graph, node_keys, sim
-        )
-        if drained_early is not None:
-            self._last_diag = drained_early
-            return self._last_diag
-
-        timed_out = self._maybe_timeout_system2_llm(
-            sim_tick, agent, obs_f, base, graph, node_keys, sim
-        )
-        if timed_out is not None:
-            return timed_out
-
         ending_macro = self._active_macro
         ending_source = self._last_source
-        # Завершение макроса: оценка прогресса для студента + лог дистилляции
-        # Пока LLM в полёте — не закрывать эпизод по календарю: окно отсчитывается до применения ответа.
         if (
             not self._s2_override_active
             and sim_tick >= self._macro_until_tick
             and self._macro_start_obs
-            and not (
-                self._llm_future is not None and not self._llm_future.done()
-            )
         ):
             cz0 = float(
                 self._macro_start_obs.get(
@@ -2235,12 +1543,8 @@ class System2Controller:
             should_plan = True
 
         if not should_plan:
-            inflight = self._llm_future is not None and not self._llm_future.done()
             hz_exp = self._macro_horizon_expired(sim_tick)
             defer = self._macro_outcome_deferred(sim_tick)
-            wt = None
-            if inflight and self._llm_submit_tick >= 0:
-                wt = int(sim_tick - self._llm_submit_tick)
             self._last_diag = {
                 "enabled": True,
                 "macro": self._active_macro,
@@ -2248,135 +1552,15 @@ class System2Controller:
                 "sim_tick": sim_tick,
                 "macro_horizon_expired": hz_exp,
                 "macro_outcome_deferred": defer,
-                "llm_wait_ticks": wt,
                 "idle": True,
                 "outcome_ema": round(self._outcome_ema, 4),
                 "student_conf": self._last_diag.get("student_conf"),
                 "last_source": self._last_source,
                 "last_neuro_node": self._last_neuro_node,
-                "llm_inflight": bool(inflight),
-                "llm_submit_tick": self._llm_submit_tick if inflight else None,
                 "recovery_steps_loaded": len(self._recovery_steps),
             }
             self._last_diag.update(self._distill_health_diag())
             return self._last_diag
-
-        summary = {
-            "tick": sim_tick,
-            "com_z": obs_f.get("com_z", obs_f.get("phys_com_z")),
-            "posture_stability": obs_f.get(
-                "posture_stability", obs_f.get("phys_posture_stability")
-            ),
-            "target_dist": obs_f.get("target_dist", obs_f.get("phys_target_dist")),
-            "foot_l": obs_f.get("foot_contact_l", obs_f.get("phys_foot_contact_l")),
-            "foot_r": obs_f.get("foot_contact_r", obs_f.get("phys_foot_contact_r")),
-        }
-
-        llm_on = llm_teacher_enabled()
-        if llm_on and not _llm_sync_forced():
-            cached = proposal_from_llm_cache_only(summary)
-            if cached is not None:
-                prop = validate_proposal(
-                    cached, allowed_intent_keys=node_keys
-                )
-                return self._apply_planning_step(
-                    sim_tick,
-                    agent,
-                    obs_f,
-                    base,
-                    graph,
-                    node_keys,
-                    sim,
-                    prop,
-                )
-            if self._llm_future is not None and not self._llm_future.done():
-                hz_exp = self._macro_horizon_expired(sim_tick)
-                defer = self._macro_outcome_deferred(sim_tick)
-                wt = (
-                    int(sim_tick - self._llm_submit_tick)
-                    if self._llm_submit_tick >= 0
-                    else None
-                )
-                self._last_diag = {
-                    "enabled": True,
-                    "macro": self._active_macro,
-                    "until": self._macro_until_tick,
-                    "sim_tick": sim_tick,
-                    "macro_horizon_expired": hz_exp,
-                    "macro_outcome_deferred": defer,
-                    "llm_wait_ticks": wt,
-                    "idle": True,
-                    "outcome_ema": round(self._outcome_ema, 4),
-                    "student_conf": self._last_diag.get("student_conf"),
-                    "last_source": self._last_source,
-                    "last_neuro_node": self._last_neuro_node,
-                    "llm_inflight": True,
-                    "llm_submit_tick": self._llm_submit_tick,
-                    "llm_submitted": False,
-                }
-                return self._last_diag
-            job = _s2_build_llm_plan_job(
-                agent=agent,
-                graph=graph,
-                sim=sim,
-                obs_f=obs_f,
-                base=base,
-                summary=dict(summary),
-                fallen=fallen,
-                node_keys=node_keys,
-            )
-            self._llm_slot_lexicon_frame = (
-                (job.get("images") or [None])[0] if job.get("unified_vlm") else None
-            )
-            self._llm_future = _system2_llm_executor().submit(llm_plan_worker, job)
-            self._llm_submit_tick = sim_tick
-            self._last_plan_tick = sim_tick
-            hz_exp = self._macro_horizon_expired(sim_tick)
-            defer = self._macro_outcome_deferred(sim_tick)
-            self._last_diag = {
-                "enabled": True,
-                "macro": self._active_macro,
-                "until": self._macro_until_tick,
-                "sim_tick": sim_tick,
-                "macro_horizon_expired": hz_exp,
-                "macro_outcome_deferred": defer,
-                "llm_wait_ticks": 0,
-                "idle": True,
-                "outcome_ema": round(self._outcome_ema, 4),
-                "student_conf": self._last_diag.get("student_conf"),
-                "last_source": self._last_source,
-                "last_neuro_node": self._last_neuro_node,
-                "llm_inflight": True,
-                "llm_submit_tick": self._llm_submit_tick,
-                "llm_submitted": True,
-            }
-            return self._last_diag
-
-        proposal_llm: System2Proposal | None = None
-        if llm_on and _llm_sync_forced():
-            job = _s2_build_llm_plan_job(
-                agent=agent,
-                graph=graph,
-                sim=sim,
-                obs_f=obs_f,
-                base=base,
-                summary=dict(summary),
-                fallen=fallen,
-                node_keys=node_keys,
-            )
-            self._llm_slot_lexicon_frame = (
-                (job.get("images") or [None])[0] if job.get("unified_vlm") else None
-            )
-            prop_try, slot_try = llm_plan_worker(job)
-            self._llm_slot_lexicon_frame = None
-            _s2_apply_unified_slot_lexicon(
-                sim, labels=slot_try, sim_tick=sim_tick, frame_b64=(job.get("images") or [None])[0]
-            )
-            proposal_llm = prop_try
-            if proposal_llm is not None:
-                proposal_llm = validate_proposal(
-                    proposal_llm, allowed_intent_keys=node_keys
-                )
 
         return self._apply_planning_step(
             sim_tick,
@@ -2386,5 +1570,4 @@ class System2Controller:
             graph,
             node_keys,
             sim,
-            proposal_llm,
         )

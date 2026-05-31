@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from engine.system2.recovery_schedule import (
-    prepare_llm_recovery_steps,
+    prepare_recovery_steps,
     sanitize_recovery_intent_deltas,
 )
 from engine.system2.success_predicates import override_recovered_tier1_ok
@@ -17,7 +17,7 @@ def test_sanitize_caps_stop_recover_delta():
 
 
 def test_prepare_llm_sanitizes_steps():
-    steps, _ = prepare_llm_recovery_steps(
+    steps, _ = prepare_recovery_steps(
         [
             {"ticks": 30, "intent_deltas": {"intent_stop_recover": 0.65}},
             {"ticks": 25, "intent_deltas": {"intent_torso_forward": 0.2}},

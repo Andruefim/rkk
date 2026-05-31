@@ -85,16 +85,13 @@ def proposal_distill_extra(
     proposal: System2Proposal | None,
     *,
     source: str,
-    llm_macro: str | None = None,
 ) -> dict[str, Any]:
-    """Fields to attach to macro-end distill when LLM/VLM shaped the episode."""
+    """Fields to attach to macro-end distill when a proposal shaped the episode."""
     if proposal is None:
         return {}
     out: dict[str, Any] = {}
-    if source == "llm" or (proposal.intent_deltas or proposal.expected_state):
+    if source or proposal.intent_deltas or proposal.expected_state:
         out["plan_source"] = source
-    if llm_macro:
-        out["llm_macro"] = str(llm_macro)
     if proposal.intent_deltas:
         out["intent_deltas"] = {
             str(k): round(float(v), 4)
@@ -269,7 +266,6 @@ def analyze_distill_file(
         if rss:
             schedule_sources[str(rss)] = schedule_sources.get(str(rss), 0) + 1
 
-    llm_rows = [r for r in rows if str(r.get("source", "")) == "llm"]
     student_rows = [
         r for r in rows if "student" in str(r.get("source", ""))
     ]
@@ -311,7 +307,6 @@ def analyze_distill_file(
             "ending_counts": ending_counts,
             "schedule_sources": schedule_sources,
         },
-        "llm_share": (len(llm_rows) / len(rows)) if rows else None,
         "student_share": (len(student_rows) / len(rows)) if rows else None,
         "health": tracker.snapshot(),
     }

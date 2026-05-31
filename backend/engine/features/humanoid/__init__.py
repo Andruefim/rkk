@@ -29,7 +29,6 @@ from engine.features.humanoid.environment import EnvironmentHumanoid, canonical_
 from engine.features.humanoid.seeds import (
     fixed_root_seeds,
     humanoid_hardcoded_seeds,
-    merge_humanoid_golden_with_llm_edges,
 )
 
 __all__ = [
@@ -60,5 +59,4 @@ __all__ = [
     "VAR_NAMES",
     "fixed_root_seeds",
     "humanoid_hardcoded_seeds",
-    "merge_humanoid_golden_with_llm_edges",
 ]

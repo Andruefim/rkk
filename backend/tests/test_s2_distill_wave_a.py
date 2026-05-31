@@ -27,16 +27,15 @@ def test_compress_recovery_steps():
     assert out[1]["ticks"] == 80
 
 
-def test_proposal_distill_extra_llm():
+def test_proposal_distill_extra_student():
     p = System2Proposal(
         macro="RECOVER_POSTURE",
         intent_deltas={"intent_torso_forward": 0.06},
         expected_state={"com_z": 0.55},
         skill_id="test_skill",
     )
-    ex = proposal_distill_extra(p, source="llm", llm_macro="RECOVER_POSTURE")
-    assert ex["plan_source"] == "llm"
-    assert ex["llm_macro"] == "RECOVER_POSTURE"
+    ex = proposal_distill_extra(p, source="student_learned")
+    assert ex["plan_source"] == "student_learned"
     assert "intent_torso_forward" in ex["intent_deltas"]
 
 
@@ -58,7 +57,6 @@ def test_analyze_distill_file(tmp_path: Path):
             "success": True,
             "delta": {"d_com_z": 0.02, "d_posture": 0.05},
             "student_conf": 0.44,
-            "recovery_llm": True,
             "recovery_steps": [{"ticks": 8, "intent_deltas": {}}],
         },
         {
