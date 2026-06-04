@@ -323,10 +323,8 @@ class System2Controller:
     def defer_sim_fall_hard_reset(self) -> bool:
         """
         Пока S2 fallen_override ведёт recovery, mixin_fall не должен вызывать reset_stance.
-        При learned recovery — defer и до активации override (genome recovery отключён).
+        Только при активном override (не при простом RKK_S2_LEARNED_RECOVERY=1).
         """
-        if _s2_learned_recovery_enabled() and system2_enabled():
-            return True
         if not self._s2_override_active:
             return False
         return os.environ.get("RKK_S2_DEFER_FALL_HARD_RESET", "1").strip().lower() not in (

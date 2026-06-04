@@ -15,6 +15,13 @@ def test_defer_sim_fall_hard_reset_while_override():
     assert c.defer_sim_fall_hard_reset()
 
 
+def test_learned_recovery_does_not_defer_without_override(monkeypatch):
+    monkeypatch.setenv("RKK_S2_LEARNED_RECOVERY", "1")
+    monkeypatch.setenv("RKK_SYSTEM2", "1")
+    c = System2Controller()
+    assert not c.defer_sim_fall_hard_reset()
+
+
 def test_validate_recovery_plan_rejects_degenerate():
     plan_too_short = [
         {"ticks": 2, "intent_deltas": {"intent_stop_recover": 0.12}},

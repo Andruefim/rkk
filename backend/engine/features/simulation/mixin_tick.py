@@ -706,7 +706,10 @@ class SimulationTickMixin:
                 if defer_fall_reset:
                     if self._fall_recovery_active:
                         self._clear_fall_recovery()
-                elif use_genome_recovery and self._maybe_recover_or_reset_after_fall(obs_fall):
+                elif self._maybe_recover_or_reset_after_fall(
+                    obs_fall,
+                    apply_genome_program=use_genome_recovery,
+                ):
                     self._invalidate_env_observe_cache()
                     obs = self.agent.env.observe()
                     self._sync_motor_state(obs, source="reset", tick=self.tick)
