@@ -28,6 +28,7 @@ from engine.core import (
     VISION_GNN_FEED_EVERY,
     MotorState,
     WORLDS,
+    is_humanoid_topology,
 )
 from engine.core.constants import (
     agent_loop_hz_from_env as _agent_loop_hz_from_env,

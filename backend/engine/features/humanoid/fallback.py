@@ -178,8 +178,21 @@ class _FallbackHumanoid(InstrumentalSandbox):
     def disable_fixed_root(self) -> None:
         self.fixed_root = False
 
+    def apply_variant_physics(
+        self,
+        *,
+        mass_scale: float = 1.30,
+        friction_scale: float = 0.70,
+        com_offset_z: float = 0.02,
+    ) -> None:
+        self._variant_mass_scale = float(mass_scale)
+        self._variant_friction_scale = float(friction_scale)
+        self._variant_com_offset_z = float(com_offset_z)
+
     def get_dynamics_params(self) -> dict[str, float]:
         """Fallback stub — aligns keys with PyBullet ``get_dynamics_params``."""
+        msc = float(getattr(self, "_variant_mass_scale", 1.0))
+        fsc = float(getattr(self, "_variant_friction_scale", 1.0))
         return {
             "schema_version": 1.0,
             "backend": 0.0,
@@ -188,8 +201,9 @@ class _FallbackHumanoid(InstrumentalSandbox):
             "gravity_y": 0.0,
             "gravity_z": -9.81,
             "timestep": float(self._dt),
-            "base_mass": 70.0,
-            "base_lateral_friction": 0.8,
-            "floor_lateral_friction": 1.0,
+            "base_mass": 70.0 * msc,
+            "base_lateral_friction": 0.8 * fsc,
+            "floor_lateral_friction": 1.0 * fsc,
             "urdf_global_scale": 1.0,
+            "variant_com_offset_z": float(getattr(self, "_variant_com_offset_z", 0.0)),
         }

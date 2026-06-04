@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from engine.goal_planning import resolve_humanoid_base
+from engine.eval_mode import curriculum_context_tags, eval_mode_enabled
 from engine.system2.distill_log import (
     DistillHealthTracker,
     compress_recovery_steps,
@@ -281,6 +282,39 @@ class System2Controller:
         self._last_override_distill_sample_tick: int = -10**9
         self._episode_plan_distill_extra: dict[str, Any] = {}
         self._distill_health = DistillHealthTracker()
+        self._autonomy_post_warmup_ticks: int = 0
+        self._autonomy_script_ticks: int = 0
+        self._autonomy_emergency_ticks: int = 0
+
+    def note_autonomy_sample(self, sim_tick: int) -> None:
+        """Track A1/A4 fractions post-warmup (WorldAutonomyContract humanoid probes)."""
+        try:
+            warmup = int(os.environ.get("RKK_SCORECARD_WARMUP_TICKS", "800"))
+        except ValueError:
+            warmup = 800
+        if int(sim_tick) < warmup:
+            return
+        self._autonomy_post_warmup_ticks += 1
+        macro = (
+            "RECOVER_POSTURE"
+            if self._s2_override_active
+            else str(self._active_macro or "IDLE")
+        )
+        if macro == "RECOVER_POSTURE" and self._motor_owner_for_tick(sim_tick) == "s2_scripted":
+            self._autonomy_script_ticks += 1
+        if self._s2_override_active:
+            self._autonomy_emergency_ticks += 1
+
+    def autonomy_fields(self) -> dict[str, float]:
+        denom = max(1, self._autonomy_post_warmup_ticks)
+        script_frac = float(self._autonomy_script_ticks) / float(denom)
+        emerg_frac = float(self._autonomy_emergency_ticks) / float(denom)
+        return {
+            "script_override_frac_post_warmup": round(script_frac, 5),
+            "emergency_override_frac_post_warmup": round(emerg_frac, 5),
+            "s2_override_frac": round(script_frac, 5),
+            "fallen_override_frac_post_warmup": round(emerg_frac, 5),
+        }
 
     @property
     def fallen_override_active(self) -> bool:
@@ -473,7 +507,7 @@ class System2Controller:
         student_conf: float | None = None,
         count_health: bool = True,
     ) -> None:
-        if not distill_enabled():
+        if not distill_enabled() or eval_mode_enabled():
             return
         path = distill_log_path()
         try:
@@ -495,6 +529,9 @@ class System2Controller:
                 for k, v in extra.items():
                     if v is not None:
                         row[k] = v
+            sim = getattr(self, "_rkk_sim", None)
+            if sim is not None and hasattr(sim, "agent"):
+                row.update(curriculum_context_tags(sim, sim.agent))
             line = json.dumps(row, ensure_ascii=False)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -527,6 +564,13 @@ class System2Controller:
     ) -> str | None:
         if not _neuro_enabled() or not success or macro == "IDLE":
             return None
+        try:
+            from engine.graph_perf import is_large_graph
+
+            if is_large_graph(agent.graph):
+                return None
+        except ImportError:
+            pass
         spec_e = episode_spec or EpisodeSuccessSpec()
         streak_key = self._neuro_streak_key(macro, spec_e)
         need = _neuro_streak_need()

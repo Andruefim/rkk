@@ -22,5 +22,12 @@ class SimulationPoseEmbodiedMixin:
                 "name": sk.name,
                 "step": self._skill_exec["index"],
                 "total": len(sk.action_sequence),
+                "chain_depth": int(self._skill_exec.get("chain_depth", 0)),
             }
+        out["chain"] = list(getattr(self, "_skill_chain", []) or [])
+        try:
+            out["chain_max_depth"] = self._skill_chain_max_depth()
+            out["chain_pe_max"] = self._skill_chain_pe_max()
+        except Exception:
+            pass
         return out

@@ -17,6 +17,8 @@ Enable: RKK_HIERARCHICAL_AI=1. See .env.example for RKK_HAI_*.
 """
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 import os
 from typing import Any
 
@@ -127,7 +129,7 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
     if not hierarchical_pe_enabled():
         return None
 
-    if sim.current_world != "humanoid":
+    if not is_humanoid_topology(sim.current_world):
         _hai_reset_pe_state(sim)
         return None
     if getattr(sim, "_fixed_root_active", False):

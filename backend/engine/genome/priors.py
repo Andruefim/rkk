@@ -378,19 +378,26 @@ def load_compressed_genome(graph, path: str | None = None) -> int:
 
     data = _load_npz(p)
     count = 0
-    ids = list(graph._node_ids)
-    d = min(len(ids), data["d"])
-    if graph._core is not None and hasattr(graph._core, "W"):
-        import torch
+    if data.get("role_subgraph"):
+        from engine.genome.compressor import apply_role_subgraph_to_graph
 
-        W = data["W_reconstructed"]
-        with torch.no_grad():
-            for i in range(d):
-                for j in range(d):
-                    if i != j and abs(float(W[i, j])) >= 0.05:
-                        if i < len(ids) and j < len(ids):
-                            graph.set_edge(ids[i], ids[j], float(W[i, j]), alpha=0.75)
-                            count += 1
+        count = int(apply_role_subgraph_to_graph(graph, data, alpha=0.75))
+    else:
+        ids = list(graph._node_ids)
+        d = min(len(ids), data["d"])
+        if graph._core is not None and hasattr(graph._core, "W"):
+            import torch
+
+            W = data["W_reconstructed"]
+            with torch.no_grad():
+                for i in range(d):
+                    for j in range(d):
+                        if i != j and abs(float(W[i, j])) >= 0.05:
+                            if i < len(ids) and j < len(ids):
+                                graph.set_edge(
+                                    ids[i], ids[j], float(W[i, j]), alpha=0.75
+                                )
+                                count += 1
     if hasattr(graph, "_maybe_init_ensemble"):
         graph._maybe_init_ensemble()
         if graph._ensemble is not None:

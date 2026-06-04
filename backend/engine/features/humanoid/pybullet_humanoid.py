@@ -1349,6 +1349,67 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         x, y, z, w = float(orn[0]), float(orn[1]), float(orn[2]), float(orn[3])
         return gravity_dir_in_link_frame((x, y, z, w))
 
+    def apply_variant_physics(
+        self,
+        *,
+        mass_scale: float = 1.30,
+        friction_scale: float = 0.70,
+        com_offset_z: float = 0.02,
+    ) -> None:
+        """Track B1: perturb mass, contact friction, and base COM (same topology)."""
+        cid = self.client
+        rid = self.robot_id
+        msc = float(np.clip(mass_scale, 0.5, 2.5))
+        fsc = float(np.clip(friction_scale, 0.1, 2.0))
+        com_z = float(np.clip(com_offset_z, -0.08, 0.08))
+        with self._physics_lock:
+            try:
+                pb.changeDynamics(
+                    rid,
+                    -1,
+                    lateralFriction=max(0.05, 0.8 * fsc),
+                    centerOfMassPosition=[0.0, 0.0, com_z],
+                    physicsClientId=cid,
+                )
+            except Exception:
+                pass
+            if getattr(self, "floor_id", None) is not None:
+                try:
+                    pb.changeDynamics(
+                        self.floor_id,
+                        -1,
+                        lateralFriction=max(0.05, 1.0 * fsc),
+                        physicsClientId=cid,
+                    )
+                except Exception:
+                    pass
+            for i in range(-1, self.n_joints):
+                try:
+                    di = pb.getDynamicsInfo(rid, i, physicsClientId=cid)
+                    m = float(di[0])
+                    lid = di[2]
+                    kw: dict = {
+                        "mass": max(1e-6, m * msc),
+                        "physicsClientId": cid,
+                    }
+                    if isinstance(lid, (list, tuple)) and len(lid) >= 3:
+                        ixx, iyy, izz = float(lid[0]), float(lid[1]), float(lid[2])
+                        kw["localInertiaDiagonal"] = [
+                            max(1e-9, ixx * msc),
+                            max(1e-9, iyy * msc),
+                            max(1e-9, izz * msc),
+                        ]
+                    pb.changeDynamics(rid, i, **kw)
+                except Exception:
+                    continue
+            if hasattr(self, "_sandbox") and self._sandbox is not None:
+                try:
+                    self._sandbox._floor_friction_base = float(
+                        np.clip(0.5 * fsc, 0.1, 1.0)
+                    )
+                except Exception:
+                    pass
+
     def get_dynamics_params(self) -> dict[str, float]:
         """
         Serializable physics regime for episodic physics_context (Phase D / I).

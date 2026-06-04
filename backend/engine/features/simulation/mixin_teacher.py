@@ -9,7 +9,7 @@ class SimulationTeacherMixin:
         """InnerVoiceNet τ2 — gated by timescale LEVEL_COGNIT."""
         if not _INNER_VOICE_AVAILABLE or self._inner_voice is None:
             return
-        if self.current_world != "humanoid":
+        if not is_humanoid_topology(self.current_world):
             return
         if self._timescale is None or not self._timescale.should_run(LEVEL_COGNIT, tick):
             return

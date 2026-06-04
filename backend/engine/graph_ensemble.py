@@ -89,12 +89,75 @@ class WeightedGraphEnsemble(nn.Module):
             d = min(self.d, W.shape[0])
             self.W_stack[i, :d, :d].copy_(W.detach()[:d, :d])
 
+    @torch.no_grad()
+    def sync_latent_edges(
+        self,
+        node_ids: list[str],
+        edge_pairs: list[tuple[str, str, float]],
+        *,
+        latent_id: str | None = None,
+    ) -> int:
+        """
+        C4: copy latent confounder edges identically into all W_k hypotheses.
+        """
+        if not edge_pairs and latent_id is None:
+            return 0
+        updated = 0
+        for k in range(self.n):
+            W = self.W_stack[k]
+            for fr, to, w in edge_pairs:
+                if fr not in node_ids or to not in node_ids:
+                    continue
+                i, j = node_ids.index(fr), node_ids.index(to)
+                W[i, j] = float(w)
+                updated += 1
+            if latent_id and latent_id in node_ids:
+                li = node_ids.index(latent_id)
+                W[li, li] = max(float(W[li, li].item()), 0.08)
+        return updated
+
+    @torch.no_grad()
+    def apply_vstructure_orientations(
+        self,
+        idx_a: int,
+        idx_c: int,
+        idx_b: int,
+        *,
+        n_orientations: int = 4,
+    ) -> int:
+        """
+        C3: assign distinct collider orientations across ensemble hypotheses.
+        Returns number of hypotheses updated.
+        """
+        n = min(max(1, n_orientations), self.n)
+        patterns: list[list[tuple[int, int, float]]] = [
+            [(idx_a, idx_c, 0.22), (idx_b, idx_c, 0.22)],
+            [(idx_c, idx_a, 0.18), (idx_c, idx_b, 0.18)],
+            [(idx_a, idx_c, 0.20), (idx_c, idx_b, 0.16)],
+            [(idx_c, idx_a, 0.16), (idx_b, idx_c, 0.20)],
+        ]
+        for k in range(n):
+            W = self.W_stack[k]
+            for i, j, w in patterns[k % len(patterns)]:
+                if i == j:
+                    continue
+                old = float(W[i, j].item())
+                W[i, j] = 0.65 * old + 0.35 * float(w)
+        return n
+
     def snapshot(self) -> dict:
         p = self.posterior().detach().cpu().tolist()
-        return {
+        out = {
             "N": self.n,
             "d": self.d,
             "entropy": round(self.entropy(), 5),
             "weights": [round(x, 5) for x in p],
             "map_idx": int(self.posterior().argmax().item()),
         }
+        if os.environ.get("RKK_LOG_DISCOVERY_SPLIT", "1").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            out["vstructure_orientations"] = min(
+                4, max(0, int(os.environ.get("RKK_VSTRUCTURE_ENSEMBLE_N", "4") or 4))
+            )
+        return out

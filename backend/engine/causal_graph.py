@@ -40,8 +40,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
+
+from engine.concept_store import CONCEPT_DEFS
+
+_BRIDGE_CONCEPT_NAMES: tuple[str, ...] = tuple(name for name, _, _ in CONCEPT_DEFS)
+_BRIDGE_CONCEPT_INDEX: dict[str, int] = {n: i for i, n in enumerate(_BRIDGE_CONCEPT_NAMES)}
 
 from engine.trajectory_contrastive import (
     trajectory_enabled,
@@ -108,6 +113,7 @@ class CausalNode:
     id_: str
     value: float = 0.5
     node_kind: str = "latent"  # sensor | motor | latent
+    role_type: str = ""  # motor | posture | contact | proprioceptive | intent | concept
 
 
 # ─── Edge ─────────────────────────────────────────────────────────────────────
@@ -259,6 +265,19 @@ class CausalGraph:
         self._traj_max_segments = 100
         self._ensemble: WeightedGraphEnsemble | None = None
         self._structure_learn_tick: int = 0
+        # Phase 2 (C2): world bridge → WM concept prediction loss
+        self._bridge_buffer: deque[dict] = deque(maxlen=256)
+        self._concept_bridge_head: nn.Linear | None = None
+        self._bridge_head_in_optim: bool = False
+        self._last_l_bridge: float = 0.0
+        self._bridge_skip_fixed_root: bool = False
+        # Phase 2 (C3): edge age + discovery split for scorecard #3
+        self._edge_age: dict[tuple[str, str], int] = {}
+        self._edge_ever_active: set[tuple[str, str]] = set()
+        self._edge_age_at_activation: dict[tuple[str, str], int] = {}
+        self._discovery_activation_log: deque[dict] = deque(maxlen=256)
+        self._discovery_new_count: int = 0
+        self._discovery_reactivated_count: int = 0
         self._snapshot_vec_engine_tick: int = -1
         self._snapshot_vec_cache_tick: int = -1
         self._snapshot_vec_cache: dict[str, float] | None = None
@@ -280,6 +299,34 @@ class CausalGraph:
         if meta is not None:
             return meta.node_kind
         return self.infer_node_kind(node_id)
+
+    def _resolve_role_type(self, node_id: str) -> str:
+        from engine.role_types import infer_role_type, role_type_enabled
+
+        if not role_type_enabled():
+            return ""
+        preset = str(getattr(self, "_env_preset", "humanoid") or "humanoid")
+        return infer_role_type(node_id, env_preset=preset)
+
+    def set_env_preset(self, preset: str) -> None:
+        """World preset for role_type inference (humanoid / humanoid_variant)."""
+        self._env_preset = str(preset)
+
+    def get_role_type(self, node_id: str) -> str:
+        meta = self._node_meta.get(node_id)
+        if meta is not None and meta.role_type:
+            return meta.role_type
+        return self._resolve_role_type(node_id)
+
+    def role_type_map(self) -> dict[str, str]:
+        from engine.role_types import build_role_map, role_type_enabled, validate_role_map
+
+        if not role_type_enabled():
+            return {}
+        preset = str(getattr(self, "_env_preset", "humanoid") or "humanoid")
+        role_map = build_role_map(self._node_ids, env_preset=preset)
+        validate_role_map(self._node_ids, role_map)
+        return role_map
 
     def get_world_model_core(self):
         """Single entry point for executive WM — always CausalGNNCore (not RSSM)."""
@@ -379,7 +426,10 @@ class CausalGraph:
             self._node_ids.append(id_)
             self._d += 1
             self._node_meta[id_] = CausalNode(
-                id_, float(value), self.infer_node_kind(id_)
+                id_,
+                float(value),
+                self.infer_node_kind(id_),
+                role_type=self._resolve_role_type(id_),
             )
         self.nodes[id_] = value
         if id_ in self._node_meta:
@@ -465,6 +515,14 @@ class CausalGraph:
             self._int_buffer.clear()
 
         self._core = old_core if preserve_state else None
+        self._node_meta = {}
+        for nid in self._node_ids:
+            self._node_meta[nid] = CausalNode(
+                nid,
+                float(self.nodes.get(nid, 0.5)),
+                self.infer_node_kind(nid),
+                role_type=self._resolve_role_type(nid),
+            )
         self._rebuild_core()
 
     def apply_env_observation(
@@ -630,6 +688,345 @@ class CausalGraph:
             return om
         return c
 
+    # ── Phase 2 Track C: bridge loss (C2) + structure metrics (C3) ─────────────
+
+    @staticmethod
+    def bridge_loss_weight() -> float:
+        try:
+            return max(0.0, float(os.environ.get("RKK_BRIDGE_LOSS_WEIGHT", "0.20")))
+        except ValueError:
+            return 0.20
+
+    @staticmethod
+    def bridge_loss_every() -> int:
+        try:
+            return max(1, int(os.environ.get("RKK_BRIDGE_LOSS_EVERY", "1")))
+        except ValueError:
+            return 1
+
+    @staticmethod
+    def bridge_respects_fixed_root() -> bool:
+        return os.environ.get("RKK_WORLD_BRIDGE_FIXED_ROOT", "0").strip().lower() not in (
+            "1", "true", "yes", "on",
+        )
+
+    def record_bridge_transition(
+        self,
+        state_after: list[float],
+        labels: list[str],
+    ) -> None:
+        """Grounded semantic labels → WM bridge training buffer (C2)."""
+        if not labels or self.bridge_loss_weight() <= 0.0:
+            return
+        if self._bridge_skip_fixed_root and not self.bridge_respects_fixed_root():
+            return
+        row = self._coerce_row_to_d(state_after)
+        valid = [lb for lb in labels if lb in _BRIDGE_CONCEPT_INDEX]
+        if not valid:
+            return
+        self._bridge_buffer.append({"state": row, "labels": valid})
+
+    def _ensure_concept_bridge_head(self, embed_dim: int) -> None:
+        if (
+            self._concept_bridge_head is not None
+            and self._concept_bridge_head.in_features == embed_dim
+        ):
+            return
+        self._concept_bridge_head = nn.Linear(
+            embed_dim, len(_BRIDGE_CONCEPT_NAMES), device=self.device
+        )
+        nn.init.xavier_uniform_(self._concept_bridge_head.weight, gain=0.4)
+        nn.init.zeros_(self._concept_bridge_head.bias)
+        if self._optim is not None and not self._bridge_head_in_optim:
+            self._optim.add_param_group(
+                {"params": self._concept_bridge_head.parameters()}
+            )
+            self._bridge_head_in_optim = True
+
+    def predict_concept_logits(self, h_flat: torch.Tensor) -> torch.Tensor:
+        """Predict semantic concept logits from flattened WM latent (B, embed_dim)."""
+        self._ensure_concept_bridge_head(int(h_flat.shape[-1]))
+        return self._concept_bridge_head(h_flat)
+
+    def _encode_states_latent_flat(self, X: torch.Tensor) -> torch.Tensor | None:
+        core = self._unwrap_gnn_core()
+        if core is None or not hasattr(core, "encode_latent"):
+            return None
+        X_pad = self._pad(X)
+        a_pad = self._pad(torch.zeros(X.shape[0], self._d, device=self.device))
+        h = core.encode_latent(X_pad, a_pad)
+        _, H = core._message_pass(h, return_latent=True)
+        H = H[..., : self._d, :]
+        return H.reshape(X.shape[0], -1)
+
+    def _compute_l_bridge(self) -> torch.Tensor:
+        """Cross-entropy over grounded bridge labels (multi-label BCE)."""
+        if (
+            self.bridge_loss_weight() <= 0.0
+            or not self._bridge_buffer
+            or self._core is None
+        ):
+            return torch.tensor(0.0, device=self.device)
+        if self._bridge_skip_fixed_root and not self.bridge_respects_fixed_root():
+            return torch.tensor(0.0, device=self.device)
+        n_calls = int(getattr(self, "_wm_train_calls", 0))
+        if n_calls % self.bridge_loss_every() != 0:
+            return torch.tensor(0.0, device=self.device)
+
+        import random
+
+        k = min(8, len(self._bridge_buffer))
+        picks = random.sample(list(self._bridge_buffer), k)
+        rows = [self._coerce_row_to_d(p["state"]) for p in picks]
+        X = torch.tensor(rows, dtype=torch.float32, device=self.device)
+        z = self._encode_states_latent_flat(X)
+        if z is None:
+            return torch.tensor(0.0, device=self.device)
+
+        logits = self.predict_concept_logits(z)
+        targets = torch.zeros(
+            logits.shape[0], logits.shape[1], device=self.device
+        )
+        for bi, item in enumerate(picks):
+            for lb in item.get("labels") or []:
+                idx = _BRIDGE_CONCEPT_INDEX.get(lb)
+                if idx is not None:
+                    targets[bi, idx] = 1.0
+        loss = F.binary_cross_entropy_with_logits(logits, targets)
+        self._last_l_bridge = float(loss.item())
+        return loss
+
+    def _track_edge_activation(self, from_: str, to: str, old_w: float, new_w: float) -> None:
+        thr = float(self.EDGE_THRESH)
+        key = (from_, to)
+        was_sig = abs(old_w) >= thr
+        now_sig = abs(new_w) >= thr
+        if now_sig and not was_sig:
+            age = int(self._edge_age.get(key, 0))
+            is_new = key not in self._edge_ever_active
+            self._edge_age_at_activation[key] = age
+            self._discovery_activation_log.append(
+                {
+                    "edge": f"{from_}→{to}",
+                    "new": is_new,
+                    "age_at_activation": age,
+                }
+            )
+            if is_new:
+                self._discovery_new_count += 1
+            else:
+                self._discovery_reactivated_count += 1
+            self._edge_age[key] = 0
+            self._edge_ever_active.add(key)
+        elif now_sig:
+            self._edge_ever_active.add(key)
+
+    def tick_edge_ages(self) -> None:
+        """Increment ages for currently significant edges (domain-agnostic discovery metric)."""
+        if self._core is None:
+            return
+        thr = float(self.EDGE_THRESH)
+        with torch.no_grad():
+            W = self._core.W_masked()[: self._d, : self._d]
+        active: set[tuple[str, str]] = set()
+        for i, fr in enumerate(self._node_ids):
+            for j, to in enumerate(self._node_ids):
+                if abs(float(W[i, j].item())) >= thr:
+                    key = (fr, to)
+                    active.add(key)
+                    self._edge_age[key] = int(self._edge_age.get(key, 0)) + 1
+        stale = [k for k in self._edge_age if k not in active]
+        for k in stale:
+            self._edge_age.pop(k, None)
+
+    def discovery_new_frac(self) -> float:
+        if not self._discovery_activation_log:
+            total = self._discovery_new_count + self._discovery_reactivated_count
+            if total <= 0:
+                return 0.0
+            return float(self._discovery_new_count) / float(total)
+        recent = list(self._discovery_activation_log)[-64:]
+        new_n = sum(1 for e in recent if e.get("new"))
+        return float(new_n) / float(len(recent))
+
+    def edge_discovery_eig(self) -> dict[str, float]:
+        """Per-node discovery EIG proxy from edge uncertainty × |W| (Track G)."""
+        out: dict[str, float] = {nid: 0.0 for nid in self._node_ids}
+        if self._core is None or not self._node_ids:
+            return out
+        thr = float(self.EDGE_THRESH)
+        with torch.no_grad():
+            W = self._core.W_masked()[: self._d, : self._d]
+            A = self._core.alpha_trust_matrix()[: self._d, : self._d]
+        for i, fr in enumerate(self._node_ids):
+            score = 0.0
+            for j in range(self._d):
+                w = float(W[i, j].item())
+                if abs(w) >= thr:
+                    unc = 1.0 - float(A[i, j].item())
+                    score += unc * abs(w)
+                w_in = float(W[j, i].item())
+                if abs(w_in) >= thr:
+                    unc = 1.0 - float(A[j, i].item())
+                    score += 0.5 * unc * abs(w_in)
+            out[fr] = float(score)
+        return out
+
+    def role_cluster_entropy(self) -> dict[str, float]:
+        """Per-node entropy of values within the node's role cluster (Track G)."""
+        import math
+
+        role_map = self.role_type_map()
+        by_role: dict[str, list[float]] = {}
+        for nid in self._node_ids:
+            rt = role_map.get(nid, "")
+            if not rt:
+                continue
+            by_role.setdefault(rt, []).append(float(self.nodes.get(nid, 0.5)))
+        ent_by_role: dict[str, float] = {}
+        for rt, vals in by_role.items():
+            if len(vals) < 2:
+                ent_by_role[rt] = 0.0
+                continue
+            hist, _ = np.histogram(vals, bins=4, range=(0.0, 1.0))
+            p = hist.astype(np.float64)
+            s = float(p.sum())
+            if s < 1e-8:
+                ent_by_role[rt] = 0.0
+                continue
+            p = p / s
+            ent_by_role[rt] = float(
+                -sum(pi * math.log(pi + 1e-12) for pi in p if pi > 0)
+            )
+        return {
+            nid: ent_by_role.get(role_map.get(nid, ""), 0.0)
+            for nid in self._node_ids
+        }
+
+    def structure_learn_every(self) -> int:
+        try:
+            return max(1, int(os.environ.get("RKK_STRUCTURE_LEARN_EVERY", "50")))
+        except ValueError:
+            return 50
+
+    def _pair_corr_from_obs(self, a: str, b: str) -> float:
+        if a not in self._node_ids or b not in self._node_ids:
+            return 0.0
+        ia, ib = self._node_ids.index(a), self._node_ids.index(b)
+        rows: list[float] = []
+        cols: list[float] = []
+        for row in list(self._obs_buffer)[-64:]:
+            cr = self._coerce_row_to_d(row)
+            if ia < len(cr) and ib < len(cr):
+                rows.append(float(cr[ia]))
+                cols.append(float(cr[ib]))
+        if len(rows) < 8:
+            return 0.0
+        x = np.asarray(rows, dtype=np.float64)
+        y = np.asarray(cols, dtype=np.float64)
+        if float(x.std()) < 1e-8 or float(y.std()) < 1e-8:
+            return 0.0
+        return float(np.corrcoef(x, y)[0, 1])
+
+    def _vstructure_search_cap(self) -> int:
+        """Cap collider search — O(d³) corr loops freeze UI when d≈100+ (vision concepts)."""
+        try:
+            return max(8, min(64, int(os.environ.get("RKK_VSTRUCTURE_MAX_NODES", "32"))))
+        except ValueError:
+            return 32
+
+    def _find_vstructure_collider(self) -> tuple[str, str, str] | None:
+        """Heuristic v-structure collider: A—C—B with weak direct A→B, strong marginals."""
+        if self._d < 3 or self._core is None:
+            return None
+        thr = float(self.EDGE_THRESH)
+        nids = self._node_ids
+        d = min(self._d, len(nids))
+        if d < 3:
+            return None
+        cap = min(d, self._vstructure_search_cap())
+        with torch.no_grad():
+            W = self._core.W_masked()[:d, :d]
+            # Top-|W| nodes as collider/parent candidates (not full O(d³) scan).
+            strength = W.abs().sum(dim=0) + W.abs().sum(dim=1)
+            order = torch.argsort(strength, descending=True)[:cap].tolist()
+        best: tuple[float, str, str, str] | None = None
+        for ci in order:
+            c = nids[ci]
+            for ai in order:
+                if ai == ci:
+                    continue
+                a = nids[ai]
+                for bi in order:
+                    if bi == ci or bi == ai:
+                        continue
+                    b = nids[bi]
+                    if abs(float(W[ai, bi].item())) >= thr:
+                        continue
+                    ca = self._pair_corr_from_obs(a, c)
+                    cb = self._pair_corr_from_obs(b, c)
+                    score = abs(ca) + abs(cb) - abs(float(W[ai, ci].item())) - abs(
+                        float(W[bi, ci].item())
+                    )
+                    if best is None or score > best[0]:
+                        best = (score, a, c, b)
+        if best is None or best[0] < 0.15:
+            return None
+        return best[1], best[2], best[3]
+
+    def tick_compositional_structure(self, engine_tick: int, *, fixed_root: bool = False) -> None:
+        """C3: edge aging + periodic v-structure orientation split in ensemble."""
+        self._bridge_skip_fixed_root = bool(fixed_root)
+        self.tick_edge_ages()
+        every = self.structure_learn_every()
+        if engine_tick - self._structure_learn_tick < every:
+            return
+        self._structure_learn_tick = int(engine_tick)
+        # Step-1 fixed_root / large graphs: skip ensemble orientation (was freezing ~tick 50).
+        if fixed_root:
+            return
+        try:
+            from engine.graph_perf import is_large_graph
+
+            if is_large_graph(self):
+                return
+        except ImportError:
+            if self._d > 80:
+                return
+        if self._ensemble is None:
+            return
+        try:
+            n_orient = max(0, int(os.environ.get("RKK_VSTRUCTURE_ENSEMBLE_N", "4")))
+        except ValueError:
+            n_orient = 4
+        if n_orient < 2:
+            return
+        triple = self._find_vstructure_collider()
+        if triple is None:
+            return
+        parent_a, collider, parent_b = triple
+        if parent_a not in self._node_ids or collider not in self._node_ids or parent_b not in self._node_ids:
+            return
+        ia = self._node_ids.index(parent_a)
+        ic = self._node_ids.index(collider)
+        ib = self._node_ids.index(parent_b)
+        self._ensemble.apply_vstructure_orientations(
+            ia, ic, ib, n_orientations=min(n_orient, self._ensemble.n)
+        )
+
+    def discovery_snapshot_fields(self) -> dict[str, float | int | list]:
+        recent_ages = [
+            int(e.get("age_at_activation", 0))
+            for e in list(self._discovery_activation_log)[-8:]
+        ]
+        return {
+            "discovery_new_frac": round(self.discovery_new_frac(), 4),
+            "discovery_new_count": int(self._discovery_new_count),
+            "discovery_reactivated_count": int(self._discovery_reactivated_count),
+            "edge_age_at_activation": recent_ages,
+            "l_bridge_last": round(float(self._last_l_bridge), 6),
+        }
+
     def _coerce_row_to_d(self, row: list[float] | list) -> list[float]:
         """Строки буферов после роста d могут быть короче/длиннее текущего _node_ids."""
         d = self._d
@@ -649,6 +1046,9 @@ class CausalGraph:
             self._invalidate_cache()
             self._sync_frozen_W_into_core()
             return
+
+        self._concept_bridge_head = None
+        self._bridge_head_in_optim = False
 
         if USE_GNN:
             from engine.causal_gnn import CausalGNNCore
@@ -769,11 +1169,13 @@ class CausalGraph:
         self._loco_fallen = bool(fallen)
 
     def _locomotion_wm_scales(self) -> tuple[float, float, float]:
-        return locomotion_wm_scales(
+        int_scale, rec_scale, lr_scale = locomotion_wm_scales(
             self._loco_reward_ema,
             self._loco_cpg_active,
             fallen=getattr(self, "_loco_fallen", False),
         )
+        lr_scale *= float(getattr(self, "_post_fr_wm_lr_mult", 1.0))
+        return int_scale, rec_scale, lr_scale
 
     def _int_buffer_for_training(self, int_scale: float) -> list[dict]:
         buf = self._int_buffer
@@ -821,6 +1223,14 @@ class CausalGraph:
         """
         if self._core is None:
             return None
+
+        try:
+            from engine.eval_mode import cross_env_allow_wm_train, eval_mode_enabled
+
+            if eval_mode_enabled() or not cross_env_allow_wm_train():
+                return None
+        except ImportError:
+            pass
 
         self._wm_train_calls = int(getattr(self, "_wm_train_calls", 0)) + 1
 
@@ -918,6 +1328,9 @@ class CausalGraph:
         """Shared backward + optimizer step for both training modes."""
         if lr_scale < 0.999:
             loss = loss * float(lr_scale)
+        prot = getattr(self, "_ewc_protector", None)
+        if prot is not None:
+            loss = prot.apply_train_penalty(self, loss)
         loss.backward()
         self._zero_grad_frozen_W()
         torch.nn.utils.clip_grad_norm_(self._core.parameters(), max_norm=1.0)
@@ -1096,7 +1509,19 @@ class CausalGraph:
             z_var = z_hat.var(dim=0).mean().clamp_min(1e-10)
             l_sz = -lz_w * z_var
 
-        loss = l_jepa + rec_coeff * l_rec + l_sig + l_dag + l_l1 + l_int + l_traj + l_sz
+        l_bridge = self._compute_l_bridge()
+        bridge_w = self.bridge_loss_weight()
+        loss = (
+            l_jepa
+            + rec_coeff * l_rec
+            + l_sig
+            + l_dag
+            + l_l1
+            + l_int
+            + l_traj
+            + l_sz
+            + bridge_w * l_bridge
+        )
 
         self._finish_train_step(loss, lr_scale=lr_scale)
 
@@ -1121,6 +1546,8 @@ class CausalGraph:
             "loco_lr_scale": round(lr_scale, 4),
             "l_traj":  round(l_traj.item(), 5),
             "l_sz":    round(l_sz.item(), 5),
+            "l_bridge": round(l_bridge.item(), 5),
+            "bridge_weight": round(bridge_w, 4),
             "h_W":     round(h_W.item(), 5),
             "mode":    "seq",
             "batch_B": B,
@@ -1282,8 +1709,10 @@ class CausalGraph:
             W = self._core.W
             w = W.detach().clone()
             old_w = float(w[i, j].item())
-            w[i, j] = 0.7 * old_w + 0.3 * float(weight)
+            new_w = 0.7 * old_w + 0.3 * float(weight)
+            w[i, j] = new_w
             W.copy_(w)
+        self._track_edge_activation(from_, to, old_w, new_w)
         self._invalidate_cache()
 
     def remove_edge(self, from_: str, to: str) -> None:

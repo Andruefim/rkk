@@ -29,6 +29,8 @@ Phase C (full RSI):
 """
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 import os
 import queue
 import threading
@@ -64,6 +66,8 @@ from engine.features.simulation.mixin_fall import SimulationFallMixin
 from engine.features.simulation.mixin_locomotion import SimulationLocomotionMixin
 from engine.features.simulation.mixin_motor_pipeline import SimulationMotorPipelineMixin
 from engine.features.simulation.mixin_phase_hierarchy import SimulationPhaseHierarchyMixin
+from engine.features.simulation.mixin_phase5 import SimulationPhase5Mixin
+from engine.features.simulation.mixin_phase6 import SimulationPhase6Mixin
 from engine.features.simulation.mixin_pose_embodied import SimulationPoseEmbodiedMixin
 from engine.features.simulation.mixin_skills import SimulationSkillsMixin
 from engine.features.simulation.mixin_snapshot_shutdown import SimulationSnapshotShutdownMixin
@@ -79,6 +83,8 @@ class Simulation(
     SimulationConceptsMixin,
     SimulationVerbalMixin,
     SimulationPhaseHierarchyMixin,
+    SimulationPhase5Mixin,
+    SimulationPhase6Mixin,
     SimulationWorldMixin,
     SimulationFallMixin,
     SimulationLocomotionMixin,
@@ -117,6 +123,8 @@ class Simulation(
         self._wire_rkk_sim_ref(self.agent.env)
 
         self.switcher = WorldSwitcher(self.agent, self.device)
+        if hasattr(self, "on_world_switch_phase6"):
+            self.switcher._on_switch_hook = self.on_world_switch_phase6
         self.demon = AdversarialDemon(n_agents=1, device=self.device)
 
         self.tick = 0
@@ -197,8 +205,13 @@ class Simulation(
         self._public_state_cache_at: float = 0.0
         self._skill_library = None
         self._skill_exec: dict | None = None
+        self._skill_chain: list[str] = []
         self.neuro_engine = NeurogenesisEngine()
         self.neuro_coordinator = NeurogenesisCoordinator(self.neuro_engine)
+        from engine.latent_confounder import LatentConfounderManager
+
+        self._latent_confounder = LatentConfounderManager()
+        self._latent_confounder_last: dict = {}
         self.behavioral_tracker = BehavioralTracker()
         self._edge_delta_hist: deque[int] = deque(maxlen=256)
         self._wm_warmup_until: int = 0
@@ -318,7 +331,7 @@ class Simulation(
         apply_motor_primitives_patch(self)
         apply_intrinsic_patch(self)
 
-        if self.current_world == "humanoid":
+        if is_humanoid_topology(self.current_world):
             try:
                 from engine.genome.priors import bootstrap_innate_genome
 

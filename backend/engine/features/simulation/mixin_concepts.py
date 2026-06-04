@@ -1,6 +1,8 @@
 """Simulation mixin: концепты, память (save/load), мета-снимок."""
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 from engine.features.simulation.mixin_imports import *
 
 
@@ -203,7 +205,7 @@ class SimulationConceptsMixin:
                     auto_fr = 0
                 if (
                     auto_fr > 0
-                    and self.current_world == "humanoid"
+                    and is_humanoid_topology(self.current_world)
                     and self.tick >= auto_fr
                 ):
                     self._curriculum_auto_fr_released = True

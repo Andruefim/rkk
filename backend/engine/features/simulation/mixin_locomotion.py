@@ -1,6 +1,8 @@
 """Simulation mixin: CPG, motor cortex (обучение — intrinsic objective)."""
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 from engine.core.constants import cpg_during_fixed_root_enabled
 from engine.features.simulation.mixin_imports import *
 
@@ -73,7 +75,7 @@ class SimulationLocomotionMixin:
             return
         if not self._locomotion_cpg_enabled():
             return
-        if self.current_world != "humanoid" or self._cpg_blocked_by_fixed_root():
+        if not is_humanoid_topology(self.current_world) or self._cpg_blocked_by_fixed_root():
             return
         s2 = getattr(self, "_system2_last", None) or {}
         if str(s2.get("motor_owner", "")) == "s2_scripted":
@@ -227,7 +229,7 @@ class SimulationLocomotionMixin:
         env_flag = os.environ.get("RKK_MOTOR_CORTEX", "1").strip().lower()
         if env_flag in ("0", "false", "no", "off"):
             return None
-        if self.current_world != "humanoid" or self._fixed_root_active:
+        if not is_humanoid_topology(self.current_world) or self._fixed_root_active:
             return None
         if self._motor_cortex is None:
             self._motor_cortex = _MotorCortexLibrary(self.device)
@@ -245,7 +247,7 @@ class SimulationLocomotionMixin:
 
         if not reflex_stabilizer_enabled():
             return None
-        if self.current_world != "humanoid" or self._fixed_root_active:
+        if not is_humanoid_topology(self.current_world) or self._fixed_root_active:
             return None
         if self._reflex_stabilizer is not None:
             return self._reflex_stabilizer
@@ -267,7 +269,7 @@ class SimulationLocomotionMixin:
 
         if not cerebellum_enabled():
             return None
-        if self.current_world != "humanoid" or self._fixed_root_active:
+        if not is_humanoid_topology(self.current_world) or self._fixed_root_active:
             return None
         if self._cerebellum is not None:
             return self._cerebellum
@@ -294,7 +296,7 @@ class SimulationLocomotionMixin:
 
         if not causal_motor_executor_enabled():
             return None
-        if self.current_world != "humanoid" or self._fixed_root_active:
+        if not is_humanoid_topology(self.current_world) or self._fixed_root_active:
             return None
         if self._causal_motor_executor is None:
             self._causal_motor_executor = CausalMotorExecutor()

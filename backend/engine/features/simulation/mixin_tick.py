@@ -62,6 +62,7 @@ class SimulationTickMixin:
 
     def _sync_temporal_blankets_to_graph(self) -> None:
         """Rebuild TemporalBlankets when |graph nodes| changes (inner_voice, concepts, neurogenesis)."""
+        from engine.graph_perf import is_large_graph, temporal_rebuild_min_interval
         from engine.temporal import TemporalBlankets
 
         g_d = len(self.agent.graph._node_ids)
@@ -70,11 +71,15 @@ class SimulationTickMixin:
         tb = self.agent.temporal
         if tb.d_input == g_d:
             return
+        if is_large_graph(self.agent.graph):
+            every = temporal_rebuild_min_interval()
+            if int(self.tick) % every != 0:
+                return
         self.agent.temporal = TemporalBlankets(d_input=g_d, device=self.device)
 
     def _maybe_post_release_stabilize_intents(self) -> None:
         """После снятия fixed_root — в окне stabilize_until усилить recover/support (плавный decay)."""
-        if self.current_world != "humanoid" or self._fixed_root_active:
+        if not is_humanoid_topology(self.current_world) or self._fixed_root_active:
             return
         if not getattr(self, "_curriculum_auto_fr_released", False):
             return
@@ -145,7 +150,7 @@ class SimulationTickMixin:
         return st
 
     def _genome_walk_active(self, is_fallen: bool) -> bool:
-        if is_fallen or self.current_world != "humanoid":
+        if is_fallen or not is_humanoid_topology(self.current_world):
             return False
         if self._fixed_root_active:
             try:
@@ -216,6 +221,18 @@ class SimulationTickMixin:
 
     def _fr_curriculum_finalize_release(self, *, reason: str) -> None:
         """Снять fixed_root в симуляции + VL, выставить окно stabilize (после мягкой физики)."""
+        try:
+            from engine.curriculum_eval_gate import maybe_gate_fr_release
+
+            if not maybe_gate_fr_release(self):
+                self._add_event(
+                    "⛔ FR release blocked by curriculum eval gate",
+                    "#ff8844",
+                    "phase",
+                )
+                return
+        except Exception:
+            pass
         self._curriculum_auto_fr_released = True
         self.disable_fixed_root()
         self._fr_soft_release_deadline = 0
@@ -235,7 +252,7 @@ class SimulationTickMixin:
 
     def _maybe_damp_motor_intents_blind_fixed_root(self) -> None:
         """При fixed_root и низком compression_gain подтягивать intent_* к дефолтам среды (меньше слепого дрейфа)."""
-        if self.current_world != "humanoid" or not self._fixed_root_active:
+        if not is_humanoid_topology(self.current_world) or not self._fixed_root_active:
             return
         if os.environ.get("RKK_FR_BLIND_MOTOR_DAMP", "1").strip().lower() in (
             "0",
@@ -547,7 +564,7 @@ class SimulationTickMixin:
     def _run_single_agent_timestep_inner_profiled(self, _t_inner0: float) -> dict:
         _pt = [time.perf_counter()]
         self._reset_tick_obs_caches()
-        if self.current_world != "humanoid":
+        if not is_humanoid_topology(self.current_world):
             self._hai_prev_com_x = None
             self._hai_pe_fwd_ema = 0.0
             self._hai_pe_vert_ema = 0.0
@@ -560,7 +577,7 @@ class SimulationTickMixin:
             auto_fr_ticks = int(os.environ.get("RKK_AUTO_FIXED_ROOT_TICKS", "0"))
         except ValueError:
             auto_fr_ticks = 0
-        if auto_fr_ticks > 0 and self.current_world == "humanoid":
+        if auto_fr_ticks > 0 and is_humanoid_topology(self.current_world):
             try:
                 fr_retry_max = int(os.environ.get("RKK_CURRICULUM_FIXED_ROOT_RETRY_MAX", "16"))
             except ValueError:
@@ -754,14 +771,14 @@ class SimulationTickMixin:
         # Re-use ``fallen`` from the early check (after optional recovery): no extra
         # ``is_fallen()`` here — duplicate calls would double-advance debounce streak.
         fallen_pre = bool(fallen)
-        if self.current_world == "humanoid":
+        if is_humanoid_topology(self.current_world):
             self._apply_genome_walk_intents(fallen_pre)
         self._maybe_apply_cpg_locomotion(fallen_pre)
         self._publish_cpg_node_snapshot()
-        if self.current_world == "humanoid" and not self._fixed_root_active:
+        if is_humanoid_topology(self.current_world) and not self._fixed_root_active:
             self._maybe_post_release_stabilize_intents()
             self._apply_hardcoded_reflexes(fallen_pre)
-        if self.current_world == "humanoid":
+        if is_humanoid_topology(self.current_world):
             base_env = self._unwrap_base_env(self.agent.env)
             cpg_on = bool(getattr(base_env, "cpg_owns_legs", False))
             loco_r = (
@@ -779,15 +796,19 @@ class SimulationTickMixin:
         self._sync_temporal_blankets_to_graph()
 
         self._prof_mark("sim.cpg_prep", _pt)
-        if self.current_world == "humanoid":
+        if is_humanoid_topology(self.current_world):
             try:
+                from engine.eval_mode import eval_mode_enabled, eval_skip_system2
                 from engine.system2.controller import system2_enabled
 
-                if system2_enabled():
+                if system2_enabled() and not (
+                    eval_mode_enabled() and eval_skip_system2()
+                ):
                     if getattr(self, "_system2", None) is None:
                         from engine.system2 import System2Controller
 
                         self._system2 = System2Controller()
+                        self._system2._rkk_sim = self
                     obs_s2 = dict(self._graph_vec_cached())
                     self._system2_last = self._system2.tick(
                         sim_tick=self.tick,
@@ -796,6 +817,9 @@ class SimulationTickMixin:
                         sim=self,
                         fallen=bool(fallen_for_s2),
                     )
+                    self._system2.note_autonomy_sample(self.tick)
+                    if isinstance(self._system2_last, dict):
+                        self._system2_last.update(self._system2.autonomy_fields())
                     fn_ctx = getattr(self._system2, "planning_context_for_wm", None)
                     if callable(fn_ctx):
                         self.agent.set_s2_planning_context(
@@ -825,14 +849,29 @@ class SimulationTickMixin:
         self._prof_mark("sim.system2", _pt)
 
         # Controlled perturbations during fixed_root to teach active balance
-        if self.current_world == "humanoid" and self._fixed_root_active:
+        _skip_perturb = False
+        try:
+            from engine.eval_mode import transfer_bench_enabled
+
+            _skip_perturb = transfer_bench_enabled()
+        except ImportError:
+            pass
+        if (
+            not _skip_perturb
+            and is_humanoid_topology(self.current_world)
+            and self._fixed_root_active
+        ):
             if self.tick % 40 == 0:
                 fn_perturb = getattr(self.agent.env, "apply_random_perturbation", None)
                 if callable(fn_perturb):
                     # Start gentle, increase force
                     force = 60.0 + min(100.0, self.tick * 0.2)
                     fn_perturb(max_force=force)
-        elif self.current_world == "humanoid" and not self._fixed_root_active:
+        elif (
+            not _skip_perturb
+            and is_humanoid_topology(self.current_world)
+            and not self._fixed_root_active
+        ):
             from engine.features.simulation.snapshot import humanoid_curriculum_step
 
             _cur_step, _ = humanoid_curriculum_step(self)
@@ -843,6 +882,12 @@ class SimulationTickMixin:
                     fn_perturb(max_force=85.0 + min(140.0, max(0, self.tick - 900) * 0.1))
 
         self.agent.graph.set_snapshot_vec_engine_tick(int(self.tick))
+        try:
+            from engine.post_fr import post_fr_wm_lr_scale
+
+            self.agent.graph._post_fr_wm_lr_mult = post_fr_wm_lr_scale(self)
+        except Exception:
+            pass
         _t_phase = time.perf_counter()
         result = self._run_agent_or_skill_step(engine_tick=self.tick)
         self._inner_phase_ms = getattr(self, "_inner_phase_ms", {})
@@ -853,7 +898,7 @@ class SimulationTickMixin:
 
         # Track action for episodic memory
         self._record_last_action(result)
-        if self.current_world == "humanoid" and self._fixed_root_active:
+        if is_humanoid_topology(self.current_world) and self._fixed_root_active:
             self._maybe_damp_motor_intents_blind_fixed_root()
 
         _obs_for_d_e: dict = {}
@@ -880,7 +925,7 @@ class SimulationTickMixin:
                     rs = self._ensure_reflex_stabilizer()
             except Exception:
                 rs = None
-        if rs is not None and self.current_world == "humanoid" and not self._fixed_root_active:
+        if rs is not None and is_humanoid_topology(self.current_world) and not self._fixed_root_active:
             try:
                 train_every = int(os.environ.get("RKK_REFLEX_TRAIN_EVERY", "3"))
             except ValueError:
@@ -901,7 +946,7 @@ class SimulationTickMixin:
                 cb_cereb = None
         if (
             cb_cereb is not None
-            and self.current_world == "humanoid"
+            and is_humanoid_topology(self.current_world)
             and not self._fixed_root_active
             and not fallen
         ):
@@ -933,7 +978,7 @@ class SimulationTickMixin:
 
         if (
             _MOTOR_CORTEX_AVAILABLE
-            and self.current_world == "humanoid"
+            and is_humanoid_topology(self.current_world)
             and not self._fixed_root_active
             and not fallen
         ):
@@ -981,7 +1026,7 @@ class SimulationTickMixin:
         # Level 3-I: Multi-scale time tick (first consumer of post-step obs)
         if _TIMESCALE_AVAILABLE and self._timescale is not None:
             self._timescale.tick(self.tick, _obs_for_d_e)
-            if self.current_world != "humanoid":
+            if not is_humanoid_topology(self.current_world):
                 motor_intents = self._timescale.get_intents(LEVEL_MOTOR)
                 for var, val in motor_intents.items():
                     if var.startswith("intent_"):
@@ -998,7 +1043,7 @@ class SimulationTickMixin:
         if (
             _PROPRIO_AVAILABLE
             and self._proprio is not None
-            and self.current_world == "humanoid"
+            and is_humanoid_topology(self.current_world)
             and not fallen
         ):
             self._proprio.update(
@@ -1022,7 +1067,7 @@ class SimulationTickMixin:
 
         # Problem 3: hierarchical PE — stride prior vs com_x drift → low-level intent residuals
         self._hai_last_diag = None
-        if self.current_world == "humanoid":
+        if is_humanoid_topology(self.current_world):
             if (
                 not self._fixed_root_active
                 and not fallen
@@ -1044,7 +1089,7 @@ class SimulationTickMixin:
         if (
             _PHASE_K_AVAILABLE
             and self._sleep_ctrl is not None
-            and self.current_world == "humanoid"
+            and is_humanoid_topology(self.current_world)
         ):
             if fallen and not self._was_fallen_last_tick:
                 self._sleep_ctrl.notify_fall()
@@ -1101,7 +1146,7 @@ class SimulationTickMixin:
         try:
             from engine.context_posterior import RollingObservationPosterior, pearl_context_enabled
 
-            if pearl_context_enabled() and self.current_world == "humanoid":
+            if pearl_context_enabled() and is_humanoid_topology(self.current_world):
                 try:
                     pearl_every = max(1, int(os.environ.get("RKK_PEARL_PUSH_EVERY", "4")))
                 except ValueError:
@@ -1129,7 +1174,7 @@ class SimulationTickMixin:
             pass
 
         # Living Memory: непрерывная временная шкала (humanoid)
-        if self.current_world == "humanoid" and self._episodic_memory is not None:
+        if is_humanoid_topology(self.current_world) and self._episodic_memory is not None:
             self._episodic_memory.append_timeline_tick(
                 self.tick, _obs_for_d_e, fallen, _posture_now, None
             )
@@ -1251,6 +1296,43 @@ class SimulationTickMixin:
             except Exception as e:
                 print(f"[Simulation] world_bridge.on_tick: {e}")
 
+        try:
+            self.agent.graph.tick_compositional_structure(
+                int(self.tick),
+                fixed_root=bool(getattr(self, "_fixed_root_active", False)),
+            )
+        except Exception:
+            pass
+
+        lc = getattr(self, "_latent_confounder", None)
+        if lc is not None:
+            try:
+                from engine.latent_confounder import collect_language_context, compute_cluster_pe
+                from engine.genome.learned_roles import c5_enabled, try_promote_all_passed
+
+                obs_lc = dict(_obs_for_d_e if _obs_for_d_e else {})
+                cluster_pe = compute_cluster_pe(self.agent.graph, obs_lc)
+                pe_lc = float(result.get("prediction_error", 0) or 0)
+                self._latent_confounder_last = lc.tick(
+                    self.agent.graph,
+                    engine_tick=int(self.tick),
+                    prediction_error=pe_lc,
+                    obs=obs_lc,
+                    cluster_pe=cluster_pe,
+                    lang_text=collect_language_context(self),
+                    world_id=str(self.current_world),
+                )
+                if c5_enabled():
+                    try_promote_all_passed(
+                        lc.records_passed_ttl(),
+                        self.agent.graph,
+                        world_id=str(self.current_world),
+                    )
+            except Exception as _lc_ex:
+                logging.getLogger(__name__).debug(
+                    "latent_confounder tick: %s", _lc_ex, exc_info=True
+                )
+
         self._prof_mark("sim.post_visual_ui", _pt)
 
         # Demon
@@ -1290,16 +1372,27 @@ class SimulationTickMixin:
             graph_deltas[0] = el_list
             self._prev_edge_count = cnt
 
-        if self.current_world == "humanoid":
+        if is_humanoid_topology(self.current_world):
             from engine.features.simulation.snapshot import humanoid_curriculum_step
 
             cur_step, _ = humanoid_curriculum_step(self)
-            if cur_step >= 3:
+            _skip_neuro = False
+            try:
+                from engine.eval_mode import eval_mode_enabled, transfer_bench_enabled
+
+                _skip_neuro = eval_mode_enabled() or transfer_bench_enabled()
+            except ImportError:
+                pass
+            if cur_step >= 3 and not _skip_neuro:
                 self.neuro_coordinator.note_step3_entry(self.tick)
                 bt = getattr(self, "behavioral_tracker", None)
                 if bt is not None:
                     bt.note_step3_entry(self.tick)
-            neuro_event = self.neuro_coordinator.request_or_apply(self, tick=self.tick)
+            neuro_event = (
+                None
+                if _skip_neuro
+                else self.neuro_coordinator.request_or_apply(self, tick=self.tick)
+            )
             if neuro_event is not None:
                 if neuro_event.get("type") == "structural_asi_growth":
                     self._add_event(
@@ -1358,7 +1451,7 @@ class SimulationTickMixin:
             if (
                 memory_diag_enabled()
                 and _mem_iv > 0
-                and self.current_world == "humanoid"
+                and is_humanoid_topology(self.current_world)
                 and self.tick % _mem_iv == 0
             ):
                 log_sim_memory(self, f"tick={self.tick}")
@@ -1374,8 +1467,17 @@ class SimulationTickMixin:
             {"tick": self.tick, "ms": _inner_ms},
         )
         # #endregion
+        try:
+            self._tick_phase6(snap)
+        except Exception:
+            pass
+        try:
+            self._tick_phase5(snap)
+        except Exception:
+            pass
+
         bt = getattr(self, "behavioral_tracker", None)
-        if bt is not None and self.current_world == "humanoid":
+        if bt is not None and is_humanoid_topology(self.current_world):
             from engine.features.simulation.snapshot import humanoid_curriculum_step
 
             cur_step, _ = humanoid_curriculum_step(self)

@@ -1,6 +1,8 @@
 """Unified neurogenesis scheduling: request during tick, apply only when safe."""
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 import os
 from typing import Any, TYPE_CHECKING
 
@@ -80,7 +82,7 @@ class NeurogenesisCoordinator:
         high_error_nodes: list[tuple[str, float]] | None = None,
     ) -> dict | None:
         """Queue growth request; returns pending descriptor or None."""
-        if sim.current_world != "humanoid":
+        if not is_humanoid_topology(sim.current_world):
             return None
         if getattr(sim, "_fixed_root_active", False) is False and self._in_step3_grace(sim, tick):
             return None

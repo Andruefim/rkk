@@ -220,6 +220,14 @@ class WorldStateBridge:
                         state_delta_l2=d,
                     )
                 )
+                g = getattr(sim, "agent", None)
+                if g is not None and hasattr(g, "graph"):
+                    try:
+                        g.graph.record_bridge_transition(
+                            list(state_vec), list(labels)
+                        )
+                    except Exception:
+                        pass
 
         self._prev_state = list(state_vec)
         self._prev_tick = tick

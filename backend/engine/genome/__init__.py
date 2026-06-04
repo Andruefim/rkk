@@ -1,4 +1,41 @@
-"""Genome: innate biological priors for the humanoid AGI."""
+"""Genome: innate biological priors and cross-topology transfer (Tracks B4, C6, E)."""
+from engine.genome.learned_roles import (
+    LearnedRoleEntry,
+    learned_roles,
+    learned_roles_snapshot,
+    promote_to_universal_concept,
+    reset_learned_roles,
+)
+from engine.genome.meta_invariants import (
+    CausalSkeleton,
+    apply_skeleton_to_graph,
+    extract_causal_skeleton,
+    extract_skeleton_from_graph,
+    match_motifs,
+    seed_W_from_motif,
+    skeleton_similarity,
+    skeleton_transfer_enabled,
+    transfer_skeleton_nonphys,
+    transfer_skeleton_to_env,
+)
+from engine.genome.role_discovery import (
+    c6_enabled,
+    discover_roles_in_new_env,
+    discovery_snapshot_fields,
+    role_discovery_thresh,
+)
+from engine.genome.spectral import (
+    CARTPOLE_VARIABLE_IDS,
+    GRID_NAV_VARIABLE_IDS,
+    SYMBOLIC_CONTROL_VARIABLE_IDS,
+    apply_spectral_transfer_to_graph,
+    humanoid_to_cartpole_transfer,
+    procrustes_align,
+    spectral_fingerprint,
+    spectral_similarity,
+    spectral_transfer_enabled,
+    transfer_W_spectral,
+)
 from engine.genome.priors import (
     CAUSAL_PRIORS,
     REFLEX_TABLE,
@@ -17,6 +54,15 @@ from engine.genome.priors import (
 )
 
 __all__ = [
+    "CARTPOLE_VARIABLE_IDS",
+    "GRID_NAV_VARIABLE_IDS",
+    "SYMBOLIC_CONTROL_VARIABLE_IDS",
+    "CausalSkeleton",
+    "LearnedRoleEntry",
+    "learned_roles",
+    "learned_roles_snapshot",
+    "promote_to_universal_concept",
+    "reset_learned_roles",
     "CAUSAL_PRIORS",
     "REFLEX_TABLE",
     "STAND_PROGRAM",
@@ -31,4 +77,24 @@ __all__ = [
     "get_stand_program",
     "get_walk_program",
     "walk_intents_at_tick",
+    "apply_skeleton_to_graph",
+    "apply_spectral_transfer_to_graph",
+    "c6_enabled",
+    "discover_roles_in_new_env",
+    "discovery_snapshot_fields",
+    "extract_causal_skeleton",
+    "extract_skeleton_from_graph",
+    "humanoid_to_cartpole_transfer",
+    "match_motifs",
+    "procrustes_align",
+    "role_discovery_thresh",
+    "seed_W_from_motif",
+    "skeleton_similarity",
+    "skeleton_transfer_enabled",
+    "spectral_fingerprint",
+    "spectral_similarity",
+    "spectral_transfer_enabled",
+    "transfer_W_spectral",
+    "transfer_skeleton_nonphys",
+    "transfer_skeleton_to_env",
 ]

@@ -1,6 +1,8 @@
 """Simulation mixin: фазы снимка, L2/L3/L4, иерархия."""
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 from engine.features.simulation.mixin_imports import *
 from engine.visual_concept_store import VisualConceptStore
 
@@ -52,6 +54,10 @@ class SimulationPhaseHierarchyMixin:
             "hierarchical_graph_env": hierarchical_graph_enabled(),
             "active": hg is not None,
         }
+        try:
+            base.update(self.agent.graph.discovery_snapshot_fields())
+        except Exception:
+            pass
         concept_snapshot = (
             dict(self._l4_last_snapshot)
             if _l4_worker_enabled()
@@ -84,7 +90,7 @@ class SimulationPhaseHierarchyMixin:
 
     def _ensure_phase2(self) -> None:
         """Ленивая инициализация компонентов фазы 2 (humanoid)."""
-        if self.current_world != "humanoid":
+        if not is_humanoid_topology(self.current_world):
             return
         if hierarchical_graph_enabled():
             if self._hierarchical_graph is None:
@@ -114,7 +120,7 @@ class SimulationPhaseHierarchyMixin:
     def _maybe_step_hierarchical_l1(self) -> None:
         if not hierarchical_graph_enabled():
             return
-        if self.current_world != "humanoid":
+        if not is_humanoid_topology(self.current_world):
             return
         if self._hierarchical_graph is None:
             return
@@ -295,7 +301,7 @@ class SimulationPhaseHierarchyMixin:
             if isinstance(snap, dict):
                 self._l4_last_snapshot = snap
             new_concepts = list(msg.get("new_concepts") or [])
-            if new_concepts:
+            if new_concepts and not getattr(self, "_fixed_root_active", False):
                 added = self._apply_l4_concepts(new_concepts)
                 c0 = new_concepts[0]
                 self._add_event(

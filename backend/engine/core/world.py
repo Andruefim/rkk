@@ -37,17 +37,47 @@ def resolve_torch_device(requested: str | None = None) -> torch.device:
         return torch.device("cpu")
 
 
+HUMANOID_TOPOLOGY_WORLDS = frozenset({"humanoid", "humanoid_variant"})
+
 WORLDS = {
     "humanoid": {"label": "Humanoid", "color": "#cc44ff"},
+    "humanoid_variant": {"label": "Humanoid (variant)", "color": "#aa66ff"},
+    "cartpole": {"label": "Cartpole (stub)", "color": "#44aaff"},
+    "grid_nav": {"label": "Grid nav (stub)", "color": "#44ff88"},
+    "symbolic_control": {"label": "Symbolic control (stub)", "color": "#ffaa44"},
 }
 
 
-def _make_env(world: str, device: torch.device):
-    if world != "humanoid":
-        raise ValueError(f"only humanoid world is supported (got {world!r})")
-    from engine.environment_humanoid import EnvironmentHumanoid
+def is_humanoid_topology(world: str | None) -> bool:
+    """Same causal variable_ids and role map (Track B0–B1)."""
+    return (world or "") in HUMANOID_TOPOLOGY_WORLDS
 
-    return EnvironmentHumanoid(device=device)
+
+def _make_env(world: str, device: torch.device):
+    if world == "humanoid_variant":
+        from engine.environment_humanoid_variant import EnvironmentHumanoidVariant
+
+        return EnvironmentHumanoidVariant(device=device)
+    if world == "humanoid":
+        from engine.environment_humanoid import EnvironmentHumanoid
+
+        return EnvironmentHumanoid(device=device)
+    if world == "grid_nav":
+        from engine.environment_grid_nav import EnvironmentGridNav
+
+        return EnvironmentGridNav(device=device)
+    if world == "symbolic_control":
+        from engine.environment_symbolic import EnvironmentSymbolic
+
+        return EnvironmentSymbolic(device=device)
+    if world == "cartpole":
+        raise ValueError(
+            f"world {world!r} stub not wired in _make_env (use transfer/eval helpers)"
+        )
+    raise ValueError(
+        f"unsupported world {world!r} "
+        "(expected humanoid, humanoid_variant, grid_nav, symbolic_control)"
+    )
 
 
 def default_bounds() -> HomeostaticBounds:
@@ -88,6 +118,7 @@ class WorldSwitcher:
             self.agent.graph.set_node(var_id, init_obs.get(var_id, 0.5))
 
         self.agent.env = new_env
+        self.agent.graph.set_env_preset(str(getattr(new_env, "preset", new_world)))
 
         from engine.temporal import TemporalBlankets
 
@@ -106,5 +137,8 @@ class WorldSwitcher:
             "gnn_d": self.agent.graph._d,
         }
         self.history.append(rec)
-        print(f"[WorldSwitch] {old} → {new_world} | +{len(new_nodes)} nodes | d={self.agent.graph._d}")
+        print(f"[WorldSwitch] {old} -> {new_world} | +{len(new_nodes)} nodes | d={self.agent.graph._d}")
+        fn = getattr(self, "_on_switch_hook", None)
+        if callable(fn):
+            fn(new_world)
         return {"switched": True, **rec}

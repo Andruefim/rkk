@@ -1,6 +1,8 @@
 """Simulation mixin: episodic fall memory."""
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 from engine.features.simulation.mixin_imports import *
 
 
@@ -21,7 +23,7 @@ class SimulationEpisodicRssmMixin:
             return
         if not episode_memory_enabled():
             return
-        if self.current_world != "humanoid" or self._fixed_root_active:
+        if not is_humanoid_topology(self.current_world) or self._fixed_root_active:
             return
 
         physics_ctx: dict[str, float] = {}

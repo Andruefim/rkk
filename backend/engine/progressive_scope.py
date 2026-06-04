@@ -191,6 +191,8 @@ class ProgressiveScope:
         posture: float,
         quality: float | None = None,
         is_fixed_root: bool = False,
+        sim: Any | None = None,
+        agent: Any | None = None,
     ) -> bool:
         """
         Update mastery estimate. Returns True if phase advanced.
@@ -236,6 +238,14 @@ class ProgressiveScope:
         if is_fixed_root and self._phase >= 1:
             return False
         if mastery >= threshold and fallen_rate < 0.3:
+            if sim is not None and agent is not None:
+                try:
+                    from engine.curriculum_eval_gate import maybe_gate_scope_advance
+
+                    if not maybe_gate_scope_advance(sim, agent):
+                        return False
+                except Exception:
+                    pass
             return self._advance_phase(mastery, fallen_rate)
         return False
 

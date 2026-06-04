@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 import os
 import threading
 import time
@@ -47,7 +49,7 @@ class BackgroundLoopService:
         s = self._sim
         if not s._cpg_decoupled_enabled():
             return
-        if s.current_world != "humanoid":
+        if not is_humanoid_topology(s.current_world):
             return
         if s._fixed_root_active and not cpg_during_fixed_root_enabled():
             return
@@ -87,7 +89,7 @@ class BackgroundLoopService:
                 if not s._locomotion_cpg_enabled():
                     time.sleep(0.05)
                     continue
-                if s.current_world != "humanoid":
+                if not is_humanoid_topology(s.current_world):
                     time.sleep(0.05)
                     continue
                 if s._fixed_root_active and not cpg_during_fixed_root_enabled():

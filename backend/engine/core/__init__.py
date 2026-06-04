@@ -13,10 +13,12 @@ from engine.core.constants import (
 )
 from engine.core.motor_types import MotorCommandLog, MotorState
 from engine.core.world import (
+    HUMANOID_TOPOLOGY_WORLDS,
     WORLDS,
     WorldSwitcher,
     _make_env,
     default_bounds,
+    is_humanoid_topology,
     resolve_torch_device,
 )
 
@@ -31,8 +33,10 @@ __all__ = [
     "l4_worker_enabled",
     "MotorCommandLog",
     "MotorState",
+    "HUMANOID_TOPOLOGY_WORLDS",
     "WORLDS",
     "WorldSwitcher",
+    "is_humanoid_topology",
     "_make_env",
     "default_bounds",
     "resolve_torch_device",

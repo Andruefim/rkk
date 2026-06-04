@@ -128,9 +128,22 @@ export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
 
       ws.onmessage = (ev) => {
         try {
-          const data = JSON.parse(ev.data) as StreamFrame;
+          const data = JSON.parse(ev.data) as StreamFrame & {
+            _ws_hello?: boolean;
+            _ws_recovery?: boolean;
+          };
           if (!data || typeof data !== "object") return;
           setFrame(prev => {
+            // Hello/recovery — только метаданные; не затирать scene/agents (иначе «перезагрузка» 3D).
+            if (data._ws_hello || data._ws_recovery) {
+              return {
+                ...prev,
+                tick: data.tick ?? prev.tick,
+                phase: data.phase ?? prev.phase,
+                entropy: data.entropy ?? prev.entropy,
+                events: data.events?.length ? data.events : prev.events,
+              };
+            }
             const raw = Array.isArray(data.agents) ? data.agents : prev.agents;
             const gd = data.graph_deltas ?? {};
             const agents = raw.map((a, i) => ({

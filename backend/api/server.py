@@ -15,6 +15,8 @@ server.py — FastAPI для Singleton AGI Humanoid (Фаза 11 + 12).
 Установить для Фазы 12: pip install opencv-python scipy
 """
 from __future__ import annotations
+
+from engine.core.world import is_humanoid_topology
 import asyncio
 import json
 import os
@@ -101,7 +103,7 @@ async def _startup_auto_vision() -> None:
         return
     try:
         sim = get_sim()
-        if sim.current_world != "humanoid":
+        if not is_humanoid_topology(sim.current_world):
             return
         if sim._visual_mode:
             return
@@ -479,7 +481,7 @@ async def fixed_root_disable():
 def humanoid_reset_stance():
     """Reset humanoid to default standing pose (for walk/recovery testing)."""
     sim = get_sim()
-    if sim.current_world != "humanoid":
+    if not is_humanoid_topology(sim.current_world):
         return {"ok": False, "error": "not_humanoid"}
     sim.disable_fixed_root()
     base = sim.agent.env

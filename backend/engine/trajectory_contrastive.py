@@ -70,6 +70,7 @@ class TrajectorySegment:
     outcome: dict[str, float]         # labeled metrics
     tick_start: int = 0
     tick_end: int = 0
+    tags: dict[str, Any] = field(default_factory=dict)
 
 
 # ── Outcome computation ──────────────────────────────────────────────────────
@@ -146,6 +147,7 @@ class TrajectoryCollector:
         self._current_obs: list[dict[str, float]] = []
         self._current_actions: list[tuple[str, float] | None] = []
         self._current_fallen: list[bool] = []
+        self._current_tags: list[dict[str, Any]] = []
         self._tick_start: int = 0
 
         self.buffer: deque[TrajectorySegment] = deque(maxlen=buf_size)
@@ -158,6 +160,7 @@ class TrajectoryCollector:
         is_fallen: bool,
         node_ids: list[str],
         engine_tick: int,
+        curriculum_tags: dict[str, Any] | None = None,
     ) -> TrajectorySegment | None:
         """
         Feed one tick of experience. Returns completed segment if ready.
@@ -172,6 +175,7 @@ class TrajectoryCollector:
         self._current_obs.append(dict(obs))
         self._current_actions.append(action)
         self._current_fallen.append(bool(is_fallen))
+        self._current_tags.append(dict(curriculum_tags or {}))
 
         if len(self._current_obs) >= self.segment_len:
             return self._finalize(engine_tick)
@@ -182,6 +186,7 @@ class TrajectoryCollector:
         obs_list = list(self._current_obs)
         act_list = list(self._current_actions)
         fallen_list = list(self._current_fallen)
+        tags_list = list(self._current_tags)
 
         # Vectorize observations for GNN training
         nids = self._node_ids
@@ -191,6 +196,24 @@ class TrajectoryCollector:
             obs_vecs.append(vec)
 
         outcome = compute_segment_outcome(obs_list, fallen_list)
+        try:
+            from engine.eval_mode import aggregate_segment_tags
+
+            tag_agg = aggregate_segment_tags(tags_list)
+        except Exception:
+            tag_agg = {}
+        if fallen_list:
+            n = len(fallen_list)
+            obs_fallen_frac = round(sum(1 for f in fallen_list if f) / n, 4)
+            if not tag_agg:
+                tag_agg = {
+                    "fallen_frac": obs_fallen_frac,
+                    "fixed_root_frac": 0.0,
+                    "dominant_stage": "unknown",
+                }
+            else:
+                tag_agg.setdefault("fallen_frac", obs_fallen_frac)
+        outcome.update(tag_agg)
 
         seg = TrajectorySegment(
             observations=obs_vecs,
@@ -198,6 +221,7 @@ class TrajectoryCollector:
             outcome=outcome,
             tick_start=self._tick_start,
             tick_end=engine_tick,
+            tags=tag_agg,
         )
         self.buffer.append(seg)
 
@@ -206,6 +230,7 @@ class TrajectoryCollector:
         self._current_obs = self._current_obs[-keep:]
         self._current_actions = self._current_actions[-keep:]
         self._current_fallen = self._current_fallen[-keep:]
+        self._current_tags = self._current_tags[-keep:]
         self._tick_start = engine_tick - keep
 
         return seg

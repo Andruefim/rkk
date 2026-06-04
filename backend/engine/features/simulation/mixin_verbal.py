@@ -1,6 +1,8 @@
 """Simulation mixin: чат, verbal tick."""
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 from engine.features.simulation.mixin_imports import *
 
 
@@ -39,7 +41,7 @@ class SimulationVerbalMixin:
         """Run async verbal tick in a daemon thread (agent thread has no asyncio loop)."""
         if not _VERBAL_AVAILABLE or self._verbal is None:
             return
-        if self.current_world != "humanoid" or self._inner_voice is None:
+        if not is_humanoid_topology(self.current_world) or self._inner_voice is None:
             return
         if not speech_enabled():
             return
@@ -62,7 +64,7 @@ class SimulationVerbalMixin:
     async def _tick_verbal(self, tick: int, fallen: bool) -> None:
         if not _VERBAL_AVAILABLE or self._verbal is None:
             return
-        if self.current_world != "humanoid" or self._inner_voice is None:
+        if not is_humanoid_topology(self.current_world) or self._inner_voice is None:
             return
         obs: dict[str, float] = {}
         try:

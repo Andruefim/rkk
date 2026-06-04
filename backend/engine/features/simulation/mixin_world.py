@@ -1,6 +1,8 @@
 """Simulation mixin: смена мира, vision, fixed_root."""
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 from engine.features.simulation.mixin_imports import *
 
 
@@ -297,6 +299,23 @@ class SimulationWorldMixin:
 
             self._fixed_root_active = False
             self._post_fr_last_release_tick = int(getattr(self, "tick", 0))
+            try:
+                from engine.post_fr import (
+                    apply_post_fr_alpha_decay,
+                    apply_post_fr_ensemble_entropy_boost,
+                    post_fr_wm_lr_scale,
+                )
+
+                n_decay = apply_post_fr_alpha_decay(self.agent.graph)
+                ent = apply_post_fr_ensemble_entropy_boost(self.agent.graph)
+                self.agent.graph._post_fr_wm_lr_mult = post_fr_wm_lr_scale(self)
+                print(
+                    f"[PostFR] alpha_decay_edges={n_decay} "
+                    f"ensemble_entropy={ent} wm_lr_mult={self.agent.graph._post_fr_wm_lr_mult:.2f}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[PostFR] calibration failed: {e}", flush=True)
 
             try:
                 n_exp = int(os.environ.get("RKK_POST_FR_EXPLORE_TICKS", "300"))
@@ -336,7 +355,7 @@ class SimulationWorldMixin:
         Pin pelvis for sleep consolidation (REM/lesson/prune).
         Uses Simulation.enable_fixed_root — not HumanoidEnvironment/PyBullet directly.
         """
-        if self.current_world != "humanoid":
+        if not is_humanoid_topology(self.current_world):
             return False
         self._sleep_prev_fixed_root = bool(self._fixed_root_active)
         if self._fixed_root_active:
@@ -357,7 +376,7 @@ class SimulationWorldMixin:
 
     def _sleep_ensure_fixed_root_while_sleeping(self) -> None:
         """Re-attach if something released fixed_root mid-sleep."""
-        if self.current_world != "humanoid" or self._fixed_root_active:
+        if not is_humanoid_topology(self.current_world) or self._fixed_root_active:
             return
         if not getattr(self, "_sleep_ctrl", None) or not self._sleep_ctrl.is_sleeping:
             return

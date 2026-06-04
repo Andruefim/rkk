@@ -14,7 +14,7 @@ class SimulationSkillsMixin:
             p = float(os.environ.get("RKK_SKILL_LIBRARY_PROB", "0.1"))
         except ValueError:
             p = 0.1
-        if self.current_world == "humanoid" and not self._fixed_root_active:
+        if is_humanoid_topology(self.current_world) and not self._fixed_root_active:
             obs = self.agent.env.observe()
             posture = float(
                 obs.get(
@@ -42,6 +42,82 @@ class SimulationSkillsMixin:
                 out.setdefault(k[5:], v)
         return out
 
+    def _skill_chain_max_depth(self) -> int:
+        try:
+            return max(1, int(os.environ.get("RKK_SKILL_CHAIN_MAX_DEPTH", "4")))
+        except ValueError:
+            return 4
+
+    def _skill_chain_pe_max(self) -> float:
+        try:
+            return float(os.environ.get("RKK_SKILL_CHAIN_PE_MAX", "0.25"))
+        except ValueError:
+            return 0.25
+
+    def _skill_chain_depth(self) -> int:
+        pack = self._skill_exec
+        if pack is None:
+            return len(getattr(self, "_skill_chain", []) or [])
+        return int(pack.get("chain_depth", len(getattr(self, "_skill_chain", []) or [])))
+
+    def _maybe_chain_next_skill(
+        self,
+        skill,
+        st_after: dict,
+        *,
+        prediction_error: float,
+        obs_before_init: dict,
+    ) -> bool:
+        """C1: queue next macro if PE gate passes and chain depth < max."""
+        depth = self._skill_chain_depth()
+        if depth >= self._skill_chain_max_depth():
+            return False
+        if float(prediction_error) > self._skill_chain_pe_max():
+            return False
+        try:
+            if not skill.postcondition(st_after):
+                return False
+        except Exception:
+            return False
+        goal = self._skill_goal_hint(st_after)
+        nxt = self._ensure_skill_library().select_skill(st_after, goal)
+        if nxt is None or nxt.name == skill.name:
+            return False
+        chain = list(getattr(self, "_skill_chain", []) or [])
+        chain.append(skill.name)
+        self._skill_chain = chain
+        self._skill_exec = {
+            "skill": nxt,
+            "index": 0,
+            "obs_before": dict(obs_before_init),
+            "chain_depth": depth + 1,
+        }
+        return True
+
+    def _start_skill_if_due(self, engine_tick: int) -> bool:
+        if not self._skill_library_enabled():
+            return False
+        if self._skill_exec is not None:
+            return False
+        import random
+
+        if random.random() > self._skill_start_prob():
+            return False
+        obs = dict(self.agent.env.observe())
+        st = self._skill_state_dict(obs)
+        goal = self._skill_goal_hint(st)
+        sk = self._ensure_skill_library().select_skill(st, goal)
+        if sk is None:
+            return False
+        self._skill_chain = []
+        self._skill_exec = {
+            "skill": sk,
+            "index": 0,
+            "obs_before": st,
+            "chain_depth": 0,
+        }
+        return True
+
     def _skill_goal_hint(self, st: dict) -> str:
         cz = float(st.get("com_z", st.get("phys_com_z", 0.5)))
         posture = float(st.get("posture_stability", st.get("phys_posture_stability", 0.5)))
@@ -57,7 +133,7 @@ class SimulationSkillsMixin:
             walk_min = 2000
         if (
             walk_min > 0
-            and self.current_world == "humanoid"
+            and is_humanoid_topology(self.current_world)
             and not self._fixed_root_active
             and self.tick < walk_min
         ):
@@ -132,12 +208,20 @@ class SimulationSkillsMixin:
                 self._ensure_skill_library().record_outcome(
                     skill, st, cz_a - cz_b
                 )
-                self._skill_exec = None
+                if not self._maybe_chain_next_skill(
+                    skill,
+                    st,
+                    prediction_error=0.0,
+                    obs_before_init=obs_before_init,
+                ):
+                    self._skill_exec = None
+                    self._skill_chain = []
             else:
                 self._skill_exec = {
                     "skill": skill,
                     "index": idx,
                     "obs_before": obs_before_init,
+                    "chain_depth": int(pack.get("chain_depth", 0)),
                 }
             return {
                 "blocked": False,
@@ -228,6 +312,19 @@ class SimulationSkillsMixin:
 
         idx += 1
         done = idx >= len(skill.action_sequence)
+        pe = float(
+            np.mean(
+                [
+                    abs(
+                        float(self.agent.graph.nodes.get(nid, 0.5))
+                        - float(obs_after_full.get(nid, 0.5))
+                    )
+                    for nid in self.agent.graph._node_ids[:24]
+                ]
+            )
+            if self.agent.graph._node_ids
+            else 0.0
+        )
         if done:
             cz_a = float(st_after.get("com_z", st_after.get("phys_com_z", 0.5)))
             cz_b = float(
@@ -237,12 +334,20 @@ class SimulationSkillsMixin:
             )
             reward = cz_a - cz_b
             self._ensure_skill_library().record_outcome(skill, st_after, reward)
-            self._skill_exec = None
+            if not self._maybe_chain_next_skill(
+                skill,
+                st_after,
+                prediction_error=pe,
+                obs_before_init=obs_before_init,
+            ):
+                self._skill_exec = None
+                self._skill_chain = []
         else:
             self._skill_exec = {
                 "skill": skill,
                 "index": idx,
                 "obs_before": obs_before_init,
+                "chain_depth": int(pack.get("chain_depth", 0)),
             }
 
         return {
@@ -250,6 +355,8 @@ class SimulationSkillsMixin:
             "skipped": True,
             "hierarchy": "skill",
             "skill": skill.name,
+            "skill_chain_depth": self._skill_chain_depth(),
+            "skill_chain": list(getattr(self, "_skill_chain", []) or []),
             "skill_step": idx,
             "skill_done": done,
             "variable": var0,
@@ -436,6 +543,8 @@ class SimulationSkillsMixin:
 
     def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
         """Curiosity-driven exploration; optional Active Inference every K ticks."""
+        if self._skill_exec is not None:
+            return self._execute_skill_frame()
         ai_on = os.environ.get("RKK_ACTIVE_INFERENCE", "0").strip().lower() in (
             "1", "true", "yes", "on",
         )
@@ -452,8 +561,10 @@ class SimulationSkillsMixin:
                     return self._run_active_inference_step(engine_tick)
                 except Exception:
                     pass
+        if self._start_skill_if_due(engine_tick):
+            return self._execute_skill_frame()
         fallen = False
-        if self.current_world == "humanoid" and not self._fixed_root_active:
+        if is_humanoid_topology(self.current_world) and not self._fixed_root_active:
             is_fn = getattr(self.agent.env, "is_fallen", None)
             fallen = bool(is_fn()) if callable(is_fn) else False
         return self.agent.step(

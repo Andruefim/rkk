@@ -55,6 +55,14 @@ def s2_wm_recover_max_branch() -> int:
         return 16
 
 
+def s2_wm_max_graph_d() -> int:
+    """Skip heavy WM beam when concept/S2 nodes inflate graph (avoids tick freeze)."""
+    try:
+        return max(48, int(os.environ.get("RKK_S2_WM_MAX_GRAPH_D", "80")))
+    except ValueError:
+        return 80
+
+
 def s2_wm_gate_strict() -> bool:
     """При активной задаче S2 — только WM-кандидат (без EIG / CEM / legacy goal_plan)."""
     if not s2_wm_planner_enabled():
@@ -373,6 +381,12 @@ def plan_s2_wm_candidate(
             return _bundle_fallback()
         return None
 
+    graph_d = int(getattr(agent.graph, "_d", 0) or 0)
+    if graph_d > s2_wm_max_graph_d():
+        fb_d = _bundle_fallback()
+        if fb_d is not None:
+            return fb_d
+
     motor = _action_var_whitelist(
         task, planning_graph_motor_vars(agent.env, list(agent.graph._node_ids))
     )
@@ -382,6 +396,8 @@ def plan_s2_wm_candidate(
     levels = _value_levels_for_task(task)
     actions: list[tuple[str, float]] = [(v, x) for v in motor for x in levels]
     max_b = plan_max_branch_effective(fixed_root=fixed_root)
+    if graph_d > 64:
+        max_b = min(max_b, max(6, int(max_b * 64 / graph_d)))
     if task.fallen_override or (task.fallen and task.macro == "RECOVER_POSTURE"):
         max_b = min(max_b, s2_wm_recover_max_branch())
     if len(actions) > max_b:

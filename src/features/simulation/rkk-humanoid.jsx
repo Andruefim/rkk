@@ -193,11 +193,34 @@ export default function RKKHumanoid() {
 
   const setSpeed = s => { setSpeedLocal(s); if (connected) wsSetSpeed(s); };
 
+  const uiRef = useRef(ui);
+  uiRef.current = ui;
+
   useEffect(() => {
+    const raw = wsFrame;
+    if (raw?._ws_hello || raw?._ws_recovery) {
+      setUI((prev) => ({
+        ...prev,
+        tick: raw.tick ?? prev.tick,
+        phase: raw.phase ?? prev.phase,
+      }));
+      return;
+    }
     const f = normFrame(wsFrame);
-    setUI(f);
+    setUI((prev) => {
+      const sk = f.scene?.skeleton;
+      const prevSk = prev.scene?.skeleton;
+      if (
+        (!sk || sk.length < 3) &&
+        prevSk &&
+        prevSk.length >= 3 &&
+        (f.tick ?? 0) >= (prev.tick ?? 0)
+      ) {
+        return { ...f, scene: prev.scene };
+      }
+      return f;
+    });
     setVisionEnabled(f.visualMode);
-    // Синхронизируем fixed_root из WS stream
     setFixedRoot(f.fixedRoot);
     fixedRootRef.current = f.fixedRoot;
   }, [wsFrame]);

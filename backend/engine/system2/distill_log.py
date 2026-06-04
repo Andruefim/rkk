@@ -209,6 +209,8 @@ def analyze_distill_file(
     by_macro: dict[str, list[dict[str, Any]]] = {}
     by_source: dict[str, list[dict[str, Any]]] = {}
     by_skill: dict[str, list[dict[str, Any]]] = {}
+    by_fixed_root: dict[str, list[dict[str, Any]]] = {"true": [], "false": []}
+    recover_fr: list[dict[str, Any]] = []
     for r in rows:
         m = str(r.get("macro", "IDLE")).upper()
         by_macro.setdefault(m, []).append(r)
@@ -217,6 +219,11 @@ def analyze_distill_file(
         sk = r.get("skill_id") or r.get("proposal_skill_id")
         if sk:
             by_skill.setdefault(str(sk), []).append(r)
+        fr_key = "true" if r.get("fixed_root") else "false"
+        by_fixed_root[fr_key].append(r)
+        macro_u = str(r.get("macro", "")).upper()
+        if macro_u == "RECOVER_POSTURE" or "recover" in str(r.get("source", "")).lower():
+            recover_fr.append(r)
 
     recover = [
         r
@@ -297,6 +304,11 @@ def analyze_distill_file(
         "by_macro": {k: _rate(v) for k, v in sorted(by_macro.items())},
         "by_source": {k: _rate(v) for k, v in sorted(by_source.items())},
         "by_skill_id": {k: _rate(v) for k, v in sorted(by_skill.items())},
+        "by_fixed_root": {k: _rate(v) for k, v in by_fixed_root.items() if v},
+        "recover_fixed_root": {
+            "count": len(recover_fr),
+            "success_rate": _rate(recover_fr),
+        },
         "recover": {
             "count": len(recover),
             "success_rate": _rate(recover),

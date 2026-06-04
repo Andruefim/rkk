@@ -94,6 +94,7 @@ from engine.rsi_lite import (
     rsi_min_interventions,
     rsi_plateau_interventions,
 )
+from engine.eval_mode import curriculum_context_tags, eval_mode_enabled
 from engine.trajectory_contrastive import TrajectoryCollector, trajectory_enabled
 from engine.progressive_scope import ProgressiveScope, progressive_scope_enabled
 
@@ -549,6 +550,9 @@ class RKKAgent:
         self._replay_buffer: deque[dict] = deque(maxlen=512)
         self._genome_ema_W: torch.Tensor | None = None
 
+        # Phase 5: meta-causal self-model (lazy init in simulation._ensure_phase5)
+        self._w_meta: Any | None = None
+
         self._bootstrap()
 
     def set_system2_candidate(self, candidate: dict | None) -> None:
@@ -581,6 +585,7 @@ class RKKAgent:
 
     # ── Bootstrap + LLM seed interface ───────────────────────────────────────
     def _bootstrap(self):
+        self.graph.set_env_preset(str(getattr(self.env, "preset", "humanoid")))
         for var_id, val in self.env.variables.items():
             self.graph.set_node(var_id, val)
 
@@ -655,9 +660,14 @@ class RKKAgent:
 
     def _refresh_h_W_cache_if_needed(self) -> None:
         """dag_constraint on d=256 is costly — share cache with score_interventions window."""
+        from engine.graph_perf import is_large_graph
+
         sce = self._effective_score_cache_every(self._last_engine_tick)
         if self._last_engine_tick - self._h_W_cache_tick >= max(1, sce):
-            self._h_W_cache = float(abs(self._get_h_W()))
+            if is_large_graph(self.graph):
+                self._h_W_cache = float(getattr(self, "_h_W_cache", 0.5) or 0.5)
+            else:
+                self._h_W_cache = float(abs(self._get_h_W()))
             self._h_W_cache_tick = self._last_engine_tick
 
     def _cached_h_W_abs(self) -> float:
@@ -803,6 +813,23 @@ class RKKAgent:
 
     def _features_for_intervention_pair(self, v_from: str, v_to: str) -> list[float]:
         """Один вектор признаков System1 для пары (в_from→в_to), как в score_interventions."""
+        from engine.graph_perf import is_large_graph
+
+        if is_large_graph(self.graph):
+            disc_rate = self._discovery_rate_for_tick(self._last_engine_tick)
+            val_from = self.graph.nodes.get(v_from, 0.5)
+            val_to = self.graph.nodes.get(v_to, 0.5)
+            return self.system1.build_features(
+                w_ij=0.0,
+                alpha_ij=0.5,
+                val_from=val_from,
+                val_to=val_to,
+                uncertainty=0.45,
+                h_W_norm=0.5,
+                grad_norm_ij=0.0,
+                intervention_count=0,
+                discovery_rate=disc_rate,
+            )
         h_W_norm = min(self._cached_h_W_abs() / max(self.graph._d, 1), 1.0)
         disc_rate = self._discovery_rate_for_tick(self._last_engine_tick)
         nid_to_i = {n: i for i, n in enumerate(self.graph._node_ids)}
@@ -992,10 +1019,9 @@ class RKKAgent:
             return 2048
 
     def _snapshot_edges_max_from_env(self) -> int:
-        try:
-            return int(os.environ.get("RKK_SNAPSHOT_EDGES_MAX", "512"))
-        except ValueError:
-            return 512
+        from engine.graph_perf import snapshot_edges_max_for_graph
+
+        return snapshot_edges_max_for_graph(self.graph)
 
     def _sample_significant_edge_pairs(
         self, max_pairs: int, rng: np.random.Generator
@@ -1790,6 +1816,8 @@ class RKKAgent:
     def step(self, engine_tick: int = 0, *, enable_l3: bool = True, fallen: bool = False) -> dict:
         _step_t0 = time.perf_counter()
         _fallen_fast = bool(fallen)
+        _eval_fast = eval_mode_enabled()
+        _perf_fast = _fallen_fast or _eval_fast
         _slow_t = {
             "observe": 0.0,
             "score_interventions": 0.0,
@@ -1845,7 +1873,7 @@ class RKKAgent:
             _score_mode = "s2_wm_strict"
             _slow_t["score_interventions"] = 0.0
             _t_score = time.perf_counter()
-        elif _fallen_fast and self._score_cache:
+        elif _perf_fast and self._score_cache:
             scores = _filter_intent_scores(self._score_cache)
             if not scores:
                 s2c = getattr(self, "_system2_candidate", None)
@@ -1872,7 +1900,18 @@ class RKKAgent:
                 _env_fixed_root_flag(self.env)
                 or _graph_fixed_root_flag(self.graph.nodes)
             )
-            if _fr_score_only and self._score_cache:
+            try:
+                from engine.graph_perf import is_large_graph as _is_large_graph
+
+                _large_graph_score_cache = _is_large_graph(self.graph) and bool(
+                    self._score_cache
+                )
+            except ImportError:
+                _large_graph_score_cache = False
+            if _large_graph_score_cache:
+                scores = list(self._score_cache)
+                _score_mode = "large_graph_cache_only"
+            elif _fr_score_only and self._score_cache:
                 scores = list(self._score_cache)
                 _score_mode = "fixed_root_cache_only"
                 # Не фоновый score_interventions при fixed_root — гонка с train_step вешает ~280.
@@ -1991,7 +2030,7 @@ class RKKAgent:
         else:
             gp = (
                 self._maybe_goal_planned_candidate()
-                if enable_l3 and not _fallen_fast
+                if enable_l3 and not _perf_fast
                 else None
             )
             if gp is not None and not (
@@ -2060,7 +2099,7 @@ class RKKAgent:
             }
 
         _nodes_now = dict(self.graph.nodes)
-        _vl_fast = bool(_fallen_fast)
+        _vl_fast = bool(_perf_fast)
         if not _vl_fast and _vl_fast_fallen_intents_enabled():
             _vl_fast = _nodes_low_posture_for_fast_vl(_nodes_now)
         if isinstance(s2_ctx, dict) and s2_ctx.get("fallen_override_active"):
@@ -2298,7 +2337,7 @@ class RKKAgent:
                 _train_due = int(engine_tick) > 0 and int(engine_tick) % fe == 0
             else:
                 _train_due = False
-        if _train_due and not skip_notears:
+        if _train_due and not skip_notears and not eval_mode_enabled():
             # #region agent log
             _t_ts = time.perf_counter()
             # #endregion
@@ -2332,7 +2371,7 @@ class RKKAgent:
                 for k in self.graph._node_ids[:32]
             ]) if self.graph._node_ids else 0.0
         )
-        if not _fallen_fast:
+        if not _perf_fast:
             self._push_causal_replay(
                 var, value, obs_before_full, observed_full,
                 compression_delta=compression_delta,
@@ -2479,7 +2518,7 @@ class RKKAgent:
             dtype=torch.float32,
             device=self.device,
         )
-        if not _fallen_fast:
+        if not _perf_fast:
             self.temporal.train_step(u_next)
 
         self._total_interventions += 1
@@ -2492,7 +2531,8 @@ class RKKAgent:
         self._last_blocked_reason = ""
 
         # Phase T: feed trajectory collector + progressive scope
-        if trajectory_enabled() and not _fallen_fast:
+        _sim = self._resolve_rkk_sim()
+        if trajectory_enabled() and not _perf_fast:
             is_env_fallen = False
             try:
                 fn_fallen = getattr(self.env, 'is_fallen', None)
@@ -2502,25 +2542,31 @@ class RKKAgent:
                     is_env_fallen = is_fallen
             except Exception:
                 is_env_fallen = is_fallen
+            _cur_tags = {}
+            if _sim is not None:
+                _cur_tags = curriculum_context_tags(_sim, self)
             completed_seg = self._traj_collector.tick(
                 obs=observed_env,
                 action=(var, float(value)),
                 is_fallen=is_env_fallen,
                 node_ids=list(self.graph._node_ids),
                 engine_tick=engine_tick,
+                curriculum_tags=_cur_tags,
             )
-            if completed_seg is not None:
+            if completed_seg is not None and not eval_mode_enabled():
                 # Feed completed segment to GNN for trajectory-level training
                 self.graph._traj_segments.append(completed_seg)
                 if len(self.graph._traj_segments) > self.graph._traj_max_segments:
                     self.graph._traj_segments = self.graph._traj_segments[-self.graph._traj_max_segments:]
-        if progressive_scope_enabled() and not _fallen_fast:
+        if progressive_scope_enabled() and not _perf_fast:
             tq = self._traj_collector.recent_quality() if trajectory_enabled() else None
             self._prog_scope.tick(
                 is_fallen=is_fallen,
                 posture=posture_now,
                 quality=tq,
                 is_fixed_root=is_fixed_root,
+                sim=_sim,
+                agent=self,
             )
 
         if _ig_diag_enabled() and self._total_interventions % 50 == 0:
@@ -2539,7 +2585,7 @@ class RKKAgent:
             )
 
         _t0_dr = time.perf_counter()
-        if _fallen_fast:
+        if _perf_fast:
             try:
                 dr_every = max(1, int(os.environ.get("RKK_DISCOVERY_RATE_EVERY_FALLEN", "8")))
             except ValueError:
@@ -2796,7 +2842,9 @@ class RKKAgent:
             alpha_every = max(1, int(os.environ.get("RKK_SNAPSHOT_ALPHA_EVERY", "40")))
         except ValueError:
             alpha_every = 40
-        if core is not None and (
+        from engine.graph_perf import is_large_graph
+
+        if core is not None and not is_large_graph(self.graph) and (
             h_W_edge_entropy is None
             or self._last_engine_tick % alpha_every == 0
         ):
@@ -2815,6 +2863,12 @@ class RKKAgent:
             "graph_mdl":             round(self.graph.mdl_size, 3),
             "compression_gain":      round(self.compression_gain, 4),
             "alpha_mean":            round(self.graph.alpha_mean, 3),
+            "post_fr_wm_lr_active": bool(
+                float(getattr(self.graph, "_post_fr_wm_lr_mult", 1.0)) > 1.001
+            ),
+            "post_fr_wm_lr_mult": round(
+                float(getattr(self.graph, "_post_fr_wm_lr_mult", 1.0)), 3
+            ),
             "phi":                   round(phi_eff, 4),
             "phi_raw":               round(phi_raw, 4),
             "node_count":            len(self.graph.nodes),
@@ -2859,9 +2913,13 @@ class RKKAgent:
                 "segments": len(self.graph._traj_segments) if hasattr(self.graph, "_traj_segments") else 0,
             },
         }
-        el_ec, el_list = self._snapshot_edges_payload()
-        snap["edge_count"] = el_ec
-        snap["edges"] = el_list
+        if eval_mode_enabled():
+            snap["edge_count"] = int(self.graph.edge_count)
+            snap["edges"] = []
+        else:
+            el_ec, el_list = self._snapshot_edges_payload()
+            snap["edge_count"] = el_ec
+            snap["edges"] = el_list
         if self.env.preset == "pybullet":
             pos_fn = getattr(self.env, "object_positions_world", None)
             if callable(pos_fn):
@@ -2875,5 +2933,22 @@ class RKKAgent:
         ens = getattr(self.graph, "_ensemble", None)
         if ens is not None:
             snap["graph_ensemble"] = ens.snapshot()
+        try:
+            snap.update(self.graph.discovery_snapshot_fields())
+        except Exception:
+            pass
+        wmeta = getattr(self, "_w_meta", None)
+        if wmeta is not None:
+            try:
+                snap["w_meta"] = wmeta.snapshot()
+                snap["meta_prediction_error"] = wmeta.meta_prediction_error_rolling(500)
+            except Exception:
+                pass
         snap["replay_buffer_len"] = len(getattr(self, "_replay_buffer", []))
+        try:
+            role_types = self.graph.role_type_map()
+            if role_types:
+                snap["meta"] = {"role_types": role_types}
+        except Exception:
+            pass
         return snap

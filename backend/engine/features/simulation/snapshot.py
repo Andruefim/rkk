@@ -1,6 +1,8 @@
 """Сборка WS/HTTP снимка состояния (вынесено из Simulation для SRP)."""
 from __future__ import annotations
 
+from engine.core.world import is_humanoid_topology
+
 from typing import Any
 
 from engine.core.constants import (
@@ -10,6 +12,15 @@ from engine.core.constants import (
     l4_worker_enabled as _l4_worker_enabled,
 )
 from engine.core.world import WORLDS
+def _learned_roles_snapshot() -> dict:
+    try:
+        from engine.genome.learned_roles import learned_roles_snapshot
+
+        return learned_roles_snapshot()
+    except ImportError:
+        return {"enabled": False, "entries": []}
+
+
 from engine.features.simulation.imports import (
     _INNER_VOICE_AVAILABLE,
     _PHASE_K_AVAILABLE,
@@ -29,7 +40,7 @@ def humanoid_curriculum_step(sim: Any) -> tuple[int, int]:
       3 — free locomotion (pelvis free, CPG + genome walk)
     Returns (step 0..3, stabilize_until tick; 0 if not humanoid).
     """
-    if getattr(sim, "current_world", None) != "humanoid":
+    if not is_humanoid_topology(getattr(sim, "current_world", None)):
         return 0, 0
     until = int(getattr(sim, "_curriculum_stabilize_until", 0) or 0)
     if getattr(sim, "_fixed_root_active", False):
@@ -218,6 +229,8 @@ def build_simulation_snapshot(
             if _VERBAL_AVAILABLE and sim._verbal is not None
             else {"enabled": False}
         ),
+        "latent_confounder": getattr(sim, "_latent_confounder_last", None) or {},
+        "learned_roles": _learned_roles_snapshot(),
         "visual_voice": (
             sim._visual_voice.snapshot()
             if _PHASE_M_AVAILABLE and sim._visual_voice is not None
@@ -235,6 +248,8 @@ def build_simulation_snapshot(
         ),
         "phase1": sim._phase1_snapshot_meta(),
         "phase2": sim._phase2_snapshot_meta(),
+        "phase5": sim._phase5_snapshot_meta(),
+        "phase6": sim._phase6_snapshot_meta() if hasattr(sim, "_phase6_snapshot_meta") else {},
         "motor_primitives": (
             sim._motor_prim_lib.snapshot()
             if getattr(sim, "_motor_prim_lib", None) is not None
