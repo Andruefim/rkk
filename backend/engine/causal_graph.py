@@ -904,10 +904,14 @@ class CausalGraph:
         }
 
     def structure_learn_every(self) -> int:
+        """Ticks between C3 structure steps; RKK_STRUCTURE_LEARN_EVERY=0 disables."""
         try:
-            return max(1, int(os.environ.get("RKK_STRUCTURE_LEARN_EVERY", "50")))
+            raw = int(os.environ.get("RKK_STRUCTURE_LEARN_EVERY", "50"))
         except ValueError:
             return 50
+        if raw <= 0:
+            return 2**31
+        return max(1, raw)
 
     def _pair_corr_from_obs(self, a: str, b: str) -> float:
         if a not in self._node_ids or b not in self._node_ids:
