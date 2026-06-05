@@ -1,39 +1,80 @@
 ---
 name: Generalization roadmap
-overview: >
-  7 фаз (0–6), Phase 6 разбита на 6a/6b/6c, 24 todo по одному за PR.
-  Scorecard: abstract A1/A4 + WorldAutonomyContract (до Phase 4);
-  pass_core_embodied frozen на humanoid Phase 2;
-  pass_agi_full = pass_agi_extended (frozen) + A1/A4 non-phys + #8–10.
-  v3 fixes: все "—"-пороги заполнены; Phase 2 contingency paths;
-  Phase 6 → 6a/6b/6c sub-gates; GoalGenerator saturation guard;
-  EWC stable-edge Fisher + subgraph-hash recompute;
-  I3 → MetaCircuitBreaker (CLOSED/OPEN/HALF_OPEN).
+overview: |
+  7 фаз (0–6), Phase 6 разбита на 6a/6b/6c, 24 todo по одному за PR. Scorecard: abstract A1/A4 + WorldAutonomyContract (до Phase 4); pass_core_embodied frozen на humanoid Phase 2; pass_agi_full = pass_agi_extended (frozen) + A1/A4 non-phys + #8–10. v3 fixes: все "—"-пороги заполнены; Phase 2 contingency paths; Phase 6 → 6a/6b/6c sub-gates; GoalGenerator saturation guard; EWC stable-edge Fisher + subgraph-hash recompute; I3 → MetaCircuitBreaker (CLOSED/OPEN/HALF_OPEN).
 todos:
-  - { id: track-a-transfer-eval,       phase: 0, status: pending, content: "[Phase 0] eval_transfer.py + RKK_EVAL_MODE + JSONL; scorecard hooks; integration/conftest stub" }
-  - { id: track-a-buffer-tags,         phase: 0, status: pending, content: "[Phase 0] теги curriculum_step/fixed_root/fallen/scope_phase в trajectory + distill" }
-  - { id: track-a-eval-gate,           phase: 0, status: pending, content: "[Phase 0] curriculum_eval_gate subprocess + snapshot; dual gate на scope + FR release" }
-  - { id: track-a-post-fr,             phase: 0, status: pending, content: "[Phase 0] POST_FR_ALPHA_DECAY + ensemble entropy + POST_FR_WM_LR_MULT" }
-  - { id: track-b-role-types,          phase: 1, status: pending, content: "[Phase 1] role_type на CausalNode; маппинг humanoid + humanoid_variant" }
-  - { id: track-b-second-world,        phase: 1, status: pending, content: "[Phase 1] humanoid_variant + cross-env benchmark; до compressor" }
-  - { id: track-b-genome-compress,     phase: 1, status: pending, content: "[Phase 1] genome compressor по role-typed подграфу; cross-world init" }
-  - { id: track-c-bridge-loss,         phase: 2, status: pending, content: "[Phase 2] bridge concept prediction loss в causal_graph train_step (C2 первый)" }
-  - { id: track-c-skills-structural,   phase: 2, status: pending, content: "[Phase 2] skill chains + v-structure posterior в ensemble (C1+C3)" }
-  - { id: track-c-latent-confounders,  phase: 3, status: pending, content: "[Phase 3] latent confounder — residual, binary/k-ary, online-EM, TTL, ensemble sync" }
-  - { id: track-c4-language-prior,     phase: 3, status: pending, content: "[Phase 3] weak language prior for latent EM — verbal/s2 text, not LLM oracle" }
-  - { id: track-c-promote-latent,      phase: 3, status: pending, content: "[Phase 3] promote_to_universal_concept — survival N≥2 worlds → learned role_type" }
-  - { id: track-d-domain-autonomy-metrics, phase: 3, status: pending, content: "[Phase 3] WorldAutonomyContract + A1/A4 abstract metrics; per-world scorecard; humanoid mapping (#1/#4)" }
-  - { id: track-b-spectral,            phase: 4, status: pending, content: "[Phase 4] genome/spectral.py + Procrustes align + humanoid→cartpole" }
-  - { id: track-c-role-discovery,      phase: 4, status: pending, content: "[Phase 4] genome/role_discovery.py — spectral map nodes in unknown env" }
-  - { id: track-e-skeleton,            phase: 4, status: pending, content: "[Phase 4] genome/meta_invariants.py — CausalSkeleton transfer (CMI topology, not W weights)" }
-  - { id: track-f-meta-w,              phase: 5, status: pending, content: "[Phase 5] W_meta ensemble — do-calculus over learning_rate, explore, curriculum → success" }
-  - { id: track-g-goal-gen,            phase: 5, status: pending, content: "[Phase 5] goal_generator.py — CausalNoveltyScore + saturation guard; автономные субцели" }
-  - { id: track-g-curriculum-graph,    phase: 5, status: pending, content: "[Phase 5] CurriculumGraph DAG; goal transfer между мирами; замена human curriculum" }
-  - { id: track-h-nonphys-skeleton,    phase: "6a", status: pending, content: "[Phase 6a] skeleton transfer в нефизические домены (grid_nav, symbolic_control stub)" }
-  - { id: track-h-symbolic-grounding,  phase: "6a", status: pending, content: "[Phase 6a] SymbolicGrounding — CausalSkeleton ↔ propositional rules; bidirectional bridge" }
-  - { id: track-i-continual,           phase: "6b", status: pending, content: "[Phase 6b] EWC/PackNet-lite для W — stable-edge Fisher; catastrophic forgetting при смене мира" }
-  - { id: track-i-self-repair,         phase: "6b", status: pending, content: "[Phase 6b] CausalHealthMonitor — авто-диагноз деградации W + self-repair trigger" }
-  - { id: track-i-meta-meta,           phase: "6c", status: pending, content: "[Phase 6c] MetaCircuitBreaker — CLOSED/OPEN/HALF_OPEN над W_meta; не do-calculus" }
+  - id: track-a-transfer-eval
+    content: "[Phase 0] eval_transfer.py + RKK_EVAL_MODE + JSONL; scorecard hooks; integration/conftest stub"
+    status: completed
+  - id: track-a-buffer-tags
+    content: "[Phase 0] теги curriculum_step/fixed_root/fallen/scope_phase в trajectory + distill"
+    status: completed
+  - id: track-a-eval-gate
+    content: "[Phase 0] curriculum_eval_gate subprocess + snapshot; dual gate на scope + FR release"
+    status: completed
+  - id: track-a-post-fr
+    content: "[Phase 0] POST_FR_ALPHA_DECAY + ensemble entropy + POST_FR_WM_LR_MULT"
+    status: completed
+  - id: track-b-role-types
+    content: "[Phase 1] role_type на CausalNode; маппинг humanoid + humanoid_variant"
+    status: completed
+  - id: track-b-second-world
+    content: "[Phase 1] humanoid_variant + cross-env benchmark; до compressor"
+    status: completed
+  - id: track-b-genome-compress
+    content: "[Phase 1] genome compressor по role-typed подграфу; cross-world init"
+    status: completed
+  - id: track-c-bridge-loss
+    content: "[Phase 2] bridge concept prediction loss в causal_graph train_step (C2 первый)"
+    status: completed
+  - id: track-c-skills-structural
+    content: "[Phase 2] skill chains + v-structure posterior в ensemble (C1+C3)"
+    status: completed
+  - id: track-c-latent-confounders
+    content: "[Phase 3] latent confounder — residual, binary/k-ary, online-EM, TTL, ensemble sync"
+    status: completed
+  - id: track-c4-language-prior
+    content: "[Phase 3] weak language prior for latent EM — verbal/s2 text, not LLM oracle"
+    status: completed
+  - id: track-c-promote-latent
+    content: "[Phase 3] promote_to_universal_concept — survival N≥2 worlds → learned role_type"
+    status: completed
+  - id: track-d-domain-autonomy-metrics
+    content: "[Phase 3] WorldAutonomyContract + A1/A4 abstract metrics; per-world scorecard; humanoid mapping (#1/#4)"
+    status: completed
+  - id: track-b-spectral
+    content: "[Phase 4] genome/spectral.py + Procrustes align + humanoid→cartpole"
+    status: completed
+  - id: track-c-role-discovery
+    content: "[Phase 4] genome/role_discovery.py — spectral map nodes in unknown env"
+    status: completed
+  - id: track-e-skeleton
+    content: "[Phase 4] genome/meta_invariants.py — CausalSkeleton transfer (CMI topology, not W weights)"
+    status: completed
+  - id: track-f-meta-w
+    content: "[Phase 5] W_meta ensemble — do-calculus over learning_rate, explore, curriculum → success"
+    status: completed
+  - id: track-g-goal-gen
+    content: "[Phase 5] goal_generator.py — CausalNoveltyScore + saturation guard; автономные субцели"
+    status: completed
+  - id: track-g-curriculum-graph
+    content: "[Phase 5] CurriculumGraph DAG; goal transfer между мирами; замена human curriculum"
+    status: completed
+  - id: track-h-nonphys-skeleton
+    content: "[Phase 6a] skeleton transfer в нефизические домены (grid_nav, symbolic_control stub)"
+    status: completed
+  - id: track-h-symbolic-grounding
+    content: "[Phase 6a] SymbolicGrounding — CausalSkeleton ↔ propositional rules; bidirectional bridge"
+    status: completed
+  - id: track-i-continual
+    content: "[Phase 6b] EWC/PackNet-lite для W — stable-edge Fisher; catastrophic forgetting при смене мира"
+    status: completed
+  - id: track-i-self-repair
+    content: "[Phase 6b] CausalHealthMonitor — авто-диагноз деградации W + self-repair trigger"
+    status: completed
+  - id: track-i-meta-meta
+    content: "[Phase 6c] MetaCircuitBreaker — CLOSED/OPEN/HALF_OPEN над W_meta; не do-calculus"
+    status: completed
 isProject: false
 ---
 
