@@ -28,14 +28,16 @@ class SimulationWorldMixin:
         return None
 
     def switch_world(self, new_world: str) -> dict:
-        """Только humanoid; переключение сцен отключено."""
+        """Switch agent environment via WorldSwitcher (humanoid, variant, grid_nav, …)."""
         if new_world not in WORLDS:
             return {"error": f"unknown world: {new_world}", "switched": False}
-        return {
-            "switched": False,
-            "world": "humanoid",
-            "current_world": self.current_world,
-        }
+        sw = getattr(self, "switcher", None)
+        if sw is None:
+            return {"error": "world switcher not initialized", "switched": False}
+        result = sw.switch(new_world)
+        if result.get("switched"):
+            self.current_world = new_world
+        return result
 
     # ── Фаза 12: Visual mode ──────────────────────────────────────────────────
     def enable_visual(self, n_slots: int = 8, mode: str = "hybrid") -> dict:

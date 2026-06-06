@@ -61,7 +61,11 @@ class MetaCircuitBreaker:
         self.ema_pe = 0.9 * self.ema_pe + 0.1 * float(meta_pe)
 
         if self.state == self.CLOSED:
-            if self.ema_pe > meta_cb_pe_open() or int(meta_age) > meta_cb_age_open():
+            if (
+                self.ema_pe > meta_cb_pe_open()
+                or float(meta_pe) > meta_cb_pe_open()
+                or int(meta_age) > meta_cb_age_open()
+            ):
                 self._transition_open(tick)
 
         elif self.state == self.OPEN:

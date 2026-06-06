@@ -72,6 +72,16 @@ class SimulationPhase6Mixin:
             self._ewc_protector.maybe_update(graph)
             snap.update(self._ewc_protector.metrics())
 
+        sr = float(snap.get("behavioral_score", snap.get("success_rate", 0.0)) or 0.0)
+        if not hasattr(self, "_world_success_last"):
+            self._world_success_last: dict[str, float] = {}
+        if not hasattr(self, "_world_success_baseline"):
+            self._world_success_baseline: dict[str, float] = {}
+        wid = str(self.current_world)
+        self._world_success_last[wid] = sr
+        if wid not in self._world_success_baseline or self._world_success_baseline[wid] <= 0:
+            self._world_success_baseline[wid] = max(sr, self._world_success_baseline.get(wid, 0.0))
+
         env = self.agent.env
         if isinstance(env, (EnvironmentGridNav, EnvironmentSymbolic)):
             wm = env.autonomy_metrics()
@@ -102,4 +112,10 @@ class SimulationPhase6Mixin:
     def on_world_switch_phase6(self, new_world: str) -> None:
         self._ensure_phase6()
         if ewc_enabled():
-            self._ewc_protector.on_world_switch(self.agent.graph, new_world)
+            prot = self._ewc_protector
+            old_world = str(getattr(self, "current_world", "humanoid"))
+            baseline = float(getattr(self, "_world_success_baseline", {}).get(old_world, 0.0))
+            current = float(getattr(self, "_world_success_last", {}).get(old_world, 0.0))
+            if baseline > 0:
+                prot.update_forgetting_ratio(baseline, current)
+            prot.on_world_switch(self.agent.graph, new_world)

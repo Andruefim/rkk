@@ -78,6 +78,7 @@ class SleepLessonAnnotation:
     seeds: list[dict] = field(default_factory=list)
     confidence: float = 1.0
     error: str = ""
+    intent_adjustments: dict[str, float] = field(default_factory=dict)
 
 
 def sleep_enabled() -> bool:

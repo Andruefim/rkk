@@ -328,19 +328,20 @@ def apply_skeleton_to_graph(
     for nid in tgt_ids:
         if nid not in graph._node_ids:
             graph.set_node(nid, 0.5)
-    d = len(graph._node_ids)
-    W_init = np.zeros((d, d), dtype=np.float32)
+    d_tgt = len(tgt_ids)
+    W_init = np.zeros((d_tgt, d_tgt), dtype=np.float32)
     W_t = transfer_skeleton_to_env(sk_ref, W_init, env_target, force=force)
     W_out = W_t.detach().cpu().numpy()
-    id_to_i = {nid: i for i, nid in enumerate(graph._node_ids)}
+    d_out = min(W_out.shape[0], W_out.shape[1], d_tgt)
     count = 0
-    for i in range(d):
-        for j in range(d):
+    for i in range(d_out):
+        for j in range(d_out):
             w = float(W_out[i, j])
             if abs(w) < 1e-5:
                 continue
-            fr = graph._node_ids[i]
-            to = graph._node_ids[j]
+            fr, to = tgt_ids[i], tgt_ids[j]
+            if fr not in graph._node_ids or to not in graph._node_ids:
+                continue
             graph.set_edge(fr, to, w, alpha=0.7)
             count += 1
     sim_hint = skeleton_min_motif_match()

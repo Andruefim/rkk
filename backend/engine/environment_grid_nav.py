@@ -50,13 +50,22 @@ class EnvironmentGridNav:
 
     def observe(self) -> dict[str, float]:
         gs = float(self.grid_size - 1)
+        ticks = max(1, self._ticks)
         return {
             "pos_x": float(np.clip(self._pos[0] / gs, 0.0, 1.0)),
             "pos_y": float(np.clip(self._pos[1] / gs, 0.0, 1.0)),
             "goal_x": float(np.clip(self._goal[0] / gs, 0.0, 1.0)),
             "goal_y": float(np.clip(self._goal[1] / gs, 0.0, 1.0)),
             "action_dir": float(np.clip(self._action_dir / 3.0, 0.0, 1.0)),
+            "goal_reached": float(self._goal_reached_count / ticks),
         }
+
+    @property
+    def variables(self) -> dict[str, float]:
+        return self.observe()
+
+    def gt_edges(self) -> list[dict]:
+        return []
 
     def intervene(self, variable: str, value: float) -> dict[str, float]:
         if variable not in self.variable_ids:

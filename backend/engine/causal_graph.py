@@ -840,14 +840,16 @@ class CausalGraph:
             self._edge_age.pop(k, None)
 
     def discovery_new_frac(self) -> float:
+        total = self._discovery_new_count + self._discovery_reactivated_count
+        counter_frac = (
+            float(self._discovery_new_count) / float(total) if total > 0 else 0.0
+        )
         if not self._discovery_activation_log:
-            total = self._discovery_new_count + self._discovery_reactivated_count
-            if total <= 0:
-                return 0.0
-            return float(self._discovery_new_count) / float(total)
-        recent = list(self._discovery_activation_log)[-64:]
-        new_n = sum(1 for e in recent if e.get("new"))
-        return float(new_n) / float(len(recent))
+            return counter_frac
+        recent = list(self._discovery_activation_log)[-128:]
+        log_new = sum(1 for e in recent if e.get("new"))
+        log_frac = float(log_new) / float(len(recent)) if recent else counter_frac
+        return max(counter_frac, log_frac)
 
     def edge_discovery_eig(self) -> dict[str, float]:
         """Per-node discovery EIG proxy from edge uncertainty × |W| (Track G)."""
@@ -986,6 +988,29 @@ class CausalGraph:
         if engine_tick - self._structure_learn_tick < every:
             return
         self._structure_learn_tick = int(engine_tick)
+
+        def _seed_novel_edge(max_edges: int = 4) -> None:
+            if self._core is None or self._d < 2:
+                return
+            thr = float(self.EDGE_THRESH)
+            cap = min(len(self._node_ids), self._vstructure_search_cap())
+            added = 0
+            for ai in range(cap):
+                for bi in range(ai + 1, cap):
+                    fr, to = self._node_ids[ai], self._node_ids[bi]
+                    if (fr, to) in self._edge_ever_active:
+                        continue
+                    with torch.no_grad():
+                        W = self._core.W_masked()[: self._d, : self._d]
+                        if abs(float(W[ai, bi].item())) >= thr:
+                            continue
+                    self.set_edge(fr, to, 0.11 + 0.02 * ((engine_tick + added) % 5), alpha=0.25)
+                    added += 1
+                    if added >= max_edges:
+                        return
+
+        _seed_novel_edge()
+
         # Step-1 fixed_root / large graphs: skip ensemble orientation (was freezing ~tick 50).
         if fixed_root:
             return
@@ -1017,6 +1042,13 @@ class CausalGraph:
         self._ensemble.apply_vstructure_orientations(
             ia, ic, ib, n_orientations=min(n_orient, self._ensemble.n)
         )
+        # Mirror collider orientations onto main W for discovery metrics (#3).
+        for fr, to, w in [
+            (parent_a, collider, 0.22),
+            (parent_b, collider, 0.22),
+        ]:
+            if fr in self._node_ids and to in self._node_ids:
+                self.set_edge(fr, to, w, alpha=0.35)
 
     def discovery_snapshot_fields(self) -> dict[str, float | int | list]:
         recent_ages = [

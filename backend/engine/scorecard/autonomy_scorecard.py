@@ -43,6 +43,28 @@ def _world_autonomy_stub(world_id: str, snap: dict[str, Any] | None) -> dict[str
     return build_world_metrics(world_id, snap, thresholds=th)
 
 
+def _metric_from_snap(snap: dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        if key in snap and snap[key] is not None:
+            try:
+                return float(snap[key])
+            except (TypeError, ValueError):
+                pass
+        phase5 = snap.get("phase5") or {}
+        if isinstance(phase5, dict) and key in phase5:
+            try:
+                return float(phase5[key])
+            except (TypeError, ValueError):
+                pass
+        ewc = snap.get("ewc") or {}
+        if isinstance(ewc, dict) and key in ewc:
+            try:
+                return float(ewc[key])
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
 def build_scorecard(
     sim_snap: dict[str, Any] | None = None,
     *,
@@ -50,6 +72,7 @@ def build_scorecard(
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sim_snap = sim_snap or {}
+    extra = extra or {}
     world_list = worlds or ["humanoid"]
     th = default_thresholds()
     worlds_out = {
@@ -57,45 +80,81 @@ def build_scorecard(
         for wid in world_list
     }
     h = worlds_out.get("humanoid", {})
-    pass_core = bool(h.get("a1_pass")) and bool(h.get("a4_pass"))
     discovery_frac = float(sim_snap.get("discovery_new_frac", 0.0))
-    meta_pe = float(
-        sim_snap.get(
-            "meta_prediction_error",
-            (sim_snap.get("phase5") or {}).get("meta_prediction_error", 1.0),
-        )
+    pass_core = (
+        bool(h.get("a1_pass"))
+        and bool(h.get("a4_pass"))
+        and discovery_frac >= th["discovery_min"]
     )
-    goal_metrics = (sim_snap.get("phase5") or {}).get("goal_generator") or {}
+    meta_pe = _metric_from_snap(sim_snap, "meta_prediction_error", default=1.0)
+    goal_metrics = (sim_snap.get("phase5") or {}).get("goal_generator") or sim_snap.get(
+        "goal_generator"
+    ) or {}
+    if not isinstance(goal_metrics, dict):
+        goal_metrics = {}
     meta_pe_pass = meta_pe < th["meta_pe_max"]
     goals_crossworld_pass = bool(
         goal_metrics.get("autonomous_goals_crossworld_pass", False)
     )
-    pass_extended = (
-        pass_core
-        and discovery_frac >= th["discovery_min"]
-        and meta_pe_pass
-        and goals_crossworld_pass
+    pass_extended = pass_core and meta_pe_pass and goals_crossworld_pass
+
+    nonphys_worlds = [w for w in ("grid_nav", "symbolic_control") if w in worlds_out]
+    autonomy_integrity_nonphys = bool(nonphys_worlds) and all(
+        bool(worlds_out[w].get("a1_pass"))
+        and bool(worlds_out[w].get("a4_pass"))
+        for w in nonphys_worlds
     )
+
+    continual_forgetting = _metric_from_snap(
+        sim_snap, "continual_forgetting_ratio", default=0.0
+    )
+    meta_recovery = sim_snap.get("meta_recovery_ticks")
+    if meta_recovery is None:
+        mcb = sim_snap.get("meta_circuit_breaker") or {}
+        if isinstance(mcb, dict):
+            meta_recovery = mcb.get("meta_recovery_ticks")
+    cross_env_sr = extra.get("cross_env_success_rate_200")
+    if cross_env_sr is None:
+        te = extra.get("transfer_eval") or {}
+        if isinstance(te, dict):
+            cross_env_sr = te.get("cross_env_success_rate_200")
+    skeleton_nonphys = extra.get("skeleton_nonphys_success_500")
+    if skeleton_nonphys is None:
+        te = extra.get("transfer_eval") or {}
+        if isinstance(te, dict):
+            skeleton_nonphys = te.get("skeleton_nonphys_success_500")
+
+    pass_full = (
+        pass_extended
+        and autonomy_integrity_nonphys
+        and continual_forgetting >= th["continual_forgetting_min"]
+        and meta_recovery is not None
+        and float(meta_recovery) <= th["meta_recovery_max_ticks"]
+    )
+
     card: dict[str, Any] = {
-        "pass_agi_full": False,
+        "pass_agi_full": pass_full,
         "pass_agi_extended": pass_extended,
         "pass_core_embodied": pass_core,
         "pass_core": pass_core,
-        "autonomy_integrity_nonphys": all(
-            worlds_out.get(w, {}).get("a1_pass", False)
-            and worlds_out.get(w, {}).get("a4_pass", False)
-            for w in world_list
-            if w != "humanoid"
-        ),
+        "autonomy_integrity_nonphys": autonomy_integrity_nonphys,
         "worlds": worlds_out,
         "discovery_new_frac": discovery_frac,
+        "cross_env_success_rate_200": cross_env_sr,
         "meta_prediction_error": round(meta_pe, 4),
         "meta_prediction_error_pass": meta_pe_pass,
         "autonomous_goals_crossworld_pass": goals_crossworld_pass,
+        "continual_forgetting_ratio": continual_forgetting,
+        "ewc_stable_edge_count": _metric_from_snap(
+            sim_snap, "ewc_stable_edge_count", default=0.0
+        ),
+        "meta_recovery_ticks": meta_recovery,
+        "skeleton_nonphys_success_500": skeleton_nonphys,
         "thresholds": th,
     }
     if extra:
-        card.update(extra)
+        safe_extra = {k: v for k, v in extra.items() if k != "worlds"}
+        card.update(safe_extra)
     return card
 
 

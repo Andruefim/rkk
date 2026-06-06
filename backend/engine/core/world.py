@@ -71,9 +71,9 @@ def _make_env(world: str, device: torch.device):
 
         return EnvironmentSymbolic(device=device)
     if world == "cartpole":
-        raise ValueError(
-            f"world {world!r} stub not wired in _make_env (use transfer/eval helpers)"
-        )
+        from engine.environment_cartpole import EnvironmentCartpole
+
+        return EnvironmentCartpole(device=device)
     raise ValueError(
         f"unsupported world {world!r} "
         "(expected humanoid, humanoid_variant, grid_nav, symbolic_control)"
@@ -114,8 +114,13 @@ class WorldSwitcher:
         new_vars = new_env.variable_ids
         new_nodes = [v for v in new_vars if v not in old_nodes]
 
-        for var_id in new_vars:
-            self.agent.graph.set_node(var_id, init_obs.get(var_id, 0.5))
+        if len(new_vars) != len(self.agent.graph._node_ids) or set(new_vars) != set(
+            self.agent.graph._node_ids
+        ):
+            self.agent.graph.rebind_variables(list(new_vars), init_obs)
+        else:
+            for var_id in new_vars:
+                self.agent.graph.set_node(var_id, init_obs.get(var_id, 0.5))
 
         self.agent.env = new_env
         self.agent.graph.set_env_preset(str(getattr(new_env, "preset", new_world)))

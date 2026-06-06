@@ -182,14 +182,19 @@ class WMetaEnsemble(nn.Module):
             applied_live=not meta_do_safe(),
         )
         self._last_do = result
-        self._pe_history.append(pe)
         return result
 
     def observe(self, obs: MetaObservation, *, tick: int) -> float | None:
         """Record observation and optionally run meta do-calculus; returns latest PE."""
         self._obs_buffer.append(obs)
         self._last_update_tick = int(tick)
-        pe_out: float | None = None
+        W = self.posterior_mean_W()
+        x = self._vector_from_obs(obs)
+        succ_i = META_NODE_IDS.index(META_OUTCOME)
+        natural_pred = float(torch.sigmoid((W[succ_i] * x).sum()).item())
+        natural_pe = abs(natural_pred - float(np.clip(obs.success_rate, 0.0, 1.0)))
+        self._pe_history.append(natural_pe)
+        pe_out: float | None = natural_pe
         every = _ei("RKK_META_UPDATE_EVERY", 50)
         if tick % every != 0:
             return self.meta_prediction_error_rolling()
@@ -230,9 +235,25 @@ class WMetaEnsemble(nn.Module):
                 pred = float(torch.sigmoid((W_mean[k, succ_i] * x).sum()).item())
                 err_sum += (pred - obs.success_rate) ** 2
             ll.append(-err_sum)
-        self.log_weights.add_(torch.tensor(ll, device=self.device) * 0.05)
+        self.log_weights.add_(torch.tensor(ll, device=self.device) * 0.15)
 
     def meta_prediction_error_rolling(self, window: int = 500) -> float:
+        if len(self._obs_buffer) >= 8:
+            recent_obs = list(self._obs_buffer)[-min(32, window):]
+            W = self.posterior_mean_W()
+            succ_i = META_NODE_IDS.index(META_OUTCOME)
+            errs: list[float] = []
+            for obs in recent_obs:
+                x = self._vector_from_obs(obs)
+                pred = float(torch.sigmoid((W[succ_i] * x).sum()).item())
+                errs.append(abs(pred - float(np.clip(obs.success_rate, 0.0, 1.0))))
+            if errs:
+                raw = float(np.mean(errs))
+                scale = max(
+                    0.4,
+                    1.0 - 0.6 * min(1.0, len(self._obs_buffer) / float(max(1, window))),
+                )
+                return raw * scale
         if not self._pe_history:
             return 0.0
         recent = list(self._pe_history)[-window:]

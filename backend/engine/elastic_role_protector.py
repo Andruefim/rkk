@@ -186,6 +186,11 @@ class ElasticRoleProtector:
         f = fisher if fisher is not None else self._fisher
         if anchor is None or f is None:
             return torch.tensor(0.0, device=W_current.device)
+        if anchor.shape != W_current.shape or f.shape != W_current.shape:
+            d = min(W_current.shape[0], anchor.shape[0], f.shape[0])
+            W_current = W_current[:d, :d]
+            anchor = anchor[:d, :d]
+            f = f[:d, :d]
         diff = (W_current - anchor) ** 2
         if ewc_packnet() and self._packnet_mask is not None:
             m = self._packnet_mask.to(diff.device)

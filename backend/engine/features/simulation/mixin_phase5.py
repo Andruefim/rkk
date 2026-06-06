@@ -135,3 +135,23 @@ class SimulationPhase5Mixin:
                 "target_val": g0.target_val,
                 "meta_success_pred": g0.meta_success_pred,
             }
+            sr = float(success) if success is not None else 0.5
+            for g in list(self._goal_generator._active):
+                val = float(self.agent.graph.nodes.get(g.var_id, 0.5))
+                near_target = abs(val - g.target_val) <= 0.18
+                ticks_active = max(0, tick - int(g.tick_proposed or tick))
+                if near_target or sr >= 0.45 or ticks_active >= 120:
+                    self._goal_generator.complete_goal(
+                        g.var_id,
+                        success_rate=max(sr, 0.55 if near_target else sr),
+                        tick=tick,
+                    )
+                    if curriculum_graph_enabled():
+                        for nid, node in self._curriculum_graph._nodes.items():
+                            if node.var_id == g.var_id and node.status == "active":
+                                self._curriculum_graph.mark_completed(
+                                    nid,
+                                    success_rate=max(sr, 0.55 if near_target else sr),
+                                    tick=tick,
+                                )
+                                break

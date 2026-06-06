@@ -49,7 +49,16 @@ class EnvironmentSymbolic:
         for i in range(self.n_rules):
             out[f"rule_{i}"] = float(self._rules[i])
         out["action_select"] = float(np.clip(self._action_select, 0.0, 1.0))
+        ticks = max(1, self._ticks)
+        out["constraints_satisfied"] = float(self._satisfied_ticks / ticks)
         return out
+
+    @property
+    def variables(self) -> dict[str, float]:
+        return self.observe()
+
+    def gt_edges(self) -> list[dict]:
+        return []
 
     def _constraints_ok(self) -> bool:
         # rule_0 => rule_1, rule_2 XOR rule_3 style soft constraints

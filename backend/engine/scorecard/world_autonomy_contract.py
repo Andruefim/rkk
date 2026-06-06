@@ -86,7 +86,7 @@ CONTRACTS: dict[str, WorldAutonomyContract] = {
         script_override_sources=("replan_script", "balance_recovery"),
         emergency_override_snapshot_key="balance_emergency_override",
         success_field="upright",
-        metrics_applicable=False,
+        metrics_applicable=True,
         a1_probe_key="replan_script_override_frac",
         a4_probe_key="balance_emergency_override",
     ),
@@ -96,7 +96,7 @@ CONTRACTS: dict[str, WorldAutonomyContract] = {
         script_override_sources=("pathfinder", "stuck_recovery"),
         emergency_override_snapshot_key="stuck_override_active",
         success_field="goal_reached",
-        metrics_applicable=False,
+        metrics_applicable=True,
         a1_probe_key="pathfinder_override_frac",
         a4_probe_key="stuck_override_active",
     ),
@@ -106,7 +106,7 @@ CONTRACTS: dict[str, WorldAutonomyContract] = {
         script_override_sources=("rule_engine", "constraint_repair"),
         emergency_override_snapshot_key="constraint_violation_override",
         success_field="constraints_satisfied",
-        metrics_applicable=False,
+        metrics_applicable=True,
         a1_probe_key="rule_engine_bailout_frac",
         a4_probe_key="constraint_violation_override",
     ),
@@ -140,6 +140,13 @@ def extract_a1_a4(
     s = snap or {}
     if world_id in ("humanoid", "humanoid_variant"):
         return _humanoid_a1(s), _humanoid_a4(s), contract.metrics_applicable
+    worlds = s.get("worlds") or {}
+    if isinstance(worlds, dict) and world_id in worlds:
+        wm = worlds[world_id]
+        if isinstance(wm, dict):
+            a1 = float(wm.get(contract.a1_probe_key, wm.get("script_override_frac_post_warmup", 0.0)))
+            a4 = float(wm.get(contract.a4_probe_key, wm.get("emergency_override_frac_post_warmup", 0.0)))
+            return a1, a4, contract.metrics_applicable
     a1 = _stub_frac(s, contract.a1_probe_key)
     a4 = _stub_frac(s, contract.a4_probe_key)
     return a1, a4, contract.metrics_applicable
