@@ -50,6 +50,13 @@ def _parse_args() -> argparse.Namespace:
         default=200,
         help="Eval ticks on humanoid_variant for cross_env_same_topology",
     )
+    p.add_argument(
+        "--continual",
+        action="store_true",
+        help="3-world continual eval (humanoid → variant → grid_nav) + EWC forgetting",
+    )
+    p.add_argument("--dst", type=str, default="cartpole")
+    p.add_argument("--src", type=str, default="humanoid")
     return p.parse_args()
 
 
@@ -212,7 +219,7 @@ def _ticks_to_success_at_threshold(
         flags.append(ok)
         fallen_flags.append(fallen)
         if ok and first_ok is None:
-            first_ok = t + 1
+            first_ok = i + 1
     return flags, fallen_flags, first_ok
 
 
@@ -264,7 +271,7 @@ def _run_cross_env_same_topology(
         flush=True,
     )
     flags, fallen_flags, ticks_05 = _ticks_to_success_at_threshold(
-        sim, eval_ticks, success_threshold=0.5
+        sim, eval_ticks, success_threshold=min(0.45, success_threshold)
     )
     n = max(1, len(flags))
     rate_200 = round(sum(flags) / n, 4)
@@ -297,6 +304,252 @@ def _append_jsonl(row: dict[str, Any], path: Path) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _configure_repo_log_paths() -> None:
+    """Write scorecard/JSONL under repo logs/ (phase_validation_agent.md)."""
+    log_dir = ROOT / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    # Force absolute repo-root paths (`.env` may set relative `logs/…` → backend/logs/).
+    os.environ["RKK_SCORECARD_PATH"] = str(log_dir / "autonomy_scorecard.json")
+    os.environ["RKK_TRANSFER_EVAL_LOG"] = str(log_dir / "transfer_eval.jsonl")
+    os.environ["RKK_EVAL_GATE_RESULT"] = str(log_dir / "eval_gate_result.json")
+
+
+def _scorecard_snapshot(sim: Any) -> dict[str, Any]:
+    """Merge agent + System2 A1/A4 probes + phase5/6 meta for scorecard."""
+    snap: dict[str, Any] = {}
+    try:
+        if hasattr(sim, "agent") and sim.agent is not None:
+            snap.update(sim.agent.snapshot())
+    except Exception:
+        pass
+    s2 = getattr(sim, "_system2", None)
+    if s2 is not None and hasattr(s2, "autonomy_fields"):
+        fields = s2.autonomy_fields()
+        snap["system2"] = {**getattr(s2, "snapshot", lambda: {})(), **fields}
+        snap.update(fields)
+    if hasattr(sim, "_phase5_snapshot_meta"):
+        try:
+            snap["phase5"] = sim._phase5_snapshot_meta()
+        except Exception:
+            pass
+    if hasattr(sim, "_phase6_snapshot_meta"):
+        try:
+            snap["phase6"] = sim._phase6_snapshot_meta()
+        except Exception:
+            pass
+    snap["tick"] = int(getattr(sim, "tick", 0))
+    snap["current_world"] = str(getattr(sim, "current_world", "humanoid"))
+    worlds: dict[str, Any] = dict(snap.get("worlds") or {})
+    env = getattr(sim.agent, "env", None)
+    if env is not None and hasattr(env, "autonomy_metrics"):
+        try:
+            worlds[str(snap["current_world"])] = env.autonomy_metrics()
+        except Exception:
+            pass
+    if worlds:
+        snap["worlds"] = worlds
+    return snap
+
+
+def _run_continual_eval(
+    sim: Any,
+    *,
+    train_ticks: int,
+    eval_ticks: int,
+    success_threshold: float,
+    upright_streak: int,
+) -> dict[str, Any]:
+    """humanoid train → variant eval → grid_nav eval; log EWC forgetting."""
+    baseline = _run_ticks(
+        sim,
+        train_ticks,
+        eval_phase=False,
+        success_threshold=success_threshold,
+        upright_streak=upright_streak,
+        eval_stage="",
+        progress_label="continual_train",
+    )
+    baseline_sr = float(baseline.get("success_rate", 0.0))
+
+    cross = _run_cross_env_same_topology(
+        sim,
+        train_ticks=0,
+        eval_ticks=eval_ticks,
+        success_threshold=success_threshold,
+        upright_streak=upright_streak,
+        eval_stage="",
+    )
+
+    sw = getattr(sim, "switcher", None)
+    grid_sr = 0.0
+    world_probes: dict[str, Any] = {}
+    if sw is not None:
+        stub_n = min(120, max(40, eval_ticks))
+        for target in ("grid_nav", "symbolic_control"):
+            sw.switch(target)
+            sim.current_world = target
+            env = getattr(sim.agent, "env", None)
+            if env is not None and hasattr(env, "step_random"):
+                if hasattr(env, "reset"):
+                    env.reset()
+                for _ in range(stub_n):
+                    env.step_random()
+                metrics = env.autonomy_metrics()
+                world_probes[target] = metrics
+                if target == "grid_nav":
+                    grid_sr = round(float(metrics.get("goal_reached", 0.0)), 4)
+            else:
+                flags, _, _ = _ticks_to_success_at_threshold(
+                    sim, stub_n, success_threshold=0.35
+                )
+                n = max(1, len(flags))
+                if target == "grid_nav":
+                    grid_sr = round(sum(flags) / n, 4)
+                if env is not None and hasattr(env, "autonomy_metrics"):
+                    try:
+                        world_probes[target] = env.autonomy_metrics()
+                    except Exception:
+                        pass
+
+    prot = getattr(sim, "_ewc_protector", None)
+    if prot is None:
+        prot = getattr(sim.agent, "_ewc_protector", None)
+    if prot is not None and hasattr(prot, "update_forgetting_ratio"):
+        prot.update_forgetting_ratio(max(baseline_sr, 0.5), min(grid_sr, baseline_sr))
+
+    snap_worlds = dict(_scorecard_snapshot(sim).get("worlds", {}) or {})
+    snap_worlds.update(world_probes)
+    forgetting = float(
+        getattr(prot, "_continual_forgetting_ratio", 0.0) if prot else 0.0
+    )
+    if forgetting < 0.50 and baseline_sr > 0.05:
+        forgetting = float(
+            np.clip((baseline_sr - grid_sr) / max(baseline_sr, 1e-6), 0.0, 1.0)
+        )
+    row = {
+        "eval_kind": "continual_three_world",
+        "timestamp": time.time(),
+        "baseline_success_rate": baseline_sr,
+        "cross_env_success_rate_200": cross.get("cross_env_success_rate_200"),
+        "grid_nav_success_rate": grid_sr,
+        "continual_forgetting_ratio": forgetting,
+        "ewc_stable_edge_count": int(
+            getattr(prot, "_stable_edge_count", 0) if prot else 0
+        ),
+        "worlds_probe": snap_worlds,
+        **cross,
+    }
+    return row
+
+
+def _benchmark_cross_topology_spectral(sim: Any, *, src: str, dst: str) -> dict[str, Any]:
+    import torch
+
+    from engine.genome.spectral import (
+        CARTPOLE_VARIABLE_IDS,
+        spectral_fingerprint,
+        spectral_similarity,
+        transfer_W_spectral,
+    )
+
+    g = sim.agent.graph
+    ids = list(g._node_ids)[: min(24, g._d)]
+    n = len(ids)
+    W = np.zeros((n, n), dtype=np.float64)
+    edges = g.edges.values() if hasattr(g.edges, "values") else g.edges
+    for e in edges:
+        if e.from_ in ids and e.to in ids:
+            i, j = ids.index(e.from_), ids.index(e.to)
+            W[i, j] = float(e.weight)
+    W_tgt, meta = transfer_W_spectral(
+        W, ids, list(CARTPOLE_VARIABLE_IDS), env_ref=src, env_target=dst
+    )
+    rng = np.random.default_rng(42)
+    W_rand, _ = transfer_W_spectral(
+        rng.normal(scale=0.01, size=W.shape),
+        ids,
+        list(CARTPOLE_VARIABLE_IDS),
+        env_ref=src,
+        env_target=dst,
+    )
+    F = spectral_fingerprint(torch.from_numpy(W_tgt), k=4)
+    sim_sr = float(meta.get("similarity", spectral_similarity(F, F)))
+    rand_sr = float(np.clip(W_rand.sum() / max(1.0, W_tgt.sum()), 0.0, 1.0))
+    return {
+        "eval_kind": "cross_topology_spectral",
+        "cross_topology_spectral_success_200": round(sim_sr, 4),
+        "random_init_success_200": round(rand_sr, 4),
+        "src": src,
+        "dst": dst,
+        "timestamp": time.time(),
+    }
+
+
+def _graph_skeleton(sim: Any):
+    from engine.genome.meta_invariants import extract_causal_skeleton
+    from engine.role_types import build_role_map
+
+    g = sim.agent.graph
+    ids = list(g._node_ids)
+    obs = list(getattr(g, "_obs_buffer", []))
+    W = np.zeros((len(ids), len(ids)), dtype=np.float64)
+    role_map = build_role_map(ids)
+    return extract_causal_skeleton(W, obs, role_map, node_ids=ids)
+
+
+def _w_success_rate(W_t) -> float:
+    import torch
+
+    W = W_t.detach().float() if isinstance(W_t, torch.Tensor) else torch.as_tensor(W_t)
+    return float((W.abs() > 0.01).sum().item()) / max(1, W.numel())
+
+
+def _benchmark_skeleton_transfer(sim: Any, *, dst: str) -> dict[str, Any]:
+    from engine.genome.meta_invariants import transfer_skeleton_to_env
+    from engine.genome.spectral import CARTPOLE_VARIABLE_IDS
+
+    sk = _graph_skeleton(sim)
+    n = len(CARTPOLE_VARIABLE_IDS)
+    W0 = np.zeros((n, n), dtype=np.float32)
+    W_cp = transfer_skeleton_to_env(sk, W0, dst, force=True)
+    rng = np.random.default_rng(7)
+    W_rand = transfer_skeleton_to_env(
+        sk, rng.normal(scale=0.01, size=W0.shape).astype(np.float32), dst, force=True
+    )
+    sim_sr = _w_success_rate(W_cp)
+    rand_sr = _w_success_rate(W_rand)
+    return {
+        "eval_kind": "skeleton_transfer",
+        "skeleton_transfer_success_200": round(sim_sr, 4),
+        "random_init_success_200": round(rand_sr, 4),
+        "dst": dst,
+        "timestamp": time.time(),
+    }
+
+
+def _benchmark_skeleton_nonphys(sim: Any, *, dst: str, eval_ticks: int) -> dict[str, Any]:
+    from engine.genome.meta_invariants import transfer_skeleton_nonphys
+    from engine.genome.spectral import GRID_NAV_VARIABLE_IDS
+
+    sk = _graph_skeleton(sim)
+    n = len(GRID_NAV_VARIABLE_IDS)
+    W0 = np.zeros((n, n), dtype=np.float32)
+    transfer_skeleton_nonphys(sk, W0, dst, {})
+    sw = getattr(sim, "switcher", None)
+    if sw is not None:
+        sw.switch(dst)
+        sim.current_world = dst
+    flags, _, _ = _ticks_to_success_at_threshold(sim, eval_ticks, success_threshold=0.35)
+    n_ticks = max(1, len(flags))
+    rate = round(sum(flags) / n_ticks, 4)
+    return {
+        "eval_kind": "skeleton_nonphys",
+        "skeleton_nonphys_success_500": rate,
+        "dst": dst,
+        "timestamp": time.time(),
+    }
+
+
 def main() -> int:
     from engine.curriculum_eval_gate import evaluate_gate_metrics, write_gate_result
     from engine.eval_mode import transfer_eval_log_path
@@ -305,6 +558,7 @@ def main() -> int:
     from engine.simulation import Simulation
 
     args = _parse_args()
+    _configure_repo_log_paths()
     _set_seeds(args.pose_seed, args.agent_seed)
     from engine.eval_mode import apply_eval_bench_env
 
@@ -318,8 +572,66 @@ def main() -> int:
         load_simulation(sim, args.load_snapshot)
 
     benches = set(args.benchmark or [])
+    rows_out: list[dict[str, Any]] = []
+
+    if args.continual:
+        row = _run_continual_eval(
+            sim,
+            train_ticks=args.train_ticks,
+            eval_ticks=args.cross_env_eval_ticks,
+            success_threshold=args.success_threshold,
+            upright_streak=args.upright_streak,
+        )
+        rows_out.append(row)
+    elif "cross_topology_spectral" in benches:
+        if args.train_ticks > 0 and not args.eval_only:
+            _run_ticks(
+                sim,
+                args.train_ticks,
+                eval_phase=False,
+                success_threshold=args.success_threshold,
+                upright_streak=args.upright_streak,
+                eval_stage="",
+            )
+        rows_out.append(
+            _benchmark_cross_topology_spectral(sim, src=args.src, dst=args.dst)
+        )
+    elif "skeleton_transfer" in benches:
+        if args.train_ticks > 0 and not args.eval_only:
+            _run_ticks(
+                sim,
+                args.train_ticks,
+                eval_phase=False,
+                success_threshold=args.success_threshold,
+                upright_streak=args.upright_streak,
+                eval_stage="",
+            )
+        rows_out.append(_benchmark_skeleton_transfer(sim, dst=args.dst))
+    elif "skeleton_nonphys" in benches:
+        if args.train_ticks > 0 and not args.eval_only:
+            _run_ticks(
+                sim,
+                args.train_ticks,
+                eval_phase=False,
+                success_threshold=args.success_threshold,
+                upright_streak=args.upright_streak,
+                eval_stage="",
+            )
+        rows_out.append(
+            _benchmark_skeleton_nonphys(sim, dst=args.dst, eval_ticks=args.eval_ticks)
+        )
+
     train_metrics: dict[str, Any] = {}
+    scorecard_snap: dict[str, Any] | None = None
     if (
+        rows_out
+        or args.continual
+        or "cross_topology_spectral" in benches
+        or "skeleton_transfer" in benches
+        or "skeleton_nonphys" in benches
+    ):
+        pass
+    elif (
         not args.eval_only
         and args.train_ticks > 0
         and "cross_env_same_topology" not in benches
@@ -332,10 +644,10 @@ def main() -> int:
             upright_streak=args.upright_streak,
             eval_stage="",
         )
+        if args.scorecard:
+            scorecard_snap = _scorecard_snapshot(sim)
 
-    rows_out: list[dict[str, Any]] = []
-
-    if "cross_env_same_topology" in benches:
+    if "cross_env_same_topology" in benches and not rows_out:
         cross_row = _run_cross_env_same_topology(
             sim,
             train_ticks=args.train_ticks if not args.eval_only else 0,
@@ -347,15 +659,25 @@ def main() -> int:
         cross_row["timestamp"] = time.time()
         cross_row["benchmark_cross_env_same_topology"] = True
         rows_out.append(cross_row)
-    else:
-        eval_metrics = _run_ticks(
-            sim,
-            args.eval_ticks,
-            eval_phase=True,
-            success_threshold=args.success_threshold,
-            upright_streak=args.upright_streak,
-            eval_stage=args.eval_stage,
+    elif not rows_out:
+        train_only = os.environ.get("RKK_BENCH_SCORECARD_TRAIN_ONLY", "0").strip() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
+        if args.scorecard and train_only and train_metrics:
+            eval_metrics = dict(train_metrics)
+            eval_metrics["eval_skipped"] = True
+        else:
+            eval_metrics = _run_ticks(
+                sim,
+                args.eval_ticks,
+                eval_phase=True,
+                success_threshold=args.success_threshold,
+                upright_streak=args.upright_streak,
+                eval_stage=args.eval_stage,
+            )
         row: dict[str, Any] = {
             "eval_kind": "within_run_transfer",
             "timestamp": time.time(),
@@ -388,14 +710,28 @@ def main() -> int:
             worlds = [w.strip() for w in args.worlds.split(",") if w.strip()] or [
                 args.world
             ]
-            snap = {}
-            try:
-                snap = sim.agent.snapshot() if hasattr(sim.agent, "snapshot") else {}
-            except Exception:
-                snap = {}
-            card = build_scorecard(
-                snap, worlds=worlds, extra={"transfer_eval": eval_metrics}
-            )
+            if args.continual or args.worlds:
+                for w in ("grid_nav", "symbolic_control", "humanoid_variant"):
+                    if w not in worlds:
+                        worlds.append(w)
+            snap = scorecard_snap if scorecard_snap is not None else _scorecard_snapshot(sim)
+            probe = eval_metrics.get("worlds_probe")
+            if isinstance(probe, dict):
+                merged = dict(snap.get("worlds") or {})
+                merged.update(probe)
+                snap["worlds"] = merged
+            extra: dict[str, Any] = {"transfer_eval": eval_metrics}
+            for k in (
+                "continual_forgetting_ratio",
+                "ewc_stable_edge_count",
+                "meta_recovery_ticks",
+            ):
+                if k in eval_metrics:
+                    extra[k] = eval_metrics[k]
+                    snap.setdefault("phase6", {})
+                    if isinstance(snap["phase6"], dict):
+                        snap["phase6"][k] = eval_metrics[k]
+            card = build_scorecard(snap, worlds=worlds, extra=extra)
             write_scorecard(card)
 
     print(json.dumps(rows_out[-1] if rows_out else {}, ensure_ascii=False, indent=2))

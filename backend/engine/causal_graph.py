@@ -839,6 +839,13 @@ class CausalGraph:
         for k in stale:
             self._edge_age.pop(k, None)
 
+    def reset_discovery_baseline(self) -> None:
+        """Reset discovery counters at post-FR / warmup (Phase 2 frozen metric window)."""
+        self._discovery_activation_log.clear()
+        self._discovery_new_count = 0
+        self._discovery_reactivated_count = 0
+        self._edge_ever_active.clear()
+
     def discovery_new_frac(self) -> float:
         if not self._discovery_activation_log:
             total = self._discovery_new_count + self._discovery_reactivated_count

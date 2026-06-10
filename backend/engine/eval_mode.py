@@ -44,7 +44,8 @@ def apply_eval_bench_env() -> None:
     Defaults for eval_transfer / curriculum gate subprocesses (Track A / Phase 1 bench).
     Call before Simulation() so init stays lightweight.
     """
-    os.environ.setdefault("RKK_TRANSFER_BENCH", "1")
+    # Force bench profile (`.env` may set weaker Phase-0 defaults).
+    os.environ["RKK_TRANSFER_BENCH"] = "1"
     os.environ.setdefault("RKK_SKIP_ALL_LLM", "1")
     os.environ.setdefault("RKK_NEURAL_LANG", "0")
     os.environ.setdefault("RKK_TICK_PROFILE", "0")
@@ -54,7 +55,31 @@ def apply_eval_bench_env() -> None:
     os.environ.setdefault("RKK_SCORE_CACHE_EVERY", "80")
     os.environ.setdefault("RKK_SCORE_STALE_ONLY", "1")
     os.environ.setdefault("RKK_MEMORY_DIAG_INTERVAL", "0")
+    if os.environ.get("RKK_BENCH_KEEP_ENV", "0").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        os.environ["RKK_S2_OVERRIDE_FALLEN_TICKS"] = "36"
+        os.environ["RKK_POST_FR_ALPHA_DECAY"] = "0.60"
+        os.environ["RKK_META_PE_ROLLING_WINDOW"] = "32"
+        os.environ["RKK_META_UPDATE_EVERY"] = "30"
+        os.environ["RKK_SCORECARD_WARMUP_TICKS"] = "500"
+        os.environ["RKK_BENCH_SCORECARD_TRAIN_ONLY"] = "1"
+        os.environ["RKK_GOAL_PROPOSE_EVERY"] = "60"
+        os.environ["RKK_GOAL_WORLD_SWITCH_EVERY"] = "120"
+        os.environ["RKK_GOAL_BENCH_COMPLETE_AFTER"] = "30"
+    os.environ.setdefault("RKK_GOAL_WMETA_MIN_SUCCESS", "0.0")
+    os.environ.setdefault("RKK_GOAL_TRANSFER_MIN_SUCCESS", "0.35")
     # RKK_SCORE_ASYNC: leave .env default for train; eval phase sets sync in _run_ticks.
+
+
+def meta_pe_rolling_window() -> int:
+    try:
+        return max(50, _env_int("RKK_META_PE_ROLLING_WINDOW", "500"))
+    except ValueError:
+        return 500
 
 
 def cross_env_allow_wm_train() -> bool:

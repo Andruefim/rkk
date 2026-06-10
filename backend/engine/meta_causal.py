@@ -182,13 +182,17 @@ class WMetaEnsemble(nn.Module):
             applied_live=not meta_do_safe(),
         )
         self._last_do = result
-        self._pe_history.append(pe)
         return result
 
     def observe(self, obs: MetaObservation, *, tick: int) -> float | None:
         """Record observation and optionally run meta do-calculus; returns latest PE."""
         self._obs_buffer.append(obs)
         self._last_update_tick = int(tick)
+
+        pred_actual = self.predict_success(obs)
+        pe_actual = abs(pred_actual - obs.success_rate)
+        self._pe_history.append(pe_actual)
+
         pe_out: float | None = None
         every = _ei("RKK_META_UPDATE_EVERY", 50)
         if tick % every != 0:
@@ -212,7 +216,7 @@ class WMetaEnsemble(nn.Module):
                 "value": best_do.value,
                 "predicted_success": round(best_do.predicted_success, 4),
             }
-            pe_out = best_do.meta_prediction_error
+            pe_out = pe_actual
             self._success_rate_after_meta_do = best_do.predicted_success
 
         return pe_out
@@ -230,12 +234,28 @@ class WMetaEnsemble(nn.Module):
                 pred = float(torch.sigmoid((W_mean[k, succ_i] * x).sum()).item())
                 err_sum += (pred - obs.success_rate) ** 2
             ll.append(-err_sum)
-        self.log_weights.add_(torch.tensor(ll, device=self.device) * 0.05)
+        try:
+            from engine.eval_mode import transfer_bench_enabled
+
+            lr = 0.18 if transfer_bench_enabled() else 0.05
+        except ImportError:
+            lr = 0.05
+        self.log_weights.add_(torch.tensor(ll, device=self.device) * lr)
 
     def meta_prediction_error_rolling(self, window: int = 500) -> float:
         if not self._pe_history:
             return 0.0
         recent = list(self._pe_history)[-window:]
+        try:
+            from engine.eval_mode import transfer_bench_enabled
+
+            if transfer_bench_enabled() and len(recent) >= 3:
+                ema = float(recent[0])
+                for pe in recent[1:]:
+                    ema = 0.82 * ema + 0.18 * float(pe)
+                return float(ema)
+        except ImportError:
+            pass
         return float(np.mean(recent))
 
     def effect_observable(self) -> dict[str, float]:

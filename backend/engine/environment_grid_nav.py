@@ -113,7 +113,8 @@ class EnvironmentGridNav:
         ticks = max(1, self._ticks)
         return {
             "pathfinder_override_frac": float(self._pathfinder_overrides / ticks),
-            "stuck_override_active": float(1.0 if self._stuck_steps >= 3 else 0.0),
+            "stuck_override_frac": float(self._stuck_overrides / ticks),
+            "stuck_override_active": float(self._stuck_overrides / ticks),
             "goal_reached": float(self._goal_reached_count / ticks),
         }
 

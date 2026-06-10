@@ -314,6 +314,8 @@ class SimulationWorldMixin:
                     f"ensemble_entropy={ent} wm_lr_mult={self.agent.graph._post_fr_wm_lr_mult:.2f}",
                     flush=True,
                 )
+                if hasattr(self.agent.graph, "reset_discovery_baseline"):
+                    self.agent.graph.reset_discovery_baseline()
             except Exception as e:
                 print(f"[PostFR] calibration failed: {e}", flush=True)
 

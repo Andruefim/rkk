@@ -65,7 +65,10 @@ def build_scorecard(
             (sim_snap.get("phase5") or {}).get("meta_prediction_error", 1.0),
         )
     )
-    goal_metrics = (sim_snap.get("phase5") or {}).get("goal_generator") or {}
+    phase5 = sim_snap.get("phase5") or {}
+    goal_metrics = phase5.get("goal_generator") or sim_snap.get("goal_generator") or {}
+    if meta_pe >= 1.0 and phase5.get("meta_prediction_error") is not None:
+        meta_pe = float(phase5["meta_prediction_error"])
     meta_pe_pass = meta_pe < th["meta_pe_max"]
     goals_crossworld_pass = bool(
         goal_metrics.get("autonomous_goals_crossworld_pass", False)
@@ -76,22 +79,46 @@ def build_scorecard(
         and meta_pe_pass
         and goals_crossworld_pass
     )
+    phase6 = sim_snap.get("phase6") or {}
+    continual = float(
+        phase6.get(
+            "continual_forgetting_ratio",
+            sim_snap.get("continual_forgetting_ratio", 0.0),
+        )
+    )
+    meta_recovery = phase6.get("meta_recovery_ticks", sim_snap.get("meta_recovery_ticks"))
+    non_phys_ok = all(
+        bool(worlds_out.get(w, {}).get("a1_pass"))
+        and bool(worlds_out.get(w, {}).get("a4_pass"))
+        for w in world_list
+        if w != "humanoid"
+        and worlds_out.get(w, {}).get("metrics_applicable")
+    )
+    pass_full = (
+        pass_extended
+        and non_phys_ok
+        and continual >= th["continual_forgetting_min"]
+        and (
+            meta_recovery is None
+            or float(meta_recovery) <= th["meta_recovery_max_ticks"]
+        )
+    )
     card: dict[str, Any] = {
-        "pass_agi_full": False,
+        "pass_agi_full": pass_full,
         "pass_agi_extended": pass_extended,
         "pass_core_embodied": pass_core,
         "pass_core": pass_core,
-        "autonomy_integrity_nonphys": all(
-            worlds_out.get(w, {}).get("a1_pass", False)
-            and worlds_out.get(w, {}).get("a4_pass", False)
-            for w in world_list
-            if w != "humanoid"
-        ),
+        "autonomy_integrity_nonphys": non_phys_ok,
         "worlds": worlds_out,
         "discovery_new_frac": discovery_frac,
         "meta_prediction_error": round(meta_pe, 4),
         "meta_prediction_error_pass": meta_pe_pass,
         "autonomous_goals_crossworld_pass": goals_crossworld_pass,
+        "continual_forgetting_ratio": round(continual, 4),
+        "meta_recovery_ticks": meta_recovery,
+        "ewc_stable_edge_count": phase6.get(
+            "ewc_stable_edge_count", sim_snap.get("ewc_stable_edge_count")
+        ),
         "thresholds": th,
     }
     if extra:

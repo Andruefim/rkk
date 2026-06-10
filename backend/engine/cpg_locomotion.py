@@ -55,8 +55,23 @@ class CPGNetwork(nn.Module):
         self.phase_bias = nn.Parameter(torch.zeros(n_oscillators, n_oscillators, device=dev))
 
         self.register_buffer("_phase", torch.zeros(n_oscillators, device=dev))
+        self.register_buffer("epsilon_amp", torch.zeros(n_oscillators, device=dev))
+        self.register_buffer("epsilon_freq", torch.zeros(n_oscillators, device=dev))
+        self.register_buffer("epsilon_phase", torch.zeros(n_oscillators, n_oscillators, device=dev))
 
         self.to(dev)
+
+    @torch.no_grad()
+    def resample_perturbations(self, sigma_amp: float = 0.05, sigma_freq: float = 0.05, sigma_phase: float = 0.05) -> None:
+        self.epsilon_amp.normal_(0.0, sigma_amp)
+        self.epsilon_freq.normal_(0.0, sigma_freq)
+        self.epsilon_phase.normal_(0.0, sigma_phase)
+
+    @torch.no_grad()
+    def clear_perturbations(self) -> None:
+        self.epsilon_amp.zero_()
+        self.epsilon_freq.zero_()
+        self.epsilon_phase.zero_()
 
     @torch.no_grad()
     def step(
@@ -64,8 +79,8 @@ class CPGNetwork(nn.Module):
         dt: float = 0.05,
         external_command: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        freq = torch.sigmoid(self.frequency) * 2.0 + 0.3
-        amp = torch.sigmoid(self.amplitude) * 0.6
+        freq = torch.sigmoid(self.frequency + self.epsilon_freq) * 2.0 + 0.3
+        amp = torch.sigmoid(self.amplitude + self.epsilon_amp) * 0.6
 
         if external_command is not None:
             ec = external_command[: self.n]
@@ -75,7 +90,7 @@ class CPGNetwork(nn.Module):
         p = self._phase + two_pi * freq * float(dt)
         self._phase.copy_(torch.remainder(p, two_pi))
 
-        diff = self._phase.unsqueeze(1) - self._phase.unsqueeze(0) - self.phase_bias
+        diff = self._phase.unsqueeze(1) - self._phase.unsqueeze(0) - (self.phase_bias + self.epsilon_phase)
         coupling = torch.sin(diff).sum(dim=1) * 0.1
         p2 = self._phase + coupling * float(dt)
         self._phase.copy_(torch.remainder(p2, two_pi))
@@ -125,6 +140,8 @@ class LocomotionController:
         self._last_motor_state: dict[str, float] = {}
         self._last_cpg_sync: dict[str, float] = {}
         self._com_x_prev_step: float | None = None
+        self._reward_baseline: float = 0.5
+        self.cpg.resample_perturbations()
 
         # MOTOR_CORTEX: cpg_weight is set externally by MotorCortexLibrary
         self.cpg_weight: float = 1.0  # used for diagnostics only here
@@ -371,34 +388,38 @@ class LocomotionController:
         Обучение CPG только из _reward_history (заполняется IntrinsicObjective).
         Вызывается после agent.step; см. engine.intristic_objective.
         """
-        try:
-            win = int(os.environ.get("RKK_CPG_REWARD_WINDOW", "24"))
-        except ValueError:
-            win = 24
-        win = max(4, min(win, 256))
-
-        if len(self._reward_history) < win:
+        if not self._reward_history:
             return
 
-        r_mean = float(np.mean(self._reward_history[-win:]))
+        # Keep history bounded to avoid memory leak
+        if len(self._reward_history) > 128:
+            self._reward_history = self._reward_history[-128:]
+
+        r_total = self._reward_history[-1]
         com_x_vel = float(getattr(self, "_last_com_x_vel", 0.0))
         try:
             fwd_scale = float(os.environ.get("RKK_CPG_FWD_BONUS", "0.4"))
         except ValueError:
             fwd_scale = 0.4
         fwd = fwd_scale * float(np.clip(com_x_vel - 0.01, 0.0, 1.0))
-        r_total = r_mean + fwd
+        r_total = r_total + fwd
+
+        baseline = getattr(self, "_reward_baseline", 0.5)
+        diff = r_total - baseline
+        self._reward_baseline = 0.98 * baseline + 0.02 * r_total
+
         self.optim.zero_grad()
-        dev = next(self.cpg.parameters()).device
-        scale = torch.tensor(r_total, device=dev, dtype=torch.float32)
-        loss = -scale * (
-            0.35 * self.cpg.amplitude.mean()
-            + 0.15 * self.cpg.frequency.mean()
-            - 0.15 * torch.abs(self.cpg.phase_bias).mean()
+        loss = - diff * (
+            (self.cpg.epsilon_amp * self.cpg.amplitude).sum() +
+            (self.cpg.epsilon_freq * self.cpg.frequency).sum() +
+            (self.cpg.epsilon_phase * self.cpg.phase_bias).sum()
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.cpg.parameters(), 0.3)
         self.optim.step()
+
+        # Resample perturbations for the next step exploration
+        self.cpg.resample_perturbations()
 
     def snapshot(self) -> dict:
         with torch.no_grad():

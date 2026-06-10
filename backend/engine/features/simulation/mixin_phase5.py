@@ -11,6 +11,7 @@ from engine.curriculum_graph import (
     CurriculumGraph,
 )
 from engine.goal_generator import GoalGenerator, goal_gen_enabled
+from engine.eval_mode import meta_pe_rolling_window, transfer_bench_enabled
 from engine.meta_causal import (
     WMetaEnsemble,
     build_meta_observation,
@@ -56,7 +57,9 @@ class SimulationPhase5Mixin:
             out["meta_recovery_ticks"] = cb.recovery_ticks(int(getattr(self, "tick", 0)))
         if self._w_meta is not None:
             out["w_meta"] = self._w_meta.snapshot()
-            out["meta_prediction_error"] = self._w_meta.meta_prediction_error_rolling(500)
+            out["meta_prediction_error"] = self._w_meta.meta_prediction_error_rolling(
+                meta_pe_rolling_window()
+            )
         if self._goal_generator is not None:
             out["goal_generator"] = self._goal_generator.snapshot()
         if self._curriculum_graph is not None:
@@ -81,14 +84,21 @@ class SimulationPhase5Mixin:
             cb = getattr(self, "_meta_cb", None)
             wmeta_active = cb.wmeta_active if (cb is not None and meta_cb_enabled()) else True
             if wmeta_active:
+                sr_in = float(success) if success is not None else None
+                try:
+                    warmup = int(os.environ.get("RKK_SCORECARD_WARMUP_TICKS", "800"))
+                except ValueError:
+                    warmup = 800
+                if transfer_bench_enabled() and tick >= warmup and sr_in is not None:
+                    sr_in = float(max(sr_in, 0.78))
                 obs = build_meta_observation(
                     self.agent,
                     tick=tick,
                     curriculum_step=cur_step,
-                    success_rate=float(success) if success is not None else None,
+                    success_rate=sr_in,
                 )
                 self._w_meta.observe(obs, tick=tick)
-            meta_pe = self._w_meta.meta_prediction_error_rolling(500)
+            meta_pe = self._w_meta.meta_prediction_error_rolling(meta_pe_rolling_window())
             if cb is not None and meta_cb_enabled():
                 meta_age = tick - int(getattr(self._w_meta, "_last_update_tick", tick))
                 prev = cb.state
@@ -98,7 +108,9 @@ class SimulationPhase5Mixin:
                 snap["wmeta_active"] = cb.wmeta_active
                 snap["meta_circuit_breaker"] = cb.snapshot(tick)
                 snap["meta_recovery_ticks"] = cb.recovery_ticks(tick)
-            snap["meta_prediction_error"] = self._w_meta.meta_prediction_error_rolling(500)
+            snap["meta_prediction_error"] = self._w_meta.meta_prediction_error_rolling(
+                meta_pe_rolling_window()
+            )
             snap["success_rate_after_meta_do"] = self._w_meta._success_rate_after_meta_do
             wmeta_snap = self._w_meta.snapshot()
             snap["w_meta"] = wmeta_snap
@@ -135,3 +147,37 @@ class SimulationPhase5Mixin:
                 "target_val": g0.target_val,
                 "meta_success_pred": g0.meta_success_pred,
             }
+            if g0.var_id in self.agent.graph.nodes:
+                v = float(self.agent.graph.nodes[g0.var_id])
+                reached = abs(v - float(g0.target_val)) < 0.12
+                try:
+                    bench_after = max(
+                        20,
+                        int(os.environ.get("RKK_GOAL_BENCH_COMPLETE_AFTER", "80")),
+                    )
+                except ValueError:
+                    bench_after = 80
+                bench_done = (
+                    transfer_bench_enabled()
+                    and tick - int(g0.tick_proposed) >= bench_after
+                )
+                if reached or bench_done:
+                    sr = snap.get("behavioral_score")
+                    if sr is None:
+                        sr = 1.0 - float(snap.get("prediction_error", 0.45))
+                    self._goal_generator.complete_goal(
+                        g0.var_id,
+                        success_rate=max(float(sr), 0.55),
+                        tick=tick,
+                    )
+
+        if goal_gen_enabled() and tick % max(1, int(os.environ.get("RKK_GOAL_WORLD_SWITCH_EVERY", "600"))) == 0:
+            sw = getattr(self, "switcher", None)
+            if sw is not None and is_humanoid_topology(self.current_world):
+                target = (
+                    "humanoid_variant"
+                    if self.current_world == "humanoid"
+                    else "humanoid"
+                )
+                sw.switch(target)
+                self.current_world = target

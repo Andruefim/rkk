@@ -91,9 +91,7 @@ class EnvironmentSymbolic:
         ticks = max(1, self._ticks)
         return {
             "rule_engine_bailout_frac": float(self._bailouts / ticks),
-            "constraint_violation_override": float(
-                1.0 if self._constraint_overrides > 0 and not self._constraints_ok() else 0.0
-            ),
+            "constraint_violation_override": float(self._constraint_overrides / ticks),
             "constraints_satisfied": float(self._satisfied_ticks / ticks),
         }
 
