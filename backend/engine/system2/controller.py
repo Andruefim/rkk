@@ -177,11 +177,11 @@ def _s2_concept_count(graph: Any) -> int:
 
 
 def _s2_wm_override_schedule_only() -> bool:
-    return os.environ.get("RKK_S2_WM_OVERRIDE_SCHEDULE_ONLY", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
+    return os.environ.get("RKK_S2_WM_OVERRIDE_SCHEDULE_ONLY", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -389,8 +389,13 @@ class System2Controller:
             "expected_ig": float(base.get("expected_ig", 0.62)),
         }
 
+    def _intention_from_sim(self, sim: Any | None) -> Any | None:
+        if sim is None:
+            return None
+        return getattr(sim, "_intention_state", None)
+
     def planning_context_for_wm(
-        self, *, fallen: bool = False, sim_tick: int = -1
+        self, *, fallen: bool = False, sim_tick: int = -1, sim: Any | None = None
     ) -> dict[str, Any]:
         """Контекст для S2-gated WM planner (agent.step после tick)."""
         macro = (
@@ -398,6 +403,7 @@ class System2Controller:
             if self._s2_override_active
             else str(self._active_macro or "IDLE")
         )
+        intent_ctx = self._intention_from_sim(sim)
         spec = (
             self._recovery_episode_spec
             if self._s2_override_active
@@ -407,16 +413,38 @@ class System2Controller:
         sched_cand = None
         if self._s2_override_active and int(sim_tick) >= 0:
             sched_cand = self._recovery_schedule_wm_candidate(int(sim_tick))
+        expected = dict(spec.expected_state or {})
+        goal_td = None
+        if intent_ctx is not None and not self._s2_override_active:
+            if getattr(intent_ctx, "macro_hint", None):
+                macro = str(intent_ctx.macro_hint)
+            if getattr(intent_ctx, "expected_state", None):
+                expected.update(dict(intent_ctx.expected_state))
+            primary = getattr(intent_ctx, "primary", None)
+            if primary is not None:
+                goal_td = float(
+                    getattr(primary, "target_val", 0.42)
+                )
         return {
             "macro": macro,
             "fallen": bool(fallen),
             "fallen_override_active": bool(self._s2_override_active),
+            "intention_narrative": (
+                str(getattr(intent_ctx, "narrative", "")) if intent_ctx else ""
+            ),
+            "intention_stack_depth": (
+                int(getattr(intent_ctx, "stack_depth", 0)) if intent_ctx else 0
+            ),
+            "intention_horizon_ticks": (
+                int(getattr(intent_ctx, "horizon_ticks", 0)) if intent_ctx else 0
+            ),
+            "goal_target_dist": goal_td,
             "learned_recovery_active": bool(
                 self._learned_recovery_active
                 and self._recovery_schedule_source == "learned"
             ),
             "motor_owner": self._motor_owner_for_tick(int(sim_tick)),
-            "expected_state": dict(spec.expected_state or {}),
+            "expected_state": expected,
             "max_prediction_error": spec.max_prediction_error,
             "skill_id": spec.skill_id,
             "bundle_candidate": bundle.get("candidate"),
@@ -1307,6 +1335,18 @@ class System2Controller:
             macro = choose_macro_from_obs(obs_f)
             source = "student"
 
+        intent_ctx = self._intention_from_sim(sim)
+        intent_horizon = _macro_horizon_ticks()
+        if intent_ctx is not None and not self._s2_override_active:
+            hint = str(getattr(intent_ctx, "macro_hint", "") or "").strip().upper()
+            if hint and hint in ("IDLE", "RECOVER_POSTURE", "LOCOMOTE_DELIVERY", "EXPLORE"):
+                macro = hint
+                source = "intention_cortex"
+            intent_horizon = max(
+                intent_horizon,
+                int(getattr(intent_ctx, "horizon_ticks", intent_horizon)),
+            )
+
         self._episode_plan_distill_extra = {}
         proposal_effective: System2Proposal | None = None
 
@@ -1314,6 +1354,14 @@ class System2Controller:
         graph_patch: dict[str, float] = dict(bundle.get("graph") or {})
         cand_tpl = bundle.get("candidate")
         residuals: dict[str, float] = dict(bundle.get("residuals") or {})
+
+        if intent_ctx is not None and not self._s2_override_active:
+            for k, v in (getattr(intent_ctx, "graph_patch", None) or {}).items():
+                if k in node_keys:
+                    graph_patch[k] = float(v)
+            for k, dv in (getattr(intent_ctx, "intent_residuals", None) or {}).items():
+                if k in node_keys:
+                    residuals[k] = residuals.get(k, 0.0) + float(dv)
 
         if proposal_effective and proposal_effective.intent_deltas:
             for k, dv in proposal_effective.intent_deltas.items():
@@ -1374,7 +1422,7 @@ class System2Controller:
         agent.set_system2_candidate(candidate)
         self._active_macro = macro
         self._last_source = source
-        self._macro_until_tick = sim_tick + _macro_horizon_ticks()
+        self._macro_until_tick = sim_tick + int(intent_horizon)
         gov = EpisodeSuccessSpec()
         if sim is not None:
             cur = getattr(sim, "_curriculum", None)

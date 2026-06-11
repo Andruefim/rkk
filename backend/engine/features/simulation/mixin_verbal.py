@@ -81,6 +81,19 @@ class SimulationVerbalMixin:
         if self._episodic_memory and self._episodic_memory._patterns:
             fall_history_brief = self._episodic_memory._patterns[0].description[:80]
 
+        intention_brief = ""
+        ctx = getattr(self, "_intention_state", None)
+        if ctx is not None and getattr(ctx, "narrative", ""):
+            intention_brief = str(ctx.narrative)[:120]
+        elif getattr(self, "_intention_cortex", None) is not None:
+            lines = getattr(self._intention_cortex, "_narrative_lines", [])
+            if lines:
+                intention_brief = str(lines[-1])[:120]
+        if intention_brief:
+            fall_history_brief = (
+                f"{fall_history_brief} | intention: {intention_brief}".strip(" |")
+            )
+
         msg = await self._verbal.tick(
             tick=tick,
             obs=obs,

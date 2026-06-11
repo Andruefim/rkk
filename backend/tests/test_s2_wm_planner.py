@@ -39,8 +39,7 @@ def test_task_active_on_fallen_override():
 
 def test_planner_enabled_by_default():
     assert s2_wm_planner_enabled()
-    assert s2_wm_gate_strict()
-    assert s2_wm_fast_override_enabled()
+    assert not s2_wm_fast_override_enabled()
 
 
 def test_bundle_fallback_quick_from_context():

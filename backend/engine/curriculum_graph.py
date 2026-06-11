@@ -11,7 +11,15 @@ from typing import Any
 
 
 def curriculum_graph_enabled() -> bool:
-    return os.environ.get("RKK_CURRICULUM_GRAPH_ENABLED", "0").strip().lower() in (
+    default = "1"
+    try:
+        from engine.intention_cortex import intention_cortex_enabled
+
+        if not intention_cortex_enabled():
+            default = "0"
+    except ImportError:
+        default = "0"
+    return os.environ.get("RKK_CURRICULUM_GRAPH_ENABLED", default).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -178,6 +186,11 @@ class CurriculumGraph:
         )
 
     def get_next_pending(self, world_id: str | None = None) -> CurriculumNode | None:
+        chain = self.pending_chain(world_id, 1)
+        return chain[0] if chain else None
+
+    def pending_chain(self, world_id: str | None, max_n: int) -> list[CurriculumNode]:
+        """Ordered pending unlocked nodes for long-horizon intention stack."""
         pending = [
             n
             for n in self._nodes.values()
@@ -185,10 +198,8 @@ class CurriculumGraph:
             and self._unlocked(n)
             and (world_id is None or n.world_id == world_id)
         ]
-        if not pending:
-            return None
         pending.sort(key=lambda n: (n.source != "seeded", n.node_id))
-        return pending[0]
+        return pending[: max(0, int(max_n))]
 
     def activate_next(self, tick: int, world_id: str = "humanoid") -> CurriculumNode | None:
         if self._active_id:

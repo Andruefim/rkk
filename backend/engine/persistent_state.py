@@ -104,6 +104,9 @@ class PersistentMeta:
     mastered_skills: list[str] = field(default_factory=list)
     failed_skills: list[str] = field(default_factory=list)
 
+    # Intention cortex (long-horizon goal stack)
+    intention_cortex: dict[str, Any] = field(default_factory=dict)
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -280,6 +283,13 @@ def collect_meta_from_simulation(sim) -> PersistentMeta:
         meta.mastered_skills = list(sim._physical_curriculum.mastered)
         meta.failed_skills = list(sim._physical_curriculum.failed)
 
+    ic = getattr(sim, "_intention_cortex", None)
+    if ic is not None:
+        try:
+            meta.intention_cortex = ic.to_dict()
+        except Exception:
+            meta.intention_cortex = {}
+
     return meta
 
 
@@ -337,5 +347,18 @@ def restore_meta_to_simulation(sim, meta: PersistentMeta) -> None:
     if sim._physical_curriculum is not None:
         sim._physical_curriculum.mastered = set(meta.mastered_skills)
         sim._physical_curriculum.failed = set(meta.failed_skills)
+
+    if meta.intention_cortex:
+        try:
+            from engine.intention_cortex import intention_cortex_enabled
+
+            if intention_cortex_enabled() and hasattr(sim, "_ensure_intention_cortex"):
+                ic = sim._ensure_intention_cortex()
+                ic.load_dict(meta.intention_cortex)
+                sim._goal_generator = ic.goal_generator
+                sim._curriculum_graph = ic.curriculum_graph
+                print("[Persist] Intention cortex stack restored")
+        except Exception as ex:
+            print(f"[Persist] Intention cortex restore skipped: {ex}")
 
     print(f"[Persist] ✅ Simulation tick restored to {meta.tick}")

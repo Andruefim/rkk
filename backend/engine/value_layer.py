@@ -578,7 +578,7 @@ class ValueLayer:
         # §2–4 Виртуальный do() + imagination rollout
         # Perf: при fixed_root + horizon=0 виртуальный WM для intent_* не нужен —
         # один шаг = локальная подстановка вектора узлов (избегаем integrate_world_model_step).
-        _fast_fr = os.environ.get("RKK_VL_FAST_FIXED_ROOT", "1").strip().lower() in (
+        _fast_fr = os.environ.get("RKK_VL_FAST_FIXED_ROOT", "0").strip().lower() in (
             "1", "true", "yes", "on",
         )
         if (

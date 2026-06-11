@@ -801,6 +801,15 @@ class SimulationTickMixin:
         self._prof_mark("sim.cpg_prep", _pt)
         if is_humanoid_topology(self.current_world):
             try:
+                self._tick_intention_pre_system2(fallen=bool(fallen_for_s2))
+            except Exception as _ic_ex:
+                logging.getLogger(__name__).warning(
+                    "intention_cortex pre-system2 failed at tick %s: %s",
+                    self.tick,
+                    _ic_ex,
+                    exc_info=True,
+                )
+            try:
                 from engine.eval_mode import eval_mode_enabled, eval_skip_system2
                 from engine.system2.controller import system2_enabled
 
@@ -826,7 +835,11 @@ class SimulationTickMixin:
                     fn_ctx = getattr(self._system2, "planning_context_for_wm", None)
                     if callable(fn_ctx):
                         self.agent.set_s2_planning_context(
-                            fn_ctx(fallen=bool(fallen_for_s2), sim_tick=int(self.tick))
+                            fn_ctx(
+                                fallen=bool(fallen_for_s2),
+                                sim_tick=int(self.tick),
+                                sim=self,
+                            )
                         )
                     else:
                         self.agent.set_s2_planning_context(None)

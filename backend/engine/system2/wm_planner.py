@@ -2,7 +2,7 @@
 S2-gated world-model planner: imagination rollouts under System 2 task + energy cost.
 
 System 2 задаёт макрос / expected_state; WM перебирает intent-действия и выбирает
-первый шаг (опционально 2–3 шага beam) по скору задачи, а не по EIG.
+первый шаг (beam RKK_PLAN_DEPTH + free-rollout RKK_IMAGINATION_STEPS) по скору задачи.
 """
 from __future__ import annotations
 
@@ -13,10 +13,13 @@ from typing import Any
 import numpy as np
 
 from engine.goal_planning import (
+    beam_search_first_action,
+    imagination_steps_for_context,
     plan_beam_k,
     plan_depth,
     plan_max_branch_effective,
     planning_graph_motor_vars,
+    subsample_actions,
 )
 from engine.symbolic_verifier import symbolic_verifier_enabled, verify_normalized_prediction
 from engine.system2.schema import EpisodeSuccessSpec
@@ -37,14 +40,14 @@ def s2_wm_planner_enabled() -> bool:
 
 
 def s2_wm_fast_override_enabled() -> bool:
-    """При fallen_override — bundle/кэш без полного WM-beam каждый тик."""
+    """При fallen_override — bundle без WM-beam (только если явно включено; иначе shallow WM)."""
     if not s2_wm_planner_enabled():
         return False
-    return os.environ.get("RKK_S2_WM_FAST_OVERRIDE", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
+    return os.environ.get("RKK_S2_WM_FAST_OVERRIDE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -67,11 +70,11 @@ def s2_wm_gate_strict() -> bool:
     """При активной задаче S2 — только WM-кандидат (без EIG / CEM / legacy goal_plan)."""
     if not s2_wm_planner_enabled():
         return False
-    return os.environ.get("RKK_S2_WM_GATE_STRICT", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
+    return os.environ.get("RKK_S2_WM_GATE_STRICT", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -152,7 +155,9 @@ def task_from_planning_context(ctx: dict[str, Any] | None, graph_nodes: dict[str
         max_prediction_error=mx_f,
         skill_id=str(ctx["skill_id"]) if ctx.get("skill_id") else None,
         goal_target_dist=float(
-            graph_nodes.get("self_goal_target_dist", graph_nodes.get("target_dist", 0.42))
+            ctx.get("goal_target_dist")
+            if ctx.get("goal_target_dist") is not None
+            else graph_nodes.get("self_goal_target_dist", graph_nodes.get("target_dist", 0.42))
         ),
         self_goal_active=float(graph_nodes.get("self_goal_active", 0.0)),
     )
@@ -334,9 +339,9 @@ def plan_s2_wm_candidate(
     if agent.graph._core is None:
         return None
     try:
-        min_steps = int(os.environ.get("RKK_S2_WM_MIN_WM_STEPS", "24"))
+        min_steps = int(os.environ.get("RKK_S2_WM_MIN_WM_STEPS", "12"))
     except ValueError:
-        min_steps = 24
+        min_steps = 12
     state0 = dict(agent.graph.nodes)
     task = task_from_planning_context(planning_context, state0)
     if not task.active:
@@ -401,12 +406,21 @@ def plan_s2_wm_candidate(
     if task.fallen_override or (task.fallen and task.macro == "RECOVER_POSTURE"):
         max_b = min(max_b, s2_wm_recover_max_branch())
     if len(actions) > max_b:
-        idx = np.random.default_rng().choice(len(actions), size=max_b, replace=False)
-        actions = [actions[int(i)] for i in idx]
+        actions = subsample_actions(actions, max_b)
 
     depth = plan_depth()
+    if task.fallen_override or (task.fallen and task.macro == "RECOVER_POSTURE"):
+        try:
+            depth = max(2, min(depth, int(os.environ.get("RKK_S2_WM_RECOVER_PLAN_DEPTH", "4"))))
+        except ValueError:
+            depth = min(depth, 4)
     beam_k = plan_beam_k()
-    horizon = agent._effective_imagination_horizon(enable_l3=True)
+    fixed_root_vl, fallen_vl, fo_vl = agent._planning_context_flags()
+    horizon = imagination_steps_for_context(
+        fallen=fallen_vl or task.fallen,
+        fallen_override=fo_vl or task.fallen_override,
+        fixed_root=fixed_root_vl or fixed_root,
+    )
 
     def _accept(sfin: dict[str, float], var: str, val: float) -> bool:
         if symbolic_verifier_enabled():
@@ -415,65 +429,22 @@ def plan_s2_wm_candidate(
                 return False
         return True
 
-    best_score = float("-inf")
-    best_first: tuple[str, float] | None = None
+    def _score(
+        s0: dict[str, float], var: str, val: float, sfin: dict[str, float]
+    ) -> float:
+        return score_wm_trajectory(s0, sfin, task, action_var=var, action_val=val)
 
-    if depth <= 1:
-        try:
-            states_fin = agent._batch_rollout_imagination_states(state0, actions)
-        except Exception:
-            return None
-        for i, (var, val) in enumerate(actions):
-            if i >= len(states_fin):
-                break
-            sfin = states_fin[i]
-            if not _accept(sfin, var, val):
-                continue
-            sc = score_wm_trajectory(state0, sfin, task, action_var=var, action_val=val)
-            if sc > best_score:
-                best_score = sc
-                best_first = (var, val)
-    else:
-        scored: list[tuple[float, str, float, dict[str, float]]] = []
-        try:
-            states1 = agent._batch_rollout_imagination_states(state0, actions)
-        except Exception:
-            return None
-        for i, (var, val) in enumerate(actions):
-            if i >= len(states1):
-                break
-            s1 = states1[i]
-            if not _accept(s1, var, val):
-                continue
-            sc = score_wm_trajectory(state0, s1, task, action_var=var, action_val=val)
-            scored.append((sc, var, val, dict(s1)))
-        scored.sort(key=lambda t: -t[0])
-        row_bases: list[dict[str, float]] = []
-        row_actions: list[tuple[str, float]] = []
-        row_meta: list[tuple[str, float, float]] = []
-        for sc1, v1, x1, s1 in scored[:beam_k]:
-            for v2, x2 in actions:
-                row_bases.append(s1)
-                row_actions.append((v2, x2))
-                row_meta.append((sc1, v1, x1))
-        try:
-            states2 = agent._batch_rollout_imagination_states(
-                state0, row_actions, row_bases=row_bases
-            )
-        except Exception:
-            states2 = []
-        for j, sfin in enumerate(states2):
-            if j >= len(row_meta):
-                break
-            sc1, v1, x1 = row_meta[j]
-            v2, x2 = row_actions[j]
-            if not _accept(sfin, v2, x2):
-                continue
-            sc2 = score_wm_trajectory(state0, sfin, task, action_var=v2, action_val=x2)
-            sc = sc1 * 0.35 + sc2
-            if sc > best_score:
-                best_score = sc
-                best_first = (v1, x1)
+    best_first, best_score = beam_search_first_action(
+        agent,
+        state0=state0,
+        actions=actions,
+        depth=depth,
+        beam_k=beam_k,
+        rollout_horizon=horizon,
+        score_fn=_score,
+        accept_fn=_accept,
+        maximize=True,
+    )
 
     if best_first is None:
         return _bundle_fallback()

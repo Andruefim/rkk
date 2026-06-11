@@ -69,13 +69,17 @@ class TeacherIGRule:
     bonus: float
 
 from engine.goal_planning import (
+    beam_search_first_action,
     goal_planning_globally_disabled,
+    imagination_steps_for_context,
     plan_max_branch_effective,
     parse_plan_value_levels,
     plan_beam_k,
     plan_depth,
     plan_max_branch,
     planning_graph_motor_vars,
+    subsample_actions,
+    vl_imagination_steps_fallen,
 )
 from engine.symbolic_verifier import (
     downrank_factor_for_violation,
@@ -395,20 +399,20 @@ def _max_fallback_tries_from_env() -> int:
 
 
 def _vl_fast_fixed_root_intents_enabled() -> bool:
-    return os.environ.get("RKK_VL_FAST_FIXED_ROOT", "1").strip().lower() in (
+    return os.environ.get("RKK_VL_FAST_FIXED_ROOT", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
 
 def _vl_fast_fallen_intents_enabled() -> bool:
-    return os.environ.get("RKK_VL_FAST_FALLEN", "1").strip().lower() in (
+    return os.environ.get("RKK_VL_FAST_FALLEN", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
 
 def _vl_fast_intent_enabled() -> bool:
     """Upright walk: skip WM propagate_from_batch when all VL candidates are intents."""
-    return os.environ.get("RKK_VL_FAST_INTENT", "1").strip().lower() in (
+    return os.environ.get("RKK_VL_FAST_INTENT", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
 
@@ -466,13 +470,10 @@ def _cheap_vl_s1_intent_batch(
 
 
 def _imagination_horizon_from_env() -> int:
-    """Фаза 13: RKK_IMAGINATION_STEPS — число шагов core(X) после мысленного do(); 0 = как раньше."""
-    raw = os.environ.get("RKK_IMAGINATION_STEPS", "1")
-    try:
-        h = int(raw)
-    except ValueError:
-        h = 0
-    return max(0, h)
+    """Фаза 13: базовый free-rollout после мысленного do() (cerebellar forward model)."""
+    from engine.goal_planning import imagination_steps_default
+
+    return imagination_steps_default()
 
 
 class RKKAgent:
@@ -690,6 +691,7 @@ class RKKAgent:
         actions: list[tuple[str, float]],
         *,
         row_bases: list[dict[str, float]] | None = None,
+        horizon: int | None = None,
     ) -> list[dict[str, float]]:
         """Batched do + free-rollout (goal planning / diagnostics)."""
         if not actions:
@@ -698,7 +700,8 @@ class RKKAgent:
             states = self.graph.propagate_from_batch(dict(base), actions)
         else:
             states = self.graph.propagate_from_multi_batch(row_bases, actions)
-        for _ in range(max(0, self._imagination_horizon)):
+        h = self._imagination_horizon if horizon is None else max(0, int(horizon))
+        for _ in range(h):
             states = self.graph.rollout_step_free_batch(states)
         return states
 
@@ -709,17 +712,40 @@ class RKKAgent:
         out = self._batch_rollout_imagination_states(dict(base), [(var, float(val))])
         return out[0] if out else dict(base)
 
-    def _effective_imagination_horizon(self, enable_l3: bool) -> int:
+    def _planning_context_flags(self) -> tuple[bool, bool, bool]:
+        fixed_root = bool(
+            getattr(self.value_layer.bounds, "fixed_root_mode", False)
+            or _env_fixed_root_flag(self.env)
+            or _graph_fixed_root_flag(self.graph.nodes)
+        )
+        ctx = getattr(self, "_s2_planning_context", None) or {}
+        fallen_override = bool(ctx.get("fallen_override_active"))
+        fallen = bool(ctx.get("fallen")) or fallen_override
+        return fixed_root, fallen, fallen_override
+
+    def _effective_imagination_horizon(
+        self,
+        enable_l3: bool,
+        *,
+        fallen: bool | None = None,
+        fallen_override: bool | None = None,
+    ) -> int:
         if not enable_l3:
             return 0
-        if getattr(self.value_layer.bounds, "fixed_root_mode", False):
-            return 0
-        if _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(self.graph.nodes):
-            return 0
-        ctx = getattr(self, "_s2_planning_context", None)
-        if isinstance(ctx, dict) and ctx.get("fallen_override_active"):
-            return 0
-        return self._imagination_horizon
+        fixed_root, ctx_fallen, ctx_fo = self._planning_context_flags()
+        if fallen is None:
+            fallen = ctx_fallen
+        if fallen_override is None:
+            fallen_override = ctx_fo
+        base = imagination_steps_for_context(
+            fallen=bool(fallen),
+            fallen_override=bool(fallen_override),
+            fixed_root=fixed_root,
+        )
+        from engine.goal_planning import imagination_steps_default
+
+        rsi_extra = max(0, int(self._imagination_horizon) - imagination_steps_default())
+        return min(48, base + rsi_extra)
 
     def _s2_wm_cache_every(self) -> int:
         ctx = getattr(self, "_s2_planning_context", None) or {}
@@ -806,7 +832,7 @@ class RKKAgent:
         if _env_fixed_root_flag(self.env) or _graph_fixed_root_flag(self.graph.nodes):
             return True
         try:
-            min_steps = int(os.environ.get("RKK_GOAL_PLAN_MIN_WM_STEPS", "40"))
+            min_steps = int(os.environ.get("RKK_GOAL_PLAN_MIN_WM_STEPS", "16"))
         except ValueError:
             min_steps = 40
         return self._notears_steps < min_steps
@@ -936,74 +962,34 @@ class RKKAgent:
 
         depth = plan_depth()
         beam_k = plan_beam_k()
+        rollout_h = self._effective_imagination_horizon(True)
 
         def _td(s: dict[str, float]) -> float:
             return float(s.get("target_dist", cur_td))
 
-        best_td = cur_td
-        best_first: tuple[str, float] | None = None
+        def _accept(s: dict[str, float], _v: str, _x: float) -> bool:
+            if symbolic_verifier_enabled():
+                ok, _ = verify_normalized_prediction(dict(s), self.env)
+                return bool(ok)
+            return True
 
-        if depth <= 1:
-            try:
-                states_fin = self._batch_rollout_imagination_states(state0, actions)
-            except Exception:
-                states_fin = []
-            for i, (var, val) in enumerate(actions):
-                if i >= len(states_fin):
-                    break
-                sfin = states_fin[i]
-                if symbolic_verifier_enabled():
-                    ok, _ = verify_normalized_prediction(dict(sfin), self.env)
-                    if not ok:
-                        continue
-                td = _td(sfin)
-                if td < best_td - 1e-6:
-                    best_td = td
-                    best_first = (var, val)
-        else:
-            scored: list[tuple[float, str, float, dict[str, float]]] = []
-            try:
-                states1 = self._batch_rollout_imagination_states(state0, actions)
-            except Exception:
-                states1 = []
-            for i, (var, val) in enumerate(actions):
-                if i >= len(states1):
-                    break
-                s1 = states1[i]
-                if symbolic_verifier_enabled():
-                    ok, _ = verify_normalized_prediction(dict(s1), self.env)
-                    if not ok:
-                        continue
-                scored.append((_td(s1), var, val, dict(s1)))
-            scored.sort(key=lambda t: t[0])
-            row_bases: list[dict[str, float]] = []
-            row_actions: list[tuple[str, float]] = []
-            row_meta: list[tuple[str, float]] = []
-            for _td1, v1, x1, s1 in scored[:beam_k]:
-                for v2, x2 in actions:
-                    row_bases.append(s1)
-                    row_actions.append((v2, x2))
-                    row_meta.append((v1, x1))
-            try:
-                states2 = self._batch_rollout_imagination_states(
-                    state0, row_actions, row_bases=row_bases
-                )
-            except Exception:
-                states2 = []
-            for j, sfin in enumerate(states2):
-                if j >= len(row_meta):
-                    break
-                v1, x1 = row_meta[j]
-                if symbolic_verifier_enabled():
-                    ok, _ = verify_normalized_prediction(dict(sfin), self.env)
-                    if not ok:
-                        continue
-                td = _td(sfin)
-                if td < best_td - 1e-6:
-                    best_td = td
-                    best_first = (v1, x1)
+        def _score(
+            _s0: dict[str, float], _v: str, _x: float, sfin: dict[str, float]
+        ) -> float:
+            return -_td(sfin)
 
-        if best_first is None:
+        best_first, best_neg_td = beam_search_first_action(
+            self,
+            state0=state0,
+            actions=actions,
+            depth=depth,
+            beam_k=beam_k,
+            rollout_horizon=rollout_h,
+            score_fn=_score,
+            accept_fn=_accept,
+            maximize=True,
+        )
+        if best_first is None or best_neg_td > -cur_td + 1e-6:
             return None
         return self._build_goal_planned_candidate(best_first[0], best_first[1])
 
@@ -2102,8 +2088,6 @@ class RKKAgent:
         _vl_fast = bool(_perf_fast)
         if not _vl_fast and _vl_fast_fallen_intents_enabled():
             _vl_fast = _nodes_low_posture_for_fast_vl(_nodes_now)
-        if isinstance(s2_ctx, dict) and s2_ctx.get("fallen_override_active"):
-            _vl_fast = True
         if _vl_fast:
             _intent_scores = _filter_intent_scores(scores)
             if _intent_scores:
@@ -2137,11 +2121,14 @@ class RKKAgent:
                 _recovery_vl = True
                 _pfr_vl = 1.0
 
-        vl_horizon = (
-            0
-            if (_fallen_fast or _vl_fast)
-            else self._effective_imagination_horizon(enable_l3)
+        _fixed_root_vl, _fallen_ctx, _fo_ctx = self._planning_context_flags()
+        vl_horizon = self._effective_imagination_horizon(
+            enable_l3,
+            fallen=_fallen_fast or _vl_fast or _fallen_ctx,
+            fallen_override=_fo_ctx,
         )
+        if (_fallen_fast or _vl_fast) and vl_horizon > 0:
+            vl_horizon = min(vl_horizon, vl_imagination_steps_fallen())
         vl_tries = min(_max_fallback_tries_from_env(), len(scores))
         if _fallen_fast or _vl_fast:
             try:

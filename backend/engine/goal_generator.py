@@ -12,7 +12,15 @@ from engine.meta_causal import WMetaEnsemble, meta_causal_enabled
 
 
 def goal_gen_enabled() -> bool:
-    return os.environ.get("RKK_GOAL_GEN_ENABLED", "0").strip().lower() in (
+    default = "1"
+    try:
+        from engine.intention_cortex import intention_cortex_enabled
+
+        if not intention_cortex_enabled():
+            default = "0"
+    except ImportError:
+        default = "0"
+    return os.environ.get("RKK_GOAL_GEN_ENABLED", default).strip().lower() in (
         "1",
         "true",
         "yes",

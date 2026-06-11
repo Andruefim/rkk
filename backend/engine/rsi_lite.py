@@ -56,7 +56,7 @@ def rsi_buffer_cap() -> int:
 
 def rsi_imagination_cap() -> int:
     try:
-        return max(0, int(os.environ.get("RKK_RSI_IMAGINATION_CAP", "4")))
+        return max(0, int(os.environ.get("RKK_RSI_IMAGINATION_CAP", "16")))
     except ValueError:
         return 4
 
