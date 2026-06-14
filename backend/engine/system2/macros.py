@@ -31,15 +31,20 @@ MACRO_TABLE: dict[str, dict[str, Any]] = {
         "graph": {
             "self_goal_active": 0.88,
             "self_goal_target_dist": 0.36,
+            "intent_stride": 0.58,
+            "intent_gait_coupling": 0.72,
+            "intent_torso_forward": 0.62,
         },
         "candidate": {
             "variable": "intent_stride",
-            "value": 0.58,
+            "value": 0.62,
             "target": "target_dist",
             "uncertainty": 0.38,
             "expected_ig": 0.88,
         },
         "residuals": {
+            "intent_stride": 0.06,
+            "intent_gait_coupling": 0.05,
             "intent_torso_forward": 0.04,
             "intent_lean_forward": 0.03,
         },

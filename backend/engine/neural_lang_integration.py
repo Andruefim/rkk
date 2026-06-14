@@ -91,6 +91,12 @@ def _patch_verbal_action(sim, nlg) -> None:
 
         thought = iv.net._last_thought.squeeze(0).detach()
 
+        intent_ctx = getattr(sim, "_intention_state", None)
+        if intent_ctx is not None:
+            narr = str(getattr(intent_ctx, "narrative", "") or "").strip()
+            if narr:
+                concepts = list(concepts) + [f"INTENT:{narr[:72]}"]
+
         # Получаем slot vector если доступен
         vis_env = getattr(sim, "_visual_env", None)
         slot_vec = None

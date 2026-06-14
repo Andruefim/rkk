@@ -64,7 +64,7 @@ CAUSAL_PRIORS: list[dict] = [
 
     # === Gait coupling (CPG-like rhythm in graph) ===
     {"from": "intent_gait_coupling", "to": "gait_phase_l", "weight": 0.35, "alpha": 0.70},
-    {"from": "intent_gait_coupling", "to": "gait_phase_r", "weight": 0.35, "alpha": 0.70},
+    {"from": "intent_gait_coupling", "to": "gait_phase_r", "weight": -0.35, "alpha": 0.70},
     {"from": "gait_phase_l", "to": "lhip",  "weight": 0.30, "alpha": 0.70},
     {"from": "gait_phase_r", "to": "rhip",  "weight": 0.30, "alpha": 0.70},
     {"from": "gait_phase_l", "to": "lknee", "weight": -0.25, "alpha": 0.70},

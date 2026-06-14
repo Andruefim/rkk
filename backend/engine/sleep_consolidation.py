@@ -76,6 +76,7 @@ class SleepLessonAnnotation:
     lesson_text: str = ""
     lesson_concepts: list[str] = field(default_factory=list)
     seeds: list[dict] = field(default_factory=list)
+    intent_adjustments: dict[str, float] = field(default_factory=dict)
     confidence: float = 1.0
     error: str = ""
 
@@ -877,8 +878,9 @@ class SleepController:
                 session.lesson_seeds_injected = n_seeds
 
         # Apply curriculum hints from lesson
-        if ann.intent_adjustments and hasattr(sim, "_timescale") and sim._timescale:
-            for var, val in ann.intent_adjustments.items():
+        intent_adj = getattr(ann, "intent_adjustments", None) or {}
+        if intent_adj and hasattr(sim, "_timescale") and sim._timescale:
+            for var, val in intent_adj.items():
                 sim._timescale.set_intent(3, var, val)
 
         print(f"[Sleep] Lesson applied: {ann.primary_concepts[:3]} verbal='{ann.verbal[:60]}'")

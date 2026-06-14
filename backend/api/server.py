@@ -34,7 +34,7 @@ import traceback
 from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from engine.core.constants import agent_loop_hz_from_env
 from engine.json_util import sanitize_for_json
@@ -203,6 +203,30 @@ def api_snapshot():
     out = dict(ps)
     out["world"] = out.get("current_world", "humanoid")
     return out
+
+
+class HumanDistanceRequest(BaseModel):
+    distance: float = Field(ge=0.0, le=1.0, description="0=contact, 1=far")
+
+
+@app.post("/api/neuro_symbolic/human_distance")
+def api_ns_human_distance(req: HumanDistanceRequest):
+    """Stub sensor: inject distance_to_human into KG + symbolic veto (P1)."""
+    sim = get_sim()
+    eng = sim.get_symbolic_engine() if hasattr(sim, "get_symbolic_engine") else None
+    if eng is None:
+        return {"ok": False, "error": "neuro_symbolic disabled"}
+    eng.set_distance_to_human(req.distance)
+    bridge = getattr(sim, "_ns_bridge", None)
+    if bridge is not None:
+        bridge.knowledge_graph.set_runtime_fact("distance_to_human", req.distance)
+    veto = eng.check_human_proximity({"distance_to_human": req.distance})
+    return {
+        "ok": True,
+        "distance": req.distance,
+        "veto": not veto.allowed,
+        "violations": veto.violations,
+    }
 
 
 @app.get("/api/tick_profile")

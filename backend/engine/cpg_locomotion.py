@@ -78,6 +78,8 @@ class CPGNetwork(nn.Module):
         self,
         dt: float = 0.05,
         external_command: torch.Tensor | None = None,
+        *,
+        coupling_gain: float = 0.1,
     ) -> torch.Tensor:
         freq = torch.sigmoid(self.frequency + self.epsilon_freq) * 2.0 + 0.3
         amp = torch.sigmoid(self.amplitude + self.epsilon_amp) * 0.6
@@ -91,7 +93,7 @@ class CPGNetwork(nn.Module):
         self._phase.copy_(torch.remainder(p, two_pi))
 
         diff = self._phase.unsqueeze(1) - self._phase.unsqueeze(0) - (self.phase_bias + self.epsilon_phase)
-        coupling = torch.sin(diff).sum(dim=1) * 0.1
+        coupling = torch.sin(diff).sum(dim=1) * float(max(0.02, coupling_gain))
         p2 = self._phase + coupling * float(dt)
         self._phase.copy_(torch.remainder(p2, two_pi))
 
@@ -167,8 +169,37 @@ class LocomotionController:
         - CPG sync: pitch_add при com_lag теперь положительный (наклон вперёд)
         """
         stride = float(self._node(agent_nodes, "intent_stride") - 0.5)
-        sup_l = float(self._node(agent_nodes, "intent_support_left") - 0.5)
-        sup_r = float(self._node(agent_nodes, "intent_support_right") - 0.5)
+        stride_raw = float(self._node(agent_nodes, "intent_stride"))
+        sup_l_val = float(self._node(agent_nodes, "intent_support_left"))
+        sup_r_val = float(self._node(agent_nodes, "intent_support_right"))
+
+        phi_l_pre = float(self.cpg._phase[0].item())
+        phi_r_pre = float(self.cpg._phase[1].item())
+
+        def _swing_factor(phi: float) -> float:
+            return float(max(0.0, math.sin(phi)))
+
+        swing_l_pre = _swing_factor(phi_l_pre)
+        swing_r_pre = _swing_factor(phi_r_pre)
+        if stride_raw >= 0.54:
+            try:
+                from engine.locomote_gait import alternating_support_from_swings
+
+                alt_l, alt_r = alternating_support_from_swings(swing_l_pre, swing_r_pre)
+                blend = float(os.environ.get("RKK_CPG_SUPPORT_BLEND", "0.85"))
+                sup_l_val = float(
+                    np.clip((1.0 - blend) * sup_l_val + blend * alt_l, 0.22, 0.82)
+                )
+                sup_r_val = float(
+                    np.clip((1.0 - blend) * sup_r_val + blend * alt_r, 0.22, 0.82)
+                )
+                self._last_motor_state["intent_support_left"] = sup_l_val
+                self._last_motor_state["intent_support_right"] = sup_r_val
+            except Exception:
+                pass
+
+        sup_l = sup_l_val - 0.5
+        sup_r = sup_r_val - 0.5
         recover = float(self._node(agent_nodes, "intent_stop_recover") - 0.5)
         energy = float(np.clip(self._node(agent_nodes, "self_energy"), 0.0, 1.0))
         com_x = float(self._node(agent_nodes, "com_x"))
@@ -206,6 +237,50 @@ class LocomotionController:
         for _uk in UPPER_BODY_INTENT_VARS:
             self._last_motor_state[str(_uk)] = float(self._node(agent_nodes, str(_uk)))
 
+        self._last_motor_state["intent_stride"] = float(np.clip(stride_raw, 0.05, 0.95))
+        coupling_raw = float(self._node(agent_nodes, "intent_gait_coupling"))
+        self._last_motor_state["intent_gait_coupling"] = float(
+            np.clip(coupling_raw, 0.05, 0.95)
+        )
+
+        # Epistemic exploration: boost stride slightly when WM uncertainty is high
+        try:
+            ep_bonus = float(os.environ.get("RKK_CPG_EPISTEMIC_STRIDE", "0.04"))
+            meta_pe = float(agent_nodes.get("meta_prediction_error", 0.0) or 0.0)
+            if meta_pe <= 0.0:
+                meta_pe = float(agent_nodes.get("self_attention", 0.5)) * 0.2
+            if ep_bonus > 0 and meta_pe > 0.12 and stride_raw < 0.68:
+                boosted = float(np.clip(stride_raw + ep_bonus * min(meta_pe, 0.35), 0.05, 0.95))
+                self._last_motor_state["intent_stride"] = boosted
+                stride = boosted - 0.5
+                stride_n = max(0.0, stride)
+        except Exception:
+            pass
+
+        posture = float(self._node(agent_nodes, "posture_stability"))
+        static_penalty_applied = False
+        try:
+            static_on = os.environ.get("RKK_CPG_STATIC_PENALTY", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            vel_thr = float(os.environ.get("RKK_CPG_STATIC_VEL_THRESH", "0.006"))
+            ps_thr = float(os.environ.get("RKK_STABLE_LOCOMOTE_PS", "0.90"))
+            if static_on and stride_raw >= 0.58 and posture >= ps_thr - 0.02:
+                vel = abs(float(self._last_com_x_vel))
+                if vel < vel_thr:
+                    nudge = float(os.environ.get("RKK_CPG_STATIC_STRIDE_NUDGE", "0.07"))
+                    boosted = float(np.clip(stride_raw + nudge, 0.05, 0.95))
+                    self._last_motor_state["intent_stride"] = boosted
+                    stride_raw = boosted
+                    stride = boosted - 0.5
+                    stride_n = max(0.0, stride)
+                    static_penalty_applied = True
+        except Exception:
+            pass
+
         intent_agg = 0.0
         try:
             for key in agent_nodes:
@@ -228,9 +303,28 @@ class LocomotionController:
         cmd[4] =  0.08 * sup_l - 0.04 * stride + 0.05 * recover    # lankle
         cmd[5] =  0.08 * sup_r + 0.04 * stride + 0.05 * recover    # rankle
 
+        if static_penalty_applied:
+            try:
+                cmd_boost = float(os.environ.get("RKK_CPG_STATIC_CMD_BOOST", "0.18"))
+                cmd = cmd * (1.0 + cmd_boost)
+            except Exception:
+                pass
+
+        if stride_raw >= 0.54:
+            with torch.no_grad():
+                self.cpg.phase_bias[0, 1] = math.pi
+                self.cpg.phase_bias[1, 0] = -math.pi
+        coupling_gain = 0.1
+        try:
+            c_raw = float(self._node(agent_nodes, "intent_gait_coupling"))
+            coupling_gain = float(np.clip((c_raw - 0.5) * 0.35 + 0.06, 0.05, 0.14))
+        except Exception:
+            coupling_gain = 0.1
+
         cpg_out = self.cpg.step(
             dt=dt,
             external_command=cmd * (0.7 + 0.3 * energy) * drive_damp,
+            coupling_gain=coupling_gain,
         )
 
         # Торс синхронизация с CPG: pitch_add > 0 = наклон вперёд
@@ -250,6 +344,33 @@ class LocomotionController:
             -0.055 * s * gscale
             + _lag_pitch * com_lag * stride_n
         )
+
+        locomote_walk = stride_raw >= 0.58 and posture >= float(
+            os.environ.get("RKK_STABLE_LOCOMOTE_PS", "0.88")
+        ) - 0.02
+        macro_loc = float(self._node(agent_nodes, "executive_macro_hint")) >= 0.95
+        pe_fwd = float(agent_nodes.get("hai_pe_fwd_ema", 0.0) or 0.0)
+        if locomote_walk or macro_loc:
+            try:
+                pe_thr = float(os.environ.get("RKK_CPG_FORWARD_PITCH_PE_THR", "-0.3"))
+            except ValueError:
+                pe_thr = -0.3
+            if pe_fwd < pe_thr or abs(self._last_com_x_vel) < float(
+                os.environ.get("RKK_CPG_STATIC_VEL_THRESH", "0.006")
+            ):
+                offset = float(os.environ.get("RKK_CPG_FORWARD_PITCH_OFFSET", "0.07"))
+                pitch_add = float(pitch_add) + offset
+                if pitch_add < 0.0:
+                    pitch_add = offset * 0.85
+                torso_forward = float(
+                    np.clip(
+                        max(torso_forward, float(self._node(agent_nodes, "intent_torso_forward"))),
+                        0.52,
+                        0.96,
+                    )
+                )
+                self._last_motor_state["intent_torso_forward"] = float(torso_forward)
+
         yaw_add = 0.05 * c_m * gscale
         lsh_add = -0.065 * s * gscale
         rsh_add =  0.065 * s * gscale
@@ -312,6 +433,20 @@ class LocomotionController:
         targets["rknee"] = float(
             np.clip(targets["rknee"] - knee_flex * swing_r * walk_gate, 0.05, 0.95)
         )
+
+        if static_penalty_applied:
+            try:
+                push = float(os.environ.get("RKK_CPG_ANKLE_PUSHOFF", "0.05"))
+                targets["lankle"] = float(
+                    np.clip(targets["lankle"] + push * max(swing_r, 0.35), 0.05, 0.95)
+                )
+                targets["rankle"] = float(
+                    np.clip(targets["rankle"] + push * max(swing_l, 0.35), 0.05, 0.95)
+                )
+                hip_push = float(os.environ.get("RKK_CPG_HIP_PUSHOFF", "0.03"))
+                targets["rhip"] = float(np.clip(targets["rhip"] + hip_push * stride_n, 0.05, 0.95))
+            except Exception:
+                pass
 
         # Вставание со спины: оба бедра к корпусу (stride≈0.5 давал walk_gate≈0 — только торс).
         torso_f = float(self._node(agent_nodes, "intent_torso_forward"))

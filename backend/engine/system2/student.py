@@ -32,6 +32,13 @@ def choose_macro_from_obs(obs: dict[str, float]) -> str:
         "no",
         "off",
     ):
+        try:
+            from engine.locomote_gate import stable_locomote_ready
+
+            if stable_locomote_ready(obs):
+                return "LOCOMOTE_DELIVERY"
+        except ImportError:
+            pass
         if (
             cz >= 0.50
             and ps >= 0.55

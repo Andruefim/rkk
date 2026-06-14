@@ -90,7 +90,7 @@ class SkillLibrary:
         ),
         Skill(
             name="hold_stance",
-            goals=frozenset({"stand", "walk"}),
+            goals=frozenset({"stand"}),
             precondition=lambda s: _cz(s) > 0.22 and _posture(s) > 0.60,
             action_sequence=[
                 [
@@ -120,8 +120,8 @@ class SkillLibrary:
                     ("intent_torso_forward", 0.56),
                     ("intent_arm_counterbalance", 0.56),
                 ],
-                [("intent_stride", 0.62), ("intent_arm_counterbalance", 0.58)],
-                [("intent_support_left", 0.44), ("intent_support_right", 0.62)],
+                [("intent_stride", 0.64), ("intent_arm_counterbalance", 0.58)],
+                [("intent_support_left", 0.62), ("intent_support_right", 0.38)],
                 [("intent_support_left", 0.56), ("intent_support_right", 0.56)],
             ],
             postcondition=lambda s: _posture(s) > 0.62,
@@ -140,8 +140,8 @@ class SkillLibrary:
                     ("intent_torso_forward", 0.56),
                     ("intent_arm_counterbalance", 0.56),
                 ],
-                [("intent_stride", 0.62), ("intent_arm_counterbalance", 0.42)],
-                [("intent_support_right", 0.44), ("intent_support_left", 0.62)],
+                [("intent_stride", 0.64), ("intent_arm_counterbalance", 0.42)],
+                [("intent_support_right", 0.62), ("intent_support_left", 0.38)],
                 [("intent_support_left", 0.56), ("intent_support_right", 0.56)],
             ],
             postcondition=lambda s: _posture(s) > 0.62,
@@ -165,6 +165,34 @@ class SkillLibrary:
                 continue
         if not applicable:
             return None
+        if g == "walk":
+            walkers = [
+                s
+                for s in applicable
+                if s.name.startswith("step_forward")
+            ]
+            if walkers:
+                left = [s for s in walkers if "_L" in s.name]
+                right = [s for s in walkers if "_R" in s.name]
+                if left and right:
+                    l_uses = sum(s.uses for s in left)
+                    r_uses = sum(s.uses for s in right)
+                    if l_uses > r_uses + 2:
+                        return min(right, key=lambda s: -s.uses)
+                    if r_uses > l_uses + 2:
+                        return min(left, key=lambda s: -s.uses)
+                    phase_l = float(state.get("gait_phase_l", 0.5))
+                    phase_r = float(state.get("gait_phase_r", 0.5))
+                    if phase_l > phase_r + 0.08:
+                        return right[0]
+                    if phase_r > phase_l + 0.08:
+                        return left[0]
+                noise = np.random.normal(0.0, 0.06, size=len(walkers))
+                best_i = max(
+                    range(len(walkers)),
+                    key=lambda i: walkers[i].success_rate + float(noise[i]),
+                )
+                return walkers[best_i]
         noise = np.random.normal(0.0, 0.08, size=len(applicable))
         best_i = max(
             range(len(applicable)),
@@ -196,7 +224,7 @@ class SkillLibrary:
                         ("intent_stride", 0.84),
                         ("intent_support_right", 0.78),
                         ("intent_torso_forward", 0.64),
-                        ("intent_gait_coupling", 0.88),
+                        ("intent_gait_coupling", 0.78),
                         ("intent_arm_counterbalance", 0.68),
                     ],
                     ("intent_support_left", 0.38),
@@ -215,7 +243,7 @@ class SkillLibrary:
                         ("intent_stride", 0.84),
                         ("intent_support_left", 0.78),
                         ("intent_torso_forward", 0.64),
-                        ("intent_gait_coupling", 0.88),
+                        ("intent_gait_coupling", 0.78),
                         ("intent_arm_counterbalance", 0.32),
                     ],
                     ("intent_support_right", 0.38),

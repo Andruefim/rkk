@@ -118,11 +118,51 @@ class SimulationSkillsMixin:
         }
         return True
 
+    def _skill_ns_blend_weight(self, st: dict) -> float:
+        """NS prior override: full weight when stable-gate LOCOMOTE is active."""
+        if self._executive_macro_hint() in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            try:
+                from engine.locomote_gate import stable_locomote_ready
+
+                if stable_locomote_ready(st):
+                    return float(os.environ.get("RKK_SKILL_NS_BLEND_STABLE", "1.0"))
+            except ImportError:
+                pass
+        try:
+            return float(os.environ.get("RKK_SKILL_NS_BLEND", "0.85"))
+        except ValueError:
+            return 0.85
+
+    def _executive_macro_hint(self) -> str:
+        s2 = getattr(self, "_system2", None)
+        if s2 is not None:
+            macro = str(getattr(s2, "_active_macro", "") or "").strip().upper()
+            if macro:
+                return macro
+        ctx = getattr(self, "_intention_state", None)
+        if ctx is not None:
+            return str(getattr(ctx, "macro_hint", "") or "").strip().upper()
+        last = getattr(self, "_system2_last", None) or {}
+        if isinstance(last, dict):
+            return str(last.get("macro") or "").strip().upper()
+        return ""
+
     def _skill_goal_hint(self, st: dict) -> str:
+        from engine.locomote_gate import stable_locomote_ready
+
         cz = float(st.get("com_z", st.get("phys_com_z", 0.5)))
         posture = float(st.get("posture_stability", st.get("phys_posture_stability", 0.5)))
         foot_l = float(st.get("foot_contact_l", st.get("phys_foot_contact_l", 0.5)))
         foot_r = float(st.get("foot_contact_r", st.get("phys_foot_contact_r", 0.5)))
+        macro = self._executive_macro_hint()
+        if macro in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            return "walk"
+        if (
+            is_humanoid_topology(self.current_world)
+            and not self._fixed_root_active
+            and stable_locomote_ready(st)
+        ):
+            return "walk"
         if cz < 0.36:
             return "stand"
         if posture < 0.68 or min(foot_l, foot_r) < 0.54:
@@ -136,17 +176,31 @@ class SimulationSkillsMixin:
             and is_humanoid_topology(self.current_world)
             and not self._fixed_root_active
             and self.tick < walk_min
+            and not stable_locomote_ready(st)
         ):
             return "stand"
         bt = getattr(self, "behavioral_tracker", None)
         if bt is not None:
             snap = self._behavioral_snapshot_cached() or {}
-            if float(snap.get("com_x_vel_ema", 0.0)) < float(
-                os.environ.get("RKK_STEP3_COM_X_VEL_MIN", "0.08")
-            ):
+            vel = float(snap.get("com_x_vel_ema", 0.0))
+            vel_min = float(os.environ.get("RKK_STEP3_COM_X_VEL_MIN", "0.08"))
+            if vel < vel_min and not stable_locomote_ready(st):
                 return "stand"
         g = os.environ.get("RKK_SKILL_GOAL", "walk").strip().lower()
         return g if g else "walk"
+
+    def _abort_stance_skill_for_locomote(self) -> None:
+        pack = self._skill_exec
+        if pack is None:
+            return
+        skill = pack.get("skill")
+        if skill is None:
+            return
+        if str(getattr(skill, "name", "")) != "hold_stance":
+            return
+        if self._executive_macro_hint() in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            self._skill_exec = None
+            self._skill_chain = []
 
     def _sim_env_intervene(
         self, var: str, val: float, *, count_intervention: bool
@@ -187,6 +241,23 @@ class SimulationSkillsMixin:
             for v, x in self._skill_step_to_pairs(step)
             if not is_read_only_macro_var(v)
         ]
+        if pairs and self._executive_macro_hint() in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            try:
+                from engine.neuro_symbolic.motor_sync import collect_motor_targets
+
+                ns_t = collect_motor_targets(self)
+                st = self._skill_state_dict(obs_before_init)
+                w = self._skill_ns_blend_weight(st)
+                blended: list[tuple[str, float]] = []
+                for v, x in pairs:
+                    ck = v[5:] if v.startswith("phys_") else v
+                    if ck.startswith("intent_") and ck in ns_t:
+                        blended.append((v, float(x) * (1.0 - w) + float(ns_t[ck]) * w))
+                    else:
+                        blended.append((v, x))
+                pairs = blended
+            except Exception:
+                pass
         var0, val0 = (pairs[0] if pairs else ("", 0.5))
 
         obs_before_env = dict(self.agent.env.observe())
@@ -291,6 +362,12 @@ class SimulationSkillsMixin:
             obs_after = dict(self.agent.env.observe())
         st_after = self._skill_state_dict(obs_after)
         self._sync_motor_state(obs_after, source="skill", tick=self.tick)
+        try:
+            from engine.neuro_symbolic.motor_sync import enforce_sticky_locomote_priors
+
+            enforce_sticky_locomote_priors(self)
+        except Exception:
+            pass
         intents_log = {
             v: float(x) for v, x in pairs if str(v).startswith("intent_")
         }
@@ -543,6 +620,7 @@ class SimulationSkillsMixin:
 
     def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
         """Curiosity-driven exploration; optional Active Inference every K ticks."""
+        self._abort_stance_skill_for_locomote()
         if self._skill_exec is not None:
             return self._execute_skill_frame()
         ai_on = os.environ.get("RKK_ACTIVE_INFERENCE", "0").strip().lower() in (

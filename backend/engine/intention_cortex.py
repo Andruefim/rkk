@@ -19,6 +19,7 @@ import numpy as np
 
 from engine.curriculum_graph import CurriculumGraph, curriculum_graph_enabled
 from engine.goal_generator import GoalCandidate, GoalGenerator, goal_gen_enabled
+from engine.locomote_gate import stable_locomote_ready
 from engine.meta_causal import WMetaEnsemble, build_meta_observation, meta_causal_enabled
 
 
@@ -204,11 +205,153 @@ class IntentionCortex:
         self._advance_stack_if_done(agent, obs, tick)
 
         primary = self._stack[0] if self._stack else None
+        if primary is not None and (
+            self._is_static_coupling_subgoal(primary)
+            or (
+                self._locomote_macro_frozen(sim)
+                and self._is_static_stride_freeze(primary)
+            )
+        ):
+            alt = self._pick_locomote_primary(self._stack)
+            if alt is not None:
+                primary = alt
         ctx = self._build_context(primary, obs, fallen, tick)
+        ctx = self._merge_deliberation(sim, ctx, tick)
         self._project_to_graph(agent, ctx, primary)
+        self._project_intent_motor(agent, ctx, primary, fallen=fallen)
         self._project_hierarchical(sim, primary, tick)
+        self._apply_symbolic_grounding(sim, ctx)
         self._last_context = ctx
+        delib = getattr(sim, "_deliberation", None)
+        if delib is not None:
+            delib.request_if_due(tick=tick, macro=ctx.macro_hint, intention_ctx=ctx)
         return ctx
+
+    def _merge_deliberation(
+        self, sim: Any, ctx: IntentionContext, tick: int
+    ) -> IntentionContext:
+        delib = getattr(sim, "_deliberation", None)
+        if delib is None:
+            return ctx
+        max_age = _ei("RKK_DELIBERATION_CACHE_TICKS", 120)
+        latest = delib.latest(max_age_ticks=max_age)
+        if latest is None:
+            return ctx
+        if latest.macro_hint and latest.macro_hint != "IDLE":
+            ctx.macro_hint = str(latest.macro_hint)
+        if latest.expected_state:
+            merged = dict(ctx.expected_state)
+            merged.update(latest.expected_state)
+            ctx.expected_state = merged
+        if latest.graph_patch:
+            gp = dict(ctx.graph_patch)
+            gp.update(latest.graph_patch)
+            ctx.graph_patch = gp
+        for k, v in (latest.intent_residuals or {}).items():
+            ctx.intent_residuals[k] = ctx.intent_residuals.get(k, 0.0) + float(v)
+        if latest.narrative:
+            base = ctx.narrative or ""
+            ctx.narrative = f"{base} | {latest.narrative}".strip(" |")
+        ctx.horizon_ticks = max(
+            ctx.horizon_ticks,
+            _ei("RKK_DELIBERATION_MACRO_TICKS", 240),
+        )
+        return ctx
+
+    def _apply_symbolic_grounding(self, sim: Any, ctx: IntentionContext) -> None:
+        try:
+            from engine.neuro_symbolic.bridge import neuro_symbolic_enabled
+        except ImportError:
+            neuro_symbolic_enabled = lambda: False  # type: ignore
+        if neuro_symbolic_enabled():
+            try:
+                bridge = getattr(sim, "_ns_bridge", None)
+                if bridge is None and hasattr(sim, "_ensure_neuro_symbolic"):
+                    sim._ensure_neuro_symbolic()
+                    bridge = getattr(sim, "_ns_bridge", None)
+                if bridge is not None:
+                    obs = dict(getattr(sim, "_graph_vec_cached", lambda: {})() or {})
+                    if not obs:
+                        obs = dict(sim.agent.graph.nodes)
+                    plan = bridge.priors_for_active_inference(
+                        ctx.macro_hint,
+                        obs,
+                        dict(sim.agent.graph.nodes),
+                        sim=sim,
+                    )
+                    self._apply_path_blocked_replan(sim, ctx, plan)
+                    if plan.narrative:
+                        ctx.narrative = f"{ctx.narrative or ''} | {plan.narrative}".strip(" |")
+                    if plan.graph_patch:
+                        gp = dict(ctx.graph_patch)
+                        gp.update(plan.graph_patch)
+                        ctx.graph_patch = gp
+                    for k, v in plan.motor_priors.items():
+                        if k.startswith("intent_"):
+                            ctx.intent_residuals[k] = ctx.intent_residuals.get(k, 0.0) + (
+                                float(v) - 0.5
+                            ) * 0.28
+                    return
+            except Exception:
+                pass
+        try:
+            from engine.symbolic_grounding import (
+                SymbolicGrounding,
+                symbolic_grounding_enabled,
+            )
+        except ImportError:
+            return
+        if not symbolic_grounding_enabled():
+            return
+        sg = getattr(sim, "_symbolic_grounding", None)
+        if sg is None:
+            sg = SymbolicGrounding()
+            sim._symbolic_grounding = sg
+        try:
+            from engine.genome.meta_invariants import extract_skeleton_from_graph
+
+            skeleton = extract_skeleton_from_graph(sim.agent.graph)
+            rules = sg.skeleton_to_rules(skeleton)
+            if rules and ctx.narrative:
+                top = str(rules[0])
+                if top:
+                    ctx.narrative = f"{ctx.narrative} [{top}]"
+        except Exception:
+            pass
+
+    def _apply_path_blocked_replan(
+        self, sim: Any, ctx: IntentionContext, plan: Any
+    ) -> None:
+        """Hard cognitive interrupt when PathBlocked violates forward preconditions."""
+        from engine.neuro_symbolic.predicates import path_forward_blocked
+
+        blocked = float((plan.facts or {}).get("PathBlocked", 0.0))
+        hard_interrupt = path_forward_blocked(blocked) or bool(
+            getattr(plan, "plan_invalidated", False)
+        )
+        if not hard_interrupt:
+            return
+        steps = list(getattr(plan, "plan_steps", None) or [])
+        if steps and steps[0] == "Turn":
+            ctx.expected_state = dict(ctx.expected_state)
+            ctx.expected_state["PathBlocked"] = 0.0
+            tag = "replan:PathBlocked→Turn"
+            if tag not in (ctx.narrative or ""):
+                ctx.narrative = f"{ctx.narrative or ''} | {tag}".strip(" |")
+            ctx.intent_residuals = dict(ctx.intent_residuals)
+            ctx.intent_residuals["intent_look_at"] = ctx.intent_residuals.get(
+                "intent_look_at", 0.0
+            ) + 0.12
+            ctx.intent_residuals["intent_stride"] = ctx.intent_residuals.get(
+                "intent_stride", 0.0
+            ) - 0.08
+        pack = getattr(sim, "_skill_exec", None)
+        if pack and path_forward_blocked(blocked):
+            skill = pack.get("skill")
+            name = str(getattr(skill, "name", "") or "")
+            if name.startswith("step_forward"):
+                sim._skill_exec = None
+                ctx.narrative = f"{ctx.narrative or ''} | abort:step_forward".strip(" |")
 
     def tick_post_step(self, sim: Any, snap: dict[str, Any]) -> None:
         """Meta observe, curriculum completion, episodic narrative — after agent step."""
@@ -242,6 +385,29 @@ class IntentionCortex:
             sg.tick_deadline = tick + _ei("RKK_INTENTION_SUBGOAL_TICKS", 400)
             self._insert_subgoal(sg)
 
+    @staticmethod
+    def _is_static_stride_freeze(sg: SubGoal) -> bool:
+        """Curriculum static-stance stride targets that conflict with LOCOMOTE."""
+        if float(sg.target_val) <= 0.52 and "stride" in str(sg.var_id):
+            return True
+        for k, v in (sg.intent_targets or {}).items():
+            if "stride" in str(k) and float(v) <= 0.52:
+                return True
+        return False
+
+    def _locomote_macro_frozen(self, sim: Any) -> bool:
+        ic = getattr(sim, "_intention_state", None) or self._last_context
+        hint = str(getattr(ic, "macro_hint", "") or "")
+        if hint in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            return True
+        s2 = getattr(sim, "_system2_last", None)
+        if isinstance(s2, dict) and str(s2.get("macro") or "") in (
+            "LOCOMOTE_DELIVERY",
+            "EXPLORE",
+        ):
+            return True
+        return False
+
     def _maybe_rebuild_stack(self, sim: Any, tick: int, world_id: str) -> None:
         every = _ei("RKK_INTENTION_REPLAN_EVERY", 120)
         if tick - self._last_replan_tick < every and self._stack:
@@ -270,10 +436,23 @@ class IntentionCortex:
                         priority=0.9,
                     )
                     sg.tick_deadline = tick + max(node.min_ticks, 200)
-                    new_stack.append(sg)
+                    if not (
+                        self._locomote_macro_frozen(sim)
+                        and self._is_static_stride_freeze(sg)
+                    ):
+                        new_stack.append(sg)
 
             pending_cursor = tick
+            freeze_static = self._locomote_macro_frozen(sim)
             for nxt in cg.pending_chain(world_id, max_depth - len(new_stack)):
+                sg_probe = SubGoal(
+                    subgoal_id=nxt.node_id,
+                    var_id=nxt.var_id,
+                    target_val=float(nxt.intent_targets.get(nxt.var_id, 0.62)),
+                    intent_targets=dict(nxt.intent_targets),
+                )
+                if freeze_static and self._is_static_stride_freeze(sg_probe):
+                    continue
                 tv = float(nxt.intent_targets.get(nxt.var_id, 0.62))
                 sg = SubGoal(
                     subgoal_id=nxt.node_id,
@@ -291,15 +470,25 @@ class IntentionCortex:
 
         for g in list(self._goal_generator._active):
             sg = SubGoal.from_goal_candidate(g)
+            if self._locomote_macro_frozen(sim) and self._is_static_stride_freeze(sg):
+                continue
             sg.tick_deadline = g.tick_proposed + _ei("RKK_INTENTION_SUBGOAL_TICKS", 400)
             if not any(s.subgoal_id == sg.subgoal_id for s in new_stack):
                 new_stack.append(sg)
 
         new_stack.sort(key=lambda s: (-s.priority, s.tick_deadline))
+        new_stack = self._prioritize_embodied_subgoals(new_stack, sim=sim)
         if self._stack and self._stack[0].status == "active":
             head = self._stack[0]
             if not any(s.subgoal_id == head.subgoal_id for s in new_stack):
-                new_stack.insert(0, head)
+                if self._is_embodied_subgoal(head) and not (
+                    self._locomote_macro_frozen(sim)
+                    and self._is_static_stride_freeze(head)
+                ):
+                    new_stack.insert(0, head)
+                else:
+                    head.status = "expired"
+                    self._completed_stack.append(head)
         self._stack = new_stack[:max_depth]
         if self._stack:
             self._stack[0].status = "active"
@@ -388,6 +577,8 @@ class IntentionCortex:
         tick: int,
     ) -> IntentionContext:
         if primary is None:
+            if not fallen and stable_locomote_ready(obs):
+                return self._stable_locomote_context(tick)
             return IntentionContext(
                 macro_hint="IDLE" if not fallen else "RECOVER_POSTURE",
                 horizon_ticks=_ei("RKK_INTENTION_MACRO_TICKS", 180),
@@ -418,7 +609,10 @@ class IntentionCortex:
             return "RECOVER_POSTURE"
         ps = float(obs.get("posture_stability", obs.get("phys_posture_stability", 0.5)))
         cz = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
-        if cz < 0.46 or ps < 0.38:
+        if ps < 0.38:
+            return "RECOVER_POSTURE"
+        # Variant / elbo-normalized com_z can sit ~0.44 while upright; trust posture first.
+        if ps <= 0.55 and cz < 0.46:
             return "RECOVER_POSTURE"
         intents = sg.intent_targets or {}
         keys = set(intents) | {sg.var_id}
@@ -429,8 +623,30 @@ class IntentionCortex:
         if any("reach" in k or "wave" in k or "arm" in k for k in keys):
             return "EXPLORE"
         if sg.var_id in ("posture_stability", "com_z", "self_posture_target"):
+            if stable_locomote_ready(obs, fallen=fallen):
+                return "LOCOMOTE_DELIVERY"
             return "IDLE" if ps > 0.55 else "RECOVER_POSTURE"
         return "LOCOMOTE_DELIVERY"
+
+    def _stable_locomote_context(self, tick: int) -> IntentionContext:
+        stride = _ef("RKK_NS_LOCOMOTE_STRIDE", 0.64)
+        coupling = _ef("RKK_NS_LOCOMOTE_COUPLING", 0.78)
+        torso = _ef("RKK_NS_LOCOMOTE_TORSO", 0.58)
+        gain = _ef("RKK_INTENTION_RESIDUAL_GAIN", 0.48)
+        return IntentionContext(
+            macro_hint="LOCOMOTE_DELIVERY",
+            graph_patch={
+                "self_goal_active": 0.88,
+                "self_attention": 0.78,
+            },
+            intent_residuals={
+                "intent_stride": (stride - 0.5) * gain,
+                "intent_gait_coupling": (coupling - 0.5) * gain,
+                "intent_torso_forward": (torso - 0.5) * gain,
+            },
+            horizon_ticks=_ei("RKK_INTENTION_MACRO_TICKS", 180),
+            narrative="stable-gate LOCOMOTE_DELIVERY",
+        )
 
     def _patches_for_subgoal(
         self, sg: SubGoal, obs: dict[str, float]
@@ -455,11 +671,12 @@ class IntentionCortex:
             patch["self_com_z_target"] = float(np.clip(sg.target_val, 0.25, 0.85))
             expected["com_z"] = patch["self_com_z_target"]
 
+        intent_gain = _ef("RKK_INTENTION_RESIDUAL_GAIN", 0.48)
         for k, v in sg.intent_targets.items():
             fv = float(np.clip(v, 0.06, 0.94))
             if k.startswith("intent_"):
-                residuals[k] = residuals.get(k, 0.0) + (fv - 0.5) * 0.35
-                if k.replace("intent_", "") in ("stride", "torso_forward"):
+                residuals[k] = residuals.get(k, 0.0) + (fv - 0.5) * intent_gain
+                if k.replace("intent_", "") in ("stride", "torso_forward", "gait_coupling"):
                     expected[k.replace("intent_", "")] = fv
             elif k in ("posture_stability", "target_dist", "com_z"):
                 expected[k] = fv
@@ -469,6 +686,103 @@ class IntentionCortex:
 
         return patch, residuals, expected
 
+    @staticmethod
+    def _is_embodied_subgoal(sg: SubGoal) -> bool:
+        if sg.var_id in ("target_dist", "posture_stability", "com_z"):
+            return True
+        if sg.var_id.startswith("intent_") or sg.var_id.startswith("phys_intent_"):
+            return True
+        intents = sg.intent_targets or {}
+        if any(str(k).startswith("intent_") or "stride" in str(k) for k in intents):
+            return True
+        if sg.var_id.startswith("l1_") or "gait_phase" in sg.var_id:
+            return False
+        if sg.var_id in ("gait_phase_l", "gait_phase_r"):
+            return False
+        return sg.var_id.startswith("intent")
+
+    @staticmethod
+    def _is_static_coupling_subgoal(sg: SubGoal) -> bool:
+        vid = str(sg.var_id)
+        if vid in ("intent_gait_coupling", "phys_intent_gait_coupling"):
+            return True
+        keys = {str(k) for k in (sg.intent_targets or {})}
+        if keys and keys <= {"intent_gait_coupling", "phys_intent_gait_coupling"}:
+            return True
+        return False
+
+    @staticmethod
+    def _pick_locomote_primary(stack: list[SubGoal]) -> SubGoal | None:
+        for sg in stack:
+            if IntentionCortex._is_static_coupling_subgoal(sg):
+                continue
+            if IntentionCortex._is_static_stride_freeze(sg):
+                continue
+            if sg.var_id in ("target_dist", "intent_stride", "phys_intent_stride") or any(
+                "stride" in str(k) or "target_dist" in str(k)
+                for k in (sg.intent_targets or {})
+            ):
+                tv = float(sg.target_val)
+                if "stride" in str(sg.var_id) and tv <= 0.52:
+                    continue
+                return sg
+        for sg in stack:
+            if not IntentionCortex._is_static_coupling_subgoal(sg):
+                if not IntentionCortex._is_static_stride_freeze(sg):
+                    return sg
+        return None
+
+    def _prioritize_embodied_subgoals(
+        self, stack: list[SubGoal], *, sim: Any | None = None
+    ) -> list[SubGoal]:
+        """Prefer walk/intent curriculum over auto-generated L1/slot stats on the stack head."""
+        if not stack:
+            return stack
+        freeze_static = sim is not None and self._locomote_macro_frozen(sim)
+        static_stride: list[SubGoal] = []
+        if freeze_static:
+            static_stride = [s for s in stack if self._is_static_stride_freeze(s)]
+            stack = [s for s in stack if s not in static_stride]
+        embodied = [s for s in stack if self._is_embodied_subgoal(s)]
+        abstract = [s for s in stack if not self._is_embodied_subgoal(s)]
+        if not embodied:
+            return stack + static_stride
+        coupling_static = [s for s in embodied if self._is_static_coupling_subgoal(s)]
+        embodied = [s for s in embodied if s not in coupling_static]
+        locomote = [
+            s
+            for s in embodied
+            if s.var_id in ("target_dist", "intent_stride", "phys_intent_stride")
+            or any("stride" in str(k) or "target_dist" in str(k) for k in (s.intent_targets or {}))
+        ]
+        if locomote:
+            rest = [s for s in embodied if s not in locomote]
+            ordered = locomote + rest + coupling_static + abstract + static_stride
+            return ordered
+        if coupling_static:
+            return embodied + coupling_static + abstract + static_stride
+        return embodied + abstract + static_stride
+
+    def _intent_targets_for_context(
+        self, primary: SubGoal | None, ctx: IntentionContext
+    ) -> dict[str, float]:
+        targets: dict[str, float] = {}
+        if primary is not None:
+            for k, v in (primary.intent_targets or {}).items():
+                if str(k).startswith("intent_"):
+                    targets[str(k)] = float(np.clip(v, 0.06, 0.94))
+            if primary.var_id.startswith("intent_"):
+                targets[primary.var_id] = float(np.clip(primary.target_val, 0.06, 0.94))
+        for k, v in (ctx.intent_residuals or {}).items():
+            if str(k).startswith("intent_"):
+                targets.setdefault(str(k), float(np.clip(0.5 + float(v), 0.06, 0.94)))
+        if ctx.macro_hint in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            stride_floor = _ef("RKK_NS_LOCOMOTE_STRIDE", 0.64)
+            for k in list(targets.keys()):
+                if "stride" in str(k) and float(targets[k]) <= 0.52:
+                    targets[k] = stride_floor
+        return targets
+
     def _project_to_graph(
         self, agent: Any, ctx: IntentionContext, primary: SubGoal | None
     ) -> None:
@@ -476,6 +790,12 @@ class IntentionCortex:
         for k, v in ctx.graph_patch.items():
             if k in nodes:
                 nodes[k] = float(np.clip(v, 0.02, 0.98))
+        blend = _ef("RKK_INTENTION_GRAPH_BLEND", 0.42)
+        for k, target in self._intent_targets_for_context(primary, ctx).items():
+            if k not in nodes:
+                continue
+            cur = float(nodes[k])
+            nodes[k] = float(np.clip(cur + blend * (target - cur), 0.05, 0.95))
         base = getattr(agent.env, "base_env", None) or agent.env
         fn = getattr(base, "apply_self_state_patch", None)
         if callable(fn):
@@ -485,6 +805,60 @@ class IntentionCortex:
                     fn(patch)
                 except Exception:
                     pass
+
+    def _project_intent_motor(
+        self,
+        agent: Any,
+        ctx: IntentionContext,
+        primary: SubGoal | None,
+        *,
+        fallen: bool,
+    ) -> None:
+        """Drive motor intents toward curriculum targets every tick (before CPG reads graph)."""
+        if fallen or ctx.macro_hint == "RECOVER_POSTURE":
+            return
+        if ctx.macro_hint not in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            return
+        targets = self._intent_targets_for_context(primary, ctx)
+        if not targets:
+            return
+        base = getattr(agent.env, "base_env", None) or agent.env
+        fn = getattr(base, "apply_motor_intent_residuals", None)
+        if not callable(fn):
+            return
+        try:
+            from engine.features.humanoid.environment import canonical_motor_intent_variable
+        except Exception:
+            return
+        motor_gain = _ef("RKK_INTENTION_MOTOR_GAIN", 0.38)
+        ms = getattr(base, "_motor_state", None)
+        if not isinstance(ms, dict):
+            return
+        residuals: dict[str, float] = {}
+        for k, target in targets.items():
+            ck = canonical_motor_intent_variable(k)
+            cur = float(ms.get(ck, agent.graph.nodes.get(k, 0.5)))
+            delta = (target - cur) * motor_gain
+            if abs(delta) >= 0.004:
+                residuals[ck] = float(delta)
+        for k, dv in (ctx.intent_residuals or {}).items():
+            sk = str(k)
+            if not sk.startswith("intent_"):
+                continue
+            ck = canonical_motor_intent_variable(sk)
+            residuals[ck] = residuals.get(ck, 0.0) + float(dv) * motor_gain
+        if residuals:
+            try:
+                fn(residuals)
+            except Exception:
+                pass
+        nodes = agent.graph.nodes
+        sync = _ef("RKK_INTENTION_MOTOR_GRAPH_SYNC", 0.55)
+        for k, target in targets.items():
+            if k not in nodes:
+                continue
+            cur = float(nodes[k])
+            nodes[k] = float(np.clip(cur + sync * (target - cur), 0.05, 0.95))
 
     def _project_hierarchical(self, sim: Any, primary: SubGoal | None, tick: int) -> None:
         if primary is None:

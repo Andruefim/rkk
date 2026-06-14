@@ -161,6 +161,19 @@ class GoalGenerator:
         for var_id, score in candidates:
             if not var_id or var_id.startswith("concept_"):
                 continue
+            if os.environ.get("RKK_NS_EMBODIED_GOALS_ONLY", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            ):
+                try:
+                    from engine.neuro_symbolic.predicates import embodied_var_id
+
+                    if not embodied_var_id(var_id):
+                        continue
+                except ImportError:
+                    pass
             key = var_id
             if self._counts[key] > self._cooldown_max():
                 continue

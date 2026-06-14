@@ -9,8 +9,10 @@ from engine.goal_planning import (
     beam_search_first_action,
     imagination_steps_default,
     imagination_steps_fallen,
+    is_humanoid_preset,
     plan_depth,
     plan_depth_max,
+    resolve_humanoid_base,
 )
 
 
@@ -73,6 +75,21 @@ def test_imagination_defaults_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("RKK_IMAGINATION_STEPS_FALLEN", raising=False)
     assert imagination_steps_default() == 12
     assert imagination_steps_fallen() == 6
+
+
+def test_resolve_humanoid_base_accepts_variant() -> None:
+    class _Variant:
+        preset = "humanoid_variant"
+
+    class _Visual:
+        preset = "visual"
+        base_env = _Variant()
+
+    assert is_humanoid_preset("humanoid")
+    assert is_humanoid_preset("humanoid_variant")
+    assert not is_humanoid_preset("grid")
+    assert resolve_humanoid_base(_Variant()) is not None
+    assert resolve_humanoid_base(_Visual()) is not None
 
 
 def test_beam_search_picks_better_first_action() -> None:

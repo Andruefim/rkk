@@ -394,6 +394,25 @@ class System2Controller:
             return None
         return getattr(sim, "_intention_state", None)
 
+    def _sync_active_macro_from_intention(self, sim: Any | None) -> None:
+        """Keep S2 macro aligned with Intention Cortex between planning ticks."""
+        if self._s2_override_active:
+            return
+        intent_ctx = self._intention_from_sim(sim)
+        if intent_ctx is None:
+            return
+        hint = str(getattr(intent_ctx, "macro_hint", "") or "").strip().upper()
+        if hint not in ("IDLE", "RECOVER_POSTURE", "LOCOMOTE_DELIVERY", "EXPLORE"):
+            return
+        if hint != str(self._active_macro or "IDLE").upper():
+            self._active_macro = hint
+            self._last_source = "intention_cortex_sync"
+        if hint in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            horizon = int(getattr(intent_ctx, "horizon_ticks", 0) or 0)
+            if horizon > 0:
+                tick = int(getattr(sim, "tick", 0) if sim is not None else 0)
+                self._macro_until_tick = max(self._macro_until_tick, tick + horizon)
+
     def planning_context_for_wm(
         self, *, fallen: bool = False, sim_tick: int = -1, sim: Any | None = None
     ) -> dict[str, Any]:
@@ -1342,6 +1361,15 @@ class System2Controller:
             if hint and hint in ("IDLE", "RECOVER_POSTURE", "LOCOMOTE_DELIVERY", "EXPLORE"):
                 macro = hint
                 source = "intention_cortex"
+            if macro == "IDLE":
+                try:
+                    from engine.locomote_gate import stable_locomote_ready
+
+                    if stable_locomote_ready(obs_f):
+                        macro = "LOCOMOTE_DELIVERY"
+                        source = "stable_locomote_gate"
+                except ImportError:
+                    pass
             intent_horizon = max(
                 intent_horizon,
                 int(getattr(intent_ctx, "horizon_ticks", intent_horizon)),
@@ -1475,20 +1503,36 @@ class System2Controller:
             "on",
         ):
             if base is not None and bool(getattr(base, "cpg_owns_legs", False)):
-                fnr = getattr(sim, "_locomotion_reward_ema", None) if sim is not None else None
-                if callable(fnr):
+                skip_guard = False
+                if macro in ("LOCOMOTE_DELIVERY", "EXPLORE") and sim is not None:
                     try:
-                        thr = float(
-                            os.environ.get("RKK_SYSTEM2_RESIDUAL_MIN_LOCOREWARD", "0.22")
+                        obs = dict(getattr(sim, "_env_observe_cached", lambda: {})() or {})
+                        ps = float(
+                            obs.get(
+                                "posture_stability",
+                                obs.get("phys_posture_stability", 0.5),
+                            )
                         )
-                    except ValueError:
-                        thr = 0.22
-                    thr = float(max(0.05, min(0.55, thr)))
-                    try:
-                        if float(fnr()) < thr:
-                            return False
+                        skip_guard = ps >= float(
+                            os.environ.get("RKK_SYSTEM2_LOCOMOTE_CPG_GUARD_PS", "0.58")
+                        )
                     except Exception:
-                        pass
+                        skip_guard = False
+                if not skip_guard:
+                    fnr = getattr(sim, "_locomotion_reward_ema", None) if sim is not None else None
+                    if callable(fnr):
+                        try:
+                            thr = float(
+                                os.environ.get("RKK_SYSTEM2_RESIDUAL_MIN_LOCOREWARD", "0.18")
+                            )
+                        except ValueError:
+                            thr = 0.18
+                        thr = float(max(0.05, min(0.55, thr)))
+                        try:
+                            if float(fnr()) < thr:
+                                return False
+                        except Exception:
+                            pass
         gap = sim_tick - self._last_residual_tick
         if gap < _residual_min_every():
             return False
@@ -1633,6 +1677,7 @@ class System2Controller:
             should_plan = True
 
         if not should_plan:
+            self._sync_active_macro_from_intention(sim)
             hz_exp = self._macro_horizon_expired(sim_tick)
             defer = self._macro_outcome_deferred(sim_tick)
             self._last_diag = {

@@ -2684,7 +2684,14 @@ class RKKAgent:
             return self._disc_rate_val
         gt_dr = self._gt_discovery_rate_fast()
         ss_dr = self.self_supervised_discovery_rate
-        if self._total_interventions < 200:
+        has_gt = bool(getattr(self.env, "_gt", None)) or bool(
+            getattr(self.env, "gt_edges", lambda: [])()
+        )
+        if not has_gt or gt_dr <= 0.0:
+            val = float(np.clip(ss_dr, 0.0, 1.0))
+            if val <= 0.01:
+                val = self._wm_learning_discovery_proxy()
+        elif self._total_interventions < 200:
             val = gt_dr
         else:
             blend = min(1.0, (self._total_interventions - 200) / 1000.0)
@@ -2692,6 +2699,29 @@ class RKKAgent:
         self._disc_rate_tick = engine_tick
         self._disc_rate_val = float(val)
         return self._disc_rate_val
+
+    def _wm_learning_discovery_proxy(self) -> float:
+        """Humanoid has no GT edges — proxy from WM train + graph compression."""
+        scores: list[float] = []
+        if self.graph.train_losses:
+            recent = self.graph.train_losses[-24:]
+            if len(recent) >= 4:
+                early = float(np.mean(recent[: len(recent) // 2]))
+                late = float(np.mean(recent[len(recent) // 2 :]))
+                if early > 1e-8:
+                    scores.append(float(np.clip((early - late) / early, 0.0, 1.0)))
+        w_meta = getattr(self, "_w_meta", None)
+        if w_meta is not None:
+            try:
+                pe = float(w_meta.meta_prediction_error_rolling(64))
+                scores.append(float(np.clip(0.35 - pe, 0.0, 0.35)) / 0.35)
+            except Exception:
+                pass
+        if self._total_interventions > 0:
+            scores.append(float(np.clip(self._total_interventions / 800.0, 0.02, 0.25)))
+        if not scores:
+            return 0.08
+        return float(np.clip(np.mean(scores), 0.02, 0.85))
 
     @property
     def discovery_rate(self) -> float:

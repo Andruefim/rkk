@@ -250,6 +250,11 @@ def build_simulation_snapshot(
         "phase2": sim._phase2_snapshot_meta(),
         "phase5": sim._phase5_snapshot_meta(),
         "phase6": sim._phase6_snapshot_meta() if hasattr(sim, "_phase6_snapshot_meta") else {},
+        "neuro_symbolic": (
+            sim._ns_snapshot_meta()
+            if hasattr(sim, "_ns_snapshot_meta")
+            else {"enabled": False}
+        ),
         "motor_primitives": (
             sim._motor_prim_lib.snapshot()
             if getattr(sim, "_motor_prim_lib", None) is not None

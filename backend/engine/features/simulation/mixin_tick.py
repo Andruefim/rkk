@@ -767,14 +767,37 @@ class SimulationTickMixin:
         self.agent.value_layer.set_teacher_vl_overlay(None)
 
         self._prof_mark("sim.teacher_vision", _pt)
-        # Phase C₁: reflex path (CPG + reflex stabilizer) stays fast and LLM-free; τ2/τ3 run later.
-        # CPG runs BEFORE agent step so legs are stabilized before high-level exploration
+        # Phase C₁: intention → CPG legs → agent (high-level planning after motor context is set).
         self._ensure_cpg_background_loop()
         self._drain_l1_motor_commands()
         # Re-use ``fallen`` from the early check (after optional recovery): no extra
         # ``is_fallen()`` here — duplicate calls would double-advance debounce streak.
         fallen_pre = bool(fallen)
         if is_humanoid_topology(self.current_world):
+            try:
+                self._tick_intention_pre_system2(fallen=bool(fallen_for_s2))
+            except Exception as _ic_ex:
+                logging.getLogger(__name__).warning(
+                    "intention_cortex pre-system2 failed at tick %s: %s",
+                    self.tick,
+                    _ic_ex,
+                    exc_info=True,
+                )
+            try:
+                self._tick_neuro_symbolic_slow(fallen=bool(fallen_for_s2))
+            except Exception as _ns_ex:
+                logging.getLogger(__name__).warning(
+                    "neuro_symbolic slow loop failed at tick %s: %s",
+                    self.tick,
+                    _ns_ex,
+                    exc_info=True,
+                )
+            try:
+                from engine.neuro_symbolic.motor_sync import sync_ns_motor_every_tick
+
+                self._ns_fast_applied = sync_ns_motor_every_tick(self)
+            except Exception:
+                self._ns_fast_applied = {}
             self._apply_genome_walk_intents(fallen_pre)
         self._maybe_apply_cpg_locomotion(fallen_pre)
         self._publish_cpg_node_snapshot()
@@ -800,15 +823,6 @@ class SimulationTickMixin:
 
         self._prof_mark("sim.cpg_prep", _pt)
         if is_humanoid_topology(self.current_world):
-            try:
-                self._tick_intention_pre_system2(fallen=bool(fallen_for_s2))
-            except Exception as _ic_ex:
-                logging.getLogger(__name__).warning(
-                    "intention_cortex pre-system2 failed at tick %s: %s",
-                    self.tick,
-                    _ic_ex,
-                    exc_info=True,
-                )
             try:
                 from engine.eval_mode import eval_mode_enabled, eval_skip_system2
                 from engine.system2.controller import system2_enabled

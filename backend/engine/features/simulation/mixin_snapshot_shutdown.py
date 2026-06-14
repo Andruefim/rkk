@@ -55,5 +55,11 @@ class SimulationSnapshotShutdownMixin:
         return out
 
     def shutdown(self):
+        delib = getattr(self, "_deliberation", None)
+        if delib is not None:
+            try:
+                delib.stop()
+            except Exception:
+                pass
         self._bg.stop_rkk_agent_loop()
         self._stop_cpg_background_loop()

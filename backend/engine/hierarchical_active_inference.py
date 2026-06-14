@@ -202,16 +202,51 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
     kp_lat = _env_f("RKK_HAI_LAT_GAIN", 0.04)
     lat_sign = _env_f("RKK_HAI_LAT_SIGN", 1.0)
 
+    locomote_macro = False
+    try:
+        ic = getattr(sim, "_intention_state", None)
+        s2 = getattr(sim, "_system2_last", None) or {}
+        macro = ""
+        if ic is not None:
+            macro = str(getattr(ic, "macro_hint", "") or "")
+        if not macro and isinstance(s2, dict):
+            macro = str(s2.get("macro") or "")
+        locomote_macro = macro.upper() in ("LOCOMOTE_DELIVERY", "EXPLORE")
+    except Exception:
+        locomote_macro = False
+
+    coupling_div = 1.0
+    support_scale = 1.0
+    if locomote_macro:
+        try:
+            coupling_div = float(os.environ.get("RKK_LOCOMOTE_COUPLING_PE_DIV", "5.0"))
+        except ValueError:
+            coupling_div = 5.0
+        coupling_div = max(1.0, coupling_div)
+        try:
+            support_scale = float(os.environ.get("RKK_LOCOMOTE_SUPPORT_PE_SCALE", "0.35"))
+        except ValueError:
+            support_scale = 0.35
+        support_scale = float(np.clip(support_scale, 0.15, 1.0))
+        kp_vert *= support_scale
+        kp_lat *= support_scale
+
+    ns_coupling = 0.78
+    try:
+        ns_coupling = float(os.environ.get("RKK_NS_LOCOMOTE_COUPLING", "0.78"))
+    except ValueError:
+        pass
+
     residuals: dict[str, float] = {}
 
     # --- Descending: forward PE → gait coupling (gated by stride intent; avoids blind boost at rest)
     if abs(pe_fwd_ema) >= dead_fwd:
         u_fwd = float(np.tanh(3.5 * pe_fwd_ema))
         stride_gate = float(np.clip((stride0 - 0.48) / 0.34, 0.12, 1.0))
-        residuals["intent_gait_coupling"] = kp * u_fwd * stride_gate
+        residuals["intent_gait_coupling"] = (kp * u_fwd * stride_gate) / coupling_div
 
-    # --- Descending: vertical PE → symmetric support
-    if abs(pe_vert_ema) >= dead_vert:
+    # --- Descending: vertical PE → support (skip symmetric boost during LOCOMOTE walk)
+    if abs(pe_vert_ema) >= dead_vert and not locomote_macro:
         u_v = float(np.tanh(3.0 * pe_vert_ema))
         dv = kp_vert * u_v
         residuals["intent_support_left"] = residuals.get("intent_support_left", 0.0) + dv
@@ -231,6 +266,12 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
         stride1 = float(np.clip(stride0 * mult, 0.05, 0.95))
         residuals["intent_stride"] = residuals.get("intent_stride", 0.0) + (stride1 - stride0)
 
+    # Static-walk penalty: marching in place is costly when LOCOMOTE is active
+    if locomote_macro and stride0 >= 0.58 and abs(actual_delta) < _env_f("RKK_CPG_STATIC_VEL_THRESH", 0.006):
+        static_push = _env_f("RKK_HAI_STATIC_STRIDE_PUSH", 0.04)
+        stride2 = float(np.clip(stride0 + static_push, 0.05, 0.95))
+        residuals["intent_stride"] = residuals.get("intent_stride", 0.0) + (stride2 - stride0)
+
     applied = bool(residuals)
     if applied:
         fn(residuals)
@@ -238,6 +279,18 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
             for k in residuals:
                 if k in graph.nodes and k in getattr(base, "_motor_state", {}):
                     graph.nodes[k] = float(base._motor_state.get(k, graph.nodes[k]))
+
+    if locomote_macro:
+        try:
+            from engine.locomote_gait import (
+                apply_alternating_support_from_cpg,
+                clamp_locomote_gait_intents,
+            )
+
+            clamp_locomote_gait_intents(sim)
+            apply_alternating_support_from_cpg(sim)
+        except Exception:
+            pass
 
     u_cpg = 0.0
     if abs(pe_fwd_ema) >= dead_fwd:

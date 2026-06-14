@@ -827,6 +827,12 @@ class EnvironmentHumanoid:
         if self._fixed_root and not _cpg_during_fixed_root_enabled():
             return
         self.cpg_owns_legs = True
+        stride = float(self._motor_state.get("intent_stride", 0.5))
+        try:
+            kp_mult = float(os.environ.get("RKK_LEG_WALK_KP_MULT", "1.12"))
+        except ValueError:
+            kp_mult = 1.12
+        self._sim._leg_walk_kp_mult = kp_mult if stride >= 0.58 else 1.0
         try:
             n_sub = int(os.environ.get("RKK_CPG_PHYS_SUBSTEPS", "0"))
         except ValueError:

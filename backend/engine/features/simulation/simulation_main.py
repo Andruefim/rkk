@@ -66,6 +66,7 @@ from engine.features.simulation.mixin_fall import SimulationFallMixin
 from engine.features.simulation.mixin_locomotion import SimulationLocomotionMixin
 from engine.features.simulation.mixin_motor_pipeline import SimulationMotorPipelineMixin
 from engine.features.simulation.mixin_phase_hierarchy import SimulationPhaseHierarchyMixin
+from engine.features.simulation.mixin_neuro_symbolic import SimulationNeuroSymbolicMixin
 from engine.features.simulation.mixin_phase5 import SimulationPhase5Mixin
 from engine.features.simulation.mixin_phase6 import SimulationPhase6Mixin
 from engine.features.simulation.mixin_pose_embodied import SimulationPoseEmbodiedMixin
@@ -83,6 +84,7 @@ class Simulation(
     SimulationConceptsMixin,
     SimulationVerbalMixin,
     SimulationPhaseHierarchyMixin,
+    SimulationNeuroSymbolicMixin,
     SimulationPhase5Mixin,
     SimulationPhase6Mixin,
     SimulationWorldMixin,

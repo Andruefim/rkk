@@ -1198,6 +1198,9 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 return
 
             is_leg = var_name in ("lhip", "rhip", "lknee", "rknee", "lankle", "rankle")
+            leg_kp_mult = float(getattr(self, "_leg_walk_kp_mult", 1.0))
+            if is_leg:
+                leg_kp_mult = float(np.clip(leg_kp_mult, 1.0, 1.35))
             if jt == pb.JOINT_SPHERICAL and callable(motor_m):
                 if var_name == "lshoulder":
                     q = pb.getQuaternionFromEuler((0.32 * real_pos, 0.42 * real_pos, 0.28 * real_pos))
@@ -1215,7 +1218,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if is_leg:
                     leg_sph_v = (5.1 if rb > 1.02 else 4.0) * vel_scale
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
-                            positionGain=0.88, velocityGain=0.27, maxVelocity=leg_sph_v,
+                            positionGain=0.88 * leg_kp_mult, velocityGain=0.27 * leg_kp_mult,
+                            maxVelocity=leg_sph_v,
                             force=[f * force_scale for f in self._mt["leg_sph"]], physicsClientId=cid)
                 else:
                     motor_m(rid, jid, pb.POSITION_CONTROL, targetPosition=list(q),
@@ -1231,7 +1235,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     pb.setJointMotorControl2(
                         rid, jid, controlMode=pb.POSITION_CONTROL,
                         targetPosition=real_pos,
-                        positionGain=0.86, velocityGain=0.22,
+                        positionGain=0.86 * leg_kp_mult, velocityGain=0.22 * leg_kp_mult,
                         maxVelocity=rev_v,
                         force=float(self._mt["leg_rev"]) * force_scale, physicsClientId=cid,
                     )

@@ -28,6 +28,14 @@ class SimulationPhase5Mixin:
 
             self._meta_cb = MetaCircuitBreaker()
         ic.ensure_curriculum_seed(getattr(self, "_physical_curriculum", None))
+        try:
+            from engine.deliberation_worker import DeliberationService, deliberation_enabled
+
+            if deliberation_enabled() and getattr(self, "_deliberation", None) is None:
+                self._deliberation = DeliberationService(self)
+                self._deliberation.ensure_started()
+        except Exception:
+            pass
         self._phase5_ready = True
         return ic
 
@@ -71,6 +79,11 @@ class SimulationPhase5Mixin:
         ctx = getattr(self, "_intention_state", None)
         if ctx is not None:
             out["intention_context"] = ctx.to_dict()
+        delib = getattr(self, "_deliberation", None)
+        if delib is not None:
+            latest = delib.latest()
+            if latest is not None:
+                out["deliberation"] = latest.to_dict()
         return out
 
     def _tick_phase5(self, snap: dict[str, Any]) -> None:

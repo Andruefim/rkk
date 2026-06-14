@@ -28,12 +28,20 @@ def goal_planning_globally_disabled() -> bool:
     )
 
 
+_HUMANOID_PRESETS = frozenset({"humanoid", "humanoid_variant"})
+
+
+def is_humanoid_preset(preset: str | None) -> bool:
+    return preset in _HUMANOID_PRESETS
+
+
 def resolve_humanoid_base(env: Any) -> Any | None:
-    """Среда humanoid или base_env внутри EnvironmentVisual."""
-    if getattr(env, "preset", None) == "humanoid":
+    """Среда humanoid / humanoid_variant или base_env внутри EnvironmentVisual."""
+    preset = getattr(env, "preset", None)
+    if is_humanoid_preset(preset):
         return env
     b = getattr(env, "base_env", None)
-    if b is not None and getattr(b, "preset", None) == "humanoid":
+    if b is not None and is_humanoid_preset(getattr(b, "preset", None)):
         return b
     return None
 
