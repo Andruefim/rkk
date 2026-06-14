@@ -146,6 +146,48 @@ class SkillLibrary:
             ],
             postcondition=lambda s: _posture(s) > 0.62,
         ),
+        Skill(
+            name="reach_object",
+            goals=frozenset({"manipulate", "delivery"}),
+            precondition=lambda s: (
+                _posture(s) > 0.58
+                and float(s.get("scene_nearest_in_reach", s.get("scene_target_in_reach", 0.0))) > 0.4
+            ),
+            action_sequence=[
+                [
+                    ("intent_reach_right", 0.74),
+                    ("intent_reach_left", 0.74),
+                    ("intent_torso_forward", 0.54),
+                ],
+                [("intent_look_at", 0.62)],
+            ],
+            postcondition=lambda s: float(s.get("intent_reach_right", 0.5)) > 0.62,
+        ),
+        Skill(
+            name="grasp_object",
+            goals=frozenset({"manipulate", "delivery"}),
+            precondition=lambda s: (
+                float(s.get("intent_reach_right", 0.5)) > 0.62
+                or float(s.get("intent_reach_left", 0.5)) > 0.62
+            ),
+            action_sequence=[
+                [("intent_grasp", 0.82), ("intent_arm_counterbalance", 0.58)],
+            ],
+            postcondition=lambda s: float(s.get("intent_grasp", 0.5)) > 0.68,
+        ),
+        Skill(
+            name="place_object",
+            goals=frozenset({"manipulate", "delivery"}),
+            precondition=lambda s: float(s.get("intent_grasp", 0.5)) > 0.65,
+            action_sequence=[
+                [
+                    ("intent_grasp", 0.40),
+                    ("intent_reach_right", 0.52),
+                    ("intent_reach_left", 0.52),
+                ],
+            ],
+            postcondition=lambda s: float(s.get("intent_grasp", 0.5)) < 0.55,
+        ),
     ]
 
     def __init__(self) -> None:

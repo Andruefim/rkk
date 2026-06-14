@@ -85,12 +85,19 @@ class BehavioralTracker:
         if self._ticks_in_step3 < min_ticks:
             return
         snap = self.snapshot()
-        if (
-            snap["com_x_vel_ema"] >= _env_float("RKK_STEP3_COM_X_VEL_MIN", 0.002)
-            and snap["fall_rate"] < _env_float("RKK_STEP3_FALL_RATE_MAX", 0.05)
-            and snap["upright_rate"] > _env_float("RKK_STEP3_UPRIGHT_MIN", 0.90)
-        ):
-            self._step3_substate = "3b_locomotion_mastered"
+        snap["ticks_in_step3"] = self._ticks_in_step3
+        try:
+            from engine.locomotion_mastery import is_locomotion_mastered
+
+            if is_locomotion_mastered(snap):
+                self._step3_substate = "3b_locomotion_mastered"
+        except ImportError:
+            if (
+                snap["com_x_vel_ema"] >= _env_float("RKK_STEP3_COM_X_VEL_MIN", 0.002)
+                and snap["fall_rate"] < _env_float("RKK_STEP3_FALL_RATE_MAX", 0.05)
+                and snap["upright_rate"] > _env_float("RKK_STEP3_UPRIGHT_MIN", 0.90)
+            ):
+                self._step3_substate = "3b_locomotion_mastered"
 
     def snapshot(self) -> dict[str, Any]:
         n = max(1, len(self._posture))

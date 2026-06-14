@@ -279,6 +279,13 @@ def run_hierarchical_pe_tick(sim: Any, obs: dict[str, float]) -> dict[str, Any] 
             for k in residuals:
                 if k in graph.nodes and k in getattr(base, "_motor_state", {}):
                     graph.nodes[k] = float(base._motor_state.get(k, graph.nodes[k]))
+        arb = getattr(sim, "_motor_arbiter", None)
+        if arb is not None and isinstance(getattr(base, "_motor_state", None), dict):
+            arb.register_from_dict(
+                "hai",
+                dict(base._motor_state),
+                precision=0.58,
+            )
 
     if locomote_macro:
         try:

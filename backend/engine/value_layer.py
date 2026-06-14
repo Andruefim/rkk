@@ -23,6 +23,7 @@ import torch
 import numpy as np
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from engine.graph_constants import is_read_only_macro_var
 
@@ -319,12 +320,22 @@ class ValueLayer:
         self.block_reasons: dict[str, int] = {r.value: 0 for r in BlockReason}
         self.imagination_checks = 0
         self.imagination_blocks = 0
+        self._vl_context: dict[str, Any] = {}
         # Phase G allostasis: smoothed interoceptive energy derivative (charge urgency)
         self._intero_energy_prev: float | None = None
         self._energy_delta_ema: float = 0.0
 
     def set_teacher_vl_overlay(self, overlay: TeacherVLOverlay | None) -> None:
         self._teacher_vl_overlay = overlay
+
+    def set_context(self, context: dict[str, Any] | None) -> None:
+        self._vl_context = dict(context or {})
+
+    def get_profile_name(self) -> str:
+        macro = str(self._vl_context.get("macro", "") or "").strip().upper()
+        if macro in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            return "locomotion"
+        return "default"
 
     @staticmethod
     def _clip_state_val(v: float) -> float:
@@ -523,6 +534,9 @@ class ValueLayer:
                 )
             if recovery_override:
                 loco_relax = 1.0
+            if self.get_profile_name() == "locomotion":
+                loco_relax = float(np.clip(loco_relax + 0.52, 0.0, 1.0))
+                repeat_threshold = max(repeat_threshold, 6)
             if intent_key == "intent_stop_recover":
                 loco_relax = max(loco_relax, 0.65)
             if posture < 0.52:

@@ -215,6 +215,16 @@ class Simulation(
         self._latent_confounder = LatentConfounderManager()
         self._latent_confounder_last: dict = {}
         self.behavioral_tracker = BehavioralTracker()
+        from engine.motor_arbiter import MotorArbiter
+        from engine.locomotion_mastery import LocomotionEval
+        from engine.interaction_eval import InteractionEval
+        from engine.scene_graph import SceneGraphObserver
+
+        self._motor_arbiter = MotorArbiter()
+        self._locomotion_eval = LocomotionEval()
+        self._interaction_eval = InteractionEval()
+        self._scene_graph = SceneGraphObserver()
+        self._s2_episodes_collected_total = 0
         self._edge_delta_hist: deque[int] = deque(maxlen=256)
         self._wm_warmup_until: int = 0
         self._neuro_pending: bool = False

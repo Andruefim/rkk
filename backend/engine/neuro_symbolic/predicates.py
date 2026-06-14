@@ -215,6 +215,34 @@ def _f(obs: dict[str, float], *keys: str, default: float = 0.5) -> float:
     return default
 
 
+ARM_REACH_M = 0.85
+
+
+def fuzzy_sigmoid(x: float, *, center: float, slope: float) -> float:
+    z = float(slope) * (float(x) - float(center))
+    return float(1.0 / (1.0 + np.exp(-np.clip(z, -12.0, 12.0))))
+
+
+def in_reach_confidence(obs: dict[str, float], obj_id: str = "target") -> float:
+    dist = float(
+        obs.get(
+            f"scene_{obj_id}_dist",
+            obs.get("scene_nearest_dist", obs.get("target_dist", 0.5)),
+        )
+    )
+    dist_m = dist * 3.0
+    return fuzzy_sigmoid(dist_m, center=ARM_REACH_M, slope=-5.0)
+
+
+def can_interact_confidence(obs: dict[str, float], obj_id: str = "target") -> float:
+    stable = float(np.clip((float(_f(obs, "posture_stability", "phys_posture_stability")) - 0.45) / 0.4, 0, 1))
+    return float(min(stable, in_reach_confidence(obs, obj_id)))
+
+
+def has_target_confidence(obs: dict[str, float]) -> float:
+    return float(np.clip(_f(obs, "scene_has_target", default=0.0), 0.0, 1.0))
+
+
 def ground_humanoid_state(
     obs: dict[str, float],
     graph_nodes: dict[str, float] | None = None,
@@ -247,6 +275,11 @@ def ground_humanoid_state(
         "PathBlocked",
         compute_path_blocked_confidence(merged, context, hysteresis=hyst),
     )
+    st.add("HasTarget", has_target_confidence(merged))
+    st.add("InReach", in_reach_confidence(merged, "target"))
+    st.add("CanInteract", can_interact_confidence(merged, "target"))
+    st.add("Grasping", float(np.clip(_f(merged, "intent_grasp", "phys_intent_grasp") - 0.55, 0, 1) * 2.0))
+    st.add("AtDeliveryZone", float(np.clip(1.0 - _f(merged, "target_dist", "phys_target_dist", default=0.5) / 0.35, 0, 1)))
 
     for k, v in merged.items():
         sk = str(k)

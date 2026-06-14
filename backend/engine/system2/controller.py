@@ -538,6 +538,79 @@ class System2Controller:
             except Exception:
                 pass
 
+    def _maybe_rolling_macro_distill(
+        self,
+        sim_tick: int,
+        agent: Any,
+        obs_f: dict[str, float],
+    ) -> None:
+        """Rolling window episodes for continuous LOCOMOTE (no terminal required)."""
+        try:
+            every = int(os.environ.get("RKK_S2_ROLLING_DISTILL_EVERY", "200"))
+        except ValueError:
+            every = 200
+        every = max(40, every)
+        if int(sim_tick) % every != 0:
+            return
+        macro = str(self._active_macro or "IDLE")
+        if macro not in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            return
+        if not self._macro_start_obs:
+            self._macro_start_obs = dict(obs_f)
+            return
+        cz0 = float(
+            self._macro_start_obs.get("com_z", self._macro_start_obs.get("phys_com_z", 0.5))
+        )
+        cz1 = float(obs_f.get("com_z", obs_f.get("phys_com_z", cz0)))
+        ps0 = float(
+            self._macro_start_obs.get(
+                "posture_stability",
+                self._macro_start_obs.get("phys_posture_stability", 0.5),
+            )
+        )
+        ps1 = float(
+            obs_f.get("posture_stability", obs_f.get("phys_posture_stability", ps0))
+        )
+        success, pe_diag = episode_success_with_pe_fallback(
+            self._macro_start_obs,
+            obs_f,
+            self._macro_episode_spec,
+            macro=macro,
+        )
+        self._student.record_outcome(macro, success, weight=0.35)
+        stud_conf: float | None = None
+        if self._learned.enabled():
+            self._learned.learn(
+                macro,
+                success,
+                dict(self._macro_start_obs),
+                d_com_z=cz1 - cz0,
+                d_posture=ps1 - ps0,
+            )
+            _, stud_conf = self._learned.predict(dict(self._macro_start_obs))
+        distill_x = pe_distill_extra(
+            pe_diag,
+            dict(self._macro_episode_spec.expected_state or {}),
+            self._macro_episode_spec.skill_id,
+        )
+        distill_x["distill_event"] = "rolling_window"
+        self._append_distill(
+            tick=sim_tick,
+            macro=macro,
+            source=str(self._last_source or "rolling"),
+            success=success,
+            delta={"d_com_z": round(cz1 - cz0, 5), "d_posture": round(ps1 - ps0, 5)},
+            obs0=snapshot_obs_for_distill(dict(self._macro_start_obs)) or None,
+            extra=distill_x,
+            student_conf=stud_conf,
+        )
+        sim = getattr(self, "_rkk_sim", None)
+        if sim is not None:
+            sim._s2_episodes_collected_total = int(
+                getattr(sim, "_s2_episodes_collected_total", 0)
+            ) + 1
+        self._macro_start_obs = dict(obs_f)
+
     def _append_distill(
         self,
         *,
@@ -1568,6 +1641,8 @@ class System2Controller:
         obs_f = self._obs_floats(obs)
         graph = agent.graph
         node_keys = frozenset(getattr(graph, "_node_ids", ()) or ())
+
+        self._maybe_rolling_macro_distill(sim_tick, agent, obs_f)
 
         ov = self._maybe_tick_fallen_override(
             sim_tick, fallen, agent, obs_f, base, graph, node_keys, sim

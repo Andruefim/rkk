@@ -1215,6 +1215,17 @@ class CausalGraph:
             "obs_after":  [obs_after.get(n, 0.0)  for n in self._node_ids],
             "source":     str(source),
         })
+        try:
+            scale = float(os.environ.get("RKK_FORWARD_REWARD_SCALE", "5.0"))
+        except ValueError:
+            scale = 5.0
+        cx0 = float(obs_before.get("com_x", obs_before.get("phys_com_x", obs_before.get("com_y", 0.5))))
+        cx1 = float(obs_after.get("com_x", obs_after.get("phys_com_x", obs_after.get("com_y", cx0))))
+        fwd = max(0.0, cx1 - cx0)
+        if fwd > 1e-5:
+            self._forward_discovery_bonus = float(
+                getattr(self, "_forward_discovery_bonus", 0.0) + fwd * scale
+            )
         if len(self._int_buffer) > self.BUFFER_SIZE:
             self._int_buffer = self._int_buffer[-self.BUFFER_SIZE:]
 

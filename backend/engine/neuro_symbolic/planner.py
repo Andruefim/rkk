@@ -84,6 +84,50 @@ HUMANOID_ACTIONS: list[SymbolicAction] = [
             "self_goal_active": 0.88,
         },
     ),
+    SymbolicAction(
+        name="ApproachObject",
+        preconditions={
+            "HasTarget": 0.55,
+            "IsStable": 0.5,
+            "NOT InReach": 0.55,
+            "NOT PathBlocked": 0.6,
+        },
+        add_effects=["InReach"],
+        motor_priors={
+            "intent_stride": 0.66,
+            "intent_torso_forward": 0.60,
+            "intent_look_at": 0.62,
+        },
+    ),
+    SymbolicAction(
+        name="ReachAndGrasp",
+        preconditions={
+            "InReach": 0.55,
+            "IsStable": 0.5,
+            "CanInteract": 0.5,
+            "NOT Grasping": 0.55,
+        },
+        add_effects=["Grasping"],
+        motor_priors={
+            "intent_reach_right": 0.72,
+            "intent_reach_left": 0.72,
+            "intent_grasp": 0.78,
+        },
+    ),
+    SymbolicAction(
+        name="PlaceAtTarget",
+        preconditions={
+            "Grasping": 0.55,
+            "AtDeliveryZone": 0.5,
+        },
+        remove_effects=["Grasping"],
+        add_effects=["Delivered"],
+        motor_priors={
+            "intent_grasp": 0.42,
+            "intent_reach_right": 0.55,
+            "intent_reach_left": 0.55,
+        },
+    ),
 ]
 
 

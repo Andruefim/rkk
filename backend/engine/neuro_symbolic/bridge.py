@@ -162,7 +162,7 @@ class NeuroSymbolicBridge:
         path: list[SymbolicAction],
         st: ProbabilisticState,
     ) -> tuple[bool, list[str]]:
-        forward_actions = {"StepForward", "ApproachTarget"}
+        forward_actions = {"StepForward", "ApproachTarget", "ApproachObject"}
         blocked = st.best("PathBlocked")
         reasons: list[str] = []
         if path_forward_blocked(blocked):
@@ -192,7 +192,7 @@ class NeuroSymbolicBridge:
         ctx.plan_invalidated = invalidated
         ctx.invalidation_reasons = reasons
 
-        forward_actions = {"StepForward", "ApproachTarget"}
+        forward_actions = {"StepForward", "ApproachTarget", "ApproachObject"}
         blocked_lvl = st.best("PathBlocked")
         if path_turn_recommended(blocked_lvl) and path:
             if path[0].name in forward_actions:
@@ -238,7 +238,7 @@ class NeuroSymbolicBridge:
         for act in HUMANOID_ACTIONS:
             if m == "RECOVER_POSTURE" and act.name == "RecoverPosture":
                 return act
-            if m == "LOCOMOTE_DELIVERY" and act.name in ("StepForward", "ApproachTarget"):
+            if m == "LOCOMOTE_DELIVERY" and act.name in ("StepForward", "ApproachTarget", "ApproachObject"):
                 if path_forward_blocked(blocked_lvl):
                     continue
                 if st.best("GoalActive") > 0.55 and act.name == "ApproachTarget":

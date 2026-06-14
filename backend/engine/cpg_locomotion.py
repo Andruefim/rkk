@@ -434,6 +434,40 @@ class LocomotionController:
             np.clip(targets["rknee"] - knee_flex * swing_r * walk_gate, 0.05, 0.95)
         )
 
+        # Ankle push-off: late-stance extension drives CoM forward (Sprint 5.2)
+        try:
+            ankle_gain = float(os.environ.get("RKK_ANKLE_PUSHOFF_GAIN", "0.08"))
+            knee_ext = float(os.environ.get("RKK_KNEE_EXTENSION_GAIN", "0.04"))
+            lean_bias = float(os.environ.get("RKK_FORWARD_LEAN_BIAS", "0.04"))
+        except ValueError:
+            ankle_gain, knee_ext, lean_bias = 0.08, 0.04, 0.04
+        late_l = float(max(0.0, np.sin(phi_l * np.pi)))
+        late_r = float(max(0.0, np.sin(phi_r * np.pi)))
+        stance_l = float(1.0 - swing_l)
+        stance_r = float(1.0 - swing_r)
+        targets["lankle"] = float(
+            np.clip(
+                targets["lankle"] + ankle_gain * late_l * stance_l * walk_gate,
+                0.05,
+                0.95,
+            )
+        )
+        targets["rankle"] = float(
+            np.clip(
+                targets["rankle"] + ankle_gain * late_r * stance_r * walk_gate,
+                0.05,
+                0.95,
+            )
+        )
+        targets["lknee"] = float(
+            np.clip(targets["lknee"] + knee_ext * (1.0 - swing_l) * walk_gate, 0.05, 0.95)
+        )
+        targets["rknee"] = float(
+            np.clip(targets["rknee"] + knee_ext * (1.0 - swing_r) * walk_gate, 0.05, 0.95)
+        )
+        targets["lhip"] = float(np.clip(targets["lhip"] + lean_bias * stance_l * walk_gate, 0.05, 0.95))
+        targets["rhip"] = float(np.clip(targets["rhip"] + lean_bias * stance_r * walk_gate, 0.05, 0.95))
+
         if static_penalty_applied:
             try:
                 push = float(os.environ.get("RKK_CPG_ANKLE_PUSHOFF", "0.05"))

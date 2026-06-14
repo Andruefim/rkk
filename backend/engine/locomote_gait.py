@@ -81,6 +81,10 @@ def clamp_locomote_gait_intents(sim: Any) -> dict[str, float]:
         phys = f"phys_{ck}"
         if phys in nodes:
             nodes[phys] = tv
+
+    arb = getattr(sim, "_motor_arbiter", None)
+    if arb is not None:
+        arb.register_from_dict("gait", out, precision=0.85)
     return out
 
 

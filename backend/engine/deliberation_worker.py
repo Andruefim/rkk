@@ -299,6 +299,8 @@ class DeliberationService:
         self._device = deliberation_device()
         self._graph_view = DeliberationGraphView(sim.agent.graph, self._device)
         self._last_request_tick = -10**9
+        self._last_delib_macro = ""
+        self._plan_cache_key: tuple[str, float] | None = None
         self._coalesced: _DelibJob | None = None
         self._coalesce_lock = threading.Lock()
         self._busy = False
@@ -346,10 +348,24 @@ class DeliberationService:
     def request_if_due(self, *, tick: int, macro: str, intention_ctx: Any | None) -> bool:
         if not deliberation_enabled():
             return False
+        sim = self._sim
+        pe_fwd = float(getattr(sim, "_hai_pe_fwd_ema", 0.0))
+        last_macro = str(getattr(self, "_last_delib_macro", "") or "")
+        macro_changed = last_macro != str(macro)
+        pe_spike = pe_fwd < -0.6
+        if not pe_spike and not macro_changed:
+            return False
+        plan_key = (str(macro), round(pe_fwd, 2))
+        if getattr(self, "_plan_cache_key", None) == plan_key and self.latest(max_age_ticks=120):
+            return False
         every = _ei("RKK_DELIBERATION_EVERY", 60)
+        if macro.upper() in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            every = max(every, _ei("RKK_DELIB_LOCOMOTE_EVERY", 90))
         if tick - self._last_request_tick < every:
             return False
         self._last_request_tick = tick
+        self._last_delib_macro = str(macro)
+        self._plan_cache_key = plan_key
         return self.enqueue(tick=tick, macro=macro, intention_ctx=intention_ctx)
 
     def enqueue(

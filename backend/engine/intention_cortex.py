@@ -209,7 +209,10 @@ class IntentionCortex:
             self._is_static_coupling_subgoal(primary)
             or (
                 self._locomote_macro_frozen(sim)
-                and self._is_static_stride_freeze(primary)
+                and (
+                    self._is_static_stride_freeze(primary)
+                    or self._is_locomote_freeze_head(primary)
+                )
             )
         ):
             alt = self._pick_locomote_primary(self._stack)
@@ -218,7 +221,7 @@ class IntentionCortex:
         ctx = self._build_context(primary, obs, fallen, tick)
         ctx = self._merge_deliberation(sim, ctx, tick)
         self._project_to_graph(agent, ctx, primary)
-        self._project_intent_motor(agent, ctx, primary, fallen=fallen)
+        self._project_intent_motor(agent, ctx, primary, fallen=fallen, sim=sim)
         self._project_hierarchical(sim, primary, tick)
         self._apply_symbolic_grounding(sim, ctx)
         self._last_context = ctx
@@ -386,6 +389,16 @@ class IntentionCortex:
             self._insert_subgoal(sg)
 
     @staticmethod
+    def _is_locomote_freeze_head(sg: SubGoal) -> bool:
+        """Freeze curriculum heads that pull intents to neutral during LOCOMOTE."""
+        if float(sg.target_val) <= 0.52:
+            return True
+        for _k, v in (sg.intent_targets or {}).items():
+            if float(v) <= 0.52:
+                return True
+        return False
+
+    @staticmethod
     def _is_static_stride_freeze(sg: SubGoal) -> bool:
         """Curriculum static-stance stride targets that conflict with LOCOMOTE."""
         if float(sg.target_val) <= 0.52 and "stride" in str(sg.var_id):
@@ -438,7 +451,10 @@ class IntentionCortex:
                     sg.tick_deadline = tick + max(node.min_ticks, 200)
                     if not (
                         self._locomote_macro_frozen(sim)
-                        and self._is_static_stride_freeze(sg)
+                        and (
+                            self._is_static_stride_freeze(sg)
+                            or self._is_locomote_freeze_head(sg)
+                        )
                     ):
                         new_stack.append(sg)
 
@@ -451,7 +467,10 @@ class IntentionCortex:
                     target_val=float(nxt.intent_targets.get(nxt.var_id, 0.62)),
                     intent_targets=dict(nxt.intent_targets),
                 )
-                if freeze_static and self._is_static_stride_freeze(sg_probe):
+                if freeze_static and (
+                    self._is_static_stride_freeze(sg_probe)
+                    or self._is_locomote_freeze_head(sg_probe)
+                ):
                     continue
                 tv = float(nxt.intent_targets.get(nxt.var_id, 0.62))
                 sg = SubGoal(
@@ -470,7 +489,10 @@ class IntentionCortex:
 
         for g in list(self._goal_generator._active):
             sg = SubGoal.from_goal_candidate(g)
-            if self._locomote_macro_frozen(sim) and self._is_static_stride_freeze(sg):
+            if self._locomote_macro_frozen(sim) and (
+                self._is_static_stride_freeze(sg)
+                or self._is_locomote_freeze_head(sg)
+            ):
                 continue
             sg.tick_deadline = g.tick_proposed + _ei("RKK_INTENTION_SUBGOAL_TICKS", 400)
             if not any(s.subgoal_id == sg.subgoal_id for s in new_stack):
@@ -483,7 +505,10 @@ class IntentionCortex:
             if not any(s.subgoal_id == head.subgoal_id for s in new_stack):
                 if self._is_embodied_subgoal(head) and not (
                     self._locomote_macro_frozen(sim)
-                    and self._is_static_stride_freeze(head)
+                    and (
+                        self._is_static_stride_freeze(head)
+                        or self._is_locomote_freeze_head(head)
+                    )
                 ):
                     new_stack.insert(0, head)
                 else:
@@ -813,6 +838,7 @@ class IntentionCortex:
         primary: SubGoal | None,
         *,
         fallen: bool,
+        sim: Any | None = None,
     ) -> None:
         """Drive motor intents toward curriculum targets every tick (before CPG reads graph)."""
         if fallen or ctx.macro_hint == "RECOVER_POSTURE":
@@ -859,6 +885,13 @@ class IntentionCortex:
                 continue
             cur = float(nodes[k])
             nodes[k] = float(np.clip(cur + sync * (target - cur), 0.05, 0.95))
+        if sim is not None:
+            arb = getattr(sim, "_motor_arbiter", None)
+            if arb is not None:
+                src = "curriculum"
+                if primary is not None:
+                    src = str(getattr(primary, "source", "curriculum") or "curriculum")
+                arb.register_from_dict(src, targets, precision=0.32)
 
     def _project_hierarchical(self, sim: Any, primary: SubGoal | None, tick: int) -> None:
         if primary is None:

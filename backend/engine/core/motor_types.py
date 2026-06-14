@@ -28,7 +28,7 @@ class MotorState:
             "intent_support_left": 0.5,
             "intent_support_right": 0.5,
             "intent_torso_forward": 0.5,
-            "intent_gait_coupling": 0.88,
+            "intent_gait_coupling": 0.78,
             "intent_arm_counterbalance": 0.5,
             "intent_stop_recover": 0.5,
             "intent_reach_right": 0.5,
@@ -88,12 +88,17 @@ class MotorState:
         self.motor_drive_l = float(obs.get("motor_drive_l", self.motor_drive_l))
         self.motor_drive_r = float(obs.get("motor_drive_r", self.motor_drive_r))
         self.posture_stability = float(obs.get("posture_stability", self.posture_stability))
-        if self.foot_contact_l > self.foot_contact_r + 0.08:
-            self.support_leg = "left"
-        elif self.foot_contact_r > self.foot_contact_l + 0.08:
-            self.support_leg = "right"
-        else:
-            self.support_leg = "balanced"
+        try:
+            from engine.motor_arbiter import get_support_leg_signal
+
+            self.support_leg = get_support_leg_signal(self.intents)
+        except Exception:
+            if self.foot_contact_l > self.foot_contact_r + 0.08:
+                self.support_leg = "left"
+            elif self.foot_contact_r > self.foot_contact_l + 0.08:
+                self.support_leg = "right"
+            else:
+                self.support_leg = "balanced"
 
     def update_from_command(
         self,

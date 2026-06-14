@@ -53,7 +53,7 @@ def test_plan_locomote_from_stable() -> None:
     )
     path = plan_to_goal(st, {"StrideHigh": 0.5})
     assert path
-    assert path[0].name in ("StepForward", "ApproachTarget")
+    assert path[0].name in ("StepForward", "ApproachTarget", "ApproachObject")
 
 
 def test_bridge_priors_for_locomote() -> None:

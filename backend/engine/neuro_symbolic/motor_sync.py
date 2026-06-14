@@ -282,6 +282,20 @@ def sync_ns_motor_every_tick(sim: Any) -> dict[str, float]:
         except Exception:
             pass
 
+    arb = getattr(sim, "_motor_arbiter", None)
+    if arb is not None:
+        priors = dict((ns_ctx or {}).get("motor_priors") or {})
+        if not priors and applied:
+            priors = {k: float(v) for k, v in applied.items() if str(k).startswith("intent_")}
+        if priors:
+            canon = {}
+            for k, v in priors.items():
+                ck = _canonical_intent_key(k)
+                if ck.startswith("intent_"):
+                    canon[ck] = float(v)
+            if canon:
+                arb.register_from_dict("ns_bridge", canon, precision=0.92)
+
     pe_fwd = getattr(sim, "_hai_pe_fwd_ema", None)
     if pe_fwd is not None:
         try:

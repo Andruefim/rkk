@@ -267,6 +267,25 @@ def build_simulation_snapshot(
         ),
         "tick_profile": _tick_profile_payload(),
     }
+    arb = getattr(sim, "_motor_arbiter", None)
+    if arb is not None:
+        payload["motor_arbiter"] = arb.snapshot()
+    s2 = payload.get("system2") or {}
+    payload["s2_learning"] = {
+        "episodes_collected": int(getattr(sim, "_s2_episodes_collected_total", 0)),
+        "student_conf": s2.get("student_conf"),
+        "distill_window": s2.get("distill_window"),
+    }
+    le = getattr(sim, "_locomotion_eval", None)
+    if le is not None:
+        payload["locomotion_eval"] = le.snapshot()
+    ie = getattr(sim, "_interaction_eval", None)
+    if ie is not None:
+        payload["interaction_eval"] = ie.snapshot()
+    sg = getattr(sim, "_scene_graph", None)
+    if sg is not None:
+        scene_extra = sg.snapshot()
+        payload["scene"] = {**(payload.get("scene") or {}), **scene_extra}
     # Санитизация (nan/inf/torch) — один раз на границе send_json/HTTP, не здесь
     # (двойной sanitize дублировал весь payload и раздувал RAM на каждый WS-кадр).
     return payload

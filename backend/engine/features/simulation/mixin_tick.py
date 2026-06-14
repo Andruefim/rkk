@@ -213,6 +213,9 @@ class SimulationTickMixin:
                 fn(residuals)
             except Exception:
                 pass
+        arb = getattr(self, "_motor_arbiter", None)
+        if arb is not None:
+            arb.register_from_dict("genome", dict(targets), precision=0.42)
         for k, v in targets.items():
             if k in self.agent.graph.nodes:
                 self.agent.graph.nodes[k] = float(
@@ -774,6 +777,7 @@ class SimulationTickMixin:
         # ``is_fallen()`` here — duplicate calls would double-advance debounce streak.
         fallen_pre = bool(fallen)
         if is_humanoid_topology(self.current_world):
+            getattr(self, "_motor_arbiter", None) and self._motor_arbiter.begin_tick()
             try:
                 self._tick_intention_pre_system2(fallen=bool(fallen_for_s2))
             except Exception as _ic_ex:
@@ -843,6 +847,8 @@ class SimulationTickMixin:
                         sim=self,
                         fallen=bool(fallen_for_s2),
                     )
+                    macro_vl = str((self._system2_last or {}).get("macro") or "")
+                    self.agent.value_layer.set_context({"macro": macro_vl})
                     self._system2.note_autonomy_sample(self.tick)
                     if isinstance(self._system2_last, dict):
                         self._system2_last.update(self._system2.autonomy_fields())
@@ -1112,6 +1118,29 @@ class SimulationTickMixin:
                 self._hai_pe_vert_ema = 0.0
                 self._hai_pe_lat_ema = 0.0
                 self._hai_pe_ema = 0.0
+        arb = getattr(self, "_motor_arbiter", None)
+        if arb is not None and is_humanoid_topology(self.current_world):
+            arb.finalize(self)
+        sg_obs = getattr(self, "_scene_graph", None)
+        if sg_obs is not None and is_humanoid_topology(self.current_world):
+            try:
+                sg_obs.update_gnn(self)
+            except Exception:
+                pass
+        le = getattr(self, "_locomotion_eval", None)
+        bt = getattr(self, "behavioral_tracker", None)
+        if le is not None and bt is not None and is_humanoid_topology(self.current_world):
+            bs = bt.snapshot()
+            ms = self._motor_state_snapshot()
+            intents = ms.get("intents") or {}
+            sl = float(intents.get("intent_support_left", 0.5))
+            sr = float(intents.get("intent_support_right", 0.5))
+            bs["support_asymmetry"] = abs(sl - sr)
+            bs["pe_fwd_ema"] = float(getattr(self, "_hai_pe_fwd_ema", 0.0))
+            bs["coupling_motor"] = float(intents.get("intent_gait_coupling", 0.5))
+            le.record_tick(bs)
+            if self.tick % 30 == 0:
+                le.evaluate()
         self._prof_mark("sim.post_cognition", _pt)
 
         # Phase K: Sleep Controller
