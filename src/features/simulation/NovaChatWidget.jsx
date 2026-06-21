@@ -1,39 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-/** Backend origin: Vite dev on :5173 → API on :8000 */
 function agentBaseUrl() {
   if (typeof window === "undefined") return "http://localhost:8000";
   const o = window.location.origin;
   return o.replace("5173", "8000").replace("5174", "8000");
 }
 
-/**
- * @param {object} [props]
- * @param {object | null} [props.system2] — снимок `snapshot.system2` с causal-stream
- * @param {number} [props.tick] — текущий тик симуляции
- * @param {"system2"|"verbal"} [props.feedMode] — verbal: речь агента + команды; system2: отладка планов
- */
-export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "verbal" }) {
+/** Чат Nova: только реплики агента (нейро-речь) и ваши команды. */
+export default function NovaChatWidget() {
   const AGENT_URL = agentBaseUrl();
   const WS_URL = AGENT_URL.replace(/^http/, "ws") + "/api/ws/chat";
 
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
-  const [statusLine, setStatusLine] = useState("tick 0 · …");
-  const [statusColor, setStatusColor] = useState("#1D9E75");
-  const [concepts, setConcepts] = useState([]);
-  const pendingAskIdRef = useRef(null);
+  const [online, setOnline] = useState(false);
   const [pendingAsk, setPendingAsk] = useState(false);
-  const lastPlanKeyRef = useRef("");
+  const pendingAskIdRef = useRef(null);
 
   const msgsRef = useRef(null);
   const wsRef = useRef(null);
   const reconnectRef = useRef(null);
-
-  const scrollBottom = () => {
-    const el = msgsRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  };
 
   const escHtml = (t) =>
     String(t ?? "")
@@ -41,70 +27,39 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
 
-  const typeTag = (type) => {
-    const map = {
-      OBSERVE: { label: "наблюдение", bg: "#E1F5EE", color: "#0F6E56" },
-      ASK: { label: "вопрос", bg: "#E6F1FB", color: "#185FA5" },
-      REPORT: { label: "рапорт", bg: "#FAEEDA", color: "#854F0B" },
-      HUMAN: { label: "вы", bg: "rgba(20,30,50,0.6)", color: "#aabbcc" },
-      SYSTEM2: { label: "system 2", bg: "#2a1a44", color: "#c9a8ff" },
-    };
-    const t = map[type] || map.OBSERVE;
-    return (
-      <span
-        style={{
-          fontSize: 10,
-          padding: "2px 6px",
-          borderRadius: 20,
-          background: t.bg,
-          color: t.color,
-          fontWeight: 500,
-        }}
-      >
-        {t.label}
-      </span>
-    );
+  const scrollBottom = () => {
+    const el = msgsRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   };
 
   const addAgentMsg = useCallback((data) => {
+    if (data.type === "REPORT") return;
+
     const isAsk = data.type === "ASK";
     if (isAsk) {
       pendingAskIdRef.current = data.id;
       setPendingAsk(true);
     }
 
-    const leftAccent =
-      { OBSERVE: "#1D9E75", ASK: "#378ADD", REPORT: "#BA7517" }[data.type] ||
-      "#1D9E75";
-
     setMessages((prev) => [
       ...prev,
       {
         kind: "agent",
-        data,
-        leftAccent,
+        text: data.text,
         isAsk,
         key: data.id || `a-${data.tick}-${prev.length}`,
       },
     ]);
   }, []);
 
-  const addHumanMsg = useCallback((text, reward) => {
-    const pid = pendingAskIdRef.current;
-    if (pid) {
+  const addHumanMsg = useCallback((text) => {
+    if (pendingAskIdRef.current) {
       pendingAskIdRef.current = null;
       setPendingAsk(false);
     }
-
     setMessages((prev) => [
       ...prev,
-      {
-        kind: "human",
-        text,
-        reward,
-        pendingId: pid,
-        key: `h-${Date.now()}`,
-      },
+      { kind: "human", text, key: `h-${Date.now()}` },
     ]);
   }, []);
 
@@ -115,11 +70,12 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
       setPendingAsk(false);
       if (!rows?.length) return;
       rows.forEach((m) => {
+        if (m.type === "REPORT") return;
         addAgentMsg(m);
-        if (m.human_replied && m.human_reply) addHumanMsg(m.human_reply, m.reward);
+        if (m.human_replied && m.human_reply) addHumanMsg(m.human_reply);
       });
-      const last = rows[rows.length - 1];
-      if (last?.type === "ASK" && !last.human_replied) {
+      const last = [...rows].reverse().find((m) => m.type === "ASK" && !m.human_replied);
+      if (last) {
         pendingAskIdRef.current = last.id;
         setPendingAsk(true);
       }
@@ -135,35 +91,24 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
     const text = input.trim();
     if (!text) return;
     setInput("");
-    addHumanMsg(text, 0);
+    addHumanMsg(text);
 
     try {
       const ws = wsRef.current;
       if (ws && ws.readyState === 1) {
         ws.send(JSON.stringify({ type: "command", text }));
       } else {
-        const r = await fetch(AGENT_URL + "/api/agent/command", {
+        await fetch(AGENT_URL + "/api/agent/command", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text }),
         });
-        const data = await r.json();
-        if (!data.ok && data.error) {
-          setMessages((prev) => [
-            ...prev,
-            { kind: "sys", text: String(data.error), key: `e-${Date.now()}` },
-          ]);
-        }
       }
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        { kind: "sys", text: "ошибка отправки команды", key: `e-${Date.now()}` },
-      ]);
+      /* ignore */
     }
   };
 
-  /** Ответ на ASK (опционально, если агент задал вопрос) */
   const sendReply = async () => {
     const text = input.trim();
     if (!text) return;
@@ -172,7 +117,7 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
       return;
     }
     setInput("");
-    addHumanMsg(text, 0);
+    addHumanMsg(text);
     try {
       const ws = wsRef.current;
       if (ws && ws.readyState === 1) {
@@ -185,248 +130,60 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
         });
       }
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        { kind: "sys", text: "ошибка отправки", key: `e-${Date.now()}` },
-      ]);
+      /* ignore */
     }
   };
 
-  /** Лента планов System2 (макрос / источник / горизонт) — не verbal inner_voice */
   useEffect(() => {
-    if (feedMode !== "system2") return;
+    const connectWS = () => {
+      if (wsRef.current) wsRef.current.close();
+      setOnline(false);
 
-    if (!system2) {
-      lastPlanKeyRef.current = "";
-      setStatusLine(`tick ${tick} · нет snapshot.system2`);
-      setStatusColor("#BA7517");
-      setConcepts([]);
-      setMessages([{ kind: "sys", text: "Ожидание causal-stream…", key: "s2-wait" }]);
-      return;
-    }
-
-    if (system2.error) {
-      setStatusLine(`tick ${tick} · System2 · ошибка`);
-      setStatusColor("#E24B4A");
-      setConcepts([]);
-      return;
-    }
-
-    if (system2.enabled === false) {
-      setStatusLine(`tick ${tick} · System2 выключен (RKK_SYSTEM2=0)`);
-      setStatusColor("#667788");
-      setConcepts([]);
-      lastPlanKeyRef.current = "";
-      setMessages([
-        {
-          kind: "sys",
-          text: "Включите RKK_SYSTEM2=1 в .env и перезапустите backend.",
-          key: "s2-off",
-        },
-      ]);
-      return;
-    }
-
-    if (system2.skipped) {
-      setStatusLine(`tick ${tick} · S2 пропуск · ${system2.skipped}`);
-      setStatusColor("#BA7517");
-      setConcepts([]);
-    } else {
-      const chips = [];
-      if (system2.macro) chips.push(String(system2.macro));
-      if (system2.source) chips.push(String(system2.source));
-      if (system2.last_neuro_node) chips.push(String(system2.last_neuro_node).slice(0, 20));
-      setConcepts(chips.slice(0, 4));
-      let line = `tick ${tick} · S2 ${system2.macro ?? "—"} · ${system2.source ?? ""}`;
-      if (system2.idle) {
-        line += " · ожидание";
-        if (system2.llm_inflight) line += " · LLM";
-        if (system2.macro_outcome_deferred) line += " · макрос→LLM";
-        else if (system2.macro_horizon_expired) line += " · горизонт истёк";
-      }
-      if (system2.outcome_ema != null) line += ` · ema ${system2.outcome_ema}`;
-      setStatusLine(line);
-      setStatusColor("#9b7ed9");
-    }
-
-    const key = [
-      system2.macro ?? "",
-      system2.source ?? "",
-      system2.until ?? "",
-      String(system2.idle ?? ""),
-      String(system2.has_candidate ?? ""),
-      system2.last_candidate_var ?? "",
-      String(system2.residuals_applied ?? ""),
-      system2.skipped ?? "",
-      String(system2.macro_horizon_expired ?? ""),
-      String(system2.macro_outcome_deferred ?? ""),
-    ].join("|");
-
-    if (key === lastPlanKeyRef.current) return;
-    lastPlanKeyRef.current = key;
-
-    const lines = [];
-    if (system2.skipped) {
-      lines.push(`Пропуск: ${system2.skipped}`);
-    } else if (system2.idle) {
-      const st = system2.sim_tick ?? tick;
-      if (system2.macro_horizon_expired) {
-        lines.push(
-          `Горизонт последнего макроса в прошлом (до тика ${system2.until ?? "—"}); сейчас тик ${st}. Следующий шаг планировщика по расписанию или при смене фазы.`
-        );
-      } else if (system2.until != null && system2.until >= 0) {
-        lines.push(
-          `Макрос «${system2.macro ?? "—"}»: окно оценки до тика ${system2.until}; сейчас тик ${st}.`
-        );
-      } else {
-        lines.push(`Планировщик в паузе (тик ${st}, макрос «${system2.macro ?? "—"}»).`);
-      }
-      if (system2.outcome_ema != null) lines.push(`EMA исходов макросов: ${system2.outcome_ema}`);
-      if (system2.student_conf != null) lines.push(`Уверенность студента: ${system2.student_conf}`);
-    } else {
-      lines.push(`Новый план: ${system2.macro ?? "—"} · источник: ${system2.source ?? "—"}`);
-      if (system2.until != null) lines.push(`Горизонт до тика: ${system2.until}`);
-      if (system2.has_candidate && system2.last_candidate_var) {
-        lines.push(`Приоритетный кандидат: ${system2.last_candidate_var}`);
-      } else if (system2.has_candidate === false) {
-        lines.push("Приоритетный intent-кандидат не выставлен.");
-      }
-      if (system2.residuals_applied != null) {
-        lines.push(`Motor residuals: ${system2.residuals_applied ? "применены" : "пропущены (rate-limit)"}`);
-      }
-      if (system2.outcome_ema != null) lines.push(`EMA исходов: ${system2.outcome_ema}`);
-      if (system2.online_buf != null) lines.push(`Онлайн-буфер: ${system2.online_buf} записей`);
-      if (system2.last_neuro_node) lines.push(`Нейро-узел: ${system2.last_neuro_node}`);
-    }
-
-    const text = lines.join("\n");
-
-    setMessages((prev) => {
-      const base = prev.filter((m) => !(m.kind === "sys" && (m.key === "s2-wait" || m.key === "s2-off")));
-      return [
-        ...base,
-        {
-          kind: "system2",
-          text,
-          tick,
-          key: `s2-${tick}-${key.slice(0, 40)}`,
-        },
-      ].slice(-48);
-    });
-  }, [system2, tick, feedMode]);
-
-  useEffect(() => {
-    if (feedMode === "system2") {
-      setStatusColor("#9b7ed9");
-      return undefined;
-    }
-
-    const fetchStats = async () => {
-      try {
-        const r = await fetch(AGENT_URL + "/api/snapshot");
-        if (!r.ok) return;
-        const d = await r.json();
-        const t = d.tick ?? tick ?? 0;
-        let line = `tick ${t}`;
-        if (system2?.enabled !== false && system2?.macro) {
-          line += ` · ${system2.macro}`;
-        } else {
-          line += ` · ${d.world ?? d.current_world ?? "humanoid"}`;
+      const ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
+      ws.onopen = () => {
+        setOnline(true);
+        if (reconnectRef.current) {
+          clearTimeout(reconnectRef.current);
+          reconnectRef.current = null;
         }
-        const verbal = d.verbal || {};
-        if (verbal.last_message) {
-          line += ` · ${(verbal.last_message.type || "").toLowerCase()}`;
+      };
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.event === "history") loadHistory(msg.data || []);
+          else if (msg.event === "agent_message") addAgentMsg(msg.data);
+        } catch {
+          /* ignore */
         }
-        setStatusLine(line);
-        const iv = d.inner_voice || {};
-        if (iv.active_concepts?.length) {
-          setConcepts(iv.active_concepts.slice(0, 4));
-        } else setConcepts([]);
-
-        const sleeping = d.sleep?.is_sleeping;
-        if (sleeping) {
-          setStatusColor("#BA7517");
-          setStatusLine(`tick ${t} · сон (${(d.sleep.current_phase || "").toLowerCase()})`);
-        } else {
-          setStatusColor("#1D9E75");
-        }
-      } catch {
-        setStatusColor("#E24B4A");
-        setStatusLine("нет подключения");
-      }
+      };
+      ws.onclose = () => {
+        setOnline(false);
+        reconnectRef.current = setTimeout(connectWS, 3000);
+      };
+      ws.onerror = () => ws.close();
     };
 
-    if (feedMode === "verbal") {
-      const connectWS = () => {
-        if (wsRef.current) wsRef.current.close();
-        setStatusColor("#BA7517");
+    connectWS();
 
-        const ws = new WebSocket(WS_URL);
-        wsRef.current = ws;
-        ws.onopen = () => {
-          setStatusColor("#1D9E75");
-          if (reconnectRef.current) {
-            clearTimeout(reconnectRef.current);
-            reconnectRef.current = null;
-          }
-        };
-        ws.onmessage = (e) => {
-          try {
-            const msg = JSON.parse(e.data);
-            if (msg.event === "history") loadHistory(msg.data || []);
-            else if (msg.event === "agent_message") addAgentMsg(msg.data);
-            else if (msg.event === "command_ack" && msg.data && !msg.data.ok) {
-              setMessages((prev) => [
-                ...prev,
-                {
-                  kind: "sys",
-                  text: String(msg.data.error || "команда не принята"),
-                  key: `ack-${Date.now()}`,
-                },
-              ]);
-            }
-          } catch {
-            /* ignore */
-          }
-        };
-        ws.onclose = () => {
-          setStatusColor("#E24B4A");
-          reconnectRef.current = setTimeout(connectWS, 3000);
-        };
-        ws.onerror = () => ws.close();
-      };
+    (async () => {
+      try {
+        const r = await fetch(AGENT_URL + "/api/agent/messages?last_n=30");
+        if (!r.ok) return;
+        const d = await r.json();
+        if (d.available === false) return;
+        loadHistory(d.messages || []);
+      } catch {
+        /* ignore */
+      }
+    })();
 
-      connectWS();
-
-      (async () => {
-        try {
-          const r = await fetch(AGENT_URL + "/api/agent/messages?last_n=30");
-          if (!r.ok) {
-            setMessages([{ kind: "sys", text: "backend недоступен", key: "s0" }]);
-            return;
-          }
-          const d = await r.json();
-          if (d.available === false) {
-            setMessages([{ kind: "sys", text: "verbal_action недоступен", key: "s1" }]);
-            return;
-          }
-          loadHistory(d.messages || []);
-        } catch {
-          setMessages([{ kind: "sys", text: "backend недоступен", key: "s2" }]);
-        }
-      })();
-    }
-
-    const tickIv = setInterval(fetchStats, feedMode === "system2" ? 6000 : 4000);
-    fetchStats();
     return () => {
-      clearInterval(tickIv);
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
       if (wsRef.current) wsRef.current.close();
     };
-  }, [AGENT_URL, WS_URL, addAgentMsg, loadHistory, feedMode, system2, tick]);
+  }, [AGENT_URL, WS_URL, addAgentMsg, loadHistory]);
 
-  const bg = "rgba(2,5,14,0.95)";
   const border = "1px solid #0a1a2e";
 
   return (
@@ -439,7 +196,7 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
         border,
         borderRadius: 4,
         overflow: "hidden",
-        background: bg,
+        background: "rgba(2,5,14,0.95)",
         minWidth: 260,
         maxWidth: 320,
       }}
@@ -459,47 +216,11 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
             width: 8,
             height: 8,
             borderRadius: "50%",
-            background: statusColor,
+            background: online ? "#1D9E75" : "#E24B4A",
             flexShrink: 0,
           }}
         />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: "#dde6ff" }}>
-            {feedMode === "system2" ? "Nova · System2" : "Nova"}
-          </div>
-          <div
-            style={{
-              fontSize: 10,
-              color: "#7788aa",
-              fontFamily: "ui-monospace, monospace",
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            }}
-          >
-            {statusLine}
-          </div>
-        </div>
-        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end" }}>
-          {concepts.map((c, i) => {
-            const name = typeof c === "string" ? c : c[0];
-            return (
-              <span
-                key={i}
-                style={{
-                  fontSize: 9,
-                  padding: "2px 6px",
-                  borderRadius: 20,
-                  background: "#2a2244",
-                  color: "#b4aee0",
-                  fontFamily: "ui-monospace, monospace",
-                }}
-              >
-                {String(name).toLowerCase().replace(/_/g, " ")}
-              </span>
-            );
-          })}
-        </div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: "#dde6ff" }}>Nova</div>
       </div>
 
       <div
@@ -514,114 +235,33 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
           background: "rgba(0,4,12,0.5)",
         }}
       >
-        {messages.map((m) => {
-          if (m.kind === "sys") {
-            return (
-              <div key={m.key} style={{ textAlign: "center", padding: "6px 0" }}>
-                <span style={{ fontSize: 10, color: "#556677" }}>{escHtml(m.text)}</span>
-              </div>
-            );
-          }
-          if (m.kind === "system2") {
-            return (
-              <div key={m.key} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                <div
-                  style={{
-                    width: 26,
-                    height: 26,
-                    borderRadius: "50%",
-                    background: "#1e1430",
-                    border: "1px solid #6b4bb8",
-                    flexShrink: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: 10,
-                    fontWeight: 600,
-                    color: "#d4b8ff",
-                  }}
-                >
-                  S2
-                </div>
-                <div style={{ maxWidth: "82%", minWidth: 70 }}>
-                  <div
-                    style={{
-                      background: "rgba(30,20,48,0.95)",
-                      border: "1px solid #4a3566",
-                      borderLeft: "2px solid #9b7ed9",
-                      borderRadius: "0 6px 6px 6px",
-                      padding: "8px 10px",
-                    }}
-                  >
-                    <div style={{ fontSize: 12, color: "#e8e0ff", lineHeight: 1.45, whiteSpace: "pre-wrap" }}>
-                      {escHtml(m.text)}
-                    </div>
-                  </div>
-                  <div style={{ marginTop: 3, display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
-                    {typeTag("SYSTEM2")}
-                    <span style={{ fontSize: 9, color: "#667788" }}>tick {m.tick ?? 0}</span>
-                  </div>
-                </div>
-              </div>
-            );
-          }
-          if (m.kind === "human") {
-            return (
+        {messages.length === 0 && (
+          <div style={{ textAlign: "center", padding: "24px 8px", fontSize: 11, color: "#556677" }}>
+            {online ? "Жду речь агента…" : "Нет связи с backend"}
+          </div>
+        )}
+        {messages.map((m) =>
+          m.kind === "human" ? (
+            <div
+              key={m.key}
+              style={{ display: "flex", justifyContent: "flex-end" }}
+            >
               <div
-                key={m.key}
                 style={{
-                  display: "flex",
-                  justifyContent: "flex-end",
-                  gap: 8,
-                  alignItems: "flex-start",
+                  maxWidth: "85%",
+                  background: "rgba(15,25,45,0.95)",
+                  border: "1px solid #1a2a40",
+                  borderRadius: "8px 0 8px 8px",
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  color: "#dde6f0",
+                  lineHeight: 1.45,
                 }}
               >
-                <div style={{ maxWidth: "78%" }}>
-                  <div
-                    style={{
-                      background: "rgba(15,25,45,0.95)",
-                      border: "1px solid #1a2a40",
-                      borderRadius: "8px 0 8px 8px",
-                      padding: "8px 10px",
-                    }}
-                  >
-                    <div style={{ fontSize: 12, color: "#dde6f0", lineHeight: 1.45 }}>
-                      {escHtml(m.text)}
-                    </div>
-                  </div>
-                  <div
-                    style={{
-                      marginTop: 3,
-                      display: "flex",
-                      justifyContent: "flex-end",
-                    }}
-                  >
-                    {typeTag("HUMAN")}
-                  </div>
-                </div>
-                <div
-                  style={{
-                    width: 26,
-                    height: 26,
-                    borderRadius: "50%",
-                    background: "#121a28",
-                    border: "1px solid #223",
-                    flexShrink: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: 10,
-                    color: "#8899aa",
-                  }}
-                >
-                  Вы
-                </div>
+                {escHtml(m.text)}
               </div>
-            );
-          }
-          const data = m.data;
-          const isAsk = m.isAsk;
-          return (
+            </div>
+          ) : (
             <div key={m.key} style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
               <div
                 style={{
@@ -641,56 +281,23 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
               >
                 N
               </div>
-              <div style={{ maxWidth: "82%", minWidth: 70 }}>
-                <div
-                  style={{
-                    background: "#e8edff",
-                    border: "1px solid #c5d0f0",
-                    borderLeft: `2px solid ${m.leftAccent}`,
-                    borderRadius: "0 6px 6px 6px",
-                    padding: "8px 10px",
-                  }}
-                >
-                  <div style={{ fontSize: 12, color: "#1a2040", lineHeight: 1.45 }}>
-                    {escHtml(data.text)}
-                  </div>
-                  {data.concepts?.length > 0 && (
-                    <div
-                      style={{
-                        marginTop: 5,
-                        fontSize: 9,
-                        color: "#5f5e5a",
-                        fontFamily: "ui-monospace, monospace",
-                      }}
-                    >
-                      {data.concepts
-                        .slice(0, 3)
-                        .map((c) => String(c).toLowerCase().replace(/_/g, " "))
-                        .join(" · ")}
-                    </div>
-                  )}
-                </div>
-                <div
-                  style={{
-                    marginTop: 3,
-                    display: "flex",
-                    gap: 4,
-                    alignItems: "center",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  {typeTag(data.type)}
-                  <span style={{ fontSize: 9, color: "#667788" }}>
-                    tick {data.tick ?? 0} · cur={((data.curiosity ?? 0) * 100).toFixed(0)}%
-                  </span>
-                  {isAsk && (
-                    <span style={{ fontSize: 9, color: "#378ADD" }}>ожидает ответа…</span>
-                  )}
-                </div>
+              <div
+                style={{
+                  maxWidth: "85%",
+                  background: "#e8edff",
+                  border: "1px solid #c5d0f0",
+                  borderRadius: "0 8px 8px 8px",
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  color: "#1a2040",
+                  lineHeight: 1.45,
+                }}
+              >
+                {escHtml(m.text)}
               </div>
             </div>
-          );
-        })}
+          )
+        )}
       </div>
 
       <div
@@ -707,19 +314,12 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
-            if (feedMode !== "system2" && e.key === "Enter" && !e.shiftKey) {
+            if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               sendReply();
             }
           }}
-          placeholder={
-            feedMode === "system2"
-              ? "Отладка S2 (feedMode=system2)"
-              : pendingAsk
-                ? "Ответить на вопрос…"
-                : "Команда агенту…"
-          }
-          disabled={feedMode === "system2"}
+          placeholder={pendingAsk ? "Ответить…" : "Написать агенту…"}
           rows={1}
           style={{
             flex: 1,
@@ -729,18 +329,16 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
             padding: "8px 10px",
             border: "1px solid #223344",
             borderRadius: 4,
-            background: feedMode === "system2" ? "rgba(0,8,20,0.35)" : "rgba(0,8,20,0.6)",
-            color: feedMode === "system2" ? "#556677" : "#dde6f0",
+            background: "rgba(0,8,20,0.6)",
+            color: "#dde6f0",
             lineHeight: 1.4,
             maxHeight: 72,
             overflowY: "auto",
-            cursor: feedMode === "system2" ? "not-allowed" : "text",
           }}
         />
         <button
           type="button"
           onClick={sendReply}
-          disabled={feedMode === "system2"}
           style={{
             padding: "8px 12px",
             fontSize: 11,
@@ -748,8 +346,8 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "v
             borderRadius: 4,
             background: "#121a28",
             border: "1px solid #334",
-            color: feedMode === "system2" ? "#445566" : "#dde6f0",
-            cursor: feedMode === "system2" ? "not-allowed" : "pointer",
+            color: "#dde6f0",
+            cursor: "pointer",
             height: 34,
             flexShrink: 0,
           }}

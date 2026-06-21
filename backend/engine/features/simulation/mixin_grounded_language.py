@@ -38,26 +38,6 @@ class SimulationGroundedLanguageMixin:
         except Exception as e:
             print(f"[GroundedLang] bootstrap skipped: {e}")
         self._grounded_lang_ready = True
-        self._patch_verbal_grounded_lang()
-
-    def _patch_verbal_grounded_lang(self) -> None:
-        """Route OBSERVE speech through graph-grounded decoder when available."""
-        verbal = getattr(self, "_verbal", None)
-        if verbal is None or getattr(self, "_grounded_lang_verbal_patched", False):
-            return
-        original = verbal.decoder.decode_observe
-
-        def grounded_decode(concepts, obs, curiosity):
-            try:
-                text = self.grounded_lang_generate(dict(obs) if obs else None)
-                if text and len(text.strip()) >= 3:
-                    return text.strip()
-            except Exception:
-                pass
-            return original(concepts, obs, curiosity)
-
-        verbal.decoder.decode_observe = grounded_decode  # type: ignore[method-assign]
-        self._grounded_lang_verbal_patched = True
 
     def _tick_grounded_language(self, *, fallen: bool) -> None:
         if not grounded_language_enabled():

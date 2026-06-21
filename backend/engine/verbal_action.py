@@ -314,6 +314,18 @@ class VerbalActionController:
         ):
             return SpeechType.ASK
 
+        _neural_ui = os.environ.get("RKK_NEURAL_LANG", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        if _neural_ui:
+            # REPORT milestones — template strings, not neural speech; skip in chat UI
+            if (tick - self._last_observe_tick) >= self._observe_every:
+                return SpeechType.OBSERVE
+            return None
+
         # REPORT stable walk milestone
         if stable_ticks > 0 and stable_ticks % 200 == 0 and (tick - self._last_report_tick) > 200:
             return SpeechType.REPORT

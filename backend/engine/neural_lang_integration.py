@@ -78,16 +78,10 @@ def _patch_verbal_action(sim, nlg) -> None:
     if verbal is None:
         return
 
-    original_decode_observe = getattr(verbal.decoder, "decode_observe", None)
-    if original_decode_observe is None:
-        return
-
     def neural_decode_observe(concepts, obs, curiosity):
-        # Пробуем нейросетевую генерацию
         iv = getattr(sim, "_inner_voice", None)
         if iv is None or not iv.net._last_thought.any():
-            # Fallback к оригиналу если InnerVoice ещё не обучен
-            return original_decode_observe(concepts, obs, curiosity)
+            return ""
 
         thought = iv.net._last_thought.squeeze(0).detach()
 
@@ -120,11 +114,10 @@ def _patch_verbal_action(sim, nlg) -> None:
             tick=sim.tick,
         )
 
-        # Если декодер ещё не обучен (пустой вывод) — используем оригинал
         if not text or len(text.strip()) < 3:
-            return original_decode_observe(concepts, obs, curiosity)
+            return ""
 
-        return text
+        return text.strip()
 
     verbal.decoder.decode_observe = neural_decode_observe
     print("[NeuralLang] Patched VerbalActionController.decode_observe")
