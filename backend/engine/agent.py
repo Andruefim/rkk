@@ -696,8 +696,17 @@ class RKKAgent:
         """Batched do + free-rollout (goal planning / diagnostics)."""
         if not actions:
             return []
+        use_cf = os.environ.get("RKK_S2_WM_COUNTERFACTUAL", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
         if row_bases is None:
-            states = self.graph.propagate_from_batch(dict(base), actions)
+            if use_cf and hasattr(self.graph, "propagate_counterfactual_batch"):
+                states = self.graph.propagate_counterfactual_batch(dict(base), actions)
+            else:
+                states = self.graph.propagate_from_batch(dict(base), actions)
         else:
             states = self.graph.propagate_from_multi_batch(row_bases, actions)
         h = self._imagination_horizon if horizon is None else max(0, int(horizon))

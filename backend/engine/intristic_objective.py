@@ -100,6 +100,36 @@ def intrinsic_eig_enabled() -> bool:
     )
 
 
+def instrumental_task_enabled() -> bool:
+    return os.environ.get("RKK_INTRINSIC_INSTRUMENTAL", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def instrumental_task_bonus(
+    macro: str,
+    success: bool,
+    *,
+    sim: Any | None = None,
+) -> float:
+    """
+    Instrumental alignment: S2 macro outcomes contribute to intrinsic objective
+    beyond pure curiosity — closes the 'eternal explorer' gap.
+    """
+    if not instrumental_task_enabled():
+        return 0.0
+    m = str(macro or "IDLE").upper()
+    if m == "IDLE":
+        return 0.0
+    w = _ef("RKK_INTRINSIC_INSTRUMENTAL_W", 0.55)
+    base = w if success else -0.18 * w
+    if sim is not None:
+        io = getattr(sim, "_intrinsic_objective", None)
+        if io is not None and hasattr(io, "note_instrumental_outcome"):
+            io.note_instrumental_outcome(m, success, base)
+    return float(base)
+
+
 def _intrinsic_mi_samples() -> int:
     return _ei("RKK_INTRINSIC_MI_SAMPLES", 8)
 
@@ -671,6 +701,19 @@ class IntrinsicObjective:
         self._reward_history: deque[float] = deque(maxlen=500)
         self.total_steps: int = 0
         self._posture_hist: deque[float] = deque(maxlen=100)
+        self._instrumental_ema: float = 0.0
+        self._instrumental_by_macro: dict[str, float] = {}
+
+    def note_instrumental_outcome(self, macro: str, success: bool, bonus: float) -> None:
+        """S2 task outcome → instrumental channel (beyond curiosity)."""
+        m = str(macro or "IDLE").upper()
+        self._instrumental_ema = float(
+            np.clip(0.94 * self._instrumental_ema + 0.06 * float(bonus), -1.0, 1.0)
+        )
+        prev = float(self._instrumental_by_macro.get(m, 0.0))
+        self._instrumental_by_macro[m] = float(
+            np.clip(0.9 * prev + 0.1 * float(bonus), -1.0, 1.0)
+        )
 
     def get_target_priors(self, snapshot_vec: dict[str, float]) -> dict[str, float]:
         """

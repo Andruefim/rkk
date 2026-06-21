@@ -210,3 +210,124 @@ class LearnedMacroStudent:
             "yes",
             "on",
         )
+
+
+# Intent vars the WM planner may choose (subset aligned with wm_planner whitelist).
+_WM_ACTION_VARS = (
+    "intent_stop_recover",
+    "intent_torso_forward",
+    "intent_stride",
+    "intent_support_left",
+    "intent_support_right",
+    "intent_lean_forward",
+    "intent_arm_counterbalance",
+    "intent_reach_left",
+    "intent_reach_right",
+)
+
+
+def _wm_feat_vec(obs_f: dict[str, float], macro: str) -> np.ndarray:
+    """Macro one-hot + posture features for WM action student."""
+    base = _feat_vec(obs_f)
+    macro_oh = np.zeros(len(_MACRO_ORDER), dtype=np.float64)
+    if macro in _MACRO_ORDER:
+        macro_oh[_MACRO_ORDER.index(macro)] = 1.0
+    return np.concatenate([base, macro_oh])
+
+
+class WmPlannerStudent:
+    """
+    Online learner for S2 WM planner: maps (macro, obs) → intent-var logits.
+    Gradient loop: record planned (var, val) at episode start → learn from outcome.
+  Closes the planner feedback path that was missing (outcome → action choice).
+    """
+
+    def __init__(self) -> None:
+        self._d = 8 + len(_MACRO_ORDER)
+        self._k = len(_WM_ACTION_VARS)
+        self._W = np.zeros((self._k, self._d + 1), dtype=np.float64)
+        self._pending: dict[str, Any] | None = None
+        self._last_conf = 0.0
+
+    def _softmax(self, logits: np.ndarray) -> np.ndarray:
+        z = logits - float(np.max(logits))
+        e = np.exp(np.clip(z, -40.0, 40.0))
+        return e / (float(np.sum(e)) + 1e-9)
+
+    def predict_var(
+        self, macro: str, obs_f: dict[str, float]
+    ) -> tuple[str, float, float]:
+        """Returns (best_var, suggested_value, confidence)."""
+        x = _wm_feat_vec(obs_f, macro)
+        aug = np.append(x, 1.0)
+        logits = self._W @ aug
+        p = self._softmax(logits)
+        j = int(np.argmax(p))
+        conf = float(p[j])
+        self._last_conf = conf
+        var = _WM_ACTION_VARS[j]
+        val = float(np.clip(0.42 + 0.28 * conf, 0.38, 0.82))
+        return var, val, conf
+
+    def record_plan(
+        self,
+        macro: str,
+        var: str,
+        val: float,
+        obs_f: dict[str, float],
+        *,
+        wm_score: float = 0.0,
+    ) -> None:
+        self._pending = {
+            "macro": str(macro).upper(),
+            "var": str(var),
+            "val": float(val),
+            "obs0": dict(obs_f),
+            "wm_score": float(wm_score),
+        }
+
+    def learn_from_outcome(
+        self,
+        success: bool,
+        obs_f: dict[str, float],
+        *,
+        d_com_z: float | None = None,
+        d_posture: float | None = None,
+    ) -> None:
+        if self._pending is None:
+            return
+        try:
+            lr = float(os.environ.get("RKK_S2_WM_STUDENT_LR", "0.05"))
+        except ValueError:
+            lr = 0.05
+        lr = float(np.clip(lr, 0.0, 0.2))
+        pend = self._pending
+        self._pending = None
+        macro = str(pend.get("macro", "IDLE"))
+        var = str(pend.get("var", "intent_stride"))
+        obs0 = dict(pend.get("obs0") or obs_f)
+        if var not in _WM_ACTION_VARS:
+            return
+        y = _WM_ACTION_VARS.index(var)
+        x = _wm_feat_vec(obs0, macro)
+        aug = np.append(x, 1.0)
+        logits = self._W @ aug
+        p = self._softmax(logits)
+        grad = p.copy()
+        grad[y] -= 1.0
+        reward = _outcome_reward(macro, success, d_com_z=d_com_z, d_posture=d_posture)
+        pred_score = float(pend.get("wm_score", 0.0))
+        if pred_score > 0.0 and success:
+            reward += 0.08 * min(1.0, pred_score)
+        self._W -= lr * reward * grad[:, None] @ aug[None, :]
+
+    def last_confidence(self) -> float:
+        return float(self._last_conf)
+
+    def enabled(self) -> bool:
+        return os.environ.get("RKK_S2_WM_STUDENT", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )

@@ -106,6 +106,33 @@ def _obs_f(state: dict[str, float], key: str, default: float = 0.5) -> float:
         return float(default)
 
 
+def _record_wm_plan_to_s2(
+    agent: Any,
+    task: "S2WmTask",
+    var: str,
+    val: float,
+    state0: dict[str, float],
+    score: float,
+) -> None:
+    """Close gradient loop: notify System2Controller of WM planner choice."""
+    sim = getattr(agent, "_resolve_rkk_sim", lambda: None)()
+    if sim is None:
+        return
+    s2 = getattr(sim, "_system2", None)
+    if s2 is None or not hasattr(s2, "note_wm_plan"):
+        return
+    try:
+        s2.note_wm_plan(
+            var,
+            val,
+            macro=task.macro,
+            obs_f=dict(state0),
+            wm_score=float(score),
+        )
+    except Exception:
+        pass
+
+
 @dataclass
 class S2WmTask:
     macro: str
@@ -347,6 +374,16 @@ def plan_s2_wm_candidate(
     if not task.active:
         return None
 
+    # WM context from S2 working memory (if available)
+    wm_ctx = (planning_context or {}).get("working_memory") or {}
+    if isinstance(wm_ctx, dict):
+        for k, v in wm_ctx.items():
+            if k in state0:
+                try:
+                    state0[k] = float(0.7 * state0[k] + 0.3 * float(v))
+                except (TypeError, ValueError):
+                    pass
+
     if task.fallen_override and s2_wm_fast_override_enabled():
         fb_fast = _bundle_fallback_quick(planning_context, task, agent)
         if fb_fast is not None:
@@ -401,6 +438,8 @@ def plan_s2_wm_candidate(
     levels = _value_levels_for_task(task)
     actions: list[tuple[str, float]] = [(v, x) for v in motor for x in levels]
     max_b = plan_max_branch_effective(fixed_root=fixed_root)
+    beam_scale = float((planning_context or {}).get("meta_wm_beam_scale", 1.0) or 1.0)
+    max_b = max(6, int(max_b * beam_scale))
     if graph_d > 64:
         max_b = min(max_b, max(6, int(max_b * 64 / graph_d)))
     if task.fallen_override or (task.fallen and task.macro == "RECOVER_POSTURE"):
@@ -450,6 +489,7 @@ def plan_s2_wm_candidate(
         return _bundle_fallback()
 
     var, val = best_first
+    _record_wm_plan_to_s2(agent, task, var, val, state0, best_score)
     target = "posture_stability"
     if task.macro == "LOCOMOTE_DELIVERY" or task.macro == "EXPLORE":
         target = "target_dist"

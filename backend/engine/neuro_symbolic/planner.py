@@ -202,3 +202,75 @@ def macro_to_goal(macro: str) -> dict[str, float]:
     if m == "EXPLORE":
         return {"SlotActive": 0.4}
     return {"IsStable": 0.6}
+
+
+# Map high-activation intent nodes → discovered symbolic operator templates.
+_INTENT_TO_ACTION: dict[str, dict[str, Any]] = {
+    "intent_wave": {
+        "name": "WaveGesture",
+        "preconditions": {"IsStable": 0.5, "CanInteract": 0.4},
+        "add_effects": ["SlotActive"],
+        "motor_priors": {"intent_wave": 0.72, "intent_reach_right": 0.55},
+    },
+    "intent_look_at": {
+        "name": "LookAt",
+        "preconditions": {"IsStable": 0.45},
+        "add_effects": ["SlotActive"],
+        "motor_priors": {"intent_look_at": 0.78},
+    },
+    "intent_grasp": {
+        "name": "GraspDiscovered",
+        "preconditions": {"InReach": 0.5, "IsStable": 0.45},
+        "add_effects": ["Grasping"],
+        "motor_priors": {"intent_grasp": 0.75, "intent_reach_right": 0.65},
+    },
+}
+
+
+def discover_actions_from_graph(
+    graph_nodes: dict[str, float],
+    state: ProbabilisticState,
+    *,
+    kg: Any | None = None,
+    min_activation: float = 0.58,
+) -> list[SymbolicAction]:
+    """
+    Extend hardcoded HUMANOID_ACTIONS with operators inferred from causal graph
+    activations (high intent_* nodes) and KG surprise rules.
+    """
+    actions: list[SymbolicAction] = list(HUMANOID_ACTIONS)
+    seen = {a.name for a in actions}
+    macro_hint = ""
+    for intent_key, spec in _INTENT_TO_ACTION.items():
+        act_val = float(graph_nodes.get(intent_key, 0.0))
+        if act_val < min_activation:
+            continue
+        name = str(spec["name"])
+        if name in seen:
+            continue
+        if kg is not None and kg.is_blocked(macro_hint or "IDLE", name):
+            continue
+        actions.append(
+            SymbolicAction(
+                name=name,
+                preconditions=dict(spec.get("preconditions") or {}),
+                add_effects=list(spec.get("add_effects") or []),
+                remove_effects=list(spec.get("remove_effects") or []),
+                motor_priors=dict(spec.get("motor_priors") or {}),
+            )
+        )
+        seen.add(name)
+    # Strong posture deviation → suggest micro-recover primitive
+    if state.best("IsFallen") > 0.45 and "MicroRecover" not in seen:
+        actions.append(
+            SymbolicAction(
+                name="MicroRecover",
+                preconditions={"IsFallen": 0.35},
+                add_effects=["IsStanding"],
+                motor_priors={
+                    "intent_stop_recover": 0.55,
+                    "intent_torso_forward": 0.58,
+                },
+            )
+        )
+    return actions

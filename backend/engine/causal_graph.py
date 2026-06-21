@@ -188,13 +188,27 @@ class NOTEARSCore(nn.Module):
         a[:, int_var_idx] = int_val
         return F.mse_loss(self.forward_dynamics(X_obs, a), X_int)
 
-    def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    def forward_dynamics(
+        self,
+        X: torch.Tensor,
+        a: torch.Tensor,
+        precision_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         X' ≈ forward(X_do), где в координатах с ненулевым a подставляется абсолютное
         целевое значение do (как в старом X_do[:, idx] = val); иначе — пассивный шаг.
         """
         m = (torch.abs(a) > 1e-8).float()
         x_in = X * (1.0 - m) + a * m
+        if precision_weights is not None:
+            pw = precision_weights
+            if pw.dim() == 1:
+                pw = pw.unsqueeze(0)
+            if pw.shape[0] == 1 and x_in.shape[0] > 1:
+                pw = pw.expand(x_in.shape[0], -1)
+            pw = pw[..., : x_in.shape[-1]]
+            mean = pw.mean().clamp(min=1e-6)
+            x_in = x_in * (pw / mean)
         return self.forward(x_in)
 
     def l1_reg(self) -> torch.Tensor:
@@ -1091,24 +1105,74 @@ class CausalGraph:
             return X[..., :cd], A[..., :cd]
         return X, A
 
+    def _symbolic_precision_wm_enabled(self) -> bool:
+        return os.environ.get("RKK_NS_PRECISION_WM", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
+    def _build_precision_weights_tensor(
+        self,
+        batch_size: int,
+        core_d: int,
+    ) -> torch.Tensor | None:
+        """
+        Merge neuro-symbolic ``_symbolic_precision`` + ``_attention_gate`` into (B, core_d).
+        Padded to core width; active nodes only.
+        """
+        if not self._symbolic_precision_wm_enabled():
+            return None
+        sp: dict[str, float] = getattr(self, "_symbolic_precision", None) or {}
+        gate: list[float] | None = getattr(self, "_attention_gate", None)
+        if not sp and not gate:
+            return None
+        w = torch.ones(core_d, dtype=torch.float32, device=self.device)
+        n_active = min(len(self._node_ids), core_d, self._d)
+        changed = False
+        for i in range(n_active):
+            nid = self._node_ids[i]
+            mult = 1.0
+            if gate is not None and i < len(gate):
+                mult *= float(gate[i])
+            if nid in sp:
+                mult *= float(sp[nid])
+            if abs(mult - 1.0) > 1e-6:
+                changed = True
+            w[i] = float(np.clip(mult, 0.1, 8.0))
+        if not changed:
+            return None
+        B = max(1, int(batch_size))
+        return w.unsqueeze(0).expand(B, -1)
+
     def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         if self._core is None:
             return X
         X_in, a_in = self._wm_inputs_for_core(X, a)
+        B = int(X_in.shape[0])
+        core_d = int(X_in.shape[-1])
+        pw = self._build_precision_weights_tensor(B, core_d)
         if hasattr(self._core, "forward_dynamics"):
-            pred = self._core.forward_dynamics(X_in, a_in)
+            pred = self._core.forward_dynamics(X_in, a_in, precision_weights=pw)
         else:
             m = (torch.abs(a_in) > 1e-8).float()
             x_in = X_in * (1.0 - m) + a_in * m
+            if pw is not None:
+                mean = pw.mean().clamp(min=1e-6)
+                x_in = x_in * (pw / mean)
             pred = self._core(x_in)
-        return pred[..., :self._d]
+        return pred[..., : self._d]
 
     def forward_dynamics_seq(self, X_seq: torch.Tensor, A_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if self._core is None:
             return X_seq, torch.zeros(0, device=self.device), torch.zeros(0, device=self.device), None, None
         X_in, A_in = self._wm_inputs_for_core(X_seq, A_seq)
+        B, T, _ = X_in.shape
+        core_d = int(X_in.shape[-1])
+        pw = self._build_precision_weights_tensor(B * T, core_d)
         if hasattr(self._core, "forward_dynamics_seq"):
-            out = self._core.forward_dynamics_seq(X_in, A_in)
+            out = self._core.forward_dynamics_seq(X_in, A_in, precision_weights=pw)
             if len(out) == 5:
                 pred, h_pred, z, p5, p20 = out
             else:
@@ -1994,6 +2058,57 @@ class CausalGraph:
             if uid in base:
                 out[uid] = float(base[uid])
         return out
+
+    def propagate_counterfactual_batch(
+        self,
+        base: dict[str, float],
+        interventions: list[tuple[str, float]],
+    ) -> list[dict[str, float]]:
+        """Batched L3 counterfactual rollouts for WM / S2 planning."""
+        if not interventions:
+            return []
+        return [
+            self.counterfactual_predict(dict(base), var, float(val))
+            for var, val in interventions
+        ]
+
+    def apply_symbolic_precision(self, weights: dict[str, float]) -> None:
+        """Downward neuro-symbolic precision map (node_id → multiplier in [0.1, 8])."""
+        if not hasattr(self, "_symbolic_precision"):
+            self._symbolic_precision: dict[str, float] = {}
+        blend = 0.42
+        try:
+            import os
+
+            blend = float(os.environ.get("RKK_NS_PRECISION_BLEND", "0.42"))
+        except ValueError:
+            pass
+        for k, w in weights.items():
+            cur = float(self._symbolic_precision.get(k, 1.0))
+            self._symbolic_precision[k] = float(
+                np.clip(cur + blend * (float(w) - cur), 0.1, 8.0)
+            )
+
+    def apply_attention_focus(
+        self,
+        focus_ids: list[str],
+        precision_weights: dict[str, float] | None = None,
+    ) -> None:
+        """Build per-node attention gate from symbolic plan focus list."""
+        if not self._node_ids:
+            return
+        n = len(self._node_ids)
+        gate = [1.0] * n
+        pw = precision_weights or {}
+        for i, nid in enumerate(self._node_ids):
+            if nid in focus_ids:
+                gate[i] = max(gate[i], float(pw.get(nid, 2.0)))
+            elif nid in pw:
+                gate[i] = max(gate[i], float(pw[nid]))
+        self._attention_gate = gate
+
+    def symbolic_precision_for(self, node_id: str) -> float:
+        return float(getattr(self, "_symbolic_precision", {}).get(node_id, 1.0))
 
     def pearl_snapshot(self) -> dict:
         """Diagnostics when ``RKK_PEARL_API`` enabled."""

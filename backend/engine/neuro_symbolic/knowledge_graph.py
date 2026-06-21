@@ -14,6 +14,8 @@ class Triple:
     predicate: str
     obj: str
     confidence: float = 1.0
+    tick_added: int = 0
+    learned: bool = False
 
 
 @dataclass
@@ -21,8 +23,17 @@ class KnowledgeGraph:
     triples: list[Triple] = field(default_factory=list)
     _index: dict[str, list[Triple]] = field(default_factory=dict)
 
-    def add(self, s: str, p: str, o: str, confidence: float = 1.0) -> None:
-        t = Triple(s, p, o, float(confidence))
+    def add(
+        self,
+        s: str,
+        p: str,
+        o: str,
+        confidence: float = 1.0,
+        *,
+        tick: int = 0,
+        learned: bool = False,
+    ) -> None:
+        t = Triple(s, p, o, float(confidence), int(tick), bool(learned))
         self.triples.append(t)
         self._index.setdefault(s, []).append(t)
 
@@ -68,6 +79,94 @@ class KnowledgeGraph:
 
     def get_runtime_fact(self, name: str, default: float = 1.0) -> float:
         return float(getattr(self, "_runtime_facts", {}).get(name, default))
+
+    def learn_from_surprise(
+        self,
+        predicate: str,
+        observed: float,
+        expected: float,
+        *,
+        tick: int = 0,
+        threshold: float = 0.22,
+    ) -> bool:
+        """Surprise-driven rule: large |obs−exp| → new causes/triggered_by triple."""
+        delta = abs(float(observed) - float(expected))
+        if delta < threshold:
+            return False
+        conf = float(min(0.92, 0.45 + delta))
+        self.add(
+            predicate,
+            "triggered_by",
+            f"Surprise_{predicate}",
+            confidence=conf,
+            tick=tick,
+            learned=True,
+        )
+        self.add(
+            f"Surprise_{predicate}",
+            "requires",
+            "Replan",
+            confidence=conf * 0.9,
+            tick=tick,
+            learned=True,
+        )
+        return True
+
+    def learn_from_plan_failure(
+        self,
+        macro: str,
+        failed_predicate: str,
+        *,
+        tick: int = 0,
+    ) -> None:
+        """Planning error → blocks relation for future STRIPS."""
+        self.add(
+            failed_predicate,
+            "blocks",
+            str(macro).upper(),
+            confidence=0.62,
+            tick=tick,
+            learned=True,
+        )
+
+    def is_blocked(self, macro: str, predicate: str) -> bool:
+        for t in self.query(predicate, "blocks"):
+            if t.obj == str(macro).upper() and t.confidence >= 0.5:
+                return True
+        return False
+
+    def forget_stale(self, tick: int, *, max_age_ticks: int | None = None) -> int:
+        """Forgetting curve: decay learned triple confidence; drop when below floor."""
+        try:
+            age = int(
+                max_age_ticks
+                if max_age_ticks is not None
+                else int(os.environ.get("RKK_KG_FORGET_TICKS", "60000"))
+            )
+        except ValueError:
+            age = 60000
+        floor = 0.12
+        decay = 0.985
+        removed = 0
+        kept: list[Triple] = []
+        new_index: dict[str, list[Triple]] = {}
+        for t in self.triples:
+            if not t.learned:
+                kept.append(t)
+                new_index.setdefault(t.subject, []).append(t)
+                continue
+            if tick - t.tick_added > age:
+                removed += 1
+                continue
+            t.confidence *= decay
+            if t.confidence < floor:
+                removed += 1
+                continue
+            kept.append(t)
+            new_index.setdefault(t.subject, []).append(t)
+        self.triples = kept
+        self._index = new_index
+        return removed
 
 
 def bootstrap_humanoid_ontology() -> KnowledgeGraph:

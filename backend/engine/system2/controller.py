@@ -9,6 +9,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from engine.goal_planning import resolve_humanoid_base
 from engine.eval_mode import curriculum_context_tags, eval_mode_enabled
 from engine.system2.distill_log import (
@@ -32,7 +34,11 @@ from engine.system2.recovery_schedule import (
     scripted_getup_episode_spec,
     scripted_getup_phase_at,
 )
-from engine.system2.learned_student import LearnedMacroStudent, snapshot_obs_for_distill
+from engine.system2.learned_student import (
+    LearnedMacroStudent,
+    WmPlannerStudent,
+    snapshot_obs_for_distill,
+)
 from engine.system2.macros import macro_bundle
 from engine.system2.schema import (
     EpisodeSuccessSpec,
@@ -48,6 +54,7 @@ from engine.system2.success_predicates import (
     should_attach_curriculum_pe_spec,
 )
 from engine.system2.student import MacroStudent, choose_macro_from_obs
+from engine.working_memory import WorkingMemoryBuffer, working_memory_enabled
 
 # Must match engine.features.humanoid.constants.SELF_VARS (avoid importing humanoid package here).
 _SELF_SET = frozenset(
@@ -240,6 +247,52 @@ def _distill_override_sample_every() -> int:
         return 240
 
 
+def _meta_cognition_enabled() -> bool:
+    return os.environ.get("RKK_S2_META_COGNITION", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _meta_plan_every(base: int, stud_conf: float, *, fallen: bool) -> int:
+    """Adaptive compute: uncertain → plan more often; confident → coast."""
+    if not _meta_cognition_enabled():
+        return base
+    if fallen:
+        return max(8, base // 3)
+    if stud_conf < 0.32:
+        return max(8, int(base * 0.55))
+    if stud_conf > 0.72:
+        return min(int(base * 1.65), 160)
+    return base
+
+
+def _meta_wm_beam_scale(stud_conf: float) -> float:
+    if not _meta_cognition_enabled():
+        return 1.0
+    return float(np.clip(0.55 + 0.9 * (1.0 - stud_conf), 0.45, 1.35))
+
+
+def _inner_voice_macro_bias(sim: Any | None) -> str | None:
+    """Map inner-voice concepts → macro hint for S2-led hierarchy."""
+    if sim is None:
+        return None
+    iv = getattr(sim, "_inner_voice", None)
+    if iv is None:
+        return None
+    concepts = iv.get_active_concepts() if hasattr(iv, "get_active_concepts") else []
+    names = {str(n).upper() for n, _ in concepts}
+    if any("FALL" in n or "PRONE" in n for n in names):
+        return "RECOVER_POSTURE"
+    if any("GOAL" in n or "TARGET" in n for n in names):
+        return "LOCOMOTE_DELIVERY"
+    if any("EXPLORE" in n or "NOVEL" in n or "SURPRISE" in n for n in names):
+        return "EXPLORE"
+    return None
+
+
 class System2Controller:
     """
     Медленный контур: раз в N тиков выбирает макрос (студент / эвристики),
@@ -250,6 +303,8 @@ class System2Controller:
     def __init__(self) -> None:
         self._student = MacroStudent()
         self._learned = LearnedMacroStudent()
+        self._wm_student = WmPlannerStudent()
+        self._wm = WorkingMemoryBuffer()
         self._active_macro = "IDLE"
         self._macro_until_tick = -1
         self._last_plan_tick = -10**9
@@ -285,6 +340,41 @@ class System2Controller:
         self._autonomy_post_warmup_ticks: int = 0
         self._autonomy_script_ticks: int = 0
         self._autonomy_emergency_ticks: int = 0
+        self._meta_stud_conf: float = 0.5
+        self._last_wm_plan: dict[str, Any] = {}
+
+    @property
+    def working_memory(self) -> WorkingMemoryBuffer:
+        return self._wm
+
+    def note_wm_plan(
+        self,
+        var: str,
+        val: float,
+        *,
+        macro: str,
+        obs_f: dict[str, float],
+        wm_score: float = 0.0,
+    ) -> None:
+        """Record WM planner action for gradient loop closure."""
+        if self._wm_student.enabled():
+            self._wm_student.record_plan(
+                macro, var, val, obs_f, wm_score=wm_score
+            )
+        self._last_wm_plan = {
+            "var": var,
+            "val": val,
+            "macro": macro,
+            "wm_score": wm_score,
+        }
+        if working_memory_enabled():
+            self._wm.write(
+                "wm_last_action",
+                float(val),
+                text=f"{macro}:{var}",
+                tick=int(getattr(self, "_last_plan_tick", 0)),
+                source="s2_wm_planner",
+            )
 
     def note_autonomy_sample(self, sim_tick: int) -> None:
         """Track A1/A4 fractions post-warmup (WorldAutonomyContract humanoid probes)."""
@@ -477,6 +567,12 @@ class System2Controller:
                 and os.environ.get("RKK_S2_CPG_DURING_OVERRIDE", "1").strip().lower()
                 not in ("0", "false", "no", "off")
             ),
+            "working_memory": (
+                self._wm.context_dict(int(sim_tick)) if working_memory_enabled() else {}
+            ),
+            "meta_stud_conf": round(float(self._meta_stud_conf), 4),
+            "meta_wm_beam_scale": round(_meta_wm_beam_scale(self._meta_stud_conf), 4),
+            "s2_led_hierarchy": True,
             "source": (
                 "fallen_override"
                 if self._s2_override_active
@@ -1426,6 +1522,24 @@ class System2Controller:
         else:
             macro = choose_macro_from_obs(obs_f)
             source = "student"
+        self._meta_stud_conf = float(stud_conf)
+
+        # S2-led hierarchy: inner voice + WM context bias macro before intention cortex
+        iv_macro = _inner_voice_macro_bias(sim)
+        if iv_macro and not self._s2_override_active:
+            macro = iv_macro
+            source = "inner_voice_bias"
+        if working_memory_enabled():
+            self._wm.decay(sim_tick)
+            wm_macro = self._wm.read_text("active_macro", "")
+            _valid_macros = ("IDLE", "RECOVER_POSTURE", "LOCOMOTE_DELIVERY", "EXPLORE")
+            if wm_macro in _valid_macros and not self._s2_override_active:
+                if stud_conf < 0.45:
+                    macro = wm_macro
+                    source = "working_memory"
+            for k, v in self._wm.context_dict(sim_tick).items():
+                if k.startswith("concept_") and v > 0.55:
+                    obs_f[k] = float(v)
 
         intent_ctx = self._intention_from_sim(sim)
         intent_horizon = _macro_horizon_ticks()
@@ -1536,6 +1650,25 @@ class System2Controller:
             EpisodeSuccessSpec.from_proposal(proposal_effective), gov
         )
         self._macro_start_obs = dict(obs_f)
+        if working_memory_enabled():
+            self._wm.write(
+                "active_macro",
+                1.0,
+                text=macro,
+                tick=sim_tick,
+                source=source,
+            )
+            if sim is not None:
+                iv = getattr(sim, "_inner_voice", None)
+                if iv is not None:
+                    for name, act in iv.get_active_concepts()[:5]:
+                        self._wm.write(
+                            f"concept_{str(name).lower()}",
+                            float(act),
+                            text=str(name),
+                            tick=sim_tick,
+                            source="inner_voice",
+                        )
 
         hz_exp = self._macro_horizon_expired(sim_tick)
         defer = self._macro_outcome_deferred(sim_tick)
@@ -1552,6 +1685,14 @@ class System2Controller:
             "blocked": False,
             "outcome_ema": round(self._outcome_ema, 4),
             "student_conf": round(float(stud_conf), 4) if self._learned.enabled() else None,
+            "wm_student_conf": (
+                round(self._wm_student.last_confidence(), 4)
+                if self._wm_student.enabled()
+                else None
+            ),
+            "meta_plan_every": _meta_plan_every(
+                _plan_every_ticks(), stud_conf, fallen=False
+            ),
             "residuals_applied": residuals_applied,
             "neuro_streak": dict(self._neuro_streak),
             "online_buf": len(self._online_buf),
@@ -1694,6 +1835,19 @@ class System2Controller:
                     d_com_z=cz1 - cz0,
                     d_posture=ps1 - ps0,
                 )
+            if self._wm_student.enabled():
+                self._wm_student.learn_from_outcome(
+                    success,
+                    obs_f,
+                    d_com_z=cz1 - cz0,
+                    d_posture=ps1 - ps0,
+                )
+            try:
+                from engine.intristic_objective import instrumental_task_bonus
+
+                instrumental_task_bonus(ending_macro, success, sim=sim)
+            except Exception:
+                pass
             spec_e = self._macro_episode_spec
             distill_x = pe_distill_extra(
                 pe_diag,
@@ -1746,7 +1900,11 @@ class System2Controller:
             self._macro_start_obs = {}
             self._macro_episode_spec = EpisodeSuccessSpec()
 
-        plan_every = _plan_every_ticks()
+        plan_every = _meta_plan_every(
+            _plan_every_ticks(),
+            self._meta_stud_conf,
+            fallen=bool(fallen),
+        )
         should_plan = (sim_tick - self._last_plan_tick) >= plan_every
         if sim_tick >= self._macro_until_tick:
             should_plan = True

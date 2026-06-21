@@ -49,6 +49,15 @@ class VetoResult:
     hard_veto: bool = False
 
 
+@dataclass
+class SymbolicHypothesis:
+    predicate: str
+    confidence: float
+    suggested_macro: str = "IDLE"
+    suggested_action: str = ""
+    rationale: str = ""
+
+
 class SymbolicCognitiveEngine:
     """
     System 2 symbolic supervisor: physics constraints + fuzzy safety axioms.
@@ -158,6 +167,81 @@ class SymbolicCognitiveEngine:
                 return fuzz
         self._last_veto = VetoResult(allowed=True)
         return self._last_veto
+
+    def generate_hypotheses(self, state: ProbabilisticState) -> list[SymbolicHypothesis]:
+        """
+        System 2 symbolic reasoning: propose world hypotheses and goal revisions
+        (not only veto). Used by S2 controller for deliberation substrate.
+        """
+        hyps: list[SymbolicHypothesis] = []
+        fallen = state.best("IsFallen")
+        stable = state.best("IsStable")
+        blocked = state.best("PathBlocked")
+        goal = state.best("GoalActive")
+
+        if fallen > 0.55:
+            hyps.append(
+                SymbolicHypothesis(
+                    predicate="IsFallen",
+                    confidence=fallen,
+                    suggested_macro="RECOVER_POSTURE",
+                    suggested_action="RecoverPosture",
+                    rationale="posture_collapse_requires_recovery",
+                )
+            )
+        if blocked > 0.55 and stable > 0.5:
+            hyps.append(
+                SymbolicHypothesis(
+                    predicate="PathBlocked",
+                    confidence=blocked,
+                    suggested_macro="LOCOMOTE_DELIVERY",
+                    suggested_action="Turn",
+                    rationale="obstacle_requires_reorientation",
+                )
+            )
+        if goal > 0.6 and stable > 0.55 and blocked < 0.45:
+            hyps.append(
+                SymbolicHypothesis(
+                    predicate="GoalActive",
+                    confidence=goal,
+                    suggested_macro="LOCOMOTE_DELIVERY",
+                    suggested_action="ApproachTarget",
+                    rationale="active_goal_with_clear_path",
+                )
+            )
+        if stable > 0.7 and goal < 0.35:
+            hyps.append(
+                SymbolicHypothesis(
+                    predicate="IsStable",
+                    confidence=stable,
+                    suggested_macro="EXPLORE",
+                    suggested_action="StepForward",
+                    rationale="stable_idle_explore_frontier",
+                )
+            )
+        return hyps
+
+    def suggest_goal_revision(
+        self,
+        state: ProbabilisticState,
+        current_macro: str,
+    ) -> dict[str, Any] | None:
+        """Return revised macro + action if symbolic hypotheses disagree with current plan."""
+        hyps = self.generate_hypotheses(state)
+        if not hyps:
+            return None
+        best = max(hyps, key=lambda h: h.confidence)
+        cur = str(current_macro or "IDLE").upper()
+        if best.suggested_macro == cur:
+            return None
+        if best.confidence < 0.52:
+            return None
+        return {
+            "macro": best.suggested_macro,
+            "action": best.suggested_action,
+            "confidence": round(best.confidence, 4),
+            "rationale": best.rationale,
+        }
 
     def veto_action(
         self,

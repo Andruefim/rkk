@@ -76,19 +76,55 @@ class SimulationNeuroSymbolicMixin:
         except Exception:
             pass
 
+        revision = None
         plan_ctx = self._ns_bridge.priors_for_active_inference(
             macro,
             obs,
             dict(agent.graph.nodes),
             sim=self,
         )
+        revision = self._ns_engine.suggest_goal_revision(
+            self._ns_bridge._last_state, macro
+        )
+        if revision and not fallen:
+            macro = str(revision.get("macro", macro))
+            plan_ctx = self._ns_bridge.priors_for_active_inference(
+                macro,
+                obs,
+                dict(agent.graph.nodes),
+                sim=self,
+            )
         prox_veto = self._ns_engine.check_human_proximity(obs)
         fuzzy_veto = self._ns_engine.check_fuzzy_safety(self._ns_bridge._last_state)
         plan_ctx.safety_veto = not prox_veto.allowed or not fuzzy_veto.allowed
         plan_ctx.safety_reasons = list(prox_veto.violations) + list(fuzzy_veto.violations)
 
+        # Symbolic hypotheses + KG online learning
+        hyps = self._ns_engine.generate_hypotheses(self._ns_bridge._last_state)
+        plan_ctx.hypotheses = [
+            {
+                "predicate": h.predicate,
+                "confidence": round(h.confidence, 4),
+                "macro": h.suggested_macro,
+                "action": h.suggested_action,
+            }
+            for h in hyps
+        ]
+        kg = self._ns_bridge.knowledge_graph
+        st_facts = self._ns_bridge._last_state.to_dict()
+        for pred, conf in st_facts.items():
+            expected = kg.get_runtime_fact(pred, conf)
+            if kg.learn_from_surprise(pred, conf, expected, tick=tick):
+                plan_ctx.invalidation_reasons.append(f"kg_surprise:{pred}")
+        if plan_ctx.plan_invalidated and plan_ctx.invalidation_reasons:
+            for reason in plan_ctx.invalidation_reasons[:2]:
+                if ":" in reason:
+                    kg.learn_from_plan_failure(macro, reason.split(":")[-1], tick=tick)
+        kg.forget_stale(tick)
+
         if not plan_ctx.safety_veto and plan_ctx.motor_priors:
             self._ns_bridge.apply_priors_to_graph(agent.graph.nodes, plan_ctx)
+            self._ns_bridge.apply_symbolic_precision_to_graph(agent.graph, plan_ctx)
             base = self._unwrap_base_env(agent.env)
             fn = getattr(base, "apply_motor_intent_residuals", None)
             if callable(fn):

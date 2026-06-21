@@ -304,14 +304,43 @@ class CausalGNNCore(nn.Module):
         """W без диагонали."""
         return self.W * self.mask
 
+    @staticmethod
+    def _coerce_precision_weights(
+        precision_weights: torch.Tensor | None,
+        B: int,
+        d: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """(B, d) / (d,) / (B, d, 1) → (B, d, 1); mean-normalized to limit scale drift."""
+        if precision_weights is None:
+            return None
+        pw = precision_weights
+        if pw.dim() == 1:
+            pw = pw.view(1, -1, 1)
+        elif pw.dim() == 2:
+            pw = pw.unsqueeze(-1)
+        if pw.shape[0] == 1 and B > 1:
+            pw = pw.expand(B, -1, -1)
+        pw = pw[..., :d, :1].to(device=device, dtype=dtype)
+        mean = pw.mean().clamp(min=1e-6)
+        return pw / mean
+
     def _message_pass(
         self,
         h: torch.Tensor,
         return_latent: bool = False,
         return_multiscale: bool = False,
+        precision_weights: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple:
         """h: (B, d, hidden) → (B, d) scalars; passes through independent mechanisms."""
         B, d, _hd = h.shape
+        pw = self._coerce_precision_weights(
+            precision_weights, B, d, device=h.device, dtype=h.dtype
+        )
+        if pw is not None:
+            h = h * pw
         A = self.W_masked()
 
         # Vectorized aggregation of parent embeddings: agg_i = \sum_j A[j, i] * h_j
@@ -348,9 +377,15 @@ class CausalGNNCore(nn.Module):
         self,
         W_batch: torch.Tensor,
         h: torch.Tensor,
+        precision_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """B parallel adjacency matrices; h (B, d, hidden) → (B, d). Does not read self.W."""
         B, d, _hd = h.shape
+        pw = self._coerce_precision_weights(
+            precision_weights, B, d, device=h.device, dtype=h.dtype
+        )
+        if pw is not None:
+            h = h * pw
         Wm = W_batch
         if Wm.shape[-1] != d or Wm.shape[-2] != d:
             Wm = Wm[..., :d, :d]
@@ -367,6 +402,7 @@ class CausalGNNCore(nn.Module):
         W_batch: torch.Tensor,
         a: torch.Tensor,
         X: torch.Tensor,
+        precision_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         One WM step per row of W_batch without mutating self.W (ensemble EIG on GPU).
@@ -385,9 +421,14 @@ class CausalGNNCore(nn.Module):
         am = torch.sigmoid(torch.abs(a) * 1000.0).unsqueeze(-1)
         h_a = self.action_enc(a.unsqueeze(-1))
         h = self.node_enc(X.unsqueeze(-1)) + am * h_a
-        return self._message_pass_with_W_batch(W_batch, h)
+        return self._message_pass_with_W_batch(W_batch, h, precision_weights)
 
-    def forward_dynamics(self, X: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    def forward_dynamics(
+        self,
+        X: torch.Tensor,
+        a: torch.Tensor,
+        precision_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         World model: X_{t+1} ≈ f(X_t, a_t).
         X_t, a_t: (B, d) в масштабе наблюдений; a_t разрежен (do(var)=val по индексу).
@@ -397,14 +438,18 @@ class CausalGNNCore(nn.Module):
         am = torch.sigmoid(torch.abs(a) * 1000.0).unsqueeze(-1)
         h_a = self.action_enc(a.unsqueeze(-1))
         h = self.node_enc(X.unsqueeze(-1)) + am * h_a
-        return self._message_pass(h)
+        return self._message_pass(h, precision_weights=precision_weights)
 
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        X: torch.Tensor,
+        precision_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Один шаг «пассивной» динамики f(X, 0) — совместимость с вызовами без явного действия
         (например подача предсказания в visual cortex).
         """
-        return self.forward_dynamics(X, torch.zeros_like(X))
+        return self.forward_dynamics(X, torch.zeros_like(X), precision_weights=precision_weights)
 
     def _adjacency_bool(self) -> torch.Tensor:
         """Directed edges j→i when |W[j,i]| > ε."""
@@ -453,6 +498,7 @@ class CausalGNNCore(nn.Module):
         a: torch.Tensor,
         int_var_idx: int,
         int_val: float,
+        precision_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Pearl-style do(X=x): fix node X, recompute only descendants(X).
@@ -472,6 +518,11 @@ class CausalGNNCore(nn.Module):
         out[:, int_var_idx] = float(int_val)
 
         h_enc = self.node_enc(X.unsqueeze(-1)) + am * h_a
+        pw = self._coerce_precision_weights(
+            precision_weights, B, d, device=X.device, dtype=X.dtype
+        )
+        if pw is not None:
+            h_enc = h_enc * pw
         h_list = [h_enc[:, j, :].detach() for j in range(d)]
         h_list[int_var_idx] = h_fixed.detach()
 
@@ -506,7 +557,10 @@ class CausalGNNCore(nn.Module):
         return h
 
     def forward_dynamics_seq(
-        self, X_seq: torch.Tensor, A_seq: torch.Tensor
+        self,
+        X_seq: torch.Tensor,
+        A_seq: torch.Tensor,
+        precision_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parallel teacher-forcing prediction over sequences (LeWM-style).
@@ -537,7 +591,10 @@ class CausalGNNCore(nn.Module):
 
         # 3. Message pass → predicted next-state scalars and latents for all timesteps
         X_pred_flat, H_pred_flat, X_pred_5_flat, X_pred_20_flat = self._message_pass(
-            H_flat, return_latent=True, return_multiscale=True
+            H_flat,
+            return_latent=True,
+            return_multiscale=True,
+            precision_weights=precision_weights,
         )
 
         # 4. Reshape back

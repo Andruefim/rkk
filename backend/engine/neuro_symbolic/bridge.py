@@ -13,6 +13,7 @@ from engine.neuro_symbolic.knowledge_graph import KnowledgeGraph, bootstrap_huma
 from engine.neuro_symbolic.planner import (
     HUMANOID_ACTIONS,
     SymbolicAction,
+    discover_actions_from_graph,
     macro_to_goal,
     plan_to_goal,
 )
@@ -50,6 +51,9 @@ class SymbolicPlanContext:
     plan_steps: list[str] = field(default_factory=list)
     motor_priors: dict[str, float] = field(default_factory=dict)
     graph_patch: dict[str, float] = field(default_factory=dict)
+    precision_weights: dict[str, float] = field(default_factory=dict)
+    attention_focus: list[str] = field(default_factory=list)
+    hypotheses: list[dict[str, Any]] = field(default_factory=list)
     narrative: str = ""
     safety_veto: bool = False
     safety_reasons: list[str] = field(default_factory=list)
@@ -183,10 +187,17 @@ class NeuroSymbolicBridge:
         self,
         macro: str,
         state: ProbabilisticState | None = None,
+        *,
+        graph_nodes: dict[str, float] | None = None,
     ) -> SymbolicPlanContext:
         st = state or self._last_state
         goal = macro_to_goal(macro)
-        path = plan_to_goal(st, goal)
+        actions = discover_actions_from_graph(
+            graph_nodes or {},
+            st,
+            kg=self._kg,
+        )
+        path = plan_to_goal(st, goal, actions=actions)
         ctx = SymbolicPlanContext(macro=str(macro).upper(), facts=st.to_dict())
         invalidated, reasons = self._check_plan_invalidation(macro, path, st)
         ctx.plan_invalidated = invalidated
@@ -222,6 +233,10 @@ class NeuroSymbolicBridge:
                 ctx.plan_steps = [act.name]
                 ctx.motor_priors = dict(act.motor_priors)
         ctx.graph_patch = self._motor_to_graph_patch(ctx.motor_priors)
+        ctx.precision_weights = self._motor_to_precision_weights(
+            ctx.motor_priors, ctx.plan_steps
+        )
+        ctx.attention_focus = self._plan_attention_focus(ctx.plan_steps, ctx.motor_priors)
         ctx.narrative = self._format_narrative(ctx)
         self._last_plan = ctx
         self._active_plan_steps = list(ctx.plan_steps)
@@ -263,6 +278,41 @@ class NeuroSymbolicBridge:
                 patch[k] = float(np.clip(0.5 + blend * (target - 0.5), 0.05, 0.95))
         return patch
 
+    def _motor_to_precision_weights(
+        self,
+        motor: dict[str, float],
+        plan_steps: list[str],
+    ) -> dict[str, float]:
+        """Downward symbolic → precision: plan-relevant nodes get higher PE weight."""
+        weights: dict[str, float] = {}
+        scale = _ef("RKK_NS_PRECISION_SCALE", 2.4)
+        for k, target in motor.items():
+            weights[k] = float(1.0 + scale * abs(float(target) - 0.5))
+        step_targets = {
+            "RecoverPosture": ("posture_stability", "com_z", "intent_stop_recover"),
+            "StepForward": ("target_dist", "intent_stride", "intent_torso_forward"),
+            "Turn": ("intent_look_at", "intent_gait_coupling", "intent_stride"),
+            "ApproachTarget": ("self_goal_active", "target_dist", "intent_stride"),
+            "HoldStance": ("posture_stability", "foot_contact_l", "foot_contact_r"),
+        }
+        for step in plan_steps:
+            for nid in step_targets.get(step, ()):
+                weights[nid] = max(weights.get(nid, 1.0), 1.0 + scale * 0.55)
+        return weights
+
+    def _plan_attention_focus(
+        self,
+        plan_steps: list[str],
+        motor: dict[str, float],
+    ) -> list[str]:
+        focus: list[str] = []
+        for step in plan_steps[:3]:
+            focus.append(step)
+        for k in sorted(motor.keys(), key=lambda x: -abs(motor[x] - 0.5))[:6]:
+            if k not in focus:
+                focus.append(k)
+        return focus[:12]
+
     def priors_for_active_inference(
         self,
         macro: str,
@@ -275,7 +325,7 @@ class NeuroSymbolicBridge:
         ctx = self._context_from_sim(sim)
         ctx["macro_hint"] = str(macro).upper()
         st = self.perceive(obs, graph_nodes, context=ctx)
-        return self.plan_for_macro(macro, st)
+        return self.plan_for_macro(macro, st, graph_nodes=graph_nodes)
 
     def inject_skeleton_rules(self, rules: list[str]) -> None:
         self._last_skeleton_rules = list(rules[:32])
@@ -297,6 +347,21 @@ class NeuroSymbolicBridge:
             graph_nodes[k] = float(
                 np.clip(cur + blend * (target - cur), 0.05, 0.95)
             )
+
+    def apply_symbolic_precision_to_graph(
+        self,
+        graph: Any,
+        ctx: SymbolicPlanContext,
+    ) -> None:
+        """Downward channel: symbolic plan → GNN precision / attention reweighting."""
+        if not ctx.precision_weights:
+            return
+        fn = getattr(graph, "apply_symbolic_precision", None)
+        if callable(fn):
+            fn(ctx.precision_weights)
+        gate_fn = getattr(graph, "apply_attention_focus", None)
+        if callable(gate_fn) and ctx.attention_focus:
+            gate_fn(ctx.attention_focus, ctx.precision_weights)
 
     def snapshot(self) -> dict[str, Any]:
         return {
