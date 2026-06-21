@@ -250,6 +250,16 @@ def api_agent_messages(last_n: int = Query(default=50, ge=1, le=200)):
     })
 
 
+@app.post("/api/agent/command")
+def api_agent_command(body: dict | None = Body(default=None)):
+    """Grounded language: human instruction → graph sensory nodes."""
+    b = body if isinstance(body, dict) else {}
+    text = str(b.get("text", "")).strip()
+    if not text:
+        return {"ok": False, "error": "empty text"}
+    return get_sim().handle_human_command(text)
+
+
 @app.post("/api/agent/reply")
 def api_agent_reply(body: dict | None = Body(default=None)):
     """Phase L: ответ человека на реплику агента."""
@@ -275,7 +285,17 @@ async def api_ws_chat(websocket: WebSocket):
             )
         while True:
             data = await websocket.receive_json()
-            if data.get("type") == "reply":
+            if data.get("type") == "command":
+                t = str(data.get("text", "")).strip()
+                if t:
+                    result = sim.handle_human_command(t)
+                    await websocket.send_text(
+                        json.dumps(
+                            {"event": "command_ack", "data": result},
+                            ensure_ascii=False,
+                        )
+                    )
+            elif data.get("type") == "reply":
                 t = str(data.get("text", "")).strip()
                 if t:
                     sim.handle_human_reply(t)

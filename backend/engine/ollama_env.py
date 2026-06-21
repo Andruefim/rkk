@@ -16,8 +16,14 @@ from typing import Any
 __all__ = [
     "DEFAULT_OLLAMA_GENERATE_URL",
     "DEFAULT_OLLAMA_MODEL",
+    "DEFAULT_OLLAMA_EMBED_MODEL",
+    "DEFAULT_OLLAMA_SPEECH_MODEL",
+    "DEFAULT_OLLAMA_EMBEDDINGS_URL",
     "get_ollama_generate_url",
+    "get_ollama_embeddings_url",
     "get_ollama_model",
+    "get_ollama_embed_model",
+    "get_ollama_speech_model",
     "ollama_think_disabled_payload",
     "ollama_yield_to_system2_enabled",
     "system2_ollama_busy",
@@ -25,6 +31,9 @@ __all__ = [
 
 DEFAULT_OLLAMA_MODEL = "gemma4:e4b"
 DEFAULT_OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
+DEFAULT_OLLAMA_EMBED_MODEL = "nomic-embed-text:latest"
+DEFAULT_OLLAMA_SPEECH_MODEL = "qwen3.5:0.8b"
+DEFAULT_OLLAMA_EMBEDDINGS_URL = "http://localhost:11434/api/embeddings"
 
 
 def get_ollama_model() -> str:
@@ -35,6 +44,24 @@ def get_ollama_model() -> str:
 def get_ollama_generate_url() -> str:
     u = (os.environ.get("RKK_OLLAMA_URL") or "").strip()
     return u or DEFAULT_OLLAMA_GENERATE_URL
+
+
+def get_ollama_embeddings_url() -> str:
+    u = (os.environ.get("RKK_OLLAMA_EMBEDDINGS_URL") or "").strip()
+    if u:
+        return u
+    base = get_ollama_generate_url().replace("/api/generate", "")
+    return base.rstrip("/") + "/api/embeddings"
+
+
+def get_ollama_embed_model() -> str:
+    m = (os.environ.get("RKK_OLLAMA_EMBED_MODEL") or "").strip()
+    return m or DEFAULT_OLLAMA_EMBED_MODEL
+
+
+def get_ollama_speech_model() -> str:
+    m = (os.environ.get("RKK_OLLAMA_SPEECH_MODEL") or "").strip()
+    return m or DEFAULT_OLLAMA_SPEECH_MODEL
 
 
 def ollama_think_disabled_payload() -> dict[str, Any]:

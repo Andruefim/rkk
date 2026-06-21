@@ -66,6 +66,7 @@ from engine.features.simulation.mixin_fall import SimulationFallMixin
 from engine.features.simulation.mixin_locomotion import SimulationLocomotionMixin
 from engine.features.simulation.mixin_motor_pipeline import SimulationMotorPipelineMixin
 from engine.features.simulation.mixin_phase_hierarchy import SimulationPhaseHierarchyMixin
+from engine.features.simulation.mixin_grounded_language import SimulationGroundedLanguageMixin
 from engine.features.simulation.mixin_neuro_symbolic import SimulationNeuroSymbolicMixin
 from engine.features.simulation.mixin_phase5 import SimulationPhase5Mixin
 from engine.features.simulation.mixin_phase6 import SimulationPhase6Mixin
@@ -83,6 +84,7 @@ from engine.features.simulation.mixin_world import SimulationWorldMixin
 class Simulation(
     SimulationConceptsMixin,
     SimulationVerbalMixin,
+    SimulationGroundedLanguageMixin,
     SimulationPhaseHierarchyMixin,
     SimulationNeuroSymbolicMixin,
     SimulationPhase5Mixin,
@@ -275,6 +277,16 @@ class Simulation(
         if _VERBAL_AVAILABLE:
             self._verbal = VerbalActionController()
             self._verbal.add_callback(self._broadcast_agent_message)
+
+        self._grounded_lang: Any = None
+        self._grounded_lang_ready = False
+        try:
+            from engine.grounded_language import grounded_language_enabled
+
+            if grounded_language_enabled():
+                self._schedule_grounded_lang_bootstrap()
+        except ImportError:
+            pass
 
         self._slot_labeler: Any = None
         self._visual_voice: Any = None

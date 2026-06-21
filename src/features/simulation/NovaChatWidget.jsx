@@ -11,9 +11,9 @@ function agentBaseUrl() {
  * @param {object} [props]
  * @param {object | null} [props.system2] — снимок `snapshot.system2` с causal-stream
  * @param {number} [props.tick] — текущий тик симуляции
- * @param {"system2"|"verbal"} [props.feedMode] — по умолчанию планы System2 (humanoid)
+ * @param {"system2"|"verbal"} [props.feedMode] — verbal: речь агента + команды; system2: отладка планов
  */
-export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "system2" }) {
+export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "verbal" }) {
   const AGENT_URL = agentBaseUrl();
   const WS_URL = AGENT_URL.replace(/^http/, "ws") + "/api/ws/chat";
 
@@ -23,6 +23,7 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
   const [statusColor, setStatusColor] = useState("#1D9E75");
   const [concepts, setConcepts] = useState([]);
   const pendingAskIdRef = useRef(null);
+  const [pendingAsk, setPendingAsk] = useState(false);
   const lastPlanKeyRef = useRef("");
 
   const msgsRef = useRef(null);
@@ -67,7 +68,10 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
 
   const addAgentMsg = useCallback((data) => {
     const isAsk = data.type === "ASK";
-    if (isAsk) pendingAskIdRef.current = data.id;
+    if (isAsk) {
+      pendingAskIdRef.current = data.id;
+      setPendingAsk(true);
+    }
 
     const leftAccent =
       { OBSERVE: "#1D9E75", ASK: "#378ADD", REPORT: "#BA7517" }[data.type] ||
@@ -87,7 +91,10 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
 
   const addHumanMsg = useCallback((text, reward) => {
     const pid = pendingAskIdRef.current;
-    if (pid) pendingAskIdRef.current = null;
+    if (pid) {
+      pendingAskIdRef.current = null;
+      setPendingAsk(false);
+    }
 
     setMessages((prev) => [
       ...prev,
@@ -104,11 +111,18 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
   const loadHistory = useCallback(
     (rows) => {
       setMessages([]);
+      pendingAskIdRef.current = null;
+      setPendingAsk(false);
       if (!rows?.length) return;
       rows.forEach((m) => {
         addAgentMsg(m);
         if (m.human_replied && m.human_reply) addHumanMsg(m.human_reply, m.reward);
       });
+      const last = rows[rows.length - 1];
+      if (last?.type === "ASK" && !last.human_replied) {
+        pendingAskIdRef.current = last.id;
+        setPendingAsk(true);
+      }
     },
     [addAgentMsg, addHumanMsg]
   );
@@ -117,8 +131,7 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
     scrollBottom();
   }, [messages]);
 
-  const sendReply = async () => {
-    if (feedMode === "system2") return;
+  const sendCommand = async () => {
     const text = input.trim();
     if (!text) return;
     setInput("");
@@ -127,14 +140,49 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
     try {
       const ws = wsRef.current;
       if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: "reply", text }));
+        ws.send(JSON.stringify({ type: "command", text }));
       } else {
-        const r = await fetch(AGENT_URL + "/api/agent/reply", {
+        const r = await fetch(AGENT_URL + "/api/agent/command", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text }),
         });
-        await r.json();
+        const data = await r.json();
+        if (!data.ok && data.error) {
+          setMessages((prev) => [
+            ...prev,
+            { kind: "sys", text: String(data.error), key: `e-${Date.now()}` },
+          ]);
+        }
+      }
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        { kind: "sys", text: "ошибка отправки команды", key: `e-${Date.now()}` },
+      ]);
+    }
+  };
+
+  /** Ответ на ASK (опционально, если агент задал вопрос) */
+  const sendReply = async () => {
+    const text = input.trim();
+    if (!text) return;
+    if (!pendingAskIdRef.current) {
+      await sendCommand();
+      return;
+    }
+    setInput("");
+    addHumanMsg(text, 0);
+    try {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: "reply", text }));
+      } else {
+        await fetch(AGENT_URL + "/api/agent/reply", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
       }
     } catch {
       setMessages((prev) => [
@@ -278,38 +326,33 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
         const r = await fetch(AGENT_URL + "/api/snapshot");
         if (!r.ok) return;
         const d = await r.json();
-        const t = d.tick ?? 0;
-        if (feedMode === "verbal") {
-          setStatusLine(`tick ${t} · ${d.world ?? d.current_world ?? "humanoid"}`);
-          const verbal = d.verbal || {};
-          if (verbal.last_message) {
-            const m = verbal.last_message;
-            setStatusLine(
-              `tick ${t} · ${(m.type || "").toLowerCase()} · cur=${((m.curiosity ?? 0) * 100).toFixed(0)}%`
-            );
-          }
-          const iv = d.inner_voice || {};
-          if (iv.active_concepts?.length) {
-            setConcepts(iv.active_concepts.slice(0, 4));
-          } else setConcepts([]);
+        const t = d.tick ?? tick ?? 0;
+        let line = `tick ${t}`;
+        if (system2?.enabled !== false && system2?.macro) {
+          line += ` · ${system2.macro}`;
+        } else {
+          line += ` · ${d.world ?? d.current_world ?? "humanoid"}`;
         }
+        const verbal = d.verbal || {};
+        if (verbal.last_message) {
+          line += ` · ${(verbal.last_message.type || "").toLowerCase()}`;
+        }
+        setStatusLine(line);
+        const iv = d.inner_voice || {};
+        if (iv.active_concepts?.length) {
+          setConcepts(iv.active_concepts.slice(0, 4));
+        } else setConcepts([]);
 
         const sleeping = d.sleep?.is_sleeping;
         if (sleeping) {
           setStatusColor("#BA7517");
-          if (feedMode === "verbal") {
-            setStatusLine(`tick ${t} · сон (${(d.sleep.current_phase || "").toLowerCase()})`);
-          }
-        } else if (feedMode === "verbal") {
+          setStatusLine(`tick ${t} · сон (${(d.sleep.current_phase || "").toLowerCase()})`);
+        } else {
           setStatusColor("#1D9E75");
-        } else if (feedMode === "system2") {
-          setStatusColor("#9b7ed9");
         }
       } catch {
-        if (feedMode === "verbal") {
-          setStatusColor("#E24B4A");
-          setStatusLine("нет подключения");
-        }
+        setStatusColor("#E24B4A");
+        setStatusLine("нет подключения");
       }
     };
 
@@ -332,6 +375,16 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
             const msg = JSON.parse(e.data);
             if (msg.event === "history") loadHistory(msg.data || []);
             else if (msg.event === "agent_message") addAgentMsg(msg.data);
+            else if (msg.event === "command_ack" && msg.data && !msg.data.ok) {
+              setMessages((prev) => [
+                ...prev,
+                {
+                  kind: "sys",
+                  text: String(msg.data.error || "команда не принята"),
+                  key: `ack-${Date.now()}`,
+                },
+              ]);
+            }
           } catch {
             /* ignore */
           }
@@ -371,7 +424,7 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
       if (reconnectRef.current) clearTimeout(reconnectRef.current);
       if (wsRef.current) wsRef.current.close();
     };
-  }, [AGENT_URL, WS_URL, addAgentMsg, loadHistory, feedMode]);
+  }, [AGENT_URL, WS_URL, addAgentMsg, loadHistory, feedMode, system2, tick]);
 
   const bg = "rgba(2,5,14,0.95)";
   const border = "1px solid #0a1a2e";
@@ -661,8 +714,10 @@ export default function NovaChatWidget({ system2 = null, tick = 0, feedMode = "s
           }}
           placeholder={
             feedMode === "system2"
-              ? "Verbal-диалог отключён (показ планов S2)"
-              : "Ответить агенту…"
+              ? "Отладка S2 (feedMode=system2)"
+              : pendingAsk
+                ? "Ответить на вопрос…"
+                : "Команда агенту…"
           }
           disabled={feedMode === "system2"}
           rows={1}

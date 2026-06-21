@@ -1274,7 +1274,7 @@ export default function RKKHumanoid() {
             </div>
           </div>}
         </div>
-        <NovaChatWidget system2={ui.system2} tick={ui.tick} feedMode="system2" />
+        <NovaChatWidget system2={ui.system2} tick={ui.tick} feedMode="verbal" />
       </div>
 
       {/* Right HUD */}

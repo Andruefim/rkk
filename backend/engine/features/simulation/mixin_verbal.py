@@ -112,9 +112,10 @@ class SimulationVerbalMixin:
         self._add_event(f"{icon} {msg.text}", "#88ffcc", "speech")
 
     def handle_human_reply(self, reply_text: str) -> dict[str, Any]:
-        """HTTP/WS: human reply to agent ASK."""
+        """HTTP/WS: human reply to agent ASK (also grounds free-text as command)."""
+        cmd = self.handle_human_command(reply_text)
         if not _VERBAL_AVAILABLE or self._verbal is None:
-            return {"ok": False, "error": "verbal unavailable"}
+            return {**cmd, "verbal": False}
         reward = float(self._verbal.on_human_reply(reply_text))
 
         lc = self._locomotion_controller
@@ -144,4 +145,4 @@ class SimulationVerbalMixin:
             except Exception:
                 pass
 
-        return {"ok": True, "reward": round(reward, 3)}
+        return {"ok": True, "reward": round(reward, 3), "grounded": cmd}

@@ -217,6 +217,55 @@ class MechanismMLP(nn.Module):
         return self.out_1(c).squeeze(-1), self.latent_predictor(c), self.out_5(c).squeeze(-1), self.out_20(c).squeeze(-1)
 
 
+# ─── Grounded Language adapters (Text ↔ Graph latent channels) ───────────────
+class LanguageAdapterIn(nn.Module):
+    """
+    Text embedding → graph sensory channels in [0, 1].
+    Matryoshka / projected embed (default 64-d) → n semantic scalar nodes.
+    """
+
+    def __init__(self, embed_dim: int = 64, n_channels: int = 8, hidden: int = 64):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.n_channels = int(n_channels)
+        self.net = nn.Sequential(
+            nn.Linear(self.embed_dim, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, self.n_channels),
+            nn.Sigmoid(),
+        )
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.45)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, emb: torch.Tensor) -> torch.Tensor:
+        """emb: (B, embed_dim) → (B, n_channels) in [0, 1]."""
+        return self.net(emb)
+
+
+class LanguageAdapterOut(nn.Module):
+    """Graph intent_speak channels → embedding space for decode / vector lookup."""
+
+    def __init__(self, n_channels: int = 8, embed_dim: int = 64, hidden: int = 64):
+        super().__init__()
+        self.n_channels = int(n_channels)
+        self.embed_dim = int(embed_dim)
+        self.net = nn.Sequential(
+            nn.Linear(self.n_channels, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, self.embed_dim),
+        )
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.45)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, channels: torch.Tensor) -> torch.Tensor:
+        """channels: (B, n_channels) → (B, embed_dim)."""
+        return self.net(channels)
+
+
 # ─── CausalGNNCore ────────────────────────────────────────────────────────────
 class CausalGNNCore(nn.Module):
     """

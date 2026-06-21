@@ -797,6 +797,15 @@ class SimulationTickMixin:
                     exc_info=True,
                 )
             try:
+                self._tick_grounded_language(fallen=bool(fallen_for_s2))
+            except Exception as _gl_ex:
+                logging.getLogger(__name__).warning(
+                    "grounded_language tick failed at tick %s: %s",
+                    self.tick,
+                    _gl_ex,
+                    exc_info=True,
+                )
+            try:
                 from engine.neuro_symbolic.motor_sync import sync_ns_motor_every_tick
 
                 self._ns_fast_applied = sync_ns_motor_every_tick(self)

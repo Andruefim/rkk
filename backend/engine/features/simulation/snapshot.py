@@ -229,6 +229,11 @@ def build_simulation_snapshot(
             if _VERBAL_AVAILABLE and sim._verbal is not None
             else {"enabled": False}
         ),
+        "grounded_language": (
+            sim._grounded_lang_snapshot()
+            if hasattr(sim, "_grounded_lang_snapshot")
+            else {"enabled": False}
+        ),
         "latent_confounder": getattr(sim, "_latent_confounder_last", None) or {},
         "learned_roles": _learned_roles_snapshot(),
         "visual_voice": (
