@@ -1,14 +1,10 @@
 """
-neural_lang_integration.py — Патч интеграции NeuralLanguageGrounding в Simulation.
+neural_lang_integration.py — NeuralLanguageGrounding (spatial memory, slot concepts).
 
-Основной путь речи и slot→concept:
-  verbal_action — CausalSpeechDecoder через generate_utterance; в SpeechDecoder остались только
-    короткие строки на cold start (без таблиц TEMPLATES_*).
-  slot_labeler — motion / scene / novelty; доп. концепты из NeuralConceptProjector (не keyword map).
-  visual_inner_voice — маршрутизация по ключам OBSERVE/ASK для нейросети; VISUAL_TEMPLATES удалены.
+Речь в чате: grounded_language.py (nomic-embed + Qwen) через mixin_verbal._hook_grounded_verbal_decoder.
+CausalSpeechDecoder (GRU) здесь НЕ патчит decode_observe.
 
-Включается из `Simulation.__init__` при RKK_NEURAL_LANG=1 (по умолчанию), если доступен
-`engine.neural_causal_language`.
+Включается из Simulation.__init__ при RKK_NEURAL_LANG=1 (slot/tick patches only).
 """
 from __future__ import annotations
 
@@ -55,10 +51,10 @@ def apply_neural_lang_patch(sim) -> bool:
     sim._neural_lang = nlg
     print(f"[NeuralLang] NeuralLanguageGrounding initialized on {device}")
 
-    # Подключаем к verbal action
-    _patch_verbal_action(sim, nlg)
+    # Speech UI: grounded_language.py (Qwen + nomic) via mixin_verbal — not GRU decode_observe.
+    # _patch_verbal_action(sim, nlg)
 
-    # Подключаем к slot_labeler (заменяем text_to_concepts)
+    # Slot concepts + spatial memory still use neural grounding.
     _patch_slot_labeler(sim, nlg)
 
     # Добавляем перехват on_agent_step (через monkey-patch метода тика)

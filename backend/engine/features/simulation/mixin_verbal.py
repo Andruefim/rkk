@@ -37,6 +37,39 @@ class SimulationVerbalMixin:
         except Exception:
             pass
 
+    def _hook_grounded_verbal_decoder(self) -> None:
+        """OBSERVE text → grounded_language (nomic + Qwen), not CausalSpeechDecoder GRU."""
+        if getattr(self, "_grounded_verbal_hooked", False):
+            return
+        if not _VERBAL_AVAILABLE or self._verbal is None:
+            return
+        try:
+            from engine.grounded_language import grounded_language_enabled
+        except ImportError:
+            return
+        if not grounded_language_enabled():
+            return
+
+        verbal = self._verbal
+        original = verbal.decoder.decode_observe
+
+        def grounded_decode(concepts, obs, curiosity):
+            try:
+                self._ensure_grounded_language()
+                o = dict(obs) if obs else {}
+                gl = getattr(self, "_grounded_lang", None)
+                if gl is not None and hasattr(self, "agent"):
+                    gl.sync_speak_vector_from_state(self.agent.graph, o)
+                text = self.grounded_lang_generate(o)
+                if text and len(text.strip()) >= 3:
+                    return text.strip()
+            except Exception:
+                pass
+            return original(concepts, obs, curiosity)
+
+        verbal.decoder.decode_observe = grounded_decode  # type: ignore[method-assign]
+        self._grounded_verbal_hooked = True
+
     def _schedule_verbal_tick(self, fallen: bool) -> None:
         """Run async verbal tick in a daemon thread (agent thread has no asyncio loop)."""
         if not _VERBAL_AVAILABLE or self._verbal is None:
@@ -66,6 +99,9 @@ class SimulationVerbalMixin:
             return
         if not is_humanoid_topology(self.current_world) or self._inner_voice is None:
             return
+
+        self._hook_grounded_verbal_decoder()
+
         obs: dict[str, float] = {}
         try:
             obs = dict(self.agent.env.observe())

@@ -320,8 +320,12 @@ class VerbalActionController:
             "no",
             "off",
         )
-        if _neural_ui:
-            # REPORT milestones — template strings, not neural speech; skip in chat UI
+        try:
+            from engine.grounded_language import grounded_language_enabled as _gl_on
+        except ImportError:
+            _gl_on = lambda: False  # noqa: E731
+        if _gl_on() or _neural_ui:
+            # REPORT milestones — templates / not grounded Qwen speech
             if (tick - self._last_observe_tick) >= self._observe_every:
                 return SpeechType.OBSERVE
             return None
