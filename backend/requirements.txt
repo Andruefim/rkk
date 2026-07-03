@@ -3,6 +3,7 @@
 # PyTorch ROCm: pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm6.2
 
 fastapi==0.115.0
+starlette>=0.37.2,<0.39.0
 uvicorn[standard]==0.30.0
 pydantic>=2.10.6
 websockets==13.0

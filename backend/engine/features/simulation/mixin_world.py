@@ -38,6 +38,45 @@ class SimulationWorldMixin:
         }
 
     # ── Фаза 12: Visual mode ──────────────────────────────────────────────────
+    def _auto_visual_should_enable(self) -> bool:
+        if os.environ.get("RKK_SKIP_AUTO_VISION", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return False
+        auto = os.environ.get("RKK_AUTO_VISUAL", "0").strip().lower()
+        if auto not in ("0", "false", "no", "off"):
+            return True
+        try:
+            from engine.visual_grounding import grounding_enabled
+
+            return grounding_enabled()
+        except ImportError:
+            return False
+
+    def _maybe_auto_enable_visual(self) -> None:
+        """Boot-time visual cortex when RKK_AUTO_VISUAL=1 or RKK_VISUAL_GROUNDING=1."""
+        if self._visual_mode or not self._auto_visual_should_enable():
+            return
+        if not is_humanoid_topology(self.current_world):
+            return
+        try:
+            n_slots = int(os.environ.get("RKK_AUTO_VISION_N_SLOTS", "8"))
+        except ValueError:
+            n_slots = 8
+        mode = (os.environ.get("RKK_AUTO_VISION_MODE", "hybrid") or "hybrid").strip()
+        out = self.enable_visual(n_slots=n_slots, mode=mode)
+        if out.get("error"):
+            print(f"[Simulation] Auto visual failed: {out.get('error')}", flush=True)
+        elif out.get("visual") and not out.get("already_enabled"):
+            print(
+                f"[Simulation] Auto visual ON: n_slots={out.get('n_slots')}, "
+                f"mode={out.get('mode')}, gnn_d={out.get('gnn_d')}",
+                flush=True,
+            )
+
     def enable_visual(self, n_slots: int = 8, mode: str = "hybrid") -> dict:
         """
         Включаем Causal Visual Cortex.

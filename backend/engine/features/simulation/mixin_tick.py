@@ -60,6 +60,77 @@ class SimulationTickMixin:
             p.record(name, (now - t0[0]) * 1000.0)
         t0[0] = now
 
+    def _human_task_motor_active(self) -> bool:
+        try:
+            from engine.task_binding import task_binding_enabled
+
+            if not task_binding_enabled():
+                return False
+            tb = getattr(self, "_task_binding", None)
+            ht = tb.active_task if tb is not None else None
+            return ht is not None and str(getattr(ht, "status", "active")) == "active"
+        except Exception:
+            return False
+
+    def _motor_substrate_suppressed(self) -> bool:
+        arb = getattr(self, "_motor_arbiter", None)
+        return arb is not None and arb.should_suppress_substrate()
+
+    @staticmethod
+    def _canonical_motor_intent_key(k: str) -> str:
+        sk = str(k)
+        if sk.startswith("phys_intent_"):
+            return "intent_" + sk[len("phys_intent_") :]
+        return sk
+
+    def _register_task_executive_motor_intents(self) -> None:
+        """Register human_task + S2 WM planner intents for arbiter finalize."""
+        arb = getattr(self, "_motor_arbiter", None)
+        if arb is None or not arb.human_task_active():
+            return
+
+        targets: dict[str, float] = {}
+        ic = getattr(self, "_intention_state", None)
+        if ic is not None:
+            primary = getattr(ic, "primary", None)
+            if primary is not None:
+                for k, v in (getattr(primary, "intent_targets", None) or {}).items():
+                    ck = self._canonical_motor_intent_key(k)
+                    if ck.startswith("intent_"):
+                        targets[ck] = float(v)
+                pvar = self._canonical_motor_intent_key(
+                    str(getattr(primary, "var_id", ""))
+                )
+                if pvar.startswith("intent_"):
+                    targets[pvar] = float(getattr(primary, "target_val", 0.5))
+            ctx = getattr(ic, "_last_context", None)
+            if ctx is not None:
+                for k, v in (getattr(ctx, "intent_residuals", None) or {}).items():
+                    ck = self._canonical_motor_intent_key(k)
+                    if ck.startswith("intent_"):
+                        targets[ck] = float(np.clip(0.5 + float(v), 0.06, 0.94))
+
+        tb = getattr(self, "_task_binding", None)
+        ht = tb.active_task if tb is not None else None
+        if ht is not None and getattr(ht, "expected_state", None):
+            for k, v in ht.expected_state.items():
+                ck = self._canonical_motor_intent_key(k)
+                if ck.startswith("intent_"):
+                    targets[ck] = float(v)
+
+        if targets:
+            arb.register_from_dict("human_task", targets)
+
+        s2 = getattr(self, "_system2", None)
+        plan = getattr(s2, "_last_wm_plan", None) if s2 is not None else None
+        if isinstance(plan, dict):
+            var = self._canonical_motor_intent_key(str(plan.get("var", "")))
+            if var.startswith("intent_"):
+                arb.register_from_dict(
+                    "s2_wm",
+                    {var: float(plan.get("val", 0.5))},
+                )
+
     def _sync_temporal_blankets_to_graph(self) -> None:
         """Rebuild TemporalBlankets when |graph nodes| changes (inner_voice, concepts, neurogenesis)."""
         from engine.graph_perf import is_large_graph, temporal_rebuild_min_interval
@@ -79,6 +150,8 @@ class SimulationTickMixin:
 
     def _maybe_post_release_stabilize_intents(self) -> None:
         """После снятия fixed_root — в окне stabilize_until усилить recover/support (плавный decay)."""
+        if self._motor_substrate_suppressed():
+            return
         if not is_humanoid_topology(self.current_world) or self._fixed_root_active:
             return
         if not getattr(self, "_curriculum_auto_fr_released", False):
@@ -119,6 +192,8 @@ class SimulationTickMixin:
 
     def _apply_hardcoded_reflexes(self, is_fallen: bool) -> None:
         """Apply genome-based spinal reflexes: fast reactive balance corrections."""
+        if self._motor_substrate_suppressed():
+            return
         base = self._unwrap_base_env(self.agent.env)
         fn = getattr(base, "apply_motor_intent_residuals", None)
         if not callable(fn) or getattr(base, "_intero_control_lost", False):
@@ -208,14 +283,17 @@ class SimulationTickMixin:
         targets = walk_intents_at_tick(self.tick)
         residuals = compute_walk_residuals(ms, self.tick)
         fn = getattr(base, "apply_motor_intent_residuals", None)
-        if callable(fn) and residuals:
+        arb = getattr(self, "_motor_arbiter", None)
+        suppress = arb is not None and arb.should_suppress_substrate()
+        if callable(fn) and residuals and not suppress:
             try:
                 fn(residuals)
             except Exception:
                 pass
-        arb = getattr(self, "_motor_arbiter", None)
         if arb is not None:
             arb.register_from_dict("genome", dict(targets), precision=0.42)
+        if suppress:
+            return
         for k, v in targets.items():
             if k in self.agent.graph.nodes:
                 self.agent.graph.nodes[k] = float(
@@ -777,7 +855,16 @@ class SimulationTickMixin:
         # ``is_fallen()`` here — duplicate calls would double-advance debounce streak.
         fallen_pre = bool(fallen)
         if is_humanoid_topology(self.current_world):
-            getattr(self, "_motor_arbiter", None) and self._motor_arbiter.begin_tick()
+            arb_ht = getattr(self, "_motor_arbiter", None)
+            if arb_ht is not None:
+                arb_ht.begin_tick()
+                arb_ht.set_human_task_active(self._human_task_motor_active())
+            try:
+                from engine.neuro_symbolic.motor_sync import feed_distance_to_human
+
+                feed_distance_to_human(self)
+            except Exception:
+                pass
             try:
                 self._tick_intention_pre_system2(fallen=bool(fallen_for_s2))
             except Exception as _ic_ex:
@@ -803,6 +890,15 @@ class SimulationTickMixin:
                     "grounded_language tick failed at tick %s: %s",
                     self.tick,
                     _gl_ex,
+                    exc_info=True,
+                )
+            try:
+                self._tick_human_task(fallen=bool(fallen_for_s2))
+            except Exception as _ht_ex:
+                logging.getLogger(__name__).warning(
+                    "human_task tick failed at tick %s: %s",
+                    self.tick,
+                    _ht_ex,
                     exc_info=True,
                 )
             try:
@@ -1117,6 +1213,7 @@ class SimulationTickMixin:
                 not self._fixed_root_active
                 and not fallen
                 and _obs_for_d_e
+                and not self._motor_substrate_suppressed()
             ):
                 from engine.hierarchical_active_inference import run_hierarchical_pe_tick
 
@@ -1129,6 +1226,7 @@ class SimulationTickMixin:
                 self._hai_pe_ema = 0.0
         arb = getattr(self, "_motor_arbiter", None)
         if arb is not None and is_humanoid_topology(self.current_world):
+            self._register_task_executive_motor_intents()
             arb.finalize(self)
         sg_obs = getattr(self, "_scene_graph", None)
         if sg_obs is not None and is_humanoid_topology(self.current_world):

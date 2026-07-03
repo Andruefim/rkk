@@ -21,6 +21,7 @@ from engine.goal_planning import (
     planning_graph_motor_vars,
     subsample_actions,
 )
+from engine.grounded_language import command_tag_for_text
 from engine.symbolic_verifier import symbolic_verifier_enabled, verify_normalized_prediction
 from engine.system2.schema import EpisodeSuccessSpec
 from engine.system2.success_predicates import (
@@ -58,24 +59,34 @@ def s2_wm_recover_max_branch() -> int:
         return 16
 
 
-def s2_wm_max_graph_d() -> int:
+def s2_wm_max_graph_d(*, human_task: bool = False) -> int:
     """Skip heavy WM beam when concept/S2 nodes inflate graph (avoids tick freeze)."""
+    default = "128" if human_task else "96"
     try:
-        return max(48, int(os.environ.get("RKK_S2_WM_MAX_GRAPH_D", "80")))
+        return max(48, int(os.environ.get("RKK_S2_WM_MAX_GRAPH_D", default)))
     except ValueError:
-        return 80
+        return int(default)
 
 
 def s2_wm_gate_strict() -> bool:
     """При активной задаче S2 — только WM-кандидат (без EIG / CEM / legacy goal_plan)."""
     if not s2_wm_planner_enabled():
         return False
-    return os.environ.get("RKK_S2_WM_GATE_STRICT", "0").strip().lower() in (
+    if os.environ.get("RKK_S2_WM_GATE_STRICT", "").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
-    )
+    ):
+        return True
+    try:
+        from engine.task_binding import task_binding_enabled
+
+        if task_binding_enabled():
+            return True
+    except ImportError:
+        pass
+    return False
 
 
 def _env_float(key: str, default: str) -> float:
@@ -146,6 +157,8 @@ class S2WmTask:
 
     @property
     def active(self) -> bool:
+        if self.skill_id == "human_command" and self.expected_state:
+            return True
         m = str(self.macro or "").strip().upper()
         if m == "IDLE" and not self.fallen_override:
             return False
@@ -165,6 +178,16 @@ class S2WmTask:
 def task_from_planning_context(ctx: dict[str, Any] | None, graph_nodes: dict[str, float]) -> S2WmTask:
     ctx = ctx or {}
     macro = str(ctx.get("macro") or "IDLE").strip().upper()
+    human_active = bool(ctx.get("human_task_active"))
+    human_text = str(ctx.get("human_task_text") or "")
+    if human_active:
+        tag = command_tag_for_text(human_text)
+        if tag == "recover":
+            macro = "RECOVER_POSTURE"
+        elif tag == "locomote":
+            macro = "LOCOMOTE_DELIVERY"
+        else:
+            macro = "EXPLORE"
     if ctx.get("fallen_override_active"):
         macro = "RECOVER_POSTURE"
     es_raw = ctx.get("expected_state")
@@ -174,13 +197,16 @@ def task_from_planning_context(ctx: dict[str, Any] | None, graph_nodes: dict[str
         mx_f = float(mx) if mx is not None else None
     except (TypeError, ValueError):
         mx_f = None
+    skill = str(ctx["skill_id"]) if ctx.get("skill_id") else None
+    if human_active and not skill:
+        skill = "human_command"
     return S2WmTask(
         macro=macro,
         fallen=bool(ctx.get("fallen", False)),
         fallen_override=bool(ctx.get("fallen_override_active", False)),
         expected_state=es,
         max_prediction_error=mx_f,
-        skill_id=str(ctx["skill_id"]) if ctx.get("skill_id") else None,
+        skill_id=skill,
         goal_target_dist=float(
             ctx.get("goal_target_dist")
             if ctx.get("goal_target_dist") is not None
@@ -288,9 +314,18 @@ def score_wm_trajectory(
         score += 0.5 * w_post * (ps1 - ps0)
         if "stride" in action_var:
             score += 0.35 * (action_val - 0.45)
-    elif m == "EXPLORE":
+    elif m == "EXPLORE" or task.skill_id == "human_command":
         score += 0.6 * w_td * (td0 - td1)
         score += 0.3 * (ps1 - ps0)
+        # Slot/visual keys in expected_state (human command goals)
+        if task.expected_state:
+            for k, tgt in task.expected_state.items():
+                if not str(k).startswith("slot_"):
+                    continue
+                c0 = _obs_f(state0, k)
+                c1 = _obs_f(state_end, k)
+                score += 0.45 * (1.0 - abs(float(tgt) - c1))
+                score += 0.2 * (c1 - c0) * float(np.sign(float(tgt) - c0))
     else:
         score += 0.5 * (td0 - td1)
 
@@ -371,6 +406,7 @@ def plan_s2_wm_candidate(
         min_steps = 12
     state0 = dict(agent.graph.nodes)
     task = task_from_planning_context(planning_context, state0)
+    human_task = bool((planning_context or {}).get("human_task_active"))
     if not task.active:
         return None
 
@@ -419,12 +455,19 @@ def plan_s2_wm_candidate(
         }
 
     if getattr(agent, "_notears_steps", 0) < min_steps:
-        if task.fallen_override or task.macro == "RECOVER_POSTURE":
+        if (
+            task.fallen_override
+            or task.macro == "RECOVER_POSTURE"
+            or human_task
+            or task.skill_id == "human_command"
+        ):
             return _bundle_fallback()
         return None
 
     graph_d = int(getattr(agent.graph, "_d", 0) or 0)
-    if graph_d > s2_wm_max_graph_d():
+    max_graph_d = s2_wm_max_graph_d(human_task=human_task)
+    fast_beam = human_task and graph_d > max_graph_d
+    if graph_d > max_graph_d and not fast_beam:
         fb_d = _bundle_fallback()
         if fb_d is not None:
             return fb_d
@@ -442,12 +485,19 @@ def plan_s2_wm_candidate(
     max_b = max(6, int(max_b * beam_scale))
     if graph_d > 64:
         max_b = min(max_b, max(6, int(max_b * 64 / graph_d)))
+    if fast_beam:
+        max_b = min(max_b, max(8, int(os.environ.get("RKK_S2_WM_HUMAN_FAST_BRANCH", "12"))))
     if task.fallen_override or (task.fallen and task.macro == "RECOVER_POSTURE"):
         max_b = min(max_b, s2_wm_recover_max_branch())
     if len(actions) > max_b:
         actions = subsample_actions(actions, max_b)
 
     depth = plan_depth()
+    if fast_beam:
+        try:
+            depth = max(2, min(depth, int(os.environ.get("RKK_S2_WM_HUMAN_FAST_DEPTH", "3"))))
+        except ValueError:
+            depth = min(depth, 3)
     if task.fallen_override or (task.fallen and task.macro == "RECOVER_POSTURE"):
         try:
             depth = max(2, min(depth, int(os.environ.get("RKK_S2_WM_RECOVER_PLAN_DEPTH", "4"))))

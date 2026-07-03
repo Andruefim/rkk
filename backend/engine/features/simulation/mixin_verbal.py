@@ -39,62 +39,92 @@ class SimulationVerbalMixin:
 
     def _hook_grounded_verbal_decoder(self) -> None:
         """OBSERVE text → grounded_language (nomic + Qwen), not CausalSpeechDecoder GRU."""
-        if getattr(self, "_grounded_verbal_hooked", False):
-            return
         if not _VERBAL_AVAILABLE or self._verbal is None:
             return
         try:
-            from engine.grounded_language import grounded_language_enabled
+            from engine.grounded_language import (
+                grounded_language_enabled,
+                state_phrase_for_speech,
+            )
         except ImportError:
             return
         if not grounded_language_enabled():
             return
 
         verbal = self._verbal
-        original = verbal.decoder.decode_observe
+        from engine.verbal_action import SpeechDecoder
+
+        base_decode = SpeechDecoder().decode_observe
 
         def grounded_decode(concepts, obs, curiosity):
             try:
                 self._ensure_grounded_language()
                 o = dict(obs) if obs else {}
                 gl = getattr(self, "_grounded_lang", None)
+                env = getattr(getattr(self, "agent", None), "env", None)
+                fallen_flag: bool | None = None
+                try:
+                    base_env = getattr(env, "base_env", env) if env is not None else None
+                    if base_env is not None and callable(getattr(base_env, "is_fallen", None)):
+                        fallen_flag = bool(base_env.is_fallen())
+                except Exception:
+                    fallen_flag = None
+                human_task = ""
+                tb = getattr(self, "_task_binding", None)
+                ht = tb.active_task if tb is not None else None
+                if ht is not None and getattr(ht, "status", "") == "active":
+                    human_task = str(getattr(ht, "text", "") or "")
                 if gl is not None and hasattr(self, "agent"):
-                    gl.sync_speak_vector_from_state(self.agent.graph, o)
+                    gl.sync_speak_vector_from_state(
+                        self.agent.graph,
+                        o,
+                        fallen=fallen_flag,
+                        env=env,
+                        human_task_text=human_task,
+                    )
                 text = self.grounded_lang_generate(o)
                 if text and len(text.strip()) >= 3:
-                    return text.strip()
+                    t = text.strip()
+                    if (
+                        t.rstrip(".") == "Я упал"
+                        and fallen_flag is False
+                        and gl is not None
+                    ):
+                        phrase = state_phrase_for_speech(
+                            o, fallen=False, env=env, human_task_text=human_task
+                        )
+                        gl.sync_speak_vector_from_state(
+                            self.agent.graph,
+                            o,
+                            fallen=False,
+                            env=env,
+                            human_task_text=human_task,
+                        )
+                        text = gl.generate_utterance(self.agent.graph, o)
+                        if text and len(text.strip()) >= 3:
+                            return text.strip()
+                        return phrase
+                    return t
             except Exception:
                 pass
-            return original(concepts, obs, curiosity)
+            return base_decode(concepts, obs, curiosity)
 
         verbal.decoder.decode_observe = grounded_decode  # type: ignore[method-assign]
-        self._grounded_verbal_hooked = True
 
     def _schedule_verbal_tick(self, fallen: bool) -> None:
-        """Run async verbal tick in a daemon thread (agent thread has no asyncio loop)."""
+        """Run verbal tick synchronously on the simulation tick thread."""
         if not _VERBAL_AVAILABLE or self._verbal is None:
             return
         if not is_humanoid_topology(self.current_world) or self._inner_voice is None:
             return
         if not speech_enabled():
             return
-        if self._verbal_tick_running:
-            return
+        try:
+            self._tick_verbal(int(self.tick), fallen)
+        except Exception as e:
+            print(f"[Verbal] tick error: {e}")
 
-        tick_now = int(self.tick)
-
-        def run() -> None:
-            self._verbal_tick_running = True
-            try:
-                asyncio.run(self._tick_verbal(tick_now, fallen))
-            except Exception as e:
-                print(f"[Verbal] tick error: {e}")
-            finally:
-                self._verbal_tick_running = False
-
-        threading.Thread(target=run, daemon=True, name="rkk-verbal-tick").start()
-
-    async def _tick_verbal(self, tick: int, fallen: bool) -> None:
+    def _tick_verbal(self, tick: int, fallen: bool) -> None:
         if not _VERBAL_AVAILABLE or self._verbal is None:
             return
         if not is_humanoid_topology(self.current_world) or self._inner_voice is None:
@@ -130,7 +160,7 @@ class SimulationVerbalMixin:
                 f"{fall_history_brief} | intention: {intention_brief}".strip(" |")
             )
 
-        msg = await self._verbal.tick(
+        msg = self._verbal.tick_sync(
             tick=tick,
             obs=obs,
             inner_voice_ctrl=self._inner_voice,

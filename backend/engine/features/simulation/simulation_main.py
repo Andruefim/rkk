@@ -30,6 +30,7 @@ Phase C (full RSI):
 from __future__ import annotations
 
 from engine.core.world import is_humanoid_topology
+from engine.embodiment_bridge import wrap_embodiment
 
 import os
 import queue
@@ -115,6 +116,9 @@ class Simulation(
         print(f"[Singleton v2] Device: {self.device} | World: {start_world}")
 
         env = _make_env(start_world, self.device)
+        self.embodiment_bridge = (
+            wrap_embodiment(env) if is_humanoid_topology(start_world) else None
+        )
         bounds = default_bounds()
 
         self.agent = RKKAgent(
@@ -369,6 +373,12 @@ class Simulation(
                     f"[Genome] Innate bootstrap failed: {type(e).__name__}: {e}",
                     flush=True,
                 )
+
+        if is_humanoid_topology(self.current_world):
+            try:
+                self._maybe_auto_enable_visual()
+            except Exception as e:
+                print(f"[Simulation] Auto visual error: {type(e).__name__}: {e}", flush=True)
 
         # ── Variable Registry: dynamic ontology ──────────────────────────────
         try:

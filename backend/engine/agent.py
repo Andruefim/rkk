@@ -39,7 +39,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 import torch
 import numpy as np
 from collections import deque
@@ -56,6 +56,9 @@ from engine.value_layer  import (
     efference_predicted_veto,
 )
 from engine.environment_humanoid import SELF_VARS
+
+if TYPE_CHECKING:
+    from engine.core.world import EmbodiedEnv
 
 
 @dataclass
@@ -481,7 +484,7 @@ class RKKAgent:
         self,
         agent_id: int,
         name:     str,
-        env:      Environment,
+        env:      Environment | EmbodiedEnv,
         device:   torch.device,
         bounds:   HomeostaticBounds | None = None,
     ):
@@ -2329,6 +2332,12 @@ class RKKAgent:
                 fe = int(os.environ.get("RKK_WM_TRAIN_EVERY_FALLEN", "0"))
             except ValueError:
                 fe = 0
+            s2_ctx = getattr(self, "_s2_planning_context", None) or {}
+            if fe <= 0 and s2_ctx.get("human_task_active"):
+                try:
+                    fe = int(os.environ.get("RKK_WM_TRAIN_EVERY_FALLEN_HUMAN", "48"))
+                except ValueError:
+                    fe = 48
             if fe > 0:
                 _train_due = int(engine_tick) > 0 and int(engine_tick) % fe == 0
             else:

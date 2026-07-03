@@ -66,18 +66,45 @@ def expected_state_key_allowlist() -> frozenset[str]:
         if inv.startswith("intent_"):
             suf = inv[len("intent_") :]
             s.add(f"phys_intent_{suf}")
+    # Language + visual task keys (human commands / slot goals)
+    for i in range(32):
+        s.add(f"slot_{i}")
+        s.add(f"sensory_audio_semantic_{i}")
+        s.add(f"intent_speak_{i}")
+    s.add("self_goal_active")
+    s.add("self_goal_target_dist")
     return frozenset(s)
 
 
-def filter_expected_state_raw(raw: dict[str, Any] | None) -> dict[str, float]:
-    """Оставить только ключи из ``expected_state_key_allowlist()`` с числовыми значениями."""
+def _dynamic_task_key(sk: str) -> bool:
+    """Observe keys allowed for human-task expected_state beyond static allowlist."""
+    if sk.startswith("slot_"):
+        return True
+    if sk.startswith("sensory_audio_semantic_"):
+        return True
+    if sk.startswith("intent_speak_"):
+        return True
+    return False
+
+
+def filter_expected_state_raw(
+    raw: dict[str, Any] | None,
+    *,
+    obs_keys: list[str] | None = None,
+) -> dict[str, float]:
+    """Оставить только ключи из allowlist (+ dynamic slot/language keys from obs)."""
     if not raw or not isinstance(raw, dict):
         return {}
-    allow = expected_state_key_allowlist()
+    allow = set(expected_state_key_allowlist())
+    if obs_keys:
+        for k in obs_keys:
+            sk = str(k).strip()
+            if _dynamic_task_key(sk):
+                allow.add(sk)
     out: dict[str, float] = {}
     for k, v in raw.items():
         sk = str(k).strip()
-        if sk not in allow:
+        if sk not in allow and not _dynamic_task_key(sk):
             continue
         try:
             out[sk] = float(v)

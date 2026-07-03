@@ -33,7 +33,11 @@ export default function NovaChatWidget() {
   };
 
   const addAgentMsg = useCallback((data) => {
-    if (data.type === "REPORT") return;
+    const isHumanTask =
+      data.type === "REPORT" &&
+      Array.isArray(data.concepts) &&
+      data.concepts.includes("HUMAN_TASK");
+    if (data.type === "REPORT" && !isHumanTask) return;
 
     const isAsk = data.type === "ASK";
     if (isAsk) {
@@ -70,7 +74,11 @@ export default function NovaChatWidget() {
       setPendingAsk(false);
       if (!rows?.length) return;
       rows.forEach((m) => {
-        if (m.type === "REPORT") return;
+        const isHumanTask =
+          m.type === "REPORT" &&
+          Array.isArray(m.concepts) &&
+          m.concepts.includes("HUMAN_TASK");
+        if (m.type === "REPORT" && !isHumanTask) return;
         addAgentMsg(m);
         if (m.human_replied && m.human_reply) addHumanMsg(m.human_reply);
       });

@@ -3,10 +3,14 @@ Fast-path motor prior sync: NS / intention → graph.nodes + env._motor_state (e
 """
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
 import numpy as np
+
+# Exo / third-person camera — proxy for human observer position (see pybullet_humanoid).
+_EXO_CAMERA_POS = (2.2, -2.2, 1.6)
 
 
 def _ef(key: str, default: float) -> float:
@@ -23,6 +27,108 @@ def _canonical_intent_key(k: str) -> str:
     if sk.startswith("intent_"):
         return sk
     return sk
+
+
+def _clip_dist_norm(v: float) -> float:
+    return float(np.clip(float(v), 0.0, 1.0))
+
+
+def _human_slot_distance(sim: Any) -> float | None:
+    """If a vision slot is labeled human/person, map activation → proximity."""
+    if not getattr(sim, "_visual_mode", False):
+        return None
+    vis_env = getattr(sim, "_visual_env", None)
+    if vis_env is None:
+        return None
+    slots = getattr(vis_env, "_last_slots", None)
+    lex = getattr(vis_env, "_slot_lexicon", None) or {}
+    if slots is None or not lex:
+        return None
+    try:
+        vals = slots.detach().cpu().numpy()
+    except Exception:
+        return None
+    n = min(len(vals), int(getattr(vis_env, "n_slots", len(vals))))
+    for k in range(n):
+        meta = lex.get(f"slot_{k}") or {}
+        label = str(meta.get("label") or "").lower()
+        if any(tok in label for tok in ("human", "person", "operator", "viewer")):
+            act = float(vals[k])
+            return _clip_dist_norm(1.0 - act * 0.85)
+    return None
+
+
+def _exo_camera_distance_m(sim: Any) -> float | None:
+    tick_phys = getattr(sim, "_tick_phys_state", None)
+    if not callable(tick_phys):
+        return None
+    try:
+        st = tick_phys()
+    except Exception:
+        return None
+    if not isinstance(st, dict):
+        return None
+    try:
+        cx = float(st.get("com_x", 0.0))
+        cy = float(st.get("com_y", 0.0))
+        cz = float(st.get("com_z", 0.75))
+    except (TypeError, ValueError):
+        return None
+    ex, ey, ez = _EXO_CAMERA_POS
+    return float(math.hypot(cx - ex, cy - ey, cz - ez))
+
+
+def resolve_distance_to_human(sim: Any) -> float | None:
+    """
+    Normalized distance to human observer: 0=contact, 1=far.
+    Returns None when no sensor/scene data is available (caller uses stub).
+    """
+    ov = getattr(sim, "_distance_to_human_override", None)
+    if ov is not None:
+        try:
+            return _clip_dist_norm(float(ov))
+        except (TypeError, ValueError):
+            pass
+
+    for src_fn in (
+        getattr(sim, "_graph_vec_cached", None),
+        getattr(sim, "_env_observe_cached", None),
+    ):
+        if not callable(src_fn):
+            continue
+        try:
+            obs = dict(src_fn() or {})
+        except Exception:
+            continue
+        for key in ("distance_to_human", "phys_distance_to_human"):
+            if key in obs:
+                try:
+                    return _clip_dist_norm(float(obs[key]))
+                except (TypeError, ValueError):
+                    pass
+
+    slot_dist = _human_slot_distance(sim)
+    if slot_dist is not None:
+        return slot_dist
+
+    dist_m = _exo_camera_distance_m(sim)
+    if dist_m is not None:
+        max_m = max(0.5, _ef("RKK_HUMAN_DIST_MAX_M", 4.0))
+        return _clip_dist_norm(dist_m / max_m)
+
+    return None
+
+
+def feed_distance_to_human(sim: Any) -> float | None:
+    """Resolve live distance and push into NS engine + sim cache."""
+    dist = resolve_distance_to_human(sim)
+    if dist is None:
+        return None
+    sim._distance_to_human = dist
+    ns_eng = getattr(sim, "_ns_engine", None)
+    if ns_eng is not None:
+        ns_eng.set_distance_to_human(dist)
+    return dist
 
 
 def locomote_macro_active(sim: Any) -> bool:
@@ -234,19 +340,23 @@ def apply_motor_targets(
 
 def sync_ns_motor_every_tick(sim: Any) -> dict[str, float]:
     """Called before CPG each tick."""
-    dist_stub = 1.0
     ns_eng = getattr(sim, "_ns_engine", None)
-    if ns_eng is not None:
-        dist_stub = float(getattr(ns_eng, "_human_distance_stub", 1.0))
+    dist_h = resolve_distance_to_human(sim)
+    if dist_h is None:
+        dist_h = 1.0
+        if ns_eng is not None:
+            dist_h = float(getattr(ns_eng, "_human_distance_stub", 1.0))
     agent = sim.agent
     nodes = agent.graph.nodes
-    nodes["distance_to_human"] = dist_stub
-    nodes["phys_distance_to_human"] = dist_stub
+    nodes["distance_to_human"] = dist_h
+    nodes["phys_distance_to_human"] = dist_h
+    if ns_eng is not None:
+        ns_eng.set_distance_to_human(dist_h)
     bridge = getattr(sim, "_ns_bridge", None)
     if bridge is not None:
-        bridge.knowledge_graph.set_runtime_fact("distance_to_human", dist_stub)
+        bridge.knowledge_graph.set_runtime_fact("distance_to_human", dist_h)
         obs = dict(getattr(sim, "_graph_vec_cached", lambda: {})() or {})
-        obs["distance_to_human"] = dist_stub
+        obs["distance_to_human"] = dist_h
         bridge.perceive(obs, nodes)
 
     w_meta = getattr(sim, "_w_meta", None) or getattr(agent, "_w_meta", None)
@@ -258,7 +368,7 @@ def sync_ns_motor_every_tick(sim: Any) -> dict[str, float]:
             pass
 
     if ns_eng is not None:
-        veto = ns_eng.check_human_proximity({"distance_to_human": dist_stub})
+        veto = ns_eng.check_human_proximity({"distance_to_human": dist_h})
         if not veto.allowed:
             base = getattr(agent.env, "base_env", None) or agent.env
             ms = getattr(base, "_motor_state", None)
@@ -269,11 +379,24 @@ def sync_ns_motor_every_tick(sim: Any) -> dict[str, float]:
             for k in list(nodes.keys()):
                 if str(k).startswith("intent_"):
                     nodes[k] = 0.5
-            return {"safety_veto": 1.0, "distance_to_human": dist_stub}
+            return {"safety_veto": 1.0, "distance_to_human": dist_h}
 
     targets = collect_motor_targets(sim)
-    applied = apply_motor_targets(sim, targets) if targets else {}
-    if locomote_macro_active(sim):
+    ns_ctx = getattr(sim, "_ns_last_ctx", None) or {}
+    arb = getattr(sim, "_motor_arbiter", None)
+    suppress = arb is not None and arb.should_suppress_substrate()
+    applied: dict[str, float] = {}
+    if targets and not suppress:
+        applied = apply_motor_targets(sim, targets)
+    elif targets and arb is not None:
+        canon_targets: dict[str, float] = {}
+        for k, v in targets.items():
+            ck = _canonical_intent_key(k)
+            if ck.startswith("intent_"):
+                canon_targets[ck] = float(v)
+        if canon_targets:
+            arb.register_from_dict("ns_bridge", canon_targets)
+    if locomote_macro_active(sim) and not suppress:
         applied.update(enforce_sticky_locomote_priors(sim))
         try:
             from engine.locomote_gait import clamp_locomote_gait_intents
@@ -282,7 +405,6 @@ def sync_ns_motor_every_tick(sim: Any) -> dict[str, float]:
         except Exception:
             pass
 
-    arb = getattr(sim, "_motor_arbiter", None)
     if arb is not None:
         priors = dict((ns_ctx or {}).get("motor_priors") or {})
         if not priors and applied:

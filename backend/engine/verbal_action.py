@@ -16,9 +16,9 @@ Reward структура:
   Спам (>3 сообщений за 100 тиков)   → -0.05 / сообщение
 
 Генерация речи:
-  При RKK_NEURAL_LANG=1 основной путь — NeuralLanguageGrounding (engine.neural_lang_integration).
-  Ниже — короткие fallback-строки для cold start / отключённой нейросети.
-  LLM для ASK — при RKK_SPEECH_LLM_ASK=1.
+  При RKK_GROUNDED_LANG=1 — grounded_language (nomic-embed + Ollama Qwen) в чате.
+  При RKK_NEURAL_LANG=1 без grounded — NeuralLanguageGrounding (GRU fallback).
+  LLM для ASK — при RKK_SPEECH_LLM_ASK=1 (выкл. когда grounded владеет чатом).
 
 RKK_SPEECH_ENABLED=1
 RKK_SPEECH_LANG=ru            — ru | en
@@ -30,7 +30,6 @@ RKK_SPEECH_SPAM_MAX=3         — max сообщений в окне
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 from collections import deque
@@ -39,6 +38,16 @@ from enum import Enum, auto
 from typing import Any, Callable
 
 import numpy as np
+
+
+def ollama_chat_speech_enabled() -> bool:
+    """Chat UI: grounded graph → Ollama Qwen (not raw GRU token soup)."""
+    try:
+        from engine.grounded_language import grounded_language_enabled
+
+        return grounded_language_enabled()
+    except ImportError:
+        return False
 
 
 def speech_enabled() -> bool:
@@ -170,7 +179,7 @@ class SpeechDecoder:
             return "Какой шаг безопаснее?" if ru else "What stride is safer?"
         return "Что делать дальше?" if ru else "What should I do next?"
 
-    async def decode_ask_llm(
+    def decode_ask_llm(
         self,
         concepts: list[str],
         obs: dict[str, float],
@@ -217,11 +226,11 @@ Question:"""
 
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(url, json=payload)
+
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.post(url, json=payload)
                 if resp.status_code == 200:
                     raw = (resp.json().get("response") or "").strip()
-                    # Clean up: remove quotes, extra punctuation
                     raw = raw.strip('"\'').split("\n")[0].strip()
                     if raw and len(raw) > 3:
                         return raw
@@ -241,8 +250,8 @@ class VerbalActionController:
     Интеграция в simulation.py:
       self._verbal = VerbalActionController()
 
-    В тик-цикле:
-      msg = await self._verbal.tick(tick, obs, inner_voice, fallen, sim)
+    В тик-цикле (main thread):
+      msg = self._verbal.tick_sync(tick, obs, inner_voice, fallen, sim)
       if msg:
           self._broadcast_agent_message(msg)
           self._add_event(f"🗣 {msg.text}", "#88ffcc", "speech")
@@ -302,17 +311,23 @@ class VerbalActionController:
         if self._is_spam(tick):
             return None
 
-        # OBSERVE on fall event
+        # OBSERVE on fall event (only when env confirms fallen)
         if fallen and (tick - self._last_observe_tick) > 20:
             return SpeechType.OBSERVE
 
-        # ASK when curiosity is high
+        # ASK when curiosity is high (off when chat uses grounded Ollama OBSERVE only)
         if (
-            curiosity >= self._ask_curiosity_threshold
+            not ollama_chat_speech_enabled()
+            and curiosity >= self._ask_curiosity_threshold
             and (tick - self._last_ask_tick) > 300
             and not fallen
         ):
             return SpeechType.ASK
+
+        if ollama_chat_speech_enabled():
+            if (tick - self._last_observe_tick) >= self._observe_every:
+                return SpeechType.OBSERVE
+            return None
 
         _neural_ui = os.environ.get("RKK_NEURAL_LANG", "1").strip().lower() not in (
             "0",
@@ -325,7 +340,6 @@ class VerbalActionController:
         except ImportError:
             _gl_on = lambda: False  # noqa: E731
         if _gl_on() or _neural_ui:
-            # REPORT milestones — templates / not grounded Qwen speech
             if (tick - self._last_observe_tick) >= self._observe_every:
                 return SpeechType.OBSERVE
             return None
@@ -345,7 +359,7 @@ class VerbalActionController:
 
         return None
 
-    async def tick(
+    def tick_sync(
         self,
         tick: int,
         obs: dict[str, float],
@@ -357,7 +371,8 @@ class VerbalActionController:
         fall_history_brief: str = "",
     ) -> AgentMessage | None:
         """
-        Main tick. Returns AgentMessage if agent speaks, else None.
+        Main tick (synchronous — safe on simulation tick thread).
+        Returns AgentMessage if agent speaks, else None.
         """
         if not speech_enabled():
             return None
@@ -395,7 +410,7 @@ class VerbalActionController:
 
         # Generate text
         concept_names = [n for n, _ in concepts]
-        text = await self._generate_text(
+        text = self._generate_text(
             speech_type, concept_names, concepts, obs, curiosity,
             stable_ticks, total_falls, fall_history_brief, llm_url, llm_model,
         )
@@ -442,7 +457,30 @@ class VerbalActionController:
 
         return msg
 
-    async def _generate_text(
+    def tick(
+        self,
+        tick: int,
+        obs: dict[str, float],
+        inner_voice_ctrl,
+        fallen: bool,
+        total_falls: int,
+        llm_url: str = "",
+        llm_model: str = "",
+        fall_history_brief: str = "",
+    ) -> AgentMessage | None:
+        """Backward-compatible alias for tick_sync."""
+        return self.tick_sync(
+            tick,
+            obs,
+            inner_voice_ctrl,
+            fallen,
+            total_falls,
+            llm_url=llm_url,
+            llm_model=llm_model,
+            fall_history_brief=fall_history_brief,
+        )
+
+    def _generate_text(
         self,
         speech_type: SpeechType,
         concept_names: list[str],
@@ -459,6 +497,8 @@ class VerbalActionController:
             return self.decoder.decode_observe(concept_names, obs, curiosity)
 
         elif speech_type == SpeechType.REPORT:
+            if ollama_chat_speech_enabled():
+                return self.decoder.decode_observe(concept_names, obs, curiosity)
             falls_since = total_falls - self._last_fall_count_reported
             if stable_ticks > 100:
                 return self.decoder.decode_report("STABLE_WALK", ticks=stable_ticks)
@@ -469,7 +509,7 @@ class VerbalActionController:
 
         elif speech_type == SpeechType.ASK:
             if self._use_llm_ask and llm_url:
-                return await self.decoder.decode_ask_llm(
+                return self.decoder.decode_ask_llm(
                     concept_names, obs, fall_history_brief, llm_url, llm_model
                 )
             return self.decoder.decode_ask_template(concept_names)

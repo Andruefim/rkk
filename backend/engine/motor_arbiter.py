@@ -27,6 +27,10 @@ INTENT_FIELDS = (
 )
 
 DEFAULT_SOURCE_PRECISION: dict[str, float] = {
+    "human_task": 0.90,
+    "s2_wm": 0.90,
+    "intention_cortex": 0.72,
+    "grounded_language": 0.68,
     "ns_bridge": 0.92,
     "gait": 0.85,
     "hai": 0.58,
@@ -35,7 +39,43 @@ DEFAULT_SOURCE_PRECISION: dict[str, float] = {
     "skill": 0.48,
     "cpg": 0.40,
     "residual": 0.50,
+    "reflex": 0.35,
 }
+
+# Higher tier wins when human task is active (executive priority ladder).
+SOURCE_TIER: dict[str, int] = {
+    "human_task": 50,
+    "s2_wm": 50,
+    "intention_cortex": 40,
+    "curriculum": 35,
+    "skill": 32,
+    "grounded_language": 30,
+    "ns_bridge": 28,
+    "cpg": 20,
+    "gait": 20,
+    "hai": 20,
+    "residual": 20,
+    "genome": 10,
+    "reflex": 10,
+}
+
+
+def source_tier(source: str) -> int:
+    return int(SOURCE_TIER.get(str(source or ""), 25))
+
+
+def tier_precision_multiplier(tier: int, *, human_task_active: bool) -> float:
+    if not human_task_active:
+        return 1.0
+    if tier >= 50:
+        return 3.5
+    if tier >= 40:
+        return 2.5
+    if tier >= 30:
+        return 1.4
+    if tier >= 20:
+        return 0.10
+    return 0.06
 
 
 def motor_arbiter_enabled() -> bool:
@@ -134,15 +174,19 @@ def arbitrate(
     *,
     macro: str = "",
     current: dict[str, float] | None = None,
+    human_task_active: bool = False,
 ) -> tuple[dict[str, float], int]:
     """
     Precision-weighted merge per field; hard clamps applied last for LOCOMOTE.
+    When human_task_active, tier ladder boosts task/S2/intention over CPG/reflex.
     Returns (merged intents, conflict count).
     """
     current = dict(current or {})
     buckets: dict[str, list[tuple[float, float]]] = {}
     for mi in intents:
+        tier = source_tier(mi.source)
         prec = float(np.clip(mi.precision, 0.05, 1.0))
+        prec *= tier_precision_multiplier(tier, human_task_active=human_task_active)
         for k, v in mi.as_field_map().items():
             buckets.setdefault(k, []).append((float(v), prec))
 
@@ -162,7 +206,7 @@ def arbitrate(
 
     macro_u = str(macro or "").strip().upper()
     locomote = macro_u in ("LOCOMOTE_DELIVERY", "EXPLORE")
-    if locomote:
+    if locomote and not human_task_active:
         c_max = _ef("RKK_NS_LOCOMOTE_COUPLING", 0.78)
         c_min = _ef("RKK_NS_LOCOMOTE_COUPLING_MIN", 0.72)
         if "intent_gait_coupling" in merged or "intent_gait_coupling" in current:
@@ -201,6 +245,17 @@ class MotorArbiter:
     def __init__(self) -> None:
         self._intents: list[MotorIntent] = []
         self._last_diag: dict[str, Any] = {}
+        self._human_task_active = False
+
+    def set_human_task_active(self, active: bool) -> None:
+        self._human_task_active = bool(active)
+
+    def human_task_active(self) -> bool:
+        return self._human_task_active
+
+    def should_suppress_substrate(self) -> bool:
+        """When human task is active, defer CPG/reflex direct motor injections."""
+        return self._human_task_active and motor_arbiter_enabled()
 
     def begin_tick(self) -> None:
         self._intents.clear()
@@ -245,12 +300,18 @@ class MotorArbiter:
             ic = getattr(sim, "_intention_state", None)
             macro = str(getattr(ic, "macro_hint", "") or "")
 
-        merged, conflicts = arbitrate(self._intents, macro=macro, current=dict(ms))
+        merged, conflicts = arbitrate(
+            self._intents,
+            macro=macro,
+            current=dict(ms),
+            human_task_active=self._human_task_active,
+        )
         if not merged:
             self._last_diag = {
                 "intents_registered": len(self._intents),
                 "coupling_final": round(float(ms.get("intent_gait_coupling", 0.5)), 4),
                 "arbiter_conflicts": 0,
+                "human_task_active": self._human_task_active,
             }
             return {}
 
@@ -273,6 +334,7 @@ class MotorArbiter:
             "stride_final": round(float(merged.get("intent_stride", ms.get("intent_stride", 0.5))), 4),
             "arbiter_conflicts": int(conflicts),
             "sources": [mi.source for mi in self._intents],
+            "human_task_active": self._human_task_active,
         }
         return merged
 

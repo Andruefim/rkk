@@ -77,9 +77,12 @@ def test_generate_goal_fallen_picks_max_eig_recovery():
     env = MagicMock()
     env.observe.return_value = {"posture_stability": 0.15}
 
-    def _eig(_g, _obs, action):
-        var = action[0][0]
-        return 0.9 if "torso_forward" in var else 0.1
+    def _eig(_g, _obs, action, return_best=False):
+        # find torso_forward candidate
+        for var, val in action:
+            if "torso_forward" in var:
+                return 0.9, var, val
+        return 0.1, action[0][0], action[0][1]
 
     with patch("engine.hypothesis_testing.eig_for_action", side_effect=_eig):
         goal = gi.generate_goal(

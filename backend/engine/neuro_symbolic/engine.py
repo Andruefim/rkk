@@ -76,6 +76,7 @@ class SymbolicCognitiveEngine:
             ),
         ]
         self._human_distance_stub: float = 1.0
+        self._human_distance_live: float | None = None
         self._last_veto = VetoResult(allowed=True)
         self._veto_count = 0
 
@@ -118,9 +119,12 @@ class SymbolicCognitiveEngine:
             )
         return VetoResult(allowed=True)
 
-    def set_distance_to_human(self, distance_norm: float) -> None:
-        """Stub sensor: 0=contact, 1=far. Used until vision/proximity wired."""
-        self._human_distance_stub = float(np.clip(distance_norm, 0.0, 1.0))
+    def set_distance_to_human(self, distance_norm: float, *, live: bool = True) -> None:
+        """0=contact, 1=far. Live sensor feed or API injection."""
+        v = float(np.clip(distance_norm, 0.0, 1.0))
+        self._human_distance_stub = v
+        if live:
+            self._human_distance_live = v
 
     def check_human_proximity(
         self,
@@ -128,7 +132,9 @@ class SymbolicCognitiveEngine:
         *,
         fuzzy_state: ProbabilisticState | None = None,
     ) -> VetoResult:
-        dist = self._human_distance_stub
+        dist = self._human_distance_live
+        if dist is None:
+            dist = self._human_distance_stub
         if obs is not None:
             if "distance_to_human" in obs:
                 dist = float(obs["distance_to_human"])

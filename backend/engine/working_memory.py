@@ -35,6 +35,18 @@ def _wm_default_ttl() -> int:
         return 2400
 
 
+def _wm_human_ttl() -> int:
+    try:
+        return max(_wm_default_ttl(), int(os.environ.get("RKK_WM_HUMAN_TTL_TICKS", "12000")))
+    except ValueError:
+        return 12000
+
+
+def _is_human_task_key(key: str) -> bool:
+    k = str(key)
+    return k.startswith("human_task_") or k.startswith("goal_human")
+
+
 @dataclass
 class WmSlot:
     key: str
@@ -69,7 +81,10 @@ class WorkingMemoryBuffer:
         k = str(key).strip()
         if not k:
             return
-        ttl = int(ttl_ticks if ttl_ticks is not None else _wm_default_ttl())
+        if ttl_ticks is None and _is_human_task_key(k):
+            ttl = _wm_human_ttl()
+        else:
+            ttl = int(ttl_ticks if ttl_ticks is not None else _wm_default_ttl())
         self._slots[k] = WmSlot(
             key=k,
             value=float(value),
@@ -82,8 +97,15 @@ class WorkingMemoryBuffer:
             self._order.remove(k)
         self._order.append(k)
         while len(self._order) > self._capacity:
-            old = self._order.pop(0)
-            self._slots.pop(old, None)
+            evict = next(
+                (ek for ek in self._order if not _is_human_task_key(ek)),
+                None,
+            )
+            if evict is None:
+                evict = self._order.pop(0)
+            else:
+                self._order.remove(evict)
+            self._slots.pop(evict, None)
 
     def read(self, key: str, default: float = 0.5) -> float:
         slot = self._slots.get(str(key))
@@ -105,7 +127,7 @@ class WorkingMemoryBuffer:
             s = self._slots.get(k)
             if s is None or not s.alive(tick):
                 continue
-            if k.startswith("goal_") or k == "active_macro":
+            if k.startswith("goal_") or k in ("active_macro", "human_task_active"):
                 if s.text:
                     out.append(s.text)
                 else:

@@ -13,8 +13,10 @@ RKK_GROUNDED_LANG_ALIGN_EVERY=400   — teacher-forcing alignment step
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -58,7 +60,162 @@ _BOOTSTRAP_PHRASES: tuple[tuple[str, str], ...] = (
     ("Help me", "help"),
     ("Стабилен", "stable"),
     ("Иду вперёд", "locomote"),
+    ("Теряю равновесие", "unstable"),
+    ("Losing balance", "unstable"),
 )
+
+_TAG_PHRASE_RU: dict[str, str] = {
+    "recover": "Встань, ты упал",
+    "fallen": "Я упал",
+    "locomote": "Иду вперёд",
+    "turn": "Повернись",
+    "help": "Помоги мне",
+    "stable": "Стабилен",
+    "unstable": "Теряю равновесие",
+}
+
+# Longer phrases first — «встань» before bare «упал».
+_TEXT_TAG_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("get up", "recover"),
+    ("встань", "recover"),
+    ("stand up", "recover"),
+    ("step forward", "locomote"),
+    ("иди впер", "locomote"),
+    ("иди", "locomote"),
+    ("вперёд", "locomote"),
+    ("вперед", "locomote"),
+    ("walk", "locomote"),
+    ("forward", "locomote"),
+    ("turn around", "turn"),
+    ("повернись", "turn"),
+    ("help me", "help"),
+    ("помоги", "help"),
+    ("losing balance", "unstable"),
+    ("теряю равновесие", "unstable"),
+    ("i fell", "fallen"),
+    ("упал", "fallen"),
+    ("fell", "fallen"),
+    ("стабилен", "stable"),
+    ("stable", "stable"),
+)
+
+
+def command_tag_for_text(
+    text: str,
+    *,
+    embed: np.ndarray | None = None,
+    store: SemanticVectorStore | None = None,
+) -> str:
+    """Semantic tag for a human command (keyword fallback + optional embed store)."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    for needle, tag in _TEXT_TAG_KEYWORDS:
+        if needle in low:
+            return tag
+    if embed is not None and store is not None and len(store) > 0:
+        hits = store.nearest(embed, top_k=1)
+        if hits and hits[0][2] > 0.55:
+            return str(hits[0][1])
+    return ""
+
+
+def motor_interventions_for_command(
+    text: str,
+    *,
+    embed: np.ndarray | None = None,
+    store: SemanticVectorStore | None = None,
+) -> dict[str, float]:
+    """Map command text → intent_* do() values for counterfactual imagination."""
+    tag = command_tag_for_text(text, embed=embed, store=store)
+    return GroundedLanguageController._motor_patch_for_tag(tag)
+
+
+def phrase_for_human_task(
+    human_task_text: str,
+    *,
+    embed: np.ndarray | None = None,
+    store: SemanticVectorStore | None = None,
+) -> str:
+    """Grounded speech label for an active human command (not a hardcoded locomote)."""
+    tag = command_tag_for_text(human_task_text, embed=embed, store=store)
+    if tag and tag in _TAG_PHRASE_RU:
+        return _TAG_PHRASE_RU[tag]
+    t = str(human_task_text or "").strip()
+    return t[:48] if t else "Стабилен"
+
+
+def _obs_f(obs: dict[str, float], key: str, default: float = 0.5) -> float:
+    v = obs.get(key, obs.get(f"phys_{key}", default))
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _resolve_humanoid_env(env: Any | None) -> Any | None:
+    if env is None:
+        return None
+    base = getattr(env, "base_env", None)
+    if base is not None and hasattr(base, "observe"):
+        return base
+    if hasattr(env, "observe"):
+        return env
+    return None
+
+
+def _normalized_fallen_com_z_threshold(env: Any | None) -> float:
+    """Match ``Environment._fallen_z_below_threshold`` in normalized com_z space."""
+    h = _resolve_humanoid_env(env)
+    if h is None:
+        return 0.28
+    try:
+        from engine.features.humanoid.environment import effective_fallen_z_m
+
+        if hasattr(h, "_norm"):
+            return float(h._norm("com_z", float(effective_fallen_z_m())))
+    except Exception:
+        pass
+    return 0.28
+
+
+def state_phrase_for_speech(
+    obs: dict[str, float],
+    *,
+    fallen: bool | None = None,
+    env: Any | None = None,
+    human_task_text: str = "",
+) -> str:
+    """
+    Embodied speech label — uses ``is_fallen()`` when available, not loose posture heuristics.
+    Walking lowers posture_stability; that must not map to «Я упал».
+    """
+    if human_task_text.strip():
+        return phrase_for_human_task(human_task_text)
+
+    h = _resolve_humanoid_env(env)
+    if fallen is None and h is not None:
+        is_fn = getattr(h, "is_fallen", None)
+        if callable(is_fn):
+            fallen = bool(is_fn())
+    fallen = bool(fallen)
+
+    cz = _obs_f(obs, "com_z")
+    ps = _obs_f(obs, "posture_stability")
+    fallen_th = _normalized_fallen_com_z_threshold(h)
+
+    if fallen or cz < fallen_th:
+        return "Я упал"
+
+    stride = _obs_f(obs, "intent_stride", 0.5)
+    if ps >= 0.38 and cz >= fallen_th + 0.06:
+        if stride > 0.52:
+            return "Иду вперёд"
+        return "Стабилен"
+    if ps < 0.32 and cz < fallen_th + 0.12:
+        return "Теряю равновесие"
+    return "Стабилен"
 
 
 def grounded_language_enabled() -> bool:
@@ -137,6 +294,37 @@ class SemanticVectorStore:
         return len(self._entries)
 
 
+def _tokenize_for_fallback(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9]+", text.lower()) if t]
+
+
+class FallbackEmbeddingClient:
+    """Deterministic bag-of-words + hash features when Ollama is unavailable."""
+
+    def __init__(self, *, embed_dim: int | None = None) -> None:
+        self.embed_dim = embed_dim or language_embed_dim()
+
+    def embed(self, text: str) -> np.ndarray | None:
+        text = str(text or "").strip()
+        if not text:
+            return None
+        dim = self.embed_dim
+        vec = np.zeros(dim, dtype=np.float32)
+        tokens = _tokenize_for_fallback(text)
+        if not tokens:
+            tokens = [text.lower()]
+        for tok in tokens:
+            digest = hashlib.sha256(tok.encode("utf-8")).digest()
+            bucket = int.from_bytes(digest[:4], "little") % dim
+            vec[bucket] += 1.0
+        phrase_digest = hashlib.sha256(text.encode("utf-8")).digest()
+        for i in range(min(8, dim)):
+            off = (i * 4) % max(1, len(phrase_digest) - 3)
+            vec[i] += int.from_bytes(phrase_digest[off : off + 2], "little") / 65535.0
+        n = float(np.linalg.norm(vec)) + 1e-9
+        return vec / n
+
+
 class OllamaEmbeddingClient:
     """Sync Ollama /api/embeddings → numpy vector (truncated to embed_dim)."""
 
@@ -144,11 +332,10 @@ class OllamaEmbeddingClient:
         self.embed_dim = embed_dim or language_embed_dim()
         self._raw_dim: int | None = None
         self._lock = threading.Lock()
+        self._fallback = FallbackEmbeddingClient(embed_dim=self.embed_dim)
+        self._ollama_ok: bool | None = None
 
-    def embed(self, text: str) -> np.ndarray | None:
-        text = str(text or "").strip()
-        if not text:
-            return None
+    def _embed_ollama(self, text: str) -> np.ndarray | None:
         url = get_ollama_embeddings_url()
         model = get_ollama_embed_model()
         payload = {"model": model, "prompt": text}
@@ -175,6 +362,18 @@ class OllamaEmbeddingClient:
             return out / n
         except Exception:
             return None
+
+    def embed(self, text: str) -> np.ndarray | None:
+        text = str(text or "").strip()
+        if not text:
+            return None
+        if self._ollama_ok is not False:
+            emb = self._embed_ollama(text)
+            if emb is not None:
+                self._ollama_ok = True
+                return emb
+            self._ollama_ok = False
+        return self._fallback.embed(text)
 
 
 class OllamaSpeechDecoder:
@@ -309,11 +508,18 @@ class GroundedLanguageController:
         if callable(fn) and weights:
             fn(weights)
 
-    def ingest_command(self, graph: Any, text: str) -> dict[str, Any]:
+    def ingest_command(
+        self,
+        graph: Any,
+        text: str,
+        *,
+        apply_motor_patch: bool = True,
+    ) -> dict[str, Any]:
         """
         Direction 1 (hearing): text → embedding → sensory graph nodes.
         """
         self.ensure_graph_nodes(graph)
+        obs_before = {nid: float(graph.nodes.get(nid, 0.5)) for nid in graph.nodes}
         emb_np = self.embedder.embed(text)
         if emb_np is None:
             return {"ok": False, "error": "embed_failed", "text": text}
@@ -324,21 +530,25 @@ class GroundedLanguageController:
         sensory = sensory_node_ids(self.n_channels)
         for i, nid in enumerate(sensory):
             graph.nodes[nid] = float(channels[i].item())
+        record_fn = getattr(graph, "record_language_interventions", None)
+        if callable(record_fn):
+            record_fn(obs_before, dict(graph.nodes))
         self._apply_attention_to_motor(graph)
-        # Tag-based motor nudge from nearest bootstrap phrase
         hits = self.store.nearest(emb_np, top_k=1)
         tag = hits[0][1] if hits else ""
-        motor_patch = self._motor_patch_for_tag(tag)
-        for k, v in motor_patch.items():
-            if k in graph.nodes:
-                cur = float(graph.nodes[k])
-                graph.nodes[k] = float(np.clip(0.65 * cur + 0.35 * v, 0.05, 0.95))
+        if apply_motor_patch:
+            motor_patch = self._motor_patch_for_tag(tag)
+            for k, v in motor_patch.items():
+                if k in graph.nodes:
+                    cur = float(graph.nodes[k])
+                    graph.nodes[k] = float(np.clip(0.65 * cur + 0.35 * v, 0.05, 0.95))
         return {
             "ok": True,
             "text": text,
             "tag": tag,
             "channels": [round(float(channels[i]), 4) for i in range(self.n_channels)],
             "nearest": hits[0][0] if hits else "",
+            "motor_patch": apply_motor_patch,
         }
 
     @staticmethod
@@ -357,12 +567,23 @@ class GroundedLanguageController:
             return {"intent_stop_recover": 0.55}
         return {}
 
-    def sync_speak_vector_from_state(self, graph: Any, obs: dict[str, float]) -> None:
+    def sync_speak_vector_from_state(
+        self,
+        graph: Any,
+        obs: dict[str, float],
+        *,
+        fallen: bool | None = None,
+        env: Any | None = None,
+        human_task_text: str = "",
+    ) -> None:
         """Write intent_speak_* from physical state (inverse grounding for output path)."""
         self.ensure_graph_nodes(graph)
-        cz = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
-        ps = float(obs.get("posture_stability", obs.get("phys_posture_stability", 0.5)))
-        phrase = "Я упал" if cz < 0.38 or ps < 0.35 else "Стабилен"
+        phrase = state_phrase_for_speech(
+            obs,
+            fallen=fallen,
+            env=env,
+            human_task_text=human_task_text,
+        )
         emb = self.embedder.embed(phrase)
         if emb is None:
             return
@@ -392,18 +613,18 @@ class GroundedLanguageController:
         self._last_output_text = text
         return text
 
-    def alignment_step(self, graph: Any, obs: dict[str, float]) -> float | None:
+    def alignment_step(
+        self,
+        graph: Any,
+        obs: dict[str, float],
+        *,
+        fallen: bool | None = None,
+        env: Any | None = None,
+    ) -> float | None:
         """
         Phase 3: teacher forcing — physical state ↔ phrase embedding alignment.
         """
-        cz = float(obs.get("com_z", obs.get("phys_com_z", 0.5)))
-        ps = float(obs.get("posture_stability", obs.get("phys_posture_stability", 0.5)))
-        if cz < 0.38 or ps < 0.35:
-            target_phrase = "Я упал"
-        elif ps > 0.72:
-            target_phrase = "Стабилен"
-        else:
-            target_phrase = "Иду вперёд"
+        target_phrase = state_phrase_for_speech(obs, fallen=fallen, env=env)
         emb_np = self.embedder.embed(target_phrase)
         if emb_np is None:
             return None
@@ -445,3 +666,8 @@ class GroundedLanguageController:
             "embed_model": get_ollama_embed_model(),
             "speech_model": get_ollama_speech_model(),
         }
+
+
+def motor_intents_from_tag(tag: str) -> dict[str, float]:
+    """Motor intent node targets for MotorArbiter / WM from a phrase tag."""
+    return dict(GroundedLanguageController._motor_patch_for_tag(tag))

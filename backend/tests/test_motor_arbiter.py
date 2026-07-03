@@ -47,3 +47,31 @@ def test_support_leg_from_intent() -> None:
 
     assert get_support_leg_signal({"intent_support_left": 0.62, "intent_support_right": 0.38}) == "left"
     assert get_support_leg_signal({"intent_support_left": 0.5, "intent_support_right": 0.5}) == "balanced"
+
+
+def test_arbitrate_human_task_priority_over_cpg() -> None:
+    intents = [
+        MotorIntent(source="cpg", precision=0.95, stride=0.82, coupling=0.88),
+        MotorIntent(source="reflex", precision=0.90, stride=0.78),
+        MotorIntent(source="human_task", precision=0.88, stride=0.42, coupling=0.52),
+    ]
+    merged, conflicts = arbitrate(intents, human_task_active=True, current={})
+    assert merged["intent_stride"] < 0.55
+    assert merged["intent_gait_coupling"] < 0.65
+    assert conflicts >= 1
+
+
+def test_arbitrate_s2_wm_over_intention_cortex() -> None:
+    intents = [
+        MotorIntent(source="intention_cortex", precision=0.72, torso_forward=0.70),
+        MotorIntent(source="s2_wm", precision=0.90, torso_forward=0.48),
+    ]
+    merged, _ = arbitrate(intents, human_task_active=True, current={})
+    assert merged["intent_torso_forward"] < 0.58
+
+
+def test_motor_arbiter_human_task_mode() -> None:
+    arb = MotorArbiter()
+    arb.set_human_task_active(True)
+    assert arb.human_task_active()
+    assert arb.should_suppress_substrate()

@@ -19,6 +19,7 @@ import numpy as np
 
 from engine.curriculum_graph import CurriculumGraph, curriculum_graph_enabled
 from engine.goal_generator import GoalCandidate, GoalGenerator, goal_gen_enabled
+from engine.grounded_language import command_tag_for_text, motor_interventions_for_command
 from engine.locomote_gate import stable_locomote_ready
 from engine.meta_causal import WMetaEnsemble, build_meta_observation, meta_causal_enabled
 
@@ -179,6 +180,76 @@ class IntentionCortex:
         self._seeded_curriculum = True
         return n
 
+    def absorb_human_task(
+        self,
+        task: Any,
+        obs: dict[str, float],
+        tick: int,
+    ) -> None:
+        """
+        Human chat command → intention stack + expected_state for S2/WM PE planning.
+        No keyword routing: goal vector comes from task_binding imagination.
+        """
+        if task is None or not getattr(task, "expected_state", None):
+            return
+        expected = dict(task.expected_state)
+        task_text = str(getattr(task, "text", ""))
+        motor = motor_interventions_for_command(task_text)
+        tag = command_tag_for_text(task_text)
+        self._last_context.expected_state = expected
+        self._last_context.narrative = f"human: {task_text[:96]}"
+        if tag == "recover":
+            self._last_context.macro_hint = "RECOVER_POSTURE"
+        else:
+            self._last_context.macro_hint = "EXPLORE"
+        self._last_context.horizon_ticks = max(
+            self._last_context.horizon_ticks,
+            _ei("RKK_TASK_DEADLINE_TICKS", 2400),
+        )
+
+        best_k = ""
+        best_delta = 0.0
+        motor_keys = set(motor.keys())
+        for k, tgt in expected.items():
+            cur = float(obs.get(k, obs.get(f"phys_{k}", 0.5)))
+            d = abs(float(tgt) - cur)
+            if motor_keys and k not in motor_keys and not str(k).startswith(
+                ("posture", "com_", "target", "slot_")
+            ):
+                continue
+            if d > best_delta:
+                best_delta = d
+                best_k = str(k)
+
+        if not best_k and motor:
+            best_k = next(iter(motor))
+        if not best_k and expected:
+            best_k = next(iter(expected))
+        if not best_k:
+            best_k = "target_dist"
+
+        sub = SubGoal(
+            subgoal_id=f"human_{int(tick)}",
+            var_id=best_k,
+            target_val=float(expected.get(best_k, 0.5)),
+            intent_targets=dict(motor),
+            world_id="humanoid",
+            tick_start=int(tick),
+            tick_deadline=int(getattr(task, "tick_deadline", tick + 2400)),
+            min_ticks=_ei("RKK_INTENTION_SUBGOAL_TICKS", 400) // 4,
+            source="human_command",
+            priority=0.92,
+            status="active",
+        )
+        self._stack = [s for s in self._stack if s.source != "human_command"]
+        self._stack.insert(0, sub)
+        line = f"[human] {getattr(task, 'text', '')[:72]}"
+        self._narrative_lines.append(line)
+        if len(self._narrative_lines) > _ei("RKK_INTENTION_NARRATIVE_CAP", 32):
+            self._narrative_lines = self._narrative_lines[
+                -_ei("RKK_INTENTION_NARRATIVE_CAP", 32) :
+            ]
+
     def tick_pre_control(
         self,
         sim: Any,
@@ -203,6 +274,14 @@ class IntentionCortex:
 
         self._maybe_rebuild_stack(sim, tick, world_id)
         self._advance_stack_if_done(agent, obs, tick)
+
+        tb = getattr(sim, "_task_binding", None)
+        ht = tb.active_task if tb is not None else None
+        if ht is not None and ht.expected_state:
+            self._last_context.expected_state = dict(ht.expected_state)
+            self._last_context.macro_hint = "EXPLORE" if not fallen else self._last_context.macro_hint
+            if getattr(ht, "text", ""):
+                self._last_context.narrative = f"human: {str(ht.text)[:96]}"
 
         primary = self._stack[0] if self._stack else None
         if primary is not None and (
@@ -873,25 +952,23 @@ class IntentionCortex:
                 continue
             ck = canonical_motor_intent_variable(sk)
             residuals[ck] = residuals.get(ck, 0.0) + float(dv) * motor_gain
-        if residuals:
-            try:
-                fn(residuals)
-            except Exception:
-                pass
-        nodes = agent.graph.nodes
-        sync = _ef("RKK_INTENTION_MOTOR_GRAPH_SYNC", 0.55)
-        for k, target in targets.items():
-            if k not in nodes:
-                continue
-            cur = float(nodes[k])
-            nodes[k] = float(np.clip(cur + sync * (target - cur), 0.05, 0.95))
-        if sim is not None:
-            arb = getattr(sim, "_motor_arbiter", None)
-            if arb is not None:
-                src = "curriculum"
-                if primary is not None:
-                    src = str(getattr(primary, "source", "curriculum") or "curriculum")
-                arb.register_from_dict(src, targets, precision=0.32)
+        arb = getattr(sim, "_motor_arbiter", None) if sim is not None else None
+        suppress = arb is not None and arb.should_suppress_substrate()
+        if not suppress:
+            if residuals:
+                try:
+                    fn(residuals)
+                except Exception:
+                    pass
+            nodes = agent.graph.nodes
+            sync = _ef("RKK_INTENTION_MOTOR_GRAPH_SYNC", 0.55)
+            for k, target in targets.items():
+                if k not in nodes:
+                    continue
+                cur = float(nodes[k])
+                nodes[k] = float(np.clip(cur + sync * (target - cur), 0.05, 0.95))
+        if arb is not None:
+            arb.register_from_dict("intention_cortex", targets)
 
     def _project_hierarchical(self, sim: Any, primary: SubGoal | None, tick: int) -> None:
         if primary is None:

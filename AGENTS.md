@@ -37,6 +37,13 @@ RKK is a two-part AGI simulation platform: a **Python backend** (FastAPI + PyBul
 - **Fallen fast-path** (`agent.step(fallen=True)`): stale score cache, VL horizon 0, skip CEM/goal-plan, ensemble/temporal/traj updates.
 - **Bench**: `python scratch/bench_tick_hz.py` (sync inner tick; reports median Hz and tick≥650).
 
+### AGI humanoid loop (opt-in)
+
+These change boot behavior and the human-command path; keep at `0` unless you need the full AGI chat loop:
+
+- **`RKK_TASK_BINDING=1`**: human chat → counterfactual WM goal → PE verify → REPORT (requires `RKK_GROUNDED_LANG=1`).
+- **`RKK_AUTO_VISUAL=1`**: auto `enable_visual()` on humanoid sim init. With `0`, visual cortex can still turn on via `RKK_VISUAL_GROUNDING=1` or `POST /api/visual/enable`.
+
 ### Key gotchas
 
 - `pybullet` requires `build-essential`, `cmake`, and `python3-dev` system packages to compile from source. These must be installed before `pip install -r backend/requirements.txt`.

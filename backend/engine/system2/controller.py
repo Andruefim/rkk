@@ -96,11 +96,48 @@ _MACRO_MEMBER_CANDIDATES: dict[str, tuple[str, ...]] = {
 
 
 def system2_enabled() -> bool:
-    return os.environ.get("RKK_SYSTEM2", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
+    return os.environ.get("RKK_SYSTEM2", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def ensure_sim_system2(sim: Any) -> System2Controller | None:
+    """Lazy-init System2 on sim (e.g. human command before first tick)."""
+    if not system2_enabled():
+        return None
+    s2 = getattr(sim, "_system2", None)
+    if s2 is None:
+        s2 = System2Controller()
+        sim._system2 = s2
+        s2._rkk_sim = sim
+    return s2
+
+
+def write_human_command_wm(sim: Any, text: str, tick: int) -> None:
+    """Persist human-command slots in S2 WM (creates controller if needed)."""
+    if not working_memory_enabled():
+        return
+    s2 = ensure_sim_system2(sim)
+    if s2 is None:
+        return
+    snippet = str(text or "")[:120]
+    wm = s2.working_memory
+    wm.write(
+        "human_task_active",
+        1.0,
+        text=snippet,
+        tick=int(tick),
+        source="human_command",
+    )
+    wm.write(
+        "human_task_pe",
+        1.0,
+        text=snippet[:80],
+        tick=int(tick),
+        source="human_command",
     )
 
 
@@ -347,6 +384,32 @@ class System2Controller:
     def working_memory(self) -> WorkingMemoryBuffer:
         return self._wm
 
+    def _sync_human_task_wm_from_sim(self, sim: Any | None, sim_tick: int) -> None:
+        """Backfill WM human-command slots when task binding active before lazy S2 tick."""
+        if not working_memory_enabled() or sim is None:
+            return
+        tb = getattr(sim, "_task_binding", None)
+        ht = tb.active_task if tb is not None else None
+        if ht is None:
+            return
+        if self._wm.has("human_task_active"):
+            return
+        snippet = str(getattr(ht, "text", "") or "")[:120]
+        self._wm.write(
+            "human_task_active",
+            1.0,
+            text=snippet,
+            tick=int(sim_tick),
+            source="task_binding_backfill",
+        )
+        self._wm.write(
+            "human_task_pe",
+            1.0,
+            text=snippet[:80],
+            tick=int(sim_tick),
+            source="task_binding_backfill",
+        )
+
     def note_wm_plan(
         self,
         var: str,
@@ -534,10 +597,28 @@ class System2Controller:
                 goal_td = float(
                     getattr(primary, "target_val", 0.42)
                 )
+
+        human_task_active = False
+        human_task_text = ""
+        max_pe_out = spec.max_prediction_error
+        if sim is not None and not self._s2_override_active:
+            tb = getattr(sim, "_task_binding", None)
+            ht = tb.active_task if tb is not None else None
+            if ht is not None and ht.expected_state:
+                expected.update(dict(ht.expected_state))
+                human_task_active = True
+                human_task_text = str(ht.text or "")[:120]
+                if not fallen:
+                    macro = "EXPLORE"
+                if ht.max_prediction_error is not None:
+                    max_pe_out = ht.max_prediction_error
+
         return {
             "macro": macro,
             "fallen": bool(fallen),
             "fallen_override_active": bool(self._s2_override_active),
+            "human_task_active": human_task_active,
+            "human_task_text": human_task_text,
             "intention_narrative": (
                 str(getattr(intent_ctx, "narrative", "")) if intent_ctx else ""
             ),
@@ -554,8 +635,8 @@ class System2Controller:
             ),
             "motor_owner": self._motor_owner_for_tick(int(sim_tick)),
             "expected_state": expected,
-            "max_prediction_error": spec.max_prediction_error,
-            "skill_id": spec.skill_id,
+            "max_prediction_error": max_pe_out,
+            "skill_id": spec.skill_id if not human_task_active else "human_command",
             "bundle_candidate": bundle.get("candidate"),
             "recovery_schedule_candidate": sched_cand,
             "wm_override_schedule_only": bool(
@@ -1767,6 +1848,8 @@ class System2Controller:
         if not system2_enabled():
             self._last_diag = {"enabled": False}
             return self._last_diag
+
+        self._sync_human_task_wm_from_sim(sim, sim_tick)
 
         base = resolve_humanoid_base(agent.env)
         if base is None:

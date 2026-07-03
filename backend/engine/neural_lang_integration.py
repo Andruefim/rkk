@@ -17,6 +17,15 @@ import numpy as np
 import torch
 
 
+def _grounded_lang_on() -> bool:
+    try:
+        from engine.grounded_language import grounded_language_enabled
+
+        return grounded_language_enabled()
+    except ImportError:
+        return False
+
+
 def _neural_lang_available() -> bool:
     try:
         from engine.neural_causal_language import NeuralLanguageGrounding  # noqa: F401
@@ -51,10 +60,11 @@ def apply_neural_lang_patch(sim) -> bool:
     sim._neural_lang = nlg
     print(f"[NeuralLang] NeuralLanguageGrounding initialized on {device}")
 
-    # Speech UI: grounded_language.py (Qwen + nomic) via mixin_verbal — not GRU decode_observe.
-    # _patch_verbal_action(sim, nlg)
+    # Chat speech: grounded_language (Qwen + nomic) via mixin_verbal — not GRU decode_observe.
+    if not _grounded_lang_on():
+        _patch_verbal_action(sim, nlg)
 
-    # Slot concepts + spatial memory still use neural grounding.
+    # Slot concepts + spatial memory
     _patch_slot_labeler(sim, nlg)
 
     # Добавляем перехват on_agent_step (через monkey-patch метода тика)

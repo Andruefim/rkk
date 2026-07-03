@@ -297,10 +297,16 @@ class CausalGraph:
         self._snapshot_vec_cache: dict[str, float] | None = None
 
     @staticmethod
+    def is_language_sensory_node(node_id: str) -> bool:
+        return str(node_id).startswith("sensory_audio_semantic_")
+
+    @staticmethod
     def infer_node_kind(node_id: str) -> str:
         """Molecular tag: sensor (exogenous), motor (intent_*), else latent."""
         if node_id.startswith("intent_"):
             return "motor"
+        if CausalGraph.is_language_sensory_node(node_id):
+            return "sensor"
         if node_id.startswith("slot_") or node_id.startswith("phys_"):
             return "sensor"
         exogenous = {"com_x", "com_y", "com_z", "foot_contact_l", "foot_contact_r"}
@@ -1293,6 +1299,26 @@ class CausalGraph:
         if len(self._int_buffer) > self.BUFFER_SIZE:
             self._int_buffer = self._int_buffer[-self.BUFFER_SIZE:]
 
+    def record_language_interventions(
+        self,
+        obs_before: dict,
+        obs_after: dict,
+    ) -> int:
+        """Record sensory_audio_semantic_* changes for WM train_step."""
+        n = 0
+        for nid in self._node_ids:
+            if not self.is_language_sensory_node(nid):
+                continue
+            before = float(obs_before.get(nid, 0.5))
+            after = float(obs_after.get(nid, 0.5))
+            if abs(after - before) < 1e-4:
+                continue
+            self.record_intervention(
+                nid, after, obs_before, obs_after, source="grounded_language"
+            )
+            n += 1
+        return n
+
     def train_step(self) -> dict[str, float] | None:
         """
         World model training step.
@@ -1477,7 +1503,7 @@ class CausalGraph:
         # BUGFIX: WM needs to know what the agent did. Inject motor intent variables as actions.
         A_seq = torch.zeros(B, T, d, dtype=torch.float32, device=self.device)
         for i, nid in enumerate(self._node_ids):
-            if nid.startswith("intent_"):
+            if nid.startswith("intent_") or self.is_language_sensory_node(nid):
                 A_seq[:, :, i] = X_seq[:, :, i]
 
         self._optim.zero_grad()

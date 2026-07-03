@@ -194,6 +194,21 @@ class EnvironmentHumanoid:
         lo, hi = _RANGES.get(key, (-1.0, 1.0))
         return float(val * (hi - lo) + lo)
 
+    # ── EmbodiedEnv (observe / step / reset) ─────────────────────────────────
+    def step(self, action: dict[str, float]) -> dict[str, float]:
+        """Apply normalized action variables, advance physics, return observation."""
+        if not action:
+            self._sim.step(self.steps_per_do)
+            self._update_interoception()
+            return self.observe()
+        pairs = [(str(k), float(v)) for k, v in action.items()]
+        return self.intervene_burst(pairs, count_intervention=False)
+
+    def reset(self) -> dict[str, float]:
+        self.reset_stance()
+        self.n_interventions = 0
+        return self.observe()
+
     # ── Observe ───────────────────────────────────────────────────────────────
     def observe(self) -> dict[str, float]:
         raw = self._sim.get_state()

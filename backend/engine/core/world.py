@@ -2,11 +2,36 @@
 from __future__ import annotations
 
 import os
+from typing import Protocol, runtime_checkable
 
 import torch
 
 from engine.agent import RKKAgent
 from engine.value_layer import HomeostaticBounds
+
+
+@runtime_checkable
+class EmbodiedEnv(Protocol):
+    """
+    Minimal observation/action contract for embodied agents (sim or hardware).
+
+    Implementations: PyBullet humanoid, fallback humanoid, future ROS drivers.
+    ``is_fallen`` is optional — use :func:`embodied_is_fallen`.
+    """
+
+    preset: str
+
+    def observe(self) -> dict[str, float]: ...
+
+    def step(self, action: dict[str, float]) -> dict[str, float]: ...
+
+    def reset(self) -> dict[str, float]: ...
+
+
+def embodied_is_fallen(env: EmbodiedEnv) -> bool:
+    """True when env exposes ``is_fallen()`` and reports fallen; else False."""
+    fn = getattr(env, "is_fallen", None)
+    return bool(fn()) if callable(fn) else False
 
 
 def resolve_torch_device(requested: str | None = None) -> torch.device:
