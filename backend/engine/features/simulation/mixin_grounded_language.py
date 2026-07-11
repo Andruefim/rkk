@@ -12,9 +12,12 @@ from engine.grounded_language import (
     grounded_language_enabled,
     motor_intents_from_tag,
 )
+from engine.goal_navigation import navigation_intents
 from engine.manipulation_verify import ManipulationEpisode, verify_manipulation
 from engine.object_resolver import ResolvedObject, resolve_manipulation_target
 from engine.task_binding import TaskBindingController, task_binding_enabled
+from engine.task_goal import TaskGoal
+from engine.task_logger import summarize_expected_state, task_log_event
 from engine.task_tree import TERMINAL_STATUSES, TaskTreeController, task_tree_enabled
 
 
@@ -39,6 +42,16 @@ def _manip_push_force() -> float:
         return 38.0
 
 
+def _nav_arrival_streak_needed() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_NAV_ARRIVAL_STREAK", "3")))
+    except ValueError:
+        return 3
+
+
+_KINDS_NEEDING_TARGET = frozenset({"reduce_distance", "contact", "displace"})
+
+
 class SimulationGroundedLanguageMixin:
     def _ensure_task_binding(self) -> TaskBindingController:
         tb = getattr(self, "_task_binding", None)
@@ -53,6 +66,327 @@ class SimulationGroundedLanguageMixin:
             tt = TaskTreeController()
             self._task_tree_ctrl = tt
         return tt
+
+    def _task_log_reset_session(self, tick: int) -> None:
+        self._task_log_session_start_tick = int(tick)
+        self._task_log_fall_count = 0
+        self._task_log_last_stage_id = None
+        self._task_log_prev_fallen = False
+        self._task_log_finished_logged = False
+
+    def _task_log_cancel_if_active(self, tick: int, *, reason: str = "preempted") -> None:
+        if getattr(self, "_task_log_finished_logged", False):
+            return
+        if getattr(self, "_task_log_session_start_tick", None) is None:
+            return
+        tt = getattr(self, "_task_tree_ctrl", None)
+        tb = getattr(self, "_task_binding", None)
+        tree_active = tt is not None and tt.is_active
+        bind_active = tb is not None and tb.active_task is not None
+        if tree_active or bind_active:
+            self._task_log_finished(
+                tick,
+                status="cancelled",
+                reason=reason,
+            )
+
+    def _task_log_finished(
+        self,
+        tick: int,
+        *,
+        status: str,
+        reason: str = "",
+        final_pe: float | None = None,
+    ) -> None:
+        if getattr(self, "_task_log_finished_logged", False):
+            return
+        self._task_log_finished_logged = True
+        start = int(getattr(self, "_task_log_session_start_tick", tick) or tick)
+        tb = getattr(self, "_task_binding", None)
+        task = tb.active_task if tb is not None else None
+        if task is None and tb is not None:
+            task = getattr(tb, "_active", None)
+        if final_pe is None and task is not None:
+            try:
+                final_pe = float(getattr(task, "last_pe", None))
+            except (TypeError, ValueError):
+                final_pe = None
+        task_log_event(
+            "task_finished",
+            tick=int(tick),
+            status=str(status),
+            reason=str(reason or "")[:200],
+            duration_ticks=max(0, int(tick) - start),
+            fall_count=int(getattr(self, "_task_log_fall_count", 0)),
+            final_pe=final_pe,
+        )
+        self._task_log_session_start_tick = None
+
+    def _task_log_command_received(
+        self,
+        tick: int,
+        text: str,
+        *,
+        command_kind: str,
+        tag: str,
+    ) -> None:
+        self._task_log_reset_session(tick)
+        task_log_event(
+            "command_received",
+            tick=int(tick),
+            text=str(text)[:120],
+            command_kind=str(command_kind),
+            tag=str(tag),
+        )
+
+    def _task_log_target_resolution(
+        self,
+        tick: int,
+        query: str,
+        resolved: Any | None,
+        diag: dict[str, Any],
+    ) -> None:
+        fields: dict[str, Any] = {"query": str(query)[:120]}
+        if resolved is not None:
+            fields["ref"] = getattr(resolved, "ref", None)
+            fields["semantic"] = getattr(resolved, "semantic", None)
+            fields["movable"] = getattr(resolved, "movable", None)
+            pos = {}
+            for k in ("x", "y", "z"):
+                try:
+                    v = getattr(resolved, k, None)
+                    if v is not None:
+                        pos[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
+            if pos:
+                fields["pos"] = pos
+        else:
+            fields["reason"] = str(diag.get("reason", "no_target"))
+        for key in ("scene_semantics", "semantics", "candidates"):
+            if key in diag and diag[key] is not None:
+                fields[key] = diag[key]
+        task_log_event("target_resolution", tick=int(tick), **fields)
+
+    def _task_log_tree_bound(self, tick: int, tt: TaskTreeController) -> None:
+        tree = tt.tree
+        if tree is None:
+            return
+        nodes: list[dict[str, str]] = []
+        root = tree.nodes.get(tree.root_id)
+        if root is not None:
+            for cid in root.children:
+                node = tree.nodes.get(cid)
+                if node is None:
+                    continue
+                nodes.append(
+                    {
+                        "id": str(node.id),
+                        "kind": str(node.kind),
+                        "label": str(node.label),
+                    }
+                )
+        task_log_event(
+            "tree_bound",
+            tick=int(tick),
+            session_id=str(tree.session_id),
+            nodes=nodes,
+        )
+        self._task_log_stage_started(tick, tt.active_node)
+
+    def _task_log_imagine_done(self, tick: int, task: Any) -> None:
+        es = dict(getattr(task, "expected_state", {}) or {})
+        summary = summarize_expected_state(es)
+        diag = dict(getattr(task, "last_diag", {}) or {})
+        task_log_event(
+            "imagine_done",
+            tick=int(tick),
+            homeo_veto=diag.get("homeo_veto"),
+            **summary,
+        )
+
+    def _task_log_stage_started(self, tick: int, node: Any | None) -> None:
+        if node is None:
+            return
+        nid = str(getattr(node, "id", "") or "")
+        if nid and nid == str(getattr(self, "_task_log_last_stage_id", "") or ""):
+            return
+        self._task_log_last_stage_id = nid or None
+        task_log_event(
+            "stage_started",
+            tick=int(tick),
+            node_id=nid or None,
+            kind=str(getattr(node, "kind", "")),
+            label=str(getattr(node, "label", "")),
+            attempts=int(getattr(node, "attempts", 0) or 0),
+        )
+
+    def _task_log_stage_done(
+        self,
+        tick: int,
+        node: Any,
+        *,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        pe = getattr(node, "last_pe", None)
+        if diagnostics:
+            pe = diagnostics.get("pe_total", diagnostics.get("last_pe", pe))
+        task_log_event(
+            "stage_done",
+            tick=int(tick),
+            node_id=str(getattr(node, "id", "")),
+            kind=str(getattr(node, "kind", "")),
+            label=str(getattr(node, "label", "")),
+            last_pe=pe,
+        )
+
+    def _task_log_stage_failed(self, tick: int, node: Any, reason: str) -> None:
+        task_log_event(
+            "stage_failed",
+            tick=int(tick),
+            node_id=str(getattr(node, "id", "")),
+            kind=str(getattr(node, "kind", "")),
+            label=str(getattr(node, "label", "")),
+            attempts=int(getattr(node, "attempts", 0) or 0),
+            failure_reason=str(reason)[:200],
+            last_pe=getattr(node, "last_pe", None),
+        )
+
+    def _tt_complete_active(
+        self,
+        tt: TaskTreeController,
+        tick: int,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> Any:
+        active = tt.active_node
+        result = tt.complete_active(tick, diagnostics=diagnostics)
+        if active is not None:
+            self._task_log_stage_done(tick, active, diagnostics=diagnostics)
+        nxt = tt.active_node
+        if nxt is not None and (active is None or str(nxt.id) != str(active.id)):
+            self._task_log_stage_started(tick, nxt)
+        return result
+
+    def _tt_fail_active(
+        self,
+        tt: TaskTreeController,
+        tick: int,
+        reason: str,
+        *,
+        retryable: bool = False,
+    ) -> Any:
+        active = tt.active_node
+        result = tt.fail_active(tick, reason, retryable=retryable)
+        if active is None:
+            return result
+        if retryable and tt.active_node is active:
+            return result
+        self._task_log_stage_failed(tick, active, reason)
+        return result
+
+    def _task_log_human_motor_targets(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        arb = getattr(self, "_motor_arbiter", None)
+        if arb is not None:
+            for mi in list(getattr(arb, "_intents", []) or []):
+                src = str(getattr(mi, "source", "") or "")
+                if src != "human_task":
+                    continue
+                as_map = getattr(mi, "as_field_map", None)
+                if callable(as_map):
+                    for k, v in as_map().items():
+                        sk = str(k)
+                        if sk.startswith("intent_"):
+                            try:
+                                out[sk] = round(float(v), 4)
+                            except (TypeError, ValueError):
+                                pass
+        if not out:
+            try:
+                out = {
+                    k: round(float(v), 4)
+                    for k, v in self.task_tree_motor_targets().items()
+                    if str(k).startswith("intent_")
+                }
+            except Exception:
+                pass
+        return out
+
+    def _task_log_progress(self, tick: int, *, obs: dict[str, float], fallen: bool) -> None:
+        if int(tick) % 50 != 0:
+            return
+        if getattr(self, "_task_log_session_start_tick", None) is None:
+            return
+        tt = getattr(self, "_task_tree_ctrl", None)
+        tb = getattr(self, "_task_binding", None)
+        tree_active = tt is not None and tt.is_active
+        bind_active = tb is not None and tb.active_task is not None
+        if not tree_active and not bind_active:
+            return
+
+        node_kind = ""
+        target_ref = ""
+        if tree_active and tt is not None:
+            active = tt.active_node
+            if active is not None:
+                node_kind = str(active.kind)
+                target_ref = str(getattr(active, "target_ref", "") or "")
+
+        last_pe = None
+        max_pe = None
+        task = tb.active_task if tb is not None else None
+        if task is None and tb is not None:
+            task = getattr(tb, "_active", None)
+        if task is not None:
+            try:
+                last_pe = float(getattr(task, "last_pe", 0.0))
+            except (TypeError, ValueError):
+                pass
+            try:
+                max_pe = float(getattr(task, "max_prediction_error", 0.0))
+            except (TypeError, ValueError):
+                pass
+
+        dist = None
+        if target_ref:
+            target_xy = self._target_xy(target_ref)
+            if target_xy is not None:
+                agent_xy, _ = self._agent_xy_forward()
+                dist = round(
+                    math.hypot(target_xy[0] - agent_xy[0], target_xy[1] - agent_xy[1]),
+                    4,
+                )
+
+        fields: dict[str, Any] = {
+            "node_kind": node_kind or None,
+            "last_pe": last_pe,
+            "max_pe": max_pe,
+            "com_x": obs.get("com_x"),
+            "com_y": obs.get("com_y"),
+            "com_x_vel": obs.get("com_x_vel"),
+            "target_dist": dist,
+            "fallen": bool(fallen),
+            "posture_stability": obs.get("posture_stability"),
+            "human_task_motor": self._task_log_human_motor_targets(),
+        }
+        task_log_event("task_progress", tick=int(tick), **fields)
+
+    def _task_log_fall_during_task(self, tick: int) -> None:
+        if getattr(self, "_task_log_session_start_tick", None) is None:
+            return
+        tt = getattr(self, "_task_tree_ctrl", None)
+        tb = getattr(self, "_task_binding", None)
+        if not (
+            (tt is not None and tt.is_active)
+            or (tb is not None and tb.active_task is not None)
+        ):
+            return
+        self._task_log_fall_count = int(getattr(self, "_task_log_fall_count", 0)) + 1
+        task_log_event(
+            "fall_during_task",
+            tick=int(tick),
+            fall_count=int(self._task_log_fall_count),
+        )
 
     def _humanoid_base_env(self) -> Any | None:
         env = getattr(getattr(self, "agent", None), "env", None)
@@ -76,18 +410,26 @@ class SimulationGroundedLanguageMixin:
                 pass
         return xy, fwd
 
-    def _infer_manip_direction(self, text: str) -> tuple[float, float]:
-        low = str(text or "").lower()
-        if any(k in low for k in ("назад", "back", "backward")):
-            return (-1.0, 0.0)
-        if any(k in low for k in ("влево", "left")):
-            return (0.0, 1.0)
-        if any(k in low for k in ("вправо", "right")):
-            return (0.0, -1.0)
-        _, fwd = self._agent_xy_forward()
-        return fwd
+    def _infer_manip_direction(
+        self,
+        text: str,
+        *,
+        target_xy: tuple[float, float] | None = None,
+        embed_fn: Any | None = None,
+    ) -> tuple[float, float]:
+        from engine.goal_grounding import infer_manip_direction
+
+        agent_xy, agent_fwd = self._agent_xy_forward()
+        return infer_manip_direction(
+            text,
+            agent_xy=agent_xy,
+            target_xy=target_xy,
+            agent_forward=agent_fwd,
+            embed_fn=embed_fn,
+        )
 
     def _clear_human_command_state(self, tick: int) -> None:
+        self._task_log_cancel_if_active(tick, reason="preempted")
         tb = getattr(self, "_task_binding", None)
         if tb is not None:
             tb.clear()
@@ -98,6 +440,7 @@ class SimulationGroundedLanguageMixin:
         self._manip_resolved = None
         self._manip_diag = {}
         self._task_tree_kind = ""
+        self._task_goal = None
         self._task_tree_reported = False
         self._task_tree_affect_done = False
         s2 = getattr(self, "_system2", None)
@@ -120,6 +463,7 @@ class SimulationGroundedLanguageMixin:
         self._manip_episode = None
         self._manip_resolved = None
         self._task_tree_kind = ""
+        self._task_goal = None
 
     def task_tree_motor_targets(self) -> dict[str, float]:
         if not task_tree_enabled():
@@ -315,6 +659,24 @@ class SimulationGroundedLanguageMixin:
                 body = f"Не удалось: {cmd[:60]}"
             self._emit_task_report(tick, cmd, done=False, body=body)
         self._apply_task_outcome_affect(success)
+        reason = ""
+        final_pe = None
+        for node in tt.tree.nodes.values():
+            if node.failure_reason:
+                reason = str(node.failure_reason)
+            if node.last_pe is not None:
+                final_pe = float(node.last_pe)
+        tb = getattr(self, "_task_binding", None)
+        if tb is not None:
+            bound = getattr(tb, "_active", None)
+            if bound is not None and getattr(bound, "last_pe", None) is not None:
+                final_pe = float(bound.last_pe)
+        self._task_log_finished(
+            tick,
+            status="done" if success else "failed",
+            reason=reason,
+            final_pe=final_pe,
+        )
         s2 = getattr(self, "_system2", None)
         if s2 is not None and hasattr(s2, "working_memory"):
             wm = s2.working_memory
@@ -353,7 +715,113 @@ class SimulationGroundedLanguageMixin:
             return None
         return float(pose.get("x", 0.0)), float(pose.get("y", 0.0))
 
-    def _tick_task_tree_manipulate(self, *, tick: int, obs: dict[str, float]) -> None:
+    def _manip_has_contact(self, resolved: ResolvedObject | None) -> bool:
+        env = getattr(getattr(self, "agent", None), "env", None)
+        if env is not None and bool(getattr(env, "_contact_flag", False)):
+            return True
+        base = self._humanoid_base_env()
+        if base is None or resolved is None:
+            return False
+        body_id = getattr(resolved, "body_id", None)
+        if body_id is None:
+            return False
+        fn = getattr(base, "_manip_has_contact", None)
+        if callable(fn):
+            return bool(fn(int(body_id)))
+        return False
+
+    def _human_task_verify_ctx(self) -> dict[str, Any]:
+        """Scene context for goal predicate verification (distance, contact, displace)."""
+        resolved = getattr(self, "_manip_resolved", None)
+        episode = getattr(self, "_manip_episode", None)
+        agent_xy, _ = self._agent_xy_forward()
+        ctx: dict[str, Any] = {"agent_xy": agent_xy}
+        ref = str(getattr(resolved, "ref", "") or "")
+        target_xy = self._target_xy(ref) if ref else None
+        if target_xy is not None:
+            ctx["target_xy"] = target_xy
+            ctx["distance_m"] = math.hypot(
+                target_xy[0] - agent_xy[0], target_xy[1] - agent_xy[1]
+            )
+        baseline = getattr(episode, "baseline_xy", None) if episode is not None else None
+        if baseline is not None:
+            ctx["baseline_xy"] = baseline
+        if episode is not None and getattr(episode, "displacement_m", None) is not None:
+            ctx["displacement_m"] = float(episode.displacement_m)
+        ctx["contact"] = 1.0 if self._manip_has_contact(resolved) else 0.0
+        return ctx
+
+    def _register_task_navigation(
+        self,
+        *,
+        active: Any,
+        dist: float,
+        approach_m: float,
+        fallen: bool,
+    ) -> None:
+        if fallen or active is None:
+            return
+        if str(active.kind) not in ("approach", "reach_contact", "approach_target"):
+            return
+
+        resolved = getattr(self, "_manip_resolved", None)
+        ref = str(getattr(resolved, "ref", "") or getattr(active, "target_ref", "") or "")
+        target_xy = self._target_xy(ref) if ref else None
+        if target_xy is None:
+            return
+
+        stop = float(active.expected_state.get("stop_distance", approach_m))
+        if str(active.kind) == "reach_contact":
+            stop = min(stop, 0.45)
+
+        agent_xy, agent_fwd = self._agent_xy_forward()
+        intents = navigation_intents(
+            agent_xy,
+            agent_fwd,
+            target_xy,
+            stop,
+            fallen=fallen,
+        )
+        if str(active.kind) == "reach_contact" and dist <= approach_m:
+            intents.update(
+                {
+                    "intent_reach_right": 0.58,
+                    "intent_grasp": 0.45,
+                }
+            )
+
+        arb = getattr(self, "_motor_arbiter", None)
+        if arb is not None and intents:
+            arb.register_from_dict("navigation", intents)
+
+    def _apply_goal_target_ref(self, goal: TaskGoal, resolved: ResolvedObject) -> None:
+        goal.target_ref = resolved.ref
+        for pred in goal.predicates:
+            if pred.kind in _KINDS_NEEDING_TARGET:
+                pred.target_ref = resolved.ref
+        tt = getattr(self, "_task_tree_ctrl", None)
+        if tt is not None and tt.tree is not None:
+            for node in tt.tree.nodes.values():
+                node.target_ref = resolved.ref
+
+    def _ground_command_goal(
+        self,
+        text: str,
+        gl: GroundedLanguageController | None,
+    ) -> TaskGoal | None:
+        try:
+            from engine.goal_grounding import ground_command
+        except ImportError:
+            return None
+        embed_fn = gl.embedder.embed if gl is not None else None
+        return ground_command(text, embed_fn)
+
+    def _goal_predicate_kinds(self, goal: TaskGoal | None) -> set[str]:
+        if goal is None:
+            return set()
+        return {str(p.kind) for p in (goal.predicates or [])}
+
+    def _tick_task_tree_goal(self, *, tick: int, obs: dict[str, float], fallen: bool) -> None:
         tt = self._ensure_task_tree()
         active = tt.active_node
         episode = getattr(self, "_manip_episode", None)
@@ -391,21 +859,46 @@ class SimulationGroundedLanguageMixin:
         kind = active.kind
         stage_enter = int(getattr(self, "_task_tree_stage_enter_tick", tick))
 
-        if kind == "approach_target":
-            if dist <= approach_m:
-                tt.complete_active(tick)
+        self._register_task_navigation(
+            active=active,
+            dist=dist,
+            approach_m=approach_m,
+            fallen=fallen,
+        )
+
+        if kind in ("approach", "approach_target"):
+            stop = float(active.expected_state.get("stop_distance", approach_m))
+            streak = int(getattr(self, "_nav_arrival_streak", 0))
+            if dist <= stop:
+                streak += 1
+            else:
+                streak = 0
+            self._nav_arrival_streak = streak
+            if streak >= _nav_arrival_streak_needed():
+                self._nav_arrival_streak = 0
+                self._tt_complete_active(tt, tick)
                 self._task_tree_stage_enter_tick = tick
             elif active.tick_deadline and tick > int(active.tick_deadline):
-                tt.fail_active(tick, "approach_timeout", retryable=True)
+                self._tt_fail_active(tt, tick, "approach_timeout", retryable=True)
+
+        elif kind == "reach_contact":
+            in_range = dist <= approach_m
+            min_elapsed = int(tick) - stage_enter >= reach_min
+            has_contact = self._manip_has_contact(resolved)
+            if has_contact or (in_range and min_elapsed):
+                self._tt_complete_active(tt, tick)
+                self._task_tree_stage_enter_tick = tick
+            elif active.tick_deadline and tick > int(active.tick_deadline):
+                self._tt_fail_active(tt, tick, "contact_timeout", retryable=True)
 
         elif kind == "reach_target":
             in_range = dist <= approach_m
             min_elapsed = int(tick) - stage_enter >= reach_min
             if in_range and min_elapsed:
-                tt.complete_active(tick)
+                self._tt_complete_active(tt, tick)
                 self._task_tree_stage_enter_tick = tick
             elif active.tick_deadline and tick > int(active.tick_deadline):
-                tt.fail_active(tick, "reach_timeout", retryable=True)
+                self._tt_fail_active(tt, tick, "reach_timeout", retryable=True)
 
         elif kind == "push_target":
             if (
@@ -426,23 +919,23 @@ class SimulationGroundedLanguageMixin:
                 vdiag = verify_manipulation(episode, target_xy, intent_signals=obs)
                 self._manip_diag["verify"] = vdiag
                 if vdiag.get("success"):
-                    tt.complete_active(tick, diagnostics=vdiag)
+                    self._tt_complete_active(tt, tick, diagnostics=vdiag)
                     self._task_tree_stage_enter_tick = tick
                 elif active.tick_deadline and tick > int(active.tick_deadline):
-                    tt.fail_active(tick, "push_timeout", retryable=True)
+                    self._tt_fail_active(tt, tick, "push_timeout", retryable=True)
             elif active.tick_deadline and tick > int(active.tick_deadline):
-                tt.fail_active(tick, "push_timeout", retryable=True)
+                self._tt_fail_active(tt, tick, "push_timeout", retryable=True)
 
         elif kind == "verify_target":
             if episode is not None and target_xy is not None:
                 vdiag = verify_manipulation(episode, target_xy, intent_signals=obs)
                 self._manip_diag["verify"] = vdiag
                 if vdiag.get("success"):
-                    tt.complete_active(tick, diagnostics=vdiag)
+                    self._tt_complete_active(tt, tick, diagnostics=vdiag)
                 elif active.tick_deadline and tick > int(active.tick_deadline):
-                    tt.fail_active(tick, "verify_failed", retryable=False)
+                    self._tt_fail_active(tt, tick, "verify_failed", retryable=False)
             elif active.tick_deadline and tick > int(active.tick_deadline):
-                tt.fail_active(tick, "verify_no_target", retryable=False)
+                self._tt_fail_active(tt, tick, "verify_no_target", retryable=False)
 
         self._maybe_finalize_task_tree(tick)
 
@@ -466,7 +959,9 @@ class SimulationGroundedLanguageMixin:
             if task is None:
                 self._maybe_finalize_task_tree(tick)
                 return
-            finished = tb.tick_verify(obs, tick, fallen=fallen)
+            finished = tb.tick_verify(
+                obs, tick, fallen=fallen, ctx=self._human_task_verify_ctx()
+            )
             if finished is None:
                 s2 = getattr(self, "_system2", None)
                 if s2 is not None and hasattr(s2, "working_memory"):
@@ -479,30 +974,34 @@ class SimulationGroundedLanguageMixin:
                     )
                 return
             if finished.status == "done":
-                tt.complete_active(tick, diagnostics=finished.last_diag)
+                self._tt_complete_active(tt, tick, diagnostics=finished.last_diag)
                 self._task_tree_stage_enter_tick = tick
                 nxt = tt.active_node
                 if nxt is not None and nxt.kind in ("verify_goal", "verify_posture"):
                     bound = getattr(tb, "_active", None)
                     if bound is not None and bound.status == "done":
-                        tt.complete_active(tick)
+                        self._tt_complete_active(tt, tick)
             else:
-                tt.fail_active(tick, str(finished.last_diag.get("reason", "failed")))
+                self._tt_fail_active(
+                    tt,
+                    tick,
+                    str(finished.last_diag.get("reason", "failed")),
+                )
         elif active.kind in ("verify_goal", "verify_posture"):
             bound = getattr(tb, "_active", None)
             if bound is not None and bound.status == "done":
-                tt.complete_active(tick)
+                self._tt_complete_active(tt, tick)
             elif bound is not None and bound.status == "failed":
-                tt.fail_active(tick, "verify_failed")
+                self._tt_fail_active(tt, tick, "verify_failed")
             elif int(tick) > int(getattr(bound, "tick_deadline", tick)):
-                tt.fail_active(tick, "deadline")
+                self._tt_fail_active(tt, tick, "deadline")
 
         self._maybe_finalize_task_tree(tick)
 
     def _tick_task_tree(self, *, fallen: bool, obs: dict[str, float], tick: int) -> None:
         kind = str(getattr(self, "_task_tree_kind", "generic") or "generic")
-        if kind == "manipulate":
-            self._tick_task_tree_manipulate(tick=tick, obs=obs)
+        if kind in ("manipulate", "goal"):
+            self._tick_task_tree_goal(tick=tick, obs=obs, fallen=fallen)
         else:
             self._tick_task_tree_generic_recover(tick=tick, obs=obs, fallen=fallen)
 
@@ -531,6 +1030,11 @@ class SimulationGroundedLanguageMixin:
         if task_tree_enabled():
             tt = getattr(self, "_task_tree_ctrl", None)
             if tt is not None and (tt.is_active or (tt.tree and tt.tree.root_status in TERMINAL_STATUSES)):
+                prev_fallen = bool(getattr(self, "_task_log_prev_fallen", False))
+                if fallen and not prev_fallen:
+                    self._task_log_fall_during_task(tick)
+                self._task_log_prev_fallen = bool(fallen)
+                self._task_log_progress(tick, obs=obs, fallen=fallen)
                 self._tick_task_tree(fallen=fallen, obs=obs, tick=tick)
                 return
 
@@ -539,7 +1043,15 @@ class SimulationGroundedLanguageMixin:
         if task is None:
             return
 
-        finished = tb.tick_verify(obs, tick, fallen=fallen)
+        prev_fallen = bool(getattr(self, "_task_log_prev_fallen", False))
+        if fallen and not prev_fallen:
+            self._task_log_fall_during_task(tick)
+        self._task_log_prev_fallen = bool(fallen)
+        self._task_log_progress(tick, obs=obs, fallen=fallen)
+
+        finished = tb.tick_verify(
+            obs, tick, fallen=fallen, ctx=self._human_task_verify_ctx()
+        )
         if finished is None:
             s2 = getattr(self, "_system2", None)
             if s2 is not None and hasattr(s2, "working_memory"):
@@ -581,6 +1093,16 @@ class SimulationGroundedLanguageMixin:
         elif task.status == "failed":
             self._emit_task_report(tick, task.text, done=False)
 
+        reason = ""
+        if isinstance(getattr(task, "last_diag", None), dict):
+            reason = str(task.last_diag.get("reason", ""))
+        self._task_log_finished(
+            tick,
+            status=str(task.status),
+            reason=reason or str(task.status),
+            final_pe=float(getattr(task, "last_pe", 0.0)),
+        )
+
         tb = getattr(self, "_task_binding", None)
         if tb is not None:
             tb.clear()
@@ -614,6 +1136,8 @@ class SimulationGroundedLanguageMixin:
         self._task_tree_cleared_pending_ack = False
         self._task_tree_stage_enter_tick = tick
         self._task_tree_last_push_tick = -999
+        self._nav_arrival_streak = 0
+        self._task_goal = None
 
         use_tb = task_binding_enabled()
         use_tree = task_tree_enabled() and use_tb
@@ -650,9 +1174,176 @@ class SimulationGroundedLanguageMixin:
             pass
 
         cmd_kind = command_kind_for_text(text, tag=tag, fallen=fallen_flag)
+        goal = self._ground_command_goal(text, gl)
+        use_goal = goal is not None and bool(goal.predicates)
+        if use_goal:
+            cmd_kind = "goal"
+            pred_kinds = self._goal_predicate_kinds(goal)
+            if pred_kinds & {"displace", "contact", "reduce_distance"}:
+                cmd_kind = "goal"
+            elif pred_kinds == {"state_key"}:
+                cmd_kind = "generic"
         self._task_tree_kind = cmd_kind
+        self._task_goal = goal if use_goal else None
+        self._task_log_command_received(
+            tick,
+            text,
+            command_kind=cmd_kind,
+            tag=tag,
+        )
+
+        if use_tree and use_goal and goal is not None:
+            tt = self._ensure_task_tree()
+            needs_target = bool(goal.diagnostics.get("needs_target", False))
+            tree = tt.bind_goal(
+                goal,
+                tick,
+                needs_target=needs_target,
+                target_ref=goal.target_ref,
+            )
+            self._task_log_tree_bound(tick, tt)
+            out["task_goal"] = goal.to_dict()
+            out["task_tree"] = tt.snapshot(tick)
+
+            resolved: ResolvedObject | None = getattr(self, "_manip_resolved", None)
+            hard_fail = False
+            fail_reason = "no_target"
+            diag: dict[str, Any] = {}
+            if needs_target:
+                embed_fn = gl.embedder.embed if gl is not None else None
+                if base is not None:
+                    agent_xy, agent_fwd = self._agent_xy_forward()
+                    extras: dict = {}
+                    fn = getattr(base, "get_sandbox_scene_extras", None)
+                    if callable(fn):
+                        try:
+                            extras = dict(fn() or {})
+                        except Exception:
+                            extras = {}
+                    try:
+                        resolved, diag = resolve_manipulation_target(
+                            text,
+                            extras,
+                            agent_xy=agent_xy,
+                            agent_forward=agent_fwd,
+                            embed_fn=embed_fn,
+                            require_movable="displace" in pred_kinds,
+                        )
+                    except Exception as exc:
+                        diag = {"reason": f"resolver_error:{exc}"}
+                self._manip_diag = dict(diag)
+                out["manipulation"] = dict(diag)
+                self._task_log_target_resolution(tick, text, resolved, diag)
+
+                if resolved is None or (
+                    "displace" in pred_kinds and resolved is not None and not resolved.movable
+                ):
+                    if "displace" in pred_kinds:
+                        hard_fail = True
+                        fail_reason = str(diag.get("reason", "no_target"))
+                    elif (
+                        resolved is None
+                        and "contact" in pred_kinds
+                        and "state_key" not in pred_kinds
+                        and "reduce_distance" not in pred_kinds
+                    ):
+                        hard_fail = True
+                        fail_reason = str(diag.get("reason", "no_target"))
+
+                if hard_fail:
+                    self._tt_fail_active(tt, tick, fail_reason, retryable=False)
+                    out["task_tree"] = tt.snapshot(tick)
+                    self._task_tree_reported = True
+                    fail_body = "Не вижу цель или не могу сдвинуть объект."
+                    self._emit_task_report(tick, text, done=False, body=fail_body)
+                    self._apply_task_outcome_affect(False)
+                    self._task_log_finished(tick, status="failed", reason=fail_reason)
+                    tt.clear(tick)
+                    self._task_tree_cleared_pending_ack = True
+                    out["ok"] = True
+                    out["task_binding"] = False
+                    return out
+
+                if resolved is not None:
+                    self._apply_goal_target_ref(goal, resolved)
+                    self._manip_resolved = resolved
+                    if "displace" in pred_kinds:
+                        target_xy = (float(resolved.position[0]), float(resolved.position[1]))
+                        embed_fn = gl.embedder.embed if gl is not None else None
+                        direction = self._infer_manip_direction(
+                            text, target_xy=target_xy, embed_fn=embed_fn
+                        )
+                        self._manip_episode = ManipulationEpisode.begin(
+                            resolved, requested_direction=direction
+                        )
+                    if tt.active_node is not None and tt.active_node.kind == "resolve_target":
+                        self._tt_complete_active(
+                            tt,
+                            tick,
+                            diagnostics={"resolved": resolved.ref},
+                        )
+                    out["manipulation_target"] = resolved.ref
+
+            if use_tb:
+                tb = self._ensure_task_binding()
+                embed_fn = gl.embedder.embed if gl is not None else None
+                task = tb.bind_command(
+                    self.agent.graph,
+                    obs,
+                    text,
+                    tick,
+                    embed_fn=embed_fn,
+                    goal=goal,
+                )
+                exp: dict[str, float] = {}
+                for p in goal.predicates:
+                    if p.kind == "state_key" and p.key:
+                        exp[str(p.key)] = float(p.target_value)
+                if exp:
+                    task.expected_state.update(exp)
+                self._task_log_imagine_done(tick, task)
+                out["task"] = task.to_dict()
+                out["task_binding"] = True
+                if tt.active_node is not None and tt.active_node.kind == "imagine_goal":
+                    self._tt_complete_active(tt, tick)
+                ic = getattr(self, "_intention_cortex", None)
+                if ic is None and hasattr(self, "_ensure_intention_cortex"):
+                    try:
+                        ic = self._ensure_intention_cortex()
+                    except Exception:
+                        ic = None
+                if ic is not None and hasattr(ic, "absorb_human_task"):
+                    ic.absorb_human_task(task, obs, tick)
+            else:
+                out["task_binding"] = False
+
+            from engine.system2.controller import write_human_command_wm
+
+            write_human_command_wm(self, text, tick)
+            try:
+                graph = self.agent.graph
+                if "self_goal_active" in graph.nodes:
+                    graph.nodes["self_goal_active"] = 1.0
+            except Exception:
+                pass
+            out["task_tree"] = tt.snapshot(tick)
+            return out
 
         if use_tree:
+            embed_fn = gl.embedder.embed if gl is not None else None
+            if embed_fn is not None and not use_goal:
+                reason = "no_goal_predicates"
+                if goal is not None:
+                    fb = goal.diagnostics.get("fallback")
+                    if fb:
+                        reason = str(fb)
+                task_log_event(
+                    "grounding_fallback",
+                    tick=tick,
+                    reason=reason,
+                    command_kind=cmd_kind,
+                    text=str(text)[:120],
+                )
             tt = self._ensure_task_tree()
             tree_kind = cmd_kind
             if cmd_kind == "manipulate":
@@ -662,6 +1353,7 @@ class SimulationGroundedLanguageMixin:
                 tick,
                 command_kind=tree_kind,
             )
+            self._task_log_tree_bound(tick, tt)
             out["task_tree"] = tt.snapshot(tick)
 
             if cmd_kind == "manipulate":
@@ -689,22 +1381,28 @@ class SimulationGroundedLanguageMixin:
                         diag = {"reason": f"resolver_error:{exc}"}
                 self._manip_diag = dict(diag)
                 out["manipulation"] = dict(diag)
+                self._task_log_target_resolution(tick, text, resolved, diag)
 
                 if resolved is None or not resolved.movable:
                     reason = str(diag.get("reason", "no_target"))
-                    tt.fail_active(tick, reason, retryable=False)
+                    self._tt_fail_active(tt, tick, reason, retryable=False)
                     out["task_tree"] = tt.snapshot(tick)
                     self._task_tree_reported = True
                     fail_body = "Не вижу цель или не могу сдвинуть объект."
                     self._emit_task_report(tick, text, done=False, body=fail_body)
                     self._apply_task_outcome_affect(False)
+                    self._task_log_finished(tick, status="failed", reason=reason)
                     tt.clear(tick)
                     self._task_tree_cleared_pending_ack = True
                     out["ok"] = True
                     out["task_binding"] = False
                     return out
 
-                direction = self._infer_manip_direction(text)
+                direction = self._infer_manip_direction(
+                    text,
+                    target_xy=(float(resolved.position[0]), float(resolved.position[1])),
+                    embed_fn=embed_fn,
+                )
                 episode = ManipulationEpisode.begin(
                     resolved, requested_direction=direction
                 )
@@ -712,7 +1410,11 @@ class SimulationGroundedLanguageMixin:
                 self._manip_resolved = resolved
                 for node in tree.nodes.values():
                     node.target_ref = resolved.ref
-                tt.complete_active(tick, diagnostics={"resolved": resolved.ref})
+                self._tt_complete_active(
+                    tt,
+                    tick,
+                    diagnostics={"resolved": resolved.ref},
+                )
                 out["task_tree"] = tt.snapshot(tick)
 
                 from engine.system2.controller import write_human_command_wm
@@ -729,11 +1431,15 @@ class SimulationGroundedLanguageMixin:
                 return out
 
             if cmd_kind == "generic":
-                tt.complete_active(tick)
+                self._tt_complete_active(tt, tick)
 
         if use_tb:
             tb = self._ensure_task_binding()
-            task = tb.bind_command(self.agent.graph, obs, text, tick)
+            embed_fn = gl.embedder.embed if gl is not None else None
+            task = tb.bind_command(
+                self.agent.graph, obs, text, tick, embed_fn=embed_fn
+            )
+            self._task_log_imagine_done(tick, task)
             out["task"] = task.to_dict()
             out["task_binding"] = True
 

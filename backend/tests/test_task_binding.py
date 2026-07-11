@@ -13,6 +13,7 @@ from engine.grounded_language import (
 from engine.system2.schema import filter_expected_state_raw
 from engine.system2.wm_planner import task_from_planning_context
 from engine.task_binding import HumanTask, TaskBindingController, task_observation_keys
+from engine.task_goal import GoalPredicate, TaskGoal
 
 
 class _InterventionGraph:
@@ -60,7 +61,7 @@ def test_imagine_expected_state_rollout() -> None:
     g.set_node("target_dist", 0.8)
     obs = {"slot_0": 0.5, "posture_stability": 0.6, "target_dist": 0.8}
     tb = TaskBindingController()
-    expected = tb.imagine_expected_state(g, obs, horizon=4)
+    expected, _, _ = tb.imagine_expected_state(g, obs, horizon=4)
     assert expected
     assert all(k in obs or k.startswith("slot_") or k in ("posture_stability", "target_dist") for k in expected)
 
@@ -112,12 +113,39 @@ def test_imagine_intervention_differs_from_free_rollout() -> None:
     g = _InterventionGraph()
     obs = {"posture_stability": 0.55, "target_dist": 0.7, "intent_stride": 0.5}
     tb = TaskBindingController()
-    free = tb.imagine_expected_state(g, obs, horizon=6, text="")
-    locomote = tb.imagine_expected_state(g, obs, horizon=6, text="Иди вперёд")
-    recover = tb.imagine_expected_state(g, obs, horizon=6, text="Встань, ты упал")
+    free, _, _ = tb.imagine_expected_state(g, obs, horizon=6, text="")
+    locomote, _, _ = tb.imagine_expected_state(g, obs, horizon=6, text="Иди вперёд")
+    recover, _, _ = tb.imagine_expected_state(g, obs, horizon=6, text="Встань, ты упал")
     assert locomote != free
     assert recover != free
     assert locomote.get("posture_stability", 0) > free.get("posture_stability", 0)
+
+
+def test_imagine_predicate_goal_not_keyword_fallback() -> None:
+    g = _InterventionGraph()
+    obs = {"posture_stability": 0.55, "target_dist": 0.7, "intent_stride": 0.5}
+    goal = TaskGoal(
+        text="иди вперёд",
+        predicates=[
+            GoalPredicate(
+                kind="state_key",
+                key="intent_stride",
+                target_value=0.66,
+                tolerance=0.15,
+            ),
+        ],
+    )
+    tb = TaskBindingController()
+    _, _, diag = tb.imagine_expected_state(g, obs, horizon=4, text="иди вперёд", goal=goal)
+    assert "intent_stride" in diag.get("interventions", [])
+
+
+def test_imagine_keyword_fallback_without_goal() -> None:
+    g = _InterventionGraph()
+    obs = {"posture_stability": 0.55, "target_dist": 0.7, "intent_stride": 0.5}
+    tb = TaskBindingController()
+    _, _, diag = tb.imagine_expected_state(g, obs, horizon=4, text="Иди вперёд")
+    assert "intent_stride" in diag.get("interventions", [])
 
 
 def test_motor_interventions_for_command() -> None:

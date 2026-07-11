@@ -11,6 +11,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from engine.task_goal import GoalPredicate, TaskGoal
+
 TASK_STATUSES = frozenset(
     {"pending", "active", "verifying", "done", "failed", "cancelled"}
 )
@@ -46,6 +48,8 @@ _MOTOR_RECOVER: dict[str, float] = {
 
 _STEP_LABELS: dict[str, str] = {
     "resolve_target": "Resolve target",
+    "approach": "Approach",
+    "reach_contact": "Reach and contact",
     "approach_target": "Approach target",
     "reach_target": "Reach target",
     "push_target": "Push target",
@@ -56,6 +60,13 @@ _STEP_LABELS: dict[str, str] = {
     "execute_goal": "Execute goal",
     "verify_goal": "Verify goal",
 }
+
+_PREDICATE_KIND_ORDER: tuple[str, ...] = (
+    "reduce_distance",
+    "contact",
+    "displace",
+    "state_key",
+)
 
 
 def _env_int(key: str, default: int) -> int:
@@ -120,15 +131,94 @@ def _status_for_kind(kind: str) -> str:
 
 
 def _motor_for_kind(kind: str) -> dict[str, float]:
-    if kind == "approach_target":
+    if kind in ("approach", "approach_target"):
         return dict(_MOTOR_APPROACH)
-    if kind == "reach_target":
+    if kind in ("reach_contact", "reach_target"):
         return dict(_MOTOR_REACH)
     if kind == "push_target":
         return dict(_MOTOR_PUSH)
     if kind == "recover_posture":
         return dict(_MOTOR_RECOVER)
     return {}
+
+
+def _sort_predicates(predicates: list[GoalPredicate]) -> list[GoalPredicate]:
+    order = {k: i for i, k in enumerate(_PREDICATE_KIND_ORDER)}
+
+    def _key(p: GoalPredicate) -> tuple[float, int]:
+        return (-float(p.weight), order.get(str(p.kind), 99))
+
+    return sorted(predicates, key=_key)
+
+
+def _decompose_from_goal(goal: TaskGoal, *, needs_target: bool) -> tuple[str, ...]:
+    """Build stage kinds from observable predicates (not command_kind)."""
+    kinds: list[str] = []
+    if needs_target:
+        kinds.append("resolve_target")
+
+    preds = _sort_predicates(list(goal.predicates or []))
+    has_displace_flow = False
+    has_generic_flow = False
+
+    for pred in preds:
+        pk = str(pred.kind)
+        if pk == "reduce_distance":
+            kinds.append("approach")
+        elif pk == "contact":
+            kinds.append("reach_contact")
+        elif pk == "displace":
+            if "approach" not in kinds:
+                kinds.append("approach")
+            if not has_displace_flow:
+                kinds.extend(["reach_target", "push_target", "verify_target"])
+                has_displace_flow = True
+        elif pk == "state_key":
+            if not has_generic_flow:
+                kinds.extend(["imagine_goal", "execute_goal", "verify_goal"])
+                has_generic_flow = True
+
+    if not kinds and not needs_target:
+        kinds.extend(list(DECOMPOSE_GENERIC))
+    return tuple(kinds)
+
+
+def _expected_state_for_kind(
+    kind: str,
+    pred: GoalPredicate | None,
+    *,
+    root_expected: dict[str, float],
+) -> dict[str, float]:
+    if kind.startswith("verify"):
+        return dict(root_expected)
+    if kind == "approach" and pred is not None and pred.kind == "reduce_distance":
+        return {"stop_distance": float(pred.target_value)}
+    if kind == "reach_contact" and pred is not None and pred.kind == "contact":
+        return {"contact_threshold": float(pred.target_value)}
+    if kind == "state_key" and pred is not None and pred.kind == "state_key" and pred.key:
+        return {str(pred.key): float(pred.target_value)}
+    return {}
+
+
+def _predicate_for_kind(kind: str, goal: TaskGoal) -> GoalPredicate | None:
+    preds = list(goal.predicates or [])
+    if kind == "approach":
+        for p in preds:
+            if p.kind == "reduce_distance":
+                return p
+    if kind == "reach_contact":
+        for p in preds:
+            if p.kind == "contact":
+                return p
+    if kind in ("reach_target", "push_target", "verify_target"):
+        for p in preds:
+            if p.kind == "displace":
+                return p
+    if kind in ("imagine_goal", "execute_goal", "verify_goal"):
+        for p in preds:
+            if p.kind == "state_key":
+                return p
+    return None
 
 
 def _decompose_kinds(command_kind: str) -> tuple[str, ...]:
@@ -358,6 +448,87 @@ class TaskTreeController:
         tree = TaskTree(
             session_id=session_id,
             command_text=str(text or "").strip(),
+            root_id=root_id,
+            active_node_id=active_id,
+            root_status="active",
+            created_tick=created,
+            nodes=nodes,
+        )
+        self._tree = tree
+        return tree
+
+    def bind_goal(
+        self,
+        goal: TaskGoal,
+        tick: int,
+        *,
+        needs_target: bool = False,
+        target_ref: str | None = None,
+        expected_state: dict[str, float] | None = None,
+    ) -> TaskTree:
+        """Bind a predicate-based TaskGoal to a hierarchical stage tree."""
+        if self.is_active or (self._tree is not None and self._tree.root_status == "active"):
+            self._cancel_tree(int(tick), "preempted")
+        self._cleared_pulse = False
+
+        session_id = str(uuid.uuid4())
+        root_id = self._new_id()
+        created = int(tick)
+        deadline = created + task_deadline_ticks()
+        exp = {str(k): float(v) for k, v in (expected_state or {}).items()}
+        text = str(goal.text or "").strip()
+
+        root = TaskNode(
+            id=root_id,
+            parent_id=None,
+            label=text[:120] or "command",
+            kind="goal",
+            status="active",
+            expected_state=dict(exp),
+            target_ref=target_ref or goal.target_ref,
+            tick_started=created,
+            tick_deadline=deadline,
+        )
+
+        nodes: dict[str, TaskNode] = {root_id: root}
+        kinds = _decompose_from_goal(goal, needs_target=needs_target)
+        max_nodes = task_tree_max_nodes()
+        child_ids: list[str] = []
+
+        for kind in kinds:
+            if len(nodes) >= max_nodes:
+                break
+            cid = self._new_id()
+            pred = _predicate_for_kind(kind, goal)
+            motor = _motor_for_kind(kind)
+            verify_exp = _expected_state_for_kind(kind, pred, root_expected=exp)
+            child = TaskNode(
+                id=cid,
+                parent_id=root_id,
+                label=_STEP_LABELS.get(kind, kind.replace("_", " ").title()),
+                kind=kind,
+                status="pending",
+                expected_state=verify_exp,
+                motor_targets=motor,
+                target_ref=target_ref or goal.target_ref,
+            )
+            nodes[cid] = child
+            child_ids.append(cid)
+
+        root.children = child_ids
+        active_id: str | None = None
+        if child_ids:
+            active_id = child_ids[0]
+            first = nodes[active_id]
+            first.status = _status_for_kind(first.kind)
+            first.tick_started = created
+            first.tick_deadline = deadline
+            if first.attempts == 0:
+                first.attempts = 1
+
+        tree = TaskTree(
+            session_id=session_id,
+            command_text=text,
             root_id=root_id,
             active_node_id=active_id,
             root_status="active",

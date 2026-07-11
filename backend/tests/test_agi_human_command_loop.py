@@ -16,14 +16,21 @@ from tests.conftest import AgiLoopSim, _default_humanoid_obs
 
 
 def _patch_fallback_embed(sim: AgiLoopSim) -> None:
-    """Deterministic embed (no Ollama) for ingest_command."""
+    """Phrase-specific deterministic embed (goal grounding + ingest_command, dim=64)."""
+    from engine.goal_grounding import clear_catalog_cache
+    from tests.test_goal_grounding import _PhraseEmbedder
+
+    clear_catalog_cache()
     sim._ensure_grounded_language()
     gl = sim._grounded_lang
     assert gl is not None
-    fake = np.random.RandomState(42).randn(64).astype(np.float32)
-    fake /= np.linalg.norm(fake) + 1e-9
-    gl.embedder.embed = lambda _t: fake  # type: ignore[method-assign]
-    gl.store.add("подойди", "approach", fake)
+    emb = _PhraseEmbedder(dim=64)
+    for phrase in ("осмотрись", "готово"):
+        emb._anchors[phrase] = emb._anchors["иди вперёд"]
+    gl.embedder.embed = emb.embed  # type: ignore[method-assign]
+    probe = emb.embed("подойди ближе")
+    if probe is not None:
+        gl.store.add("подойди", "approach", probe)
 
 
 def test_command_ingest_bind_writes_wm(agi_loop_sim: AgiLoopSim) -> None:
@@ -166,6 +173,8 @@ def test_task_done_emits_verbal_report(agi_loop_sim: AgiLoopSim) -> None:
     task.tick_started = 10
     task.expected_state = {"target_dist": 0.35, "posture_stability": 0.75}
     task.max_prediction_error = 0.25
+    if task.goal is not None:
+        task.goal.wm_trusted = True
 
     match_obs = dict(sim._obs)
     for k, tgt in task.expected_state.items():

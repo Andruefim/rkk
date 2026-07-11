@@ -58,6 +58,9 @@ class AgiLoopEnv:
         self._scene_extras: dict = {}
         self._manip_chair = [1.0, 0.0, 0.4]
         self._manip_body_id = 9001
+        self._contact_flag = False
+        self._ball_body_id = 9100
+        self._ball_pos = [1.2, 0.0, 0.25]
 
     @property
     def base_env(self) -> AgiLoopEnv:
@@ -102,26 +105,35 @@ class AgiLoopEnv:
         )
 
     def get_manipulation_target_pose(self, ref: str) -> dict | None:
-        reg = self._scene_extras.get("registry") or []
-        if isinstance(reg, dict):
-            reg = list(reg.values())
-        for row in reg:
-            if str(row.get("ref")) == str(ref):
-                if int(row.get("body_id", -1)) == int(self._manip_body_id):
-                    return {
-                        "ref": ref,
-                        "body_id": self._manip_body_id,
-                        "x": float(self._manip_chair[0]),
-                        "y": float(self._manip_chair[1]),
-                        "z": float(self._manip_chair[2]),
-                    }
+        from engine.object_resolver import collect_scene_candidates
+
+        for row in collect_scene_candidates(self._scene_extras):
+            if str(row.get("ref")) != str(ref):
+                continue
+            body_id = row.get("body_id")
+            if str(ref) == "ball":
                 return {
                     "ref": ref,
-                    "body_id": row.get("body_id"),
-                    "x": float(row.get("x", self._manip_chair[0])),
-                    "y": float(row.get("y", self._manip_chair[1])),
-                    "z": float(row.get("z", self._manip_chair[2])),
+                    "body_id": int(self._ball_body_id),
+                    "x": float(self._ball_pos[0]),
+                    "y": float(self._ball_pos[1]),
+                    "z": float(self._ball_pos[2]),
                 }
+            if body_id is not None and int(body_id) == int(self._manip_body_id):
+                return {
+                    "ref": ref,
+                    "body_id": self._manip_body_id,
+                    "x": float(self._manip_chair[0]),
+                    "y": float(self._manip_chair[1]),
+                    "z": float(self._manip_chair[2]),
+                }
+            return {
+                "ref": ref,
+                "body_id": body_id,
+                "x": float(row.get("x", 0.0)),
+                "y": float(row.get("y", 0.0)),
+                "z": float(row.get("z", 0.5)),
+            }
         if str(ref) == "manip_chair_front":
             return {
                 "ref": ref,
@@ -130,7 +142,20 @@ class AgiLoopEnv:
                 "y": float(self._manip_chair[1]),
                 "z": float(self._manip_chair[2]),
             }
+        if str(ref) == "ball":
+            return {
+                "ref": ref,
+                "body_id": int(self._ball_body_id),
+                "x": float(self._ball_pos[0]),
+                "y": float(self._ball_pos[1]),
+                "z": float(self._ball_pos[2]),
+            }
         return None
+
+    def _manip_has_contact(self, body_id: int) -> bool:
+        if bool(self._contact_flag):
+            return True
+        return int(body_id) == int(self._ball_body_id) and bool(self._contact_flag)
 
     def apply_manipulation_push(
         self,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+from engine.task_goal import GoalPredicate, TaskGoal
 from engine.task_tree import (
     DECOMPOSE_GENERIC,
     DECOMPOSE_MANIPULATE,
@@ -14,6 +15,42 @@ from engine.task_tree import (
 @pytest.fixture
 def ctrl() -> TaskTreeController:
     return TaskTreeController()
+
+
+def test_bind_goal_contact_decomposition(ctrl: TaskTreeController) -> None:
+    goal = TaskGoal(
+        text="touch ball",
+        predicates=[
+            GoalPredicate(kind="reduce_distance", target_value=0.9, tolerance=0.25),
+            GoalPredicate(kind="contact", target_value=1.0, tolerance=0.5),
+        ],
+        diagnostics={"needs_target": True},
+    )
+    tree = ctrl.bind_goal(goal, tick=1, needs_target=True, target_ref="ball")
+    kinds = [tree.nodes[c].kind for c in tree.nodes[tree.root_id].children]
+    assert kinds == ["resolve_target", "approach", "reach_contact"]
+    approach = tree.nodes[tree.nodes[tree.root_id].children[1]]
+    assert approach.expected_state.get("stop_distance") == 0.9
+
+
+def test_bind_goal_displace_decomposition(ctrl: TaskTreeController) -> None:
+    goal = TaskGoal(
+        text="push box",
+        predicates=[
+            GoalPredicate(kind="reduce_distance", target_value=0.9),
+            GoalPredicate(kind="displace", target_value=0.12),
+        ],
+        diagnostics={"needs_target": True},
+    )
+    tree = ctrl.bind_goal(goal, tick=2, needs_target=True)
+    kinds = [tree.nodes[c].kind for c in tree.nodes[tree.root_id].children]
+    assert kinds == [
+        "resolve_target",
+        "approach",
+        "reach_target",
+        "push_target",
+        "verify_target",
+    ]
 
 
 def test_decomposition_manipulate(ctrl: TaskTreeController) -> None:

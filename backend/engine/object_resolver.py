@@ -177,20 +177,99 @@ def infer_semantic_from_query(query: str) -> str | None:
     return None
 
 
-def _obj_xyz(row: dict) -> tuple[float, float, float]:
-    x = float(row.get("x", row.get("hx", row.get("tx", 0.0))))
-    y = float(row.get("y", row.get("hy", row.get("ty", 0.0))))
-    z = float(row.get("z", row.get("hz", row.get("tz", 0.5))))
-    return x, y, z
-
-
 def _is_movable(row: dict) -> bool:
     if "movable" in row:
         return bool(row.get("movable"))
     if "static" in row:
         return not bool(row.get("static"))
-    mass = float(row.get("mass", 1.0))
-    return mass > 0.0
+    if row.get("body_id") is not None:
+        return True
+    return False
+
+
+def _has_coords(row: dict) -> bool:
+    pos = row.get("pos")
+    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        return True
+    for key in ("x", "y", "hx", "tx"):
+        if key in row:
+            try:
+                float(row[key])
+                return True
+            except (TypeError, ValueError):
+                pass
+    return False
+
+
+def _norm_semantic(key: str) -> str:
+    return re.sub(r"[_\-\s]+", "_", str(key or "").strip().lower()).strip("_") or "object"
+
+
+def _candidate_row(
+    row: dict,
+    *,
+    ref: str,
+    source: str,
+    semantic_fallback: str | None = None,
+) -> dict:
+    pos = _obj_xyz(row)
+    body_id = row.get("body_id")
+    sem = _semantic_of(row, semantic_fallback or _norm_semantic(ref))
+    return {
+        "ref": ref,
+        "id": str(row.get("id") or ref),
+        "body_id": body_id,
+        "semantic": sem,
+        "label": str(row.get("label") or ""),
+        "x": pos[0],
+        "y": pos[1],
+        "z": pos[2],
+        "mass": float(row.get("mass", 1.0 if body_id is not None else 0.0)),
+        "movable": _is_movable(row),
+        "source": source,
+    }
+
+
+def _append_extra_candidates(out: list[dict], extras: dict) -> None:
+    for key, val in extras.items():
+        if key in _HANDLED_EXTRA_KEYS:
+            continue
+        source = str(key)
+        sem_fallback = _norm_semantic(key)
+        if isinstance(val, dict):
+            if _has_coords(val):
+                ref = str(val.get("ref") or val.get("id") or key)
+                out.append(_candidate_row(val, ref=ref, source=source, semantic_fallback=sem_fallback))
+                continue
+            for subkey, row in val.items():
+                if not isinstance(row, dict) or not _has_coords(row):
+                    continue
+                ref = str(row.get("ref") or row.get("id") or f"{key}_{subkey}")
+                out.append(
+                    _candidate_row(row, ref=ref, source=source, semantic_fallback=sem_fallback)
+                )
+        elif isinstance(val, list):
+            for i, row in enumerate(val):
+                if not isinstance(row, dict) or not _has_coords(row):
+                    continue
+                ref = str(row.get("ref") or row.get("id") or f"{key}_{i}")
+                out.append(
+                    _candidate_row(row, ref=ref, source=source, semantic_fallback=sem_fallback)
+                )
+
+
+_HANDLED_EXTRA_KEYS = frozenset({"registry", "props", "static_geometry"})
+
+
+def _obj_xyz(row: dict) -> tuple[float, float, float]:
+    pos = row.get("pos")
+    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        z = float(pos[2]) if len(pos) > 2 else 0.5
+        return float(pos[0]), float(pos[1]), z
+    x = float(row.get("x", row.get("hx", row.get("tx", 0.0))))
+    y = float(row.get("y", row.get("hy", row.get("ty", 0.0))))
+    z = float(row.get("z", row.get("hz", row.get("tz", 0.5))))
+    return x, y, z
 
 
 def _semantic_of(row: dict, fallback: str = "object") -> str:
@@ -201,8 +280,22 @@ def _semantic_of(row: dict, fallback: str = "object") -> str:
     return fallback
 
 
+def _dedup_candidates_by_ref(candidates: list[dict]) -> list[dict]:
+    """Keep one row per ref; prefer movable entries when registry/extras duplicate."""
+    by_ref: dict[str, dict] = {}
+    for row in candidates:
+        ref = str(row["ref"])
+        prev = by_ref.get(ref)
+        if prev is None:
+            by_ref[ref] = row
+            continue
+        if bool(row.get("movable")) and not bool(prev.get("movable")):
+            by_ref[ref] = row
+    return list(by_ref.values())
+
+
 def collect_scene_candidates(scene_extras: dict | None) -> list[dict]:
-    """Flatten registry, props, and static geometry into candidate rows."""
+    """Flatten scene extras (registry, props, static, and generic keyed objects)."""
     extras = dict(scene_extras or {})
     out: list[dict] = []
 
@@ -214,20 +307,7 @@ def collect_scene_candidates(scene_extras: dict | None) -> list[dict]:
             if not isinstance(row, dict):
                 continue
             ref = str(row.get("ref") or row.get("id") or f"registry_{i}")
-            pos = _obj_xyz(row)
-            out.append({
-                "ref": ref,
-                "id": ref,
-                "body_id": row.get("body_id"),
-                "semantic": _semantic_of(row, "object"),
-                "label": str(row.get("label") or ""),
-                "x": pos[0],
-                "y": pos[1],
-                "z": pos[2],
-                "mass": float(row.get("mass", 1.0)),
-                "movable": _is_movable(row),
-                "source": str(row.get("source") or "registry"),
-            })
+            out.append(_candidate_row(row, ref=ref, source=str(row.get("source") or "registry"), semantic_fallback="object"))
 
     props = extras.get("props") or []
     if isinstance(props, list):
@@ -235,20 +315,7 @@ def collect_scene_candidates(scene_extras: dict | None) -> list[dict]:
             if not isinstance(row, dict):
                 continue
             ref = str(row.get("ref") or row.get("id") or f"prop_{i}")
-            pos = _obj_xyz(row)
-            out.append({
-                "ref": ref,
-                "id": ref,
-                "body_id": row.get("body_id"),
-                "semantic": _semantic_of(row, "prop"),
-                "label": str(row.get("label") or ""),
-                "x": pos[0],
-                "y": pos[1],
-                "z": pos[2],
-                "mass": float(row.get("mass", 0.3)),
-                "movable": _is_movable(row),
-                "source": str(row.get("source") or "props"),
-            })
+            out.append(_candidate_row(row, ref=ref, source=str(row.get("source") or "props"), semantic_fallback="prop"))
 
     static = extras.get("static_geometry") or []
     if isinstance(static, list):
@@ -256,22 +323,19 @@ def collect_scene_candidates(scene_extras: dict | None) -> list[dict]:
             if not isinstance(row, dict):
                 continue
             ref = str(row.get("ref") or row.get("id") or f"static_{i}")
-            pos = _obj_xyz(row)
-            out.append({
-                "ref": ref,
-                "id": ref,
-                "body_id": None,
-                "semantic": _semantic_of(row, "static"),
-                "label": str(row.get("label") or ""),
-                "x": pos[0],
-                "y": pos[1],
-                "z": pos[2],
-                "mass": 0.0,
-                "movable": False,
-                "source": "static_geometry",
-            })
+            row_static = dict(row)
+            row_static.setdefault("static", True)
+            out.append(
+                _candidate_row(
+                    row_static,
+                    ref=ref,
+                    source="static_geometry",
+                    semantic_fallback="static",
+                )
+            )
 
-    return out
+    _append_extra_candidates(out, extras)
+    return _dedup_candidates_by_ref(out)
 
 
 def _normalize_xy(v: tuple[float, float]) -> tuple[float, float]:
@@ -361,9 +425,6 @@ def resolve_manipulation_target(
 
     embed_scores: dict[str, float] = {}
 
-    def _combined_match(ref: str) -> float:
-        return lexical_scores.get(ref, 0.0)
-
     if has_noun and embed_fn is not None:
         query_text = " ".join(noun_tokens)
         q_vec = embed_fn(query_text)
@@ -377,10 +438,7 @@ def resolve_manipulation_target(
                     embed_scores[str(c["ref"])] = _cosine(q_vec, s_vec)
 
     def _effective_match(ref: str) -> float:
-        lex = _combined_match(ref)
-        if lex >= _LEXICAL_MATCH_THRESHOLD:
-            return lex
-        return embed_scores.get(ref, 0.0)
+        return max(lexical_scores.get(ref, 0.0), embed_scores.get(ref, 0.0))
 
     if has_noun:
         matched = [c for c in candidates if _effective_match(str(c["ref"])) >= _LEXICAL_MATCH_THRESHOLD]
