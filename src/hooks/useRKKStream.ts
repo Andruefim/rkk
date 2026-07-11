@@ -91,11 +91,75 @@ const DEFAULT_FRAME: StreamFrame = {
   tom_links: [], events: [], graph_deltas: {},
 };
 
+type WsMetaFrame = StreamFrame & { _ws_hello?: boolean; _ws_recovery?: boolean };
+
+const FRAME_THROTTLE_MS = 100;
+
+function mergeStreamFrame(prev: StreamFrame, data: WsMetaFrame): StreamFrame {
+  if (data._ws_hello || data._ws_recovery) {
+    return {
+      ...prev,
+      tick: data.tick ?? prev.tick,
+      phase: data.phase ?? prev.phase,
+      entropy: data.entropy ?? prev.entropy,
+      events: data.events?.length ? data.events : prev.events,
+    };
+  }
+  const raw = Array.isArray(data.agents) ? data.agents : prev.agents;
+  const gd = data.graph_deltas ?? {};
+  const agents = raw.map((a, i) => ({
+    ...a,
+    edges: gd[i as keyof typeof gd] ?? prev.agents[i]?.edges ?? a.edges,
+  }));
+  const prevScene = prev.scene ?? {};
+  const nextScene = data.scene ?? {};
+  const nextSk = nextScene.skeleton;
+  const scene = {
+    ...prevScene,
+    ...nextScene,
+    static_geometry:
+      nextScene.static_geometry ?? prevScene.static_geometry,
+    skeleton:
+      nextSk && nextSk.length >= 3 ? nextSk : prevScene.skeleton,
+  };
+  return { ...data, agents, scene };
+}
+
 export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
   const [frame,      setFrame]      = useState<StreamFrame>(DEFAULT_FRAME);
   const [connected,  setConnected]  = useState(false);
   const [speed,      setSpeedState] = useState(1);
   const wsRef = useRef<WebSocket | null>(null);
+  /** Latest merged WS frame — updated every onmessage for 3D (bypasses React throttle). */
+  const rawFrameRef = useRef<StreamFrame>(DEFAULT_FRAME);
+  const lastSetFrameMsRef = useRef(0);
+  const pendingFrameRef = useRef<StreamFrame | null>(null);
+  const throttleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const scheduleThrottledSetFrame = useCallback((merged: StreamFrame) => {
+    const now = Date.now();
+    const elapsed = now - lastSetFrameMsRef.current;
+    if (elapsed >= FRAME_THROTTLE_MS) {
+      lastSetFrameMsRef.current = now;
+      setFrame(merged);
+      pendingFrameRef.current = null;
+      if (throttleTimerRef.current !== null) {
+        clearTimeout(throttleTimerRef.current);
+        throttleTimerRef.current = null;
+      }
+      return;
+    }
+    pendingFrameRef.current = merged;
+    if (throttleTimerRef.current !== null) return;
+    throttleTimerRef.current = setTimeout(() => {
+      throttleTimerRef.current = null;
+      const pending = pendingFrameRef.current;
+      if (!pending) return;
+      pendingFrameRef.current = null;
+      lastSetFrameMsRef.current = Date.now();
+      setFrame(pending);
+    }, FRAME_THROTTLE_MS - elapsed);
+  }, []);
 
   const setSpeed = useCallback((s: number) => {
     setSpeedState(s);
@@ -138,38 +202,11 @@ export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
 
       ws.onmessage = (ev) => {
         try {
-          const data = JSON.parse(ev.data) as StreamFrame & {
-            _ws_hello?: boolean;
-            _ws_recovery?: boolean;
-          };
+          const data = JSON.parse(ev.data) as WsMetaFrame;
           if (!data || typeof data !== "object") return;
-          setFrame(prev => {
-            // Hello/recovery — только метаданные; не затирать scene/agents (иначе «перезагрузка» 3D).
-            if (data._ws_hello || data._ws_recovery) {
-              return {
-                ...prev,
-                tick: data.tick ?? prev.tick,
-                phase: data.phase ?? prev.phase,
-                entropy: data.entropy ?? prev.entropy,
-                events: data.events?.length ? data.events : prev.events,
-              };
-            }
-            const raw = Array.isArray(data.agents) ? data.agents : prev.agents;
-            const gd = data.graph_deltas ?? {};
-            const agents = raw.map((a, i) => ({
-              ...a,
-              edges: gd[i as keyof typeof gd] ?? prev.agents[i]?.edges ?? a.edges,
-            }));
-            const prevScene = prev.scene ?? {};
-            const nextScene = data.scene ?? {};
-            const scene = {
-              ...prevScene,
-              ...nextScene,
-              static_geometry:
-                nextScene.static_geometry ?? prevScene.static_geometry,
-            };
-            return { ...data, agents, scene };
-          });
+          const merged = mergeStreamFrame(rawFrameRef.current, data);
+          rawFrameRef.current = merged;
+          scheduleThrottledSetFrame(merged);
         } catch (e) {
           console.error("[RKK] Parse error", e);
         }
@@ -180,10 +217,14 @@ export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
     return () => {
       cancelled = true;
       clearTimeout(reconnectTimer);
+      if (throttleTimerRef.current !== null) {
+        clearTimeout(throttleTimerRef.current);
+        throttleTimerRef.current = null;
+      }
       ws?.close();
       wsRef.current = null;
     };
-  }, [wsUrl]);
+  }, [wsUrl, scheduleThrottledSetFrame]);
 
-  return { frame, connected, speed, setSpeed, reset };
+  return { frame, rawFrameRef, connected, speed, setSpeed, reset };
 }

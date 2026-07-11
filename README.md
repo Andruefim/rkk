@@ -1,73 +1,37 @@
-# React + TypeScript + Vite
+# RKK — Embodied AGI Humanoid Simulation
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Платформа для симуляции воплощённого (embodied) AGI-агента: гуманоид в физическом мире PyBullet, управляемый нейрокогнитивной архитектурой — каузальная GNN-модель мира, System2-планирование, CPG-локомоция, grounded language, интероцепция/аффект и иерархическое дерево задач.
 
-Currently, two official plugins are available:
+Гуманоид принимает команды человека в чате (например, «подойди к предмету и дотронься до него»), строит план (imagine → execute → verify), выполняет его в симуляции, докладывает о результате и остаётся автономным между заданиями. Ход выполнения отображается на фронтенде в виде дерева задач.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Архитектура
 
-## React Compiler
+- **Backend** (`backend/`) — Python: FastAPI + PyBullet + PyTorch. Тик-цикл агента: восприятие → мир-модель (causal GNN) → планирование (System2 / WM planner) → моторный арбитраж (рефлексы, CPG, executive-интенты) → действие.
+- **Frontend** (`src/`) — TypeScript/React + Three.js (Vite). 3D-визуализация сцены и скелета, чат с агентом, панель дерева задач, телеметрия.
+- Связь: WebSocket `ws://localhost:8000/ws/causal-stream` + REST на порту 8000.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Запуск
 
-## Expanding the ESLint configuration
+```bash
+# Backend (порт 8000)
+cd backend
+pip install -r requirements.txt
+python run.py
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+# Frontend (порт 5173)
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Конфигурация — в `.env` в корне репозитория (устройство `RKK_DEVICE`, частоты циклов, флаги AGI-контура `RKK_TASK_BINDING` / `RKK_TASK_TREE` и др.). Подробности по флагам, профилированию тиков и тюнингу производительности — в `AGENTS.md`.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Проверки
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npx tsc -b        # типы фронтенда
+npx eslint .      # линт фронтенда
+npm run build     # прод-сборка
+
+cd backend
+$env:RKK_RUN_TESTS="1"; python -m pytest tests/ -q   # тесты бэкенда (PowerShell)
 ```

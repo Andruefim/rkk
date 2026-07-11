@@ -401,7 +401,8 @@ class EnvironmentHumanoid:
 
     @classmethod
     def _comfort_zone(cls, var: str) -> tuple[float, float]:
-        # Убраны жесткие лимиты _JOINT_COMFORT_RANGE для открытого обучения моторике.
+        if var in ("lshoulder", "rshoulder"):
+            return 0.30, 0.75
         return 0.05, 0.95
 
     def _balance_spine_pitch_nudge(self, raw: dict[str, float]) -> float:
@@ -604,24 +605,25 @@ class EnvironmentHumanoid:
             )
         self._sim.set_joint("spine_pitch", pitch)
 
+        sh_lo, sh_hi = self._comfort_zone("lshoulder")
         l_sh = float(
             np.clip(
                 0.5
                 - (arm_cb - 0.5) * 0.65 * am
-                + (rl - 0.5) * 0.88 * am
+                + (rl - 0.5) * 0.55 * am
                 - (wave - 0.5) * 0.12 * am,
-                0.05,
-                0.95,
+                sh_lo,
+                sh_hi,
             )
         )
         r_sh = float(
             np.clip(
                 0.5
                 + (arm_cb - 0.5) * 0.65 * am
-                + (rr - 0.5) * 0.88 * am
+                + (rr - 0.5) * 0.55 * am
                 + (wave - 0.5) * 0.12 * am,
-                0.05,
-                0.95,
+                sh_lo,
+                sh_hi,
             )
         )
         self._sim.set_joint("lshoulder", l_sh)
@@ -694,8 +696,10 @@ class EnvironmentHumanoid:
                 0.95,
             )
         )
-        self._sim.set_joint("lknee", knee)
-        self._sim.set_joint("rknee", knee)
+        leg_asym_k = 0.06
+        leg_asym = leg_asym_k * (sup_l - sup_r)
+        self._sim.set_joint("lknee", float(np.clip(knee + leg_asym, 0.05, 0.95)))
+        self._sim.set_joint("rknee", float(np.clip(knee - leg_asym, 0.05, 0.95)))
 
         rec_excess = float(np.clip((recover - 0.5) * 2.4, 0.0, 1.0))
         bilateral_hip_tuck = float(
@@ -725,8 +729,8 @@ class EnvironmentHumanoid:
         )
 
         ankle = float(np.clip(0.5 + (sup_l + sup_r - 1.0) * 0.12, 0.05, 0.95))
-        self._sim.set_joint("lankle", ankle)
-        self._sim.set_joint("rankle", ankle)
+        self._sim.set_joint("lankle", float(np.clip(ankle + leg_asym, 0.05, 0.95)))
+        self._sim.set_joint("rankle", float(np.clip(ankle - leg_asym, 0.05, 0.95)))
 
         self._apply_upper_body_from_intents(cpg_sync=None)
 

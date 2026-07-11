@@ -86,6 +86,24 @@ def _joint_slew_max_step() -> float:
         return 0.115
 
 
+def _shoulder_rad_limits() -> tuple[float, float]:
+    try:
+        lo = float(os.environ.get("RKK_SHOULDER_MIN_RAD", "-0.8"))
+    except ValueError:
+        lo = -0.8
+    try:
+        hi = float(os.environ.get("RKK_SHOULDER_MAX_RAD", "1.1"))
+    except ValueError:
+        hi = 1.1
+    return lo, hi
+
+
+def clamp_shoulder_real_pos(real_pos: float) -> float:
+    """Anatomical clamp for spherical shoulder before Euler mapping."""
+    lo, hi = _shoulder_rad_limits()
+    return float(np.clip(real_pos, lo, hi))
+
+
 def _spine_pitch_euler_coeff() -> float:
     """Масштаб Эйлер-компоненты наклона таза (около оси pitch URDF); см. RKK_SPINE_PITCH_EULER_COEFF."""
     try:
@@ -1439,6 +1457,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             if is_leg:
                 leg_kp_mult = float(np.clip(leg_kp_mult, 1.0, 1.35))
             if jt == pb.JOINT_SPHERICAL and callable(motor_m):
+                if var_name in ("lshoulder", "rshoulder"):
+                    real_pos = clamp_shoulder_real_pos(real_pos)
                 if var_name == "lshoulder":
                     q = pb.getQuaternionFromEuler((0.32 * real_pos, 0.42 * real_pos, 0.28 * real_pos))
                 elif var_name == "rshoulder":

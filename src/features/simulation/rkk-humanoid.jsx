@@ -164,9 +164,7 @@ const SKELETON_BONES = [
 export default function RKKHumanoid() {
   const mountRef   = useRef(null);
   const rafRef     = useRef(null);
-  const { frame: wsFrame, connected, setSpeed: wsSetSpeed } = useRKKStream(WS_CAUSAL_URL);
-  const wsFrameRef = useRef(wsFrame);
-  wsFrameRef.current = wsFrame;
+  const { frame: wsFrame, rawFrameRef, connected, setSpeed: wsSetSpeed } = useRKKStream(WS_CAUSAL_URL);
 
   const [speed,        setSpeedLocal]    = useState(1);
   const [ui,           setUI]            = useState(() => normFrame(wsFrame));
@@ -765,22 +763,44 @@ export default function RKKHumanoid() {
       return {x:pt.x??0,y:pt.z??0,z:pt.y??0};
     }
 
-    function ingestSkeleton(sk,tick){
-      if(!sk||sk.length<3) return;
-      const t=Number(tick??0);
-      if(t===skInterp.lastTick) return;
-      const poses=sk.slice(0,JOINT_COUNT).map(skToPose);
-      if(skInterp.next){
-        skInterp.prev=skInterp.next;
-        skInterp.prevTime=skInterp.nextTime;
+    const SK_POSE_EPS = 1e-4;
+    function skeletonPoseChanged(sk) {
+      const prev = skInterp.next;
+      if (!prev || !sk || sk.length < 3) return true;
+      const a = skToPose(sk[0]);
+      const b = prev[0];
+      if (!a || !b) return true;
+      if (
+        Math.abs(a.x - b.x) > SK_POSE_EPS
+        || Math.abs(a.y - b.y) > SK_POSE_EPS
+        || Math.abs(a.z - b.z) > SK_POSE_EPS
+      ) return true;
+      const a1 = skToPose(sk[1]);
+      const b1 = prev[1];
+      if (!a1 || !b1) return true;
+      return (
+        Math.abs(a1.x - b1.x) > SK_POSE_EPS
+        || Math.abs(a1.y - b1.y) > SK_POSE_EPS
+        || Math.abs(a1.z - b1.z) > SK_POSE_EPS
+      );
+    }
+
+    function ingestSkeleton(sk, tick) {
+      if (!sk || sk.length < 3) return;
+      const t = Number(tick ?? 0);
+      if (t === skInterp.lastTick && !skeletonPoseChanged(sk)) return;
+      const poses = sk.slice(0, JOINT_COUNT).map(skToPose);
+      if (skInterp.next) {
+        skInterp.prev = skInterp.next;
+        skInterp.prevTime = skInterp.nextTime;
       }
-      skInterp.next=poses;
-      skInterp.nextTime=performance.now();
-      if(skInterp.prevTime>0&&skInterp.nextTime>skInterp.prevTime){
-        const dt=skInterp.nextTime-skInterp.prevTime;
-        skInterp.frameInterval=skInterp.frameInterval*0.8+dt*0.2;
+      skInterp.next = poses;
+      skInterp.nextTime = performance.now();
+      if (skInterp.prevTime > 0 && skInterp.nextTime > skInterp.prevTime) {
+        const dt = skInterp.nextTime - skInterp.prevTime;
+        skInterp.frameInterval = Math.max(16, skInterp.frameInterval * 0.8 + dt * 0.2);
       }
-      skInterp.lastTick=t;
+      skInterp.lastTick = t;
     }
 
     function interpolatedJoint(i){
@@ -805,10 +825,12 @@ export default function RKKHumanoid() {
       if(len>0.001){b.lookAt(bp);b.rotateX(Math.PI/2);}
     }
 
-    function loop(){
-      rafRef.current=requestAnimationFrame(loop);
+    let lastLoopErr = 0;
+    function loop() {
+      rafRef.current = requestAnimationFrame(loop);
+      try {
       frame++;
-      const ds=normFrame(wsFrameRef.current);
+      const ds = normFrame(rawFrameRef.current);
       const ag=ds.agent;
       const wCol=parseInt((ds.worldColor||"#cc44ff").replace("#",""),16);
       const fallen=ds.fallen||ds.scene?.fallen;
@@ -1049,10 +1071,37 @@ export default function RKKHumanoid() {
       visionRing.material.opacity=isVis?0.5+Math.sin(frame*.06)*.2:0.;
 
       renderer.render(scene,camera);
+      } catch (err) {
+        const now = performance.now();
+        if (now - lastLoopErr > 1000) {
+          lastLoopErr = now;
+          console.error("[RKK] rAF loop error", err);
+        }
+      }
     }
     loop();
 
-    const el=renderer.domElement;
+    const el = renderer.domElement;
+    const gl = renderer.getContext();
+    const onCtxLost = (e) => {
+      e.preventDefault();
+      console.warn("[RKK] WebGL context lost");
+    };
+    const onCtxRestored = () => {
+      console.warn("[RKK] WebGL context restored — reinitializing renderer");
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, GFX.dprCap));
+      if (mount) {
+        renderer.setSize(mount.clientWidth, mount.clientHeight);
+        camera.aspect = mount.clientWidth / mount.clientHeight;
+        camera.updateProjectionMatrix();
+      }
+      cancelAnimationFrame(rafRef.current);
+      loop();
+    };
+    if (gl) {
+      gl.canvas.addEventListener("webglcontextlost", onCtxLost);
+      gl.canvas.addEventListener("webglcontextrestored", onCtxRestored);
+    }
     el.style.cursor="grab"; el.style.touchAction="none";
     const onPD=e=>{if(e.button!==0)return;camDrag=true;camPtrX=e.clientX;camPtrY=e.clientY;el.setPointerCapture(e.pointerId);el.style.cursor="grabbing";};
     const onPM=e=>{if(!camDrag)return;camAzim-=(e.clientX-camPtrX)*.005;camElev-=(e.clientY-camPtrY)*.005;camElev=Math.max(.08,Math.min(Math.PI/2-.06,camElev));camPtrX=e.clientX;camPtrY=e.clientY;};
@@ -1065,6 +1114,10 @@ export default function RKKHumanoid() {
     window.addEventListener("resize",onR);
     return()=>{
       cancelAnimationFrame(rafRef.current);
+      if (gl) {
+        gl.canvas.removeEventListener("webglcontextlost", onCtxLost);
+        gl.canvas.removeEventListener("webglcontextrestored", onCtxRestored);
+      }
       el.removeEventListener("pointerdown",onPD);el.removeEventListener("pointermove",onPM);
       el.removeEventListener("pointerup",onPU);el.removeEventListener("pointercancel",onPU);
       el.removeEventListener("wheel",onW);window.removeEventListener("resize",onR);

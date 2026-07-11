@@ -240,11 +240,18 @@ class SimulationTickMixin:
             d_sup = 0.06
         decay = max(0.12, 1.0 - float(age) / float(span))
         scale = float(np.clip(decay, 0.2, 1.0))
+        alt = (int(self.tick) // 30) % 2
+        if alt == 0:
+            sup_l = d_sup * scale
+            sup_r = d_sup * scale * 0.4
+        else:
+            sup_l = d_sup * scale * 0.4
+            sup_r = d_sup * scale
         fn(
             {
                 "intent_stop_recover": d_rec * scale,
-                "intent_support_left": d_sup * scale,
-                "intent_support_right": d_sup * scale,
+                "intent_support_left": sup_l,
+                "intent_support_right": sup_r,
             }
         )
 
@@ -537,6 +544,14 @@ class SimulationTickMixin:
             fn = getattr(self.agent.env, "reset_stance", None)
             if callable(fn):
                 fn()
+                lc = getattr(self, "_locomotion_controller", None)
+                if lc is not None:
+                    reset_fn = getattr(lc, "reset_cpg_phases", None)
+                    if callable(reset_fn):
+                        try:
+                            reset_fn()
+                        except Exception:
+                            pass
             self.agent.graph._obs_buffer.clear()
             self.agent.graph._int_buffer.clear()
             self._add_event(
@@ -1639,7 +1654,12 @@ class SimulationTickMixin:
             or (self.tick - int(self._cached_scene_tick)) >= scene_every
         )
         if scene_stale:
-            self._cached_scene = scene_fn() if callable(scene_fn) else {}
+            try:
+                self._cached_scene = scene_fn() if callable(scene_fn) else {}
+            except Exception:
+                # Keep last good scene; light patch below retries skeleton and
+                # its failure streak re-invalidates the cache for another attempt.
+                self._cached_scene = dict(getattr(self, "_cached_scene", {}) or {})
             self._cached_scene_tick = int(self.tick)
             self._cached_skeleton_tick = int(self.tick)
             from engine.tick_profiler import tick_profile
@@ -1766,12 +1786,29 @@ class SimulationTickMixin:
         env = getattr(self.agent, "env", None)
         if env is None:
             return
+        _log = logging.getLogger(__name__)
         try:
             sk_fn = getattr(env, "get_joint_positions_world", None)
             if callable(sk_fn):
                 scene["skeleton"] = sk_fn()
-        except Exception:
-            pass
+            streak = int(getattr(self, "_skel_patch_fail_streak", 0))
+            if streak:
+                self._skel_patch_fail_streak = 0
+        except Exception as exc:
+            streak = int(getattr(self, "_skel_patch_fail_streak", 0)) + 1
+            self._skel_patch_fail_streak = streak
+            last_warn = int(getattr(self, "_skel_patch_last_warn_tick", -200))
+            if int(self.tick) - last_warn >= 100:
+                self._skel_patch_last_warn_tick = int(self.tick)
+                _log.warning(
+                    "skeleton light-patch failed (streak=%d tick=%d): %s",
+                    streak,
+                    int(self.tick),
+                    exc,
+                )
+            if streak >= 3:
+                self._cached_scene_tick = -1
+                self._skel_patch_fail_streak = 0
         sim = getattr(env, "_sim", None)
         try:
             aq_fn = getattr(sim, "get_ankle_quaternions_three_js", None)

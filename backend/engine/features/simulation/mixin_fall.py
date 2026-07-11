@@ -83,6 +83,14 @@ class SimulationFallMixin:
         if self.tick - self._last_fall_reset_tick < 4:
             return False
         fn()
+        lc = getattr(self, "_locomotion_controller", None)
+        if lc is not None:
+            reset_fn = getattr(lc, "reset_cpg_phases", None)
+            if callable(reset_fn):
+                try:
+                    reset_fn()
+                except Exception:
+                    pass
         self.agent.graph._obs_buffer.clear()
         self.agent.graph._int_buffer.clear()
         self._last_fall_reset_tick = self.tick

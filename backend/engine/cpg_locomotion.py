@@ -294,14 +294,32 @@ class LocomotionController:
             intent_agg = 0.0
         drive_damp = float(np.clip(1.0 - 0.06 * intent_agg, 0.72, 1.0))
 
+        gscale = float(
+            np.clip(max(stride_n, 0.42 * recover_n + 0.48 * low_z) * 1.8, 0.0, 1.0)
+        )
+        walk_blend = float(
+            np.clip(max(stride_n, 0.5 * recover_n + 0.45 * low_z), 0.0, 1.0)
+        )
+        walk_gate = float(np.clip(walk_blend * (0.35 + 0.65 * gscale), 0.0, 1.0))
+        try:
+            suppress = float(os.environ.get("RKK_CPG_RECOVERY_WALK_SUPPRESS", "0.85"))
+        except ValueError:
+            suppress = 0.85
+        suppress = float(np.clip(suppress, 0.0, 1.0))
+        rec_gate = float(np.clip(max(recover_n, low_z * 0.9), 0.0, 1.0))
+        if rec_gate > 0.35:
+            walk_gate *= float(1.0 - suppress * rec_gate)
+        bilateral_scale = float(1.0 - walk_gate)
+
         # CPG команды для ног
         cmd = torch.zeros(6, dtype=torch.float32, device=self.device)
-        cmd[0] =  0.19 * stride - 0.08 * sup_r - 0.05 * recover   # lhip
-        cmd[1] = -0.19 * stride - 0.08 * sup_l - 0.05 * recover   # rhip
-        cmd[2] =  0.14 * sup_l + 0.10 * recover                    # lknee
-        cmd[3] =  0.14 * sup_r + 0.10 * recover                    # rknee
-        cmd[4] =  0.08 * sup_l - 0.04 * stride + 0.05 * recover    # lankle
-        cmd[5] =  0.08 * sup_r + 0.04 * stride + 0.05 * recover    # rankle
+        recover_bil = recover * bilateral_scale
+        cmd[0] =  0.19 * stride - 0.08 * sup_r - 0.05 * recover_bil  # lhip
+        cmd[1] = -0.19 * stride - 0.08 * sup_l - 0.05 * recover_bil  # rhip
+        cmd[2] =  0.14 * sup_l + 0.10 * recover_bil                  # lknee
+        cmd[3] =  0.14 * sup_r + 0.10 * recover_bil                  # rknee
+        cmd[4] =  0.08 * sup_l - 0.04 * stride + 0.05 * recover_bil  # lankle
+        cmd[5] =  0.08 * sup_r + 0.04 * stride + 0.05 * recover_bil  # rankle
 
         if static_penalty_applied:
             try:
@@ -314,6 +332,7 @@ class LocomotionController:
             with torch.no_grad():
                 self.cpg.phase_bias[0, 1] = math.pi
                 self.cpg.phase_bias[1, 0] = -math.pi
+                self._clamp_phase_bias_pairs()
         coupling_gain = 0.1
         try:
             c_raw = float(self._node(agent_nodes, "intent_gait_coupling"))
@@ -328,9 +347,6 @@ class LocomotionController:
         )
 
         # Торс синхронизация с CPG: pitch_add > 0 = наклон вперёд
-        gscale = float(
-            np.clip(max(stride_n, 0.42 * recover_n + 0.48 * low_z) * 1.8, 0.0, 1.0)
-        )
         s = float(torch.sin(self.cpg._phase[0]).item())
         c_m = float(torch.cos(self.cpg._phase[2]).item())
         
@@ -386,18 +402,6 @@ class LocomotionController:
         swing_r = _swing_factor(phi_r)
         hip_lift = _env_cpg_swing_float("RKK_CPG_SWING_HIP_LIFT", "0.08")
         knee_flex = _env_cpg_swing_float("RKK_CPG_SWING_KNEE_FLEX", "0.10")
-        walk_blend = float(
-            np.clip(max(stride_n, 0.5 * recover_n + 0.45 * low_z), 0.0, 1.0)
-        )
-        walk_gate = float(np.clip(walk_blend * (0.35 + 0.65 * gscale), 0.0, 1.0))
-        try:
-            suppress = float(os.environ.get("RKK_CPG_RECOVERY_WALK_SUPPRESS", "0.85"))
-        except ValueError:
-            suppress = 0.85
-        suppress = float(np.clip(suppress, 0.0, 1.0))
-        rec_gate = float(np.clip(max(recover_n, low_z * 0.9), 0.0, 1.0))
-        if rec_gate > 0.35:
-            walk_gate *= float(1.0 - suppress * rec_gate)
 
         self._last_cpg_sync = {
             "sin": s, "cos_mid": c_m,
@@ -495,10 +499,11 @@ class LocomotionController:
         )
         hip_tuck = _env_cpg_swing_float("RKK_CPG_RECOVERY_HIP_TUCK", "0.04")
         knee_tuck_x = _env_cpg_swing_float("RKK_CPG_RECOVERY_KNEE_FLEX_EXTRA", "0.02")
-        targets["lhip"] = float(np.clip(targets["lhip"] + hip_tuck * tuck_gate, 0.05, 0.95))
-        targets["rhip"] = float(np.clip(targets["rhip"] + hip_tuck * tuck_gate, 0.05, 0.95))
-        targets["lknee"] = float(np.clip(targets["lknee"] - knee_tuck_x * tuck_gate, 0.05, 0.95))
-        targets["rknee"] = float(np.clip(targets["rknee"] - knee_tuck_x * tuck_gate, 0.05, 0.95))
+        tuck_bil = tuck_gate * bilateral_scale
+        targets["lhip"] = float(np.clip(targets["lhip"] + hip_tuck * tuck_bil, 0.05, 0.95))
+        targets["rhip"] = float(np.clip(targets["rhip"] + hip_tuck * tuck_bil, 0.05, 0.95))
+        targets["lknee"] = float(np.clip(targets["lknee"] - knee_tuck_x * tuck_bil, 0.05, 0.95))
+        targets["rknee"] = float(np.clip(targets["rknee"] - knee_tuck_x * tuck_bil, 0.05, 0.95))
 
         # Наклон «вперёд» в интентах → прижать бёдра (не только spine_pitch).
         try:
@@ -520,8 +525,8 @@ class LocomotionController:
                 1.0,
             )
         )
-        hip_from_torso = coeff_th * torso_excess * torso_hip_scale
-        knee_from_torso = coeff_tk * torso_excess * torso_hip_scale
+        hip_from_torso = coeff_th * torso_excess * torso_hip_scale * bilateral_scale
+        knee_from_torso = coeff_tk * torso_excess * torso_hip_scale * bilateral_scale
         targets["lhip"] = float(np.clip(targets["lhip"] + hip_from_torso, 0.05, 0.95))
         targets["rhip"] = float(np.clip(targets["rhip"] + hip_from_torso, 0.05, 0.95))
         targets["lknee"] = float(np.clip(targets["lknee"] - knee_from_torso, 0.05, 0.95))
@@ -586,9 +591,33 @@ class LocomotionController:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.cpg.parameters(), 0.3)
         self.optim.step()
+        with torch.no_grad():
+            self._clamp_phase_bias_pairs()
 
         # Resample perturbations for the next step exploration
         self.cpg.resample_perturbations()
+
+    @torch.no_grad()
+    def reset_cpg_phases(self) -> None:
+        """Reset oscillators to left-right antiphase (φ_l=0, φ_r=π for hip/knee/ankle)."""
+        p = self.cpg._phase
+        p[0] = 0.0
+        p[1] = math.pi
+        p[2] = 0.0
+        p[3] = math.pi
+        p[4] = 0.0
+        p[5] = math.pi
+
+    @torch.no_grad()
+    def _clamp_phase_bias_pairs(self) -> None:
+        margin = 0.35
+        for i, j in ((0, 1), (2, 3)):
+            self.cpg.phase_bias[i, j] = torch.clamp(
+                self.cpg.phase_bias[i, j], math.pi - margin, math.pi + margin
+            )
+            self.cpg.phase_bias[j, i] = torch.clamp(
+                self.cpg.phase_bias[j, i], -math.pi - margin, -math.pi + margin
+            )
 
     def snapshot(self) -> dict:
         with torch.no_grad():
