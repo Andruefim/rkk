@@ -1,37 +1,37 @@
-# RKK — Embodied AGI Humanoid Simulation
+# RKK — Embodied Agent Simulation
 
-Платформа для симуляции воплощённого (embodied) AGI-агента: гуманоид в физическом мире PyBullet, управляемый нейрокогнитивной архитектурой — каузальная GNN-модель мира, System2-планирование, CPG-локомоция, grounded language, интероцепция/аффект и иерархическое дерево задач.
+A simulation platform for an embodied agent: a humanoid in a PyBullet physics world driven by a neurocognitive architecture — a causal GNN world model, System2 planning, CPG locomotion, grounded language, interoception/affect, and a hierarchical task tree.
 
-Гуманоид принимает команды человека в чате (например, «подойди к предмету и дотронься до него»), строит план (imagine → execute → verify), выполняет его в симуляции, докладывает о результате и остаётся автономным между заданиями. Ход выполнения отображается на фронтенде в виде дерева задач.
+The agent accepts human commands in chat (e.g. "walk to the object in front of you and touch it"), builds a plan (imagine → execute → verify), carries it out in simulation, reports the result, and stays autonomous between tasks. Execution progress is shown on the frontend as a task tree.
 
-## Архитектура
+## Architecture
 
-- **Backend** (`backend/`) — Python: FastAPI + PyBullet + PyTorch. Тик-цикл агента: восприятие → мир-модель (causal GNN) → планирование (System2 / WM planner) → моторный арбитраж (рефлексы, CPG, executive-интенты) → действие.
-- **Frontend** (`src/`) — TypeScript/React + Three.js (Vite). 3D-визуализация сцены и скелета, чат с агентом, панель дерева задач, телеметрия.
-- Связь: WebSocket `ws://localhost:8000/ws/causal-stream` + REST на порту 8000.
+- **Backend** (`backend/`) — Python: FastAPI + PyBullet + PyTorch. Agent tick loop: perception → world model (causal GNN) → planning (System2 / WM planner) → motor arbitration (reflexes, CPG, executive intents) → action.
+- **Frontend** (`src/`) — TypeScript/React + Three.js (Vite). 3D visualization of the scene and skeleton, agent chat, task tree panel, telemetry.
+- Communication: WebSocket `ws://localhost:8000/ws/causal-stream` + REST on port 8000.
 
-## Запуск
+## Getting started
 
 ```bash
-# Backend (порт 8000)
+# Backend (port 8000)
 cd backend
 pip install -r requirements.txt
 python run.py
 
-# Frontend (порт 5173)
+# Frontend (port 5173)
 npm install
 npm run dev
 ```
 
-Конфигурация — в `.env` в корне репозитория (устройство `RKK_DEVICE`, частоты циклов, флаги AGI-контура `RKK_TASK_BINDING` / `RKK_TASK_TREE` и др.). Подробности по флагам, профилированию тиков и тюнингу производительности — в `AGENTS.md`.
+Configuration lives in `.env` at the repo root (device via `RKK_DEVICE`, loop rates, task-loop flags `RKK_TASK_BINDING` / `RKK_TASK_TREE`, etc.). See `AGENTS.md` for details on flags, tick profiling, and performance tuning.
 
-## Проверки
+## Checks
 
 ```bash
-npx tsc -b        # типы фронтенда
-npx eslint .      # линт фронтенда
-npm run build     # прод-сборка
+npx tsc -b        # frontend type check
+npx eslint .      # frontend lint
+npm run build     # production build
 
 cd backend
-$env:RKK_RUN_TESTS="1"; python -m pytest tests/ -q   # тесты бэкенда (PowerShell)
+$env:RKK_RUN_TESTS="1"; python -m pytest tests/ -q   # backend tests (PowerShell)
 ```
