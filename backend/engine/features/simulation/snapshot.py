@@ -234,6 +234,11 @@ def build_simulation_snapshot(
             if hasattr(sim, "_grounded_lang_snapshot")
             else {"enabled": False}
         ),
+        "task_tree": (
+            sim._task_tree_snapshot()
+            if hasattr(sim, "_task_tree_snapshot")
+            else {"active": False}
+        ),
         "latent_confounder": getattr(sim, "_latent_confounder_last", None) or {},
         "learned_roles": _learned_roles_snapshot(),
         "visual_voice": (

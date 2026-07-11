@@ -1013,3 +1013,109 @@ class EnvironmentHumanoid:
         if callable(fn):
             scene.update(fn())
         return scene
+
+    def resolve_manipulation_target(
+        self,
+        query: str,
+        *,
+        agent_forward: tuple[float, float] | None = None,
+        embed_fn=None,
+    ) -> tuple:
+        """Resolve manipulation target via scene extras (no VLM)."""
+        from engine.object_resolver import resolve_manipulation_target
+
+        raw = self._sim.get_state() if hasattr(self._sim, "get_state") else {}
+        agent_xy = (float(raw.get("com_x", 0.0)), float(raw.get("com_y", 0.0)))
+        extras: dict = {}
+        fn = getattr(self._sim, "get_sandbox_scene_extras", None)
+        if callable(fn):
+            try:
+                extras = dict(fn() or {})
+            except Exception:
+                extras = {}
+        return resolve_manipulation_target(
+            query,
+            extras,
+            agent_xy=agent_xy,
+            agent_forward=agent_forward,
+            embed_fn=embed_fn,
+        )
+
+    def apply_manipulation_push(
+        self,
+        body_id: int,
+        direction_xy: tuple[float, float],
+        force_n: float | None = None,
+    ) -> dict:
+        """Bounded push assist on a movable target (PyBullet when available)."""
+        fn = getattr(self._sim, "apply_manipulation_push", None)
+        if callable(fn):
+            try:
+                return dict(fn(body_id, direction_xy, force_n) or {})
+            except Exception as exc:
+                return {"applied": False, "reason": f"push_error:{exc}"}
+        return {"applied": False, "reason": "backend_unsupported"}
+
+    def get_manipulation_target_pose(self, ref: str) -> dict | None:
+        fn = getattr(self._sim, "get_manipulation_target_pose", None)
+        if callable(fn):
+            try:
+                out = fn(ref)
+                return dict(out) if isinstance(out, dict) else None
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def manip_approach_m() -> float:
+        try:
+            return float(os.environ.get("RKK_MANIP_APPROACH_M", "0.9"))
+        except ValueError:
+            return 0.9
+
+    @staticmethod
+    def manip_reach_min_ticks() -> int:
+        try:
+            return max(1, int(os.environ.get("RKK_MANIP_REACH_MIN_TICKS", "16")))
+        except ValueError:
+            return 16
+
+    @staticmethod
+    def manip_push_every() -> int:
+        try:
+            return max(1, int(os.environ.get("RKK_MANIP_PUSH_EVERY", "4")))
+        except ValueError:
+            return 4
+
+    def apply_task_outcome_affect(self, success: bool) -> dict[str, float]:
+        """Bounded intero shift on human-task outcome (event-only, no per-tick affect)."""
+        try:
+            d_energy = float(os.environ.get("RKK_TASK_AFFECT_ENERGY", "0.05"))
+        except ValueError:
+            d_energy = 0.05
+        try:
+            d_stress = float(os.environ.get("RKK_TASK_AFFECT_STRESS", "0.18"))
+        except ValueError:
+            d_stress = 0.18
+        st = self._intero_state
+        before = dict(st)
+        if success:
+            st["intero_energy"] = float(
+                np.clip(float(st.get("intero_energy", 0.5)) + d_energy, 0.0, 1.0)
+            )
+            st["intero_stress"] = float(
+                np.clip(float(st.get("intero_stress", 0.0)) - 0.04, 0.0, 1.0)
+            )
+        else:
+            st["intero_stress"] = float(
+                np.clip(float(st.get("intero_stress", 0.0)) + d_stress, 0.0, 1.0)
+            )
+            st["intero_energy"] = float(
+                np.clip(float(st.get("intero_energy", 0.5)) - 0.03, 0.0, 1.0)
+            )
+        return {
+            "intero_energy": float(st["intero_energy"]),
+            "intero_stress": float(st["intero_stress"]),
+            "delta_energy": float(st["intero_energy"] - before.get("intero_energy", 0.0)),
+            "delta_stress": float(st["intero_stress"] - before.get("intero_stress", 0.0)),
+        }

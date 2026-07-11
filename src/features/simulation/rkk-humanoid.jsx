@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import * as THREE from "three";
 import { useRKKStream } from "../../hooks/useRKKStream";
 import NovaChatWidget from "./NovaChatWidget";
+import TaskTreePanel, { normTaskTree } from "./TaskTreePanel";
 
 /** Backend REST + WS (override in .env: VITE_RKK_API_URL=http://127.0.0.1:8000) */
 const API = import.meta.env.VITE_RKK_API_URL ?? "http://localhost:8000";
@@ -146,6 +147,7 @@ function normFrame(raw) {
     behavioral:raw.behavioral??null,
     curriculumStabilizeUntil:raw.curriculum_stabilize_until??0,
     system2: raw.system2 ?? null,
+    taskTree: normTaskTree(raw.task_tree),
   };
 }
 
@@ -755,6 +757,44 @@ export default function RKKHumanoid() {
     const displayJointPos=[];
     const SK_LERP=0.42;
     const SK_SNAP_DIST=0.85;
+    const skInterp={
+      prev:null,next:null,prevTime:0,nextTime:0,lastTick:-1,frameInterval:66.67,
+    };
+
+    function skToPose(pt){
+      return {x:pt.x??0,y:pt.z??0,z:pt.y??0};
+    }
+
+    function ingestSkeleton(sk,tick){
+      if(!sk||sk.length<3) return;
+      const t=Number(tick??0);
+      if(t===skInterp.lastTick) return;
+      const poses=sk.slice(0,JOINT_COUNT).map(skToPose);
+      if(skInterp.next){
+        skInterp.prev=skInterp.next;
+        skInterp.prevTime=skInterp.nextTime;
+      }
+      skInterp.next=poses;
+      skInterp.nextTime=performance.now();
+      if(skInterp.prevTime>0&&skInterp.nextTime>skInterp.prevTime){
+        const dt=skInterp.nextTime-skInterp.prevTime;
+        skInterp.frameInterval=skInterp.frameInterval*0.8+dt*0.2;
+      }
+      skInterp.lastTick=t;
+    }
+
+    function interpolatedJoint(i){
+      const prev=skInterp.prev,next=skInterp.next;
+      if(!next||!next[i]) return null;
+      if(!prev||!prev[i]||skInterp.frameInterval<=0) return next[i];
+      const alpha=Math.min(1,Math.max(0,(performance.now()-skInterp.nextTime)/skInterp.frameInterval));
+      const p=prev[i],n=next[i];
+      return {
+        x:n.x+(n.x-p.x)*alpha,
+        y:n.y+(n.y-p.y)*alpha,
+        z:n.z+(n.z-p.z)*alpha,
+      };
+    }
 
     function updateBone(b,a,bp){
       const mid=new THREE.Vector3().addVectors(a,bp).multiplyScalar(0.5);
@@ -800,11 +840,17 @@ export default function RKKHumanoid() {
       const jointPositions=[];
       const ankleQuats=ds.scene?.ankleQuats;
       if(sk&&sk.length>=3){
+        ingestSkeleton(sk,ds.tick);
         sk.slice(0,JOINT_COUNT).forEach((pt,i)=>{
-          const target=new THREE.Vector3(pt.x??0,pt.z??0,pt.y??0);
+          const interp=interpolatedJoint(i);
+          const target=interp
+            ?new THREE.Vector3(interp.x,interp.y,interp.z)
+            :new THREE.Vector3(pt.x??0,pt.z??0,pt.y??0);
           if(!displayJointPos[i]) displayJointPos[i]=target.clone();
-          else if(displayJointPos[i].distanceTo(target)>SK_SNAP_DIST) displayJointPos[i].copy(target);
-          else displayJointPos[i].lerp(target,SK_LERP);
+          else if(!skInterp.prev){
+            if(displayJointPos[i].distanceTo(target)>SK_SNAP_DIST) displayJointPos[i].copy(target);
+            else displayJointPos[i].lerp(target,SK_LERP);
+          }else displayJointPos[i].set(target.x,target.y,target.z);
           const v=displayJointPos[i];
           jointPositions.push(v);
           if(i<jointMeshes.length){
@@ -1275,6 +1321,7 @@ export default function RKKHumanoid() {
           </div>}
         </div>
         <NovaChatWidget />
+        <TaskTreePanel taskTree={ui.taskTree} />
       </div>
 
       {/* Right HUD */}

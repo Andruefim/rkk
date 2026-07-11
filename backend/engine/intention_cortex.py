@@ -250,6 +250,17 @@ class IntentionCortex:
                 -_ei("RKK_INTENTION_NARRATIVE_CAP", 32) :
             ]
 
+    def clear_human_command(self) -> None:
+        """Drop human-command subgoals and expected_state after task completion."""
+        self._stack = [s for s in self._stack if s.source != "human_command"]
+        self._last_context.expected_state = {}
+        if str(self._last_context.macro_hint or "").upper() in (
+            "EXPLORE",
+            "RECOVER_POSTURE",
+        ):
+            self._last_context.macro_hint = ""
+        self._last_context.narrative = ""
+
     def tick_pre_control(
         self,
         sim: Any,
@@ -954,10 +965,25 @@ class IntentionCortex:
             residuals[ck] = residuals.get(ck, 0.0) + float(dv) * motor_gain
         arb = getattr(sim, "_motor_arbiter", None) if sim is not None else None
         suppress = arb is not None and arb.should_suppress_substrate()
+        try:
+            from engine.motor_arbiter import is_balance_critical_intent_field
+        except Exception:
+            is_balance_critical_intent_field = lambda _k: False  # noqa: E731
+        balance_residuals = {
+            k: v for k, v in residuals.items() if is_balance_critical_intent_field(k)
+        }
+        other_residuals = {
+            k: v for k, v in residuals.items() if k not in balance_residuals
+        }
+        if balance_residuals:
+            try:
+                fn(balance_residuals)
+            except Exception:
+                pass
         if not suppress:
-            if residuals:
+            if other_residuals:
                 try:
-                    fn(residuals)
+                    fn(other_residuals)
                 except Exception:
                     pass
             nodes = agent.graph.nodes

@@ -1,0 +1,283 @@
+"""Integration: task tree + command/tick loop (mock env, no PyBullet)."""
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest import mock
+
+import numpy as np
+import pytest
+
+from engine.task_tree import DECOMPOSE_MANIPULATE
+from engine.verbal_action import SpeechType
+from tests.conftest import AgiLoopSim, _default_humanoid_obs
+from tests.test_agi_human_command_loop import _patch_fallback_embed
+
+
+def _chair_scene() -> dict:
+    return {
+        "registry": [
+            {
+                "ref": "manip_chair_front",
+                "id": "manip_chair_front",
+                "body_id": 9001,
+                "semantic": "chair",
+                "movable": True,
+                "mass": 5.5,
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.4,
+                "source": "test",
+            }
+        ]
+    }
+
+
+def test_manip_command_creates_five_step_tree_and_resolves(agi_loop_sim: AgiLoopSim) -> None:
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    sim.agent.env.set_scene_extras(_chair_scene())
+    sim.agent.env._obs["com_x"] = 0.0
+    sim.agent.env._obs["com_y"] = 0.0
+
+    out = sim.handle_human_command("передвинь стул вперёд")
+
+    assert out["ok"] is True
+    tree = out.get("task_tree") or {}
+    assert tree.get("active") is True
+    assert out.get("manipulation_target") == "manip_chair_front"
+    tt = sim._ensure_task_tree()
+    root = tt.tree
+    assert root is not None
+    kinds = [root.nodes[c].kind for c in root.nodes[root.root_id].children]
+    assert kinds == list(DECOMPOSE_MANIPULATE)
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "approach_target"
+
+
+def test_manip_no_target_fails_and_reports(agi_loop_sim: AgiLoopSim) -> None:
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    sim.agent.env.set_scene_extras({"registry": []})
+    verbal = SimpleNamespace(
+        _messages=[],
+        _on_message=[],
+        total_messages=0,
+        _last_report_tick=-1,
+    )
+    sim._verbal = verbal
+
+    out = sim.handle_human_command("передвинь стул")
+
+    assert out["ok"] is True
+    assert out.get("task_binding") is False
+    assert len(verbal._messages) == 1
+    assert "не вижу" in verbal._messages[0].text.lower() or "не могу" in verbal._messages[0].text.lower()
+    assert verbal._messages[0].speech_type == SpeechType.REPORT
+
+
+def test_manip_motor_stage_progresses(agi_loop_sim: AgiLoopSim) -> None:
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    sim.agent.env.set_scene_extras(_chair_scene())
+    sim.agent.env._obs["com_x"] = 0.0
+    sim.agent.env._obs["com_y"] = 0.0
+    sim.handle_human_command("move chair forward")
+    tt = sim._ensure_task_tree()
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "approach_target"
+
+    sim.agent.env._obs["com_x"] = 0.95
+    sim.agent.env._obs["com_y"] = 0.0
+    sim.tick = 101
+    sim._tick_human_task(fallen=False)
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "reach_target"
+
+    sim.tick = 104
+    sim._tick_human_task(fallen=False)
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "push_target"
+
+
+def test_manip_physical_verify_required_not_intent(agi_loop_sim: AgiLoopSim) -> None:
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    sim.agent.env.set_scene_extras(_chair_scene())
+    sim.handle_human_command("push chair")
+    tt = sim._ensure_task_tree()
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "approach_target"
+    tt.complete_active(sim.tick)
+    tt.complete_active(sim.tick + 1)
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "push_target"
+
+    sim.set_obs(
+        {
+            **_default_humanoid_obs(),
+            "intent_grasp": 0.95,
+            "intent_reach_right": 0.95,
+            "com_x": 0.0,
+            "com_y": 0.0,
+        }
+    )
+    sim.tick = 200
+    sim._tick_human_task(fallen=False)
+    assert tt.is_active
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "push_target"
+
+
+def test_manip_full_success_reports_and_clears(agi_loop_sim: AgiLoopSim) -> None:
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    sim.agent.env.set_scene_extras(_chair_scene())
+    verbal = SimpleNamespace(
+        _messages=[],
+        _on_message=[],
+        total_messages=0,
+        _last_report_tick=-1,
+    )
+    sim._verbal = verbal
+    sim.grounded_lang_generate = lambda obs=None: "Готово."  # type: ignore[method-assign]
+
+    out = sim.handle_human_command("передвинь стул вперёд")
+    tt = sim._ensure_task_tree()
+    assert out["manipulation_target"] == "manip_chair_front"
+    assert tt.tree is not None
+    assert all(
+        node.target_ref == "manip_chair_front"
+        for node in tt.tree.nodes.values()
+    )
+
+    near_obs = {**sim._obs, "com_x": 0.95, "com_y": 0.0}
+    sim.set_obs(near_obs)
+    with mock.patch("engine.verbal_action.ollama_chat_speech_enabled", return_value=False):
+        for tick in range(101, 109):
+            sim.tick = tick
+            sim._tick_human_task(fallen=False)
+            if getattr(sim, "_task_tree_cleared_pending_ack", False):
+                break
+
+    assert tt.tree is not None
+    assert tt.tree.root_status == "done"
+    assert tt.snapshot(sim.tick)["cleared"] is True
+    assert len(verbal._messages) == 1
+    assert verbal._messages[0].speech_type == SpeechType.REPORT
+    assert sim._manip_diag["verify"]["success"] is True
+    assert sim._system2.working_memory.read("human_task_active") == 0.0
+
+    sim.tick += 1
+    sim._tick_human_task(fallen=False)
+    assert tt.tree is None
+    assert len(verbal._messages) == 1
+
+
+def test_push_timeout_with_stationary_target_fails(
+    agi_loop_sim: AgiLoopSim, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RKK_TASK_REPLAN_MAX", "0")
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    sim.agent.env.set_scene_extras(_chair_scene())
+    sim.handle_human_command("push chair")
+    tt = sim._ensure_task_tree()
+    tt.complete_active(sim.tick)  # approach
+    tt.complete_active(sim.tick)  # reach
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "push_target"
+    tt.active_node.tick_deadline = sim.tick
+
+    monkeypatch.setattr(
+        sim.agent.env,
+        "apply_manipulation_push",
+        lambda *_args, **_kwargs: {"applied": False, "reason": "blocked"},
+    )
+    sim.tick += 1
+    sim._tick_human_task(fallen=False)
+
+    assert tt.tree is not None
+    assert tt.tree.root_status == "failed"
+    assert tt.snapshot(sim.tick)["cleared"] is True
+
+
+def test_outcome_affect_once_and_bounded(agi_loop_sim: AgiLoopSim) -> None:
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    sim.agent.env.set_scene_extras(_chair_scene())
+    sim.handle_human_command("move chair")
+    tt = sim._ensure_task_tree()
+    while tt.is_active and tt.active_node is not None:
+        tt.complete_active(sim.tick)
+        sim.tick += 1
+    before_e = float(sim.agent.env._intero_state["intero_energy"])
+    before_s = float(sim.agent.env._intero_state["intero_stress"])
+    sim._maybe_finalize_task_tree(sim.tick)
+    after_e = float(sim.agent.env._intero_state["intero_energy"])
+    after_s = float(sim.agent.env._intero_state["intero_stress"])
+    assert after_e - before_e <= 0.06
+    assert after_s - before_s <= 0.0
+    sim._maybe_finalize_task_tree(sim.tick + 1)
+    assert float(sim.agent.env._intero_state["intero_energy"]) == after_e
+
+
+def test_completion_clears_tb_tree_wm_and_one_report(agi_loop_sim: AgiLoopSim) -> None:
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    verbal = SimpleNamespace(
+        _messages=[],
+        _on_message=[],
+        total_messages=0,
+        _last_report_tick=-1,
+    )
+    sim._verbal = verbal
+    sim.grounded_lang_generate = lambda obs=None: "Готово."  # type: ignore[method-assign]
+
+    sim.handle_human_command("подойди ближе")
+    tb = sim._ensure_task_binding()
+    task = tb.active_task
+    assert task is not None
+    task.expected_state = {"target_dist": 0.35, "posture_stability": 0.75}
+    task.max_prediction_error = 0.25
+    match_obs = dict(sim._obs)
+    for k, tgt in task.expected_state.items():
+        match_obs[k] = float(tgt)
+    sim.set_obs(match_obs)
+
+    with mock.patch("engine.verbal_action.ollama_chat_speech_enabled", return_value=False):
+        sim.tick = task.tick_started + 2
+        sim._tick_human_task(fallen=False)
+        sim.tick = task.tick_started + 3
+        sim._tick_human_task(fallen=False)
+
+    assert len(verbal._messages) == 1
+    assert verbal._messages[0].speech_type == SpeechType.REPORT
+    wm = sim._system2.working_memory
+    assert wm.read("human_task_active") == 0.0
+    assert tb.active_task is None
+    tt = sim._ensure_task_tree()
+    assert not tt.is_active
+
+
+def test_generic_tree_verifies_task_binding_once_per_tick(
+    agi_loop_sim: AgiLoopSim,
+) -> None:
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    sim.handle_human_command("подойди ближе")
+    tb = sim._ensure_task_binding()
+
+    with mock.patch.object(tb, "tick_verify", wraps=tb.tick_verify) as verify:
+        sim.tick += 1
+        sim._tick_human_task(fallen=False)
+
+    assert verify.call_count == 1
+
+
+@pytest.mark.parametrize("val,expect", [("0", False), ("1", True)])
+def test_task_tree_enabled_flag(monkeypatch: pytest.MonkeyPatch, val: str, expect: bool) -> None:
+    monkeypatch.setenv("RKK_TASK_BINDING", "1")
+    monkeypatch.setenv("RKK_TASK_TREE", val)
+    from engine.task_tree import task_tree_enabled
+
+    assert task_tree_enabled() is expect

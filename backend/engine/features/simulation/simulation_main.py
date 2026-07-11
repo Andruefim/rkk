@@ -138,6 +138,7 @@ class Simulation(
         self.tick = 0
         self._cached_scene: dict = {}
         self._cached_scene_tick = -1
+        self._cached_skeleton_tick = -1
         self.phase = 1
         self.max_phase = 1
 
@@ -167,6 +168,7 @@ class Simulation(
         self._fr_soft_release_reason: str = ""
         self._stand_ticks = 0
         self._last_fall_reset_tick: int = -999
+        self._post_reset_motor_hold_until: int = 0
         self._fall_recovery_active = False
         self._fall_recovery_start_tick = 0
         self._fall_recovery_last_progress_tick = 0

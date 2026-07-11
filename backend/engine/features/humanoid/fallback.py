@@ -1,12 +1,16 @@
 """Fallback humanoid без PyBullet (детерминированная заглушка)."""
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from engine.features.humanoid.constants import (
     ARM_VARS,
     HEAD_VARS,
     LEG_VARS,
+    PENTHOUSE_SPAWN_X,
+    PENTHOUSE_SPAWN_Y,
     SPINE_VARS,
     STAND_Z,
     _RANGES,
@@ -34,6 +38,31 @@ class _FallbackHumanoid(InstrumentalSandbox):
         self._target_pad = np.array([3.6, -3.9, 0.02], dtype=np.float64)
         self._vel = np.zeros(3)
         self._dt = 0.02
+        self._manip_chair = np.array([0.0, 0.0, 0.4], dtype=np.float64)
+        self._manip_chair_start = np.array([0.0, 0.0, 0.4], dtype=np.float64)
+        self._object_registry: list[dict] = []
+        self._physics_step_count = 0
+        if os.environ.get("RKK_MANIP_CHAIR", "0").strip().lower() in ("1", "true", "yes", "on"):
+            spawn = np.array([float(PENTHOUSE_SPAWN_X), float(PENTHOUSE_SPAWN_Y)], dtype=float)
+            center = np.array([0.0, 0.0], dtype=float)
+            delta = center - spawn
+            n = float(np.linalg.norm(delta))
+            fwd = delta / n if n > 1e-6 else np.array([1.0, 0.0])
+            pos = spawn + fwd * 1.05
+            self._manip_chair = np.array([pos[0], pos[1], 0.4], dtype=np.float64)
+            self._manip_chair_start = self._manip_chair.copy()
+            self._object_registry.append({
+                "ref": "manip_chair_front",
+                "id": "manip_chair_front",
+                "body_id": 9001,
+                "semantic": "chair",
+                "movable": True,
+                "mass": 5.5,
+                "x": float(pos[0]),
+                "y": float(pos[1]),
+                "z": 0.4,
+                "source": "manip_chair",
+            })
         self._init_instrumental()
 
     def _compute_lever_pin(self) -> float:
@@ -43,6 +72,7 @@ class _FallbackHumanoid(InstrumentalSandbox):
         return float(np.clip(1.0 - d / 0.35, 0.0, 1.0))
 
     def step(self, n: int = 10):
+        self._physics_step_count += int(n)
         if self.fixed_root:
             self.com[:2] += np.random.normal(0, 0.0005, 2)
             self._tick_hidden_state()
@@ -137,6 +167,14 @@ class _FallbackHumanoid(InstrumentalSandbox):
         pts = [self.ball] + [self.cubes[i].copy() for i in range(len(self.cubes))]
         d_lv = min(float(np.linalg.norm(p[:2] - self._lever_center[:2])) for p in pts)
         lp = float(np.clip(1.0 - d_lv / 0.35, 0.0, 1.0))
+        registry = []
+        for row in getattr(self, "_object_registry", []) or []:
+            entry = dict(row)
+            if str(entry.get("ref")) == "manip_chair_front":
+                entry["x"] = float(self._manip_chair[0])
+                entry["y"] = float(self._manip_chair[1])
+                entry["z"] = float(self._manip_chair[2])
+            registry.append(entry)
         return {
             "ball": {"x": float(self.ball[0]), "y": float(self.ball[1]), "z": float(self.ball[2])},
             "lever": {
@@ -153,7 +191,43 @@ class _FallbackHumanoid(InstrumentalSandbox):
             },
             "static_geometry": [],
             "props": [],
+            "registry": registry,
         }
+
+    def get_physics_object_positions(self) -> dict:
+        return self.get_sandbox_scene_extras()
+
+    def get_manipulation_target_pose(self, ref: str) -> dict | None:
+        if str(ref) != "manip_chair_front":
+            return None
+        return {
+            "ref": "manip_chair_front",
+            "body_id": 9001,
+            "x": float(self._manip_chair[0]),
+            "y": float(self._manip_chair[1]),
+            "z": float(self._manip_chair[2]),
+        }
+
+    def apply_manipulation_push(
+        self,
+        body_id: int,
+        direction_xy: tuple[float, float],
+        force_n: float | None = None,
+    ) -> dict:
+        if int(body_id) != 9001:
+            return {"applied": False, "reason": "unknown_body"}
+        dx, dy = float(direction_xy[0]), float(direction_xy[1])
+        n = float(np.hypot(dx, dy))
+        if n < 1e-6:
+            return {"applied": False, "reason": "zero_direction"}
+        scale = 0.004 * float(force_n or 38.0)
+        self._manip_chair[0] += (dx / n) * scale
+        self._manip_chair[1] += (dy / n) * scale
+        for row in getattr(self, "_object_registry", []) or []:
+            if row.get("body_id") == 9001:
+                row["x"] = float(self._manip_chair[0])
+                row["y"] = float(self._manip_chair[1])
+        return {"applied": True, "body_id": 9001, "force_n": float(force_n or 38.0)}
 
     def get_frame_base64(self, view="side", **kwargs) -> str | None:
         return None
@@ -170,6 +244,12 @@ class _FallbackHumanoid(InstrumentalSandbox):
         self.torso_euler = np.zeros(3)
         self._vel = np.zeros(3)
         self.ball = np.array([1.8, 1.4, 0.14], dtype=np.float64)
+        self._manip_chair = self._manip_chair_start.copy()
+        for row in getattr(self, "_object_registry", []) or []:
+            if row.get("body_id") == 9001:
+                row["x"] = float(self._manip_chair[0])
+                row["y"] = float(self._manip_chair[1])
+                row["z"] = float(self._manip_chair[2])
         self._reset_instrumental_hidden()
 
     def enable_fixed_root(self) -> None:

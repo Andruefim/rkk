@@ -32,17 +32,24 @@ RKK is a two-part AGI simulation platform: a **Python backend** (FastAPI + PyBul
 ### Performance tuning (env)
 
 - **`RKK_VISION_GNN_FEED_EVERY=8`**: GNN→vision PC (`integrate_world_model_step`); was hardcoded every 2 ticks.
-- **`RKK_SCENE_CACHE_EVERY=6`**: PyBullet scene/skeleton refresh interval (avoid `1`).
+- **`RKK_SCENE_CACHE_EVERY=6`**: full PyBullet scene rebuild interval (`static_geometry`, registry, etc.; avoid `1`).
+- **`RKK_SKELETON_EVERY=1`**: lightweight per-tick skeleton/ankleQuats/cubes patch on top of cached scene (decoupled from scene cache).
+- **`RKK_WS_STATIC_EVERY=30`**: WebSocket omits `scene.static_geometry` between full frames; frontend retains last known static mesh.
 - **`RKK_WM_TRAIN_EVERY` / `RKK_WM_TRAIN_EVERY_FALLEN`**: WM `train_step` cadence (fallen default: off).
 - **Fallen fast-path** (`agent.step(fallen=True)`): stale score cache, VL horizon 0, skip CEM/goal-plan, ensemble/temporal/traj updates.
 - **Bench**: `python scratch/bench_tick_hz.py` (sync inner tick; reports median Hz and tick≥650).
 
-### AGI humanoid loop (opt-in)
+### AGI humanoid validation loop
 
-These change boot behavior and the human-command path; keep at `0` unless you need the full AGI chat loop:
+The tracked `.env` enables the command/task-tree/manipulation validation path. Set these to `0` for legacy autonomous-only runs:
 
 - **`RKK_TASK_BINDING=1`**: human chat → counterfactual WM goal → PE verify → REPORT (requires `RKK_GROUNDED_LANG=1`).
+- **`RKK_TASK_TREE=1`**: hierarchical task tree (manipulate / recover / generic decomposition) on top of task binding; default on when binding is on unless `RKK_TASK_TREE=0`.
+- **`RKK_MANIP_CHAIR=1`**: spawn movable chair proxy for manipulation tests; resolver uses the cached scene registry.
 - **`RKK_AUTO_VISUAL=1`**: auto `enable_visual()` on humanoid sim init. With `0`, visual cortex can still turn on via `RKK_VISUAL_GROUNDING=1` or `POST /api/visual/enable`.
+- The validation profile keeps `RKK_AUTO_VISUAL=0`, `RKK_VISUAL_GROUNDING=0`, and `RKK_SCENE_CACHE_EVERY=6`; enable vision explicitly when testing visual grounding.
+- **`RKK_TASK_MOTOR_BODYSPLIT=1`** (default): during active human tasks, register only upper-body intents (`reach`/`grasp`/`wave`/head) as `human_task`; balance-critical fields (`stride`, `support_*`, `torso_forward`, etc.) stay with reflex/gait. Set `0` for legacy full WM intent override.
+- **`RKK_TASK_MOTOR_HOLD_TICKS=60`**: after fall hard-reset, skip `human_task` motor registration for N ticks so reflexes can recover stance before reach resumes.
 
 ### Key gotchas
 

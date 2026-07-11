@@ -116,6 +116,35 @@ def _humanoid_urdf_leg_mass_scale() -> float:
         return 1.30
 
 
+def _manip_chair_enabled() -> bool:
+    return os.environ.get("RKK_MANIP_CHAIR", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _manip_push_enabled() -> bool:
+    return os.environ.get("RKK_MANIP_PUSH", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _manip_contact_every() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_MANIP_CONTACT_EVERY", "4")))
+    except ValueError:
+        return 4
+
+
+def _manip_push_force_n() -> float:
+    try:
+        return float(np.clip(float(os.environ.get("RKK_MANIP_PUSH_FORCE", "38.0")), 4.0, 120.0))
+    except ValueError:
+        return 38.0
+
+
+def _manip_chair_mass() -> float:
+    try:
+        return float(np.clip(float(os.environ.get("RKK_MANIP_CHAIR_MASS", "5.5")), 1.0, 40.0))
+    except ValueError:
+        return 5.5
+
+
 def _custom_humanoid_mass_vector() -> list[float]:
     """
     base + 12 звеньев кастомной куклы. Бедро ≥ голень, иначе «палки» не перевешивают таз.
@@ -301,6 +330,14 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self._prop_starts: list[list[float]] = []
         self._prop_meta: list[dict] = []
         self._build_rich_environment()
+        self._manip_chair_id: int | None = None
+        self._manip_chair_start: list[float] = []
+        self._object_registry: list[dict] = []
+        self._manip_pose_cache: dict[str, tuple[int, tuple[float, float, float]]] = {}
+        self._physics_step_count: int = 0
+        self._manip_contact_tick: int = 0
+        if _manip_chair_enabled():
+            self._build_manip_chair()
 
         self.robot_id = self._load_humanoid()
         self.n_joints = pb.getNumJoints(self.robot_id, physicsClientId=self.client)
@@ -775,6 +812,189 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 "b": float(cfg["color"][2]),
             })
 
+    def _spawn_forward_xy(self, distance_m: float = 1.05) -> tuple[float, float]:
+        """World XY one step in front of penthouse spawn (toward scene center)."""
+        spawn = np.array([float(PENTHOUSE_SPAWN_X), float(PENTHOUSE_SPAWN_Y)], dtype=float)
+        center = np.array([0.0, 0.0], dtype=float)
+        delta = center - spawn
+        n = float(np.linalg.norm(delta))
+        if n < 1e-6:
+            fwd = np.array([1.0, 0.0], dtype=float)
+        else:
+            fwd = delta / n
+        pos = spawn + fwd * float(distance_m)
+        return float(pos[0]), float(pos[1])
+
+    def _build_manip_chair(self) -> None:
+        """Dynamic proxy chair in front of agent spawn (separate from static cafe seats)."""
+        cid = self.client
+        cx, cy = self._spawn_forward_xy()
+        seat_half = [0.24, 0.24, 0.40]
+        try:
+            dist = float(os.environ.get("RKK_MANIP_CHAIR_DIST", "1.05"))
+            cx, cy = self._spawn_forward_xy(dist)
+        except ValueError:
+            pass
+        cz = float(seat_half[2])
+        col = pb.createCollisionShape(
+            pb.GEOM_BOX, halfExtents=seat_half, physicsClientId=cid
+        )
+        vis = pb.createVisualShape(
+            pb.GEOM_BOX,
+            halfExtents=seat_half,
+            rgbaColor=[0.42, 0.36, 0.32, 1.0],
+            physicsClientId=cid,
+        )
+        mass = _manip_chair_mass()
+        pos = [cx, cy, cz]
+        bid = pb.createMultiBody(
+            baseMass=mass,
+            baseCollisionShapeIndex=col,
+            baseVisualShapeIndex=vis,
+            basePosition=pos,
+            physicsClientId=cid,
+        )
+        pb.changeDynamics(
+            bid, -1, lateralFriction=0.62, rollingFriction=0.04, physicsClientId=cid
+        )
+        self._manip_chair_id = int(bid)
+        self._manip_chair_start = [float(pos[0]), float(pos[1]), float(pos[2])]
+        self._object_registry.append({
+            "ref": "manip_chair_front",
+            "id": "manip_chair_front",
+            "body_id": int(bid),
+            "semantic": "chair",
+            "movable": True,
+            "mass": float(mass),
+            "x": float(pos[0]),
+            "y": float(pos[1]),
+            "z": float(pos[2]),
+            "source": "manip_chair",
+        })
+
+    def _registry_snapshot(self) -> list[dict]:
+        """Registry rows with live poses for one registered body each."""
+        out: list[dict] = []
+        for row in getattr(self, "_object_registry", []) or []:
+            if not isinstance(row, dict):
+                continue
+            entry = {k: v for k, v in row.items() if k != "position"}
+            bid = entry.get("body_id")
+            if bid is not None:
+                try:
+                    p, _ = pb.getBasePositionAndOrientation(int(bid), physicsClientId=self.client)
+                    entry["x"] = float(p[0])
+                    entry["y"] = float(p[1])
+                    entry["z"] = float(p[2])
+                except Exception:
+                    pass
+            out.append(entry)
+        return out
+
+    def get_physics_object_positions(self) -> dict:
+        """Scene extras for resolver / scene graph (not called every tick by default)."""
+        return self.get_sandbox_scene_extras()
+
+    def get_manipulation_target_pose(self, ref: str) -> dict | None:
+        """Cheap cached pose lookup for a single manipulation target."""
+        key = str(ref)
+        cached = self._manip_pose_cache.get(key)
+        if cached is not None and cached[0] == self._physics_step_count:
+            p = cached[1]
+            return {"ref": key, "x": p[0], "y": p[1], "z": p[2]}
+
+        body_id: int | None = None
+        for row in getattr(self, "_object_registry", []) or []:
+            if str(row.get("ref")) == key or str(row.get("id")) == key:
+                bid = row.get("body_id")
+                if bid is not None:
+                    body_id = int(bid)
+                break
+        if body_id is None:
+            return None
+        with self._physics_lock:
+            p, _ = pb.getBasePositionAndOrientation(body_id, physicsClientId=self.client)
+        pos = (float(p[0]), float(p[1]), float(p[2]))
+        self._manip_pose_cache[key] = (self._physics_step_count, pos)
+        return {"ref": key, "body_id": body_id, "x": pos[0], "y": pos[1], "z": pos[2]}
+
+    def _manip_registry_row(self, body_id: int) -> dict | None:
+        for row in getattr(self, "_object_registry", []) or []:
+            if row.get("body_id") is not None and int(row["body_id"]) == int(body_id):
+                return row
+        return None
+
+    def _manip_agent_near_target(self, body_id: int, reach_m: float = 0.92) -> bool:
+        com, _ = self.get_com()
+        p, _ = pb.getBasePositionAndOrientation(int(body_id), physicsClientId=self.client)
+        d = float(np.linalg.norm(np.array(p[:2]) - com[:2]))
+        return d <= float(reach_m)
+
+    def _manip_has_contact(self, body_id: int) -> bool:
+        rid, cid = self.robot_id, self.client
+        pts = pb.getContactPoints(bodyA=rid, bodyB=int(body_id), physicsClientId=cid)
+        if pts:
+            return True
+        n_links = pb.getNumJoints(rid, physicsClientId=cid)
+        for li in range(n_links):
+            pts = pb.getContactPoints(bodyA=rid, bodyB=int(body_id), linkIndexA=li, physicsClientId=cid)
+            if pts:
+                return True
+        return False
+
+    def apply_manipulation_push(
+        self,
+        body_id: int,
+        direction_xy: tuple[float, float],
+        force_n: float | None = None,
+    ) -> dict:
+        """
+        Bounded horizontal push assist — no grasp constraint.
+        Only when target is movable, agent is near, and (optionally) in contact.
+        """
+        if not _manip_push_enabled():
+            return {"applied": False, "reason": "push_disabled"}
+        row = self._manip_registry_row(int(body_id))
+        if row is None:
+            return {"applied": False, "reason": "unknown_body"}
+        if not bool(row.get("movable", True)):
+            return {"applied": False, "reason": "target_static"}
+
+        dx, dy = float(direction_xy[0]), float(direction_xy[1])
+        n = float(np.hypot(dx, dy))
+        if n < 1e-6:
+            return {"applied": False, "reason": "zero_direction"}
+        dx, dy = dx / n, dy / n
+        fmax = float(force_n if force_n is not None else _manip_push_force_n())
+
+        with self._physics_lock:
+            if not self._manip_agent_near_target(int(body_id)):
+                return {"applied": False, "reason": "agent_too_far"}
+
+            self._manip_contact_tick += 1
+            need_contact = self._manip_contact_tick % _manip_contact_every() == 0
+            has_contact = self._manip_has_contact(int(body_id)) if need_contact else True
+            if need_contact and not has_contact:
+                return {"applied": False, "reason": "no_contact"}
+
+            p, _ = pb.getBasePositionAndOrientation(int(body_id), physicsClientId=self.client)
+            app = [float(p[0]), float(p[1]), float(p[2])]
+            pb.applyExternalForce(
+                int(body_id),
+                -1,
+                [dx * fmax, dy * fmax, 0.0],
+                app,
+                flags=pb.WORLD_FRAME,
+                physicsClientId=self.client,
+            )
+        return {
+            "applied": True,
+            "body_id": int(body_id),
+            "force_n": round(fmax, 3),
+            "direction_xy": [round(dx, 4), round(dy, 4)],
+            "contact_checked": bool(need_contact),
+        }
+
     def _load_humanoid(self) -> int:
         local = HUMANOID_URDF_PATH
         candidates: list[str] = []
@@ -959,6 +1179,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         with self._physics_lock:
             for _ in range(n):
                 pb.stepSimulation(physicsClientId=self.client)
+                self._physics_step_count += 1
                 self._tick_hidden_state()
                 self._apply_friction_to_ankle_joints()
             self._maybe_unstick_ball_from_torso()
@@ -1136,6 +1357,22 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 pid, p0, [0, 0, 0, 1], physicsClientId=cid,
             )
             pb.resetBaseVelocity(pid, [0, 0, 0], [0, 0, 0], physicsClientId=cid)
+
+        if getattr(self, "_manip_chair_id", None) is not None and self._manip_chair_start:
+            pb.resetBasePositionAndOrientation(
+                self._manip_chair_id,
+                self._manip_chair_start,
+                [0, 0, 0, 1],
+                physicsClientId=cid,
+            )
+            pb.resetBaseVelocity(
+                self._manip_chair_id, [0, 0, 0], [0, 0, 0], physicsClientId=cid,
+            )
+            for row in getattr(self, "_object_registry", []) or []:
+                if row.get("body_id") == self._manip_chair_id:
+                    row["x"] = float(self._manip_chair_start[0])
+                    row["y"] = float(self._manip_chair_start[1])
+                    row["z"] = float(self._manip_chair_start[2])
 
         self._reset_instrumental_hidden()
 
@@ -1317,6 +1554,11 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             out.append(np.array(pos, dtype=np.float64))
         for pid in getattr(self, "prop_ids", []) or []:
             pos, _ = pb.getBasePositionAndOrientation(pid, physicsClientId=self.client)
+            out.append(np.array(pos, dtype=np.float64))
+        if getattr(self, "_manip_chair_id", None) is not None:
+            pos, _ = pb.getBasePositionAndOrientation(
+                self._manip_chair_id, physicsClientId=self.client
+            )
             out.append(np.array(pos, dtype=np.float64))
         return out
 
@@ -1596,7 +1838,13 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                     "r": float(meta.get("r", 0.5)),
                     "g": float(meta.get("g", 0.5)),
                     "b": float(meta.get("b", 0.5)),
+                    "movable": True,
+                    "mass": float(meta.get("mass", 0.3)),
+                    "semantic": str(meta.get("semantic", "prop")),
+                    "body_id": int(pid),
+                    "source": "props",
                 })
+            registry_out = self._registry_snapshot()
             return {
                 "ball": ball,
                 "lever": {
@@ -1613,6 +1861,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 },
                 "static_geometry": [{**row} for row in getattr(self, "_static_scene_export", [])],
                 "props": props_out,
+                "registry": registry_out,
             }
 
     def _link_world_pos(self, link_name: str) -> np.ndarray | None:

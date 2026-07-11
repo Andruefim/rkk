@@ -26,6 +26,103 @@ INTENT_FIELDS = (
     "intent_grasp",
 )
 
+# Upper-body / manipulation intents safe for human_task executive override.
+TASK_SAFE_INTENT_FIELDS: frozenset[str] = frozenset(
+    {
+        "intent_reach_right",
+        "intent_reach_left",
+        "intent_grasp",
+        "intent_wave",
+        "intent_look_at",
+    }
+)
+
+# Locomotion / balance intents — reflex/gait must retain authority during human tasks.
+BALANCE_CRITICAL_INTENT_FIELDS: frozenset[str] = frozenset(
+    {
+        "intent_stride",
+        "intent_gait_coupling",
+        "intent_torso_forward",
+        "intent_support_left",
+        "intent_support_right",
+        "intent_arm_counterbalance",
+        "intent_lean_forward",
+        "intent_stop_recover",
+    }
+)
+
+_BALANCE_CRITICAL_TASK_PRECISION_SCALE = 0.3
+_REACH_TORSO_CLAMP_THRESHOLD = 0.6
+_REACH_TORSO_CLAMP_MARGIN = 0.08
+
+
+def is_task_safe_intent_field(field: str) -> bool:
+    f = str(field or "")
+    if f in TASK_SAFE_INTENT_FIELDS:
+        return True
+    return f.startswith("intent_head_")
+
+
+def is_balance_critical_intent_field(field: str) -> bool:
+    return str(field or "") in BALANCE_CRITICAL_INTENT_FIELDS
+
+
+def task_motor_bodysplit_enabled() -> bool:
+    return os.environ.get("RKK_TASK_MOTOR_BODYSPLIT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def task_motor_hold_ticks() -> int:
+    try:
+        return max(0, int(os.environ.get("RKK_TASK_MOTOR_HOLD_TICKS", "60")))
+    except ValueError:
+        return 60
+
+
+def filter_human_task_targets(targets: dict[str, float]) -> dict[str, float]:
+    """Keep task-safe intents; omit balance-critical fields for human_task registration."""
+    targets = clamp_torso_during_reach(targets)
+    if not task_motor_bodysplit_enabled():
+        return dict(targets)
+    out: dict[str, float] = {}
+    for k, v in targets.items():
+        ck = str(k)
+        if not ck.startswith("intent_"):
+            continue
+        if is_balance_critical_intent_field(ck):
+            continue
+        out[ck] = float(v)
+    return out
+
+
+def human_task_field_precision(base_precision: float, field: str) -> float:
+    if (
+        task_motor_bodysplit_enabled()
+        and is_balance_critical_intent_field(field)
+    ):
+        return float(base_precision) * _BALANCE_CRITICAL_TASK_PRECISION_SCALE
+    return float(base_precision)
+
+
+def clamp_torso_during_reach(targets: dict[str, float]) -> dict[str, float]:
+    out = dict(targets)
+    reach = max(
+        float(out.get("intent_reach_left", 0.5)),
+        float(out.get("intent_reach_right", 0.5)),
+    )
+    if reach <= _REACH_TORSO_CLAMP_THRESHOLD:
+        return out
+    lo = 0.5 - _REACH_TORSO_CLAMP_MARGIN
+    hi = 0.5 + _REACH_TORSO_CLAMP_MARGIN
+    for k in ("intent_torso_forward", "intent_lean_forward"):
+        if k in out:
+            out[k] = float(np.clip(out[k], lo, hi))
+    return out
+
 DEFAULT_SOURCE_PRECISION: dict[str, float] = {
     "human_task": 0.90,
     "s2_wm": 0.90,
@@ -64,8 +161,15 @@ def source_tier(source: str) -> int:
     return int(SOURCE_TIER.get(str(source or ""), 25))
 
 
-def tier_precision_multiplier(tier: int, *, human_task_active: bool) -> float:
+def tier_precision_multiplier(
+    tier: int,
+    *,
+    human_task_active: bool,
+    field: str = "",
+) -> float:
     if not human_task_active:
+        return 1.0
+    if field and is_balance_critical_intent_field(field) and tier < 50:
         return 1.0
     if tier >= 50:
         return 3.5
@@ -185,9 +289,13 @@ def arbitrate(
     buckets: dict[str, list[tuple[float, float]]] = {}
     for mi in intents:
         tier = source_tier(mi.source)
-        prec = float(np.clip(mi.precision, 0.05, 1.0))
-        prec *= tier_precision_multiplier(tier, human_task_active=human_task_active)
         for k, v in mi.as_field_map().items():
+            prec = float(np.clip(mi.precision, 0.05, 1.0))
+            prec *= tier_precision_multiplier(
+                tier, human_task_active=human_task_active, field=k
+            )
+            if mi.source == "human_task":
+                prec *= human_task_field_precision(1.0, k)
             buckets.setdefault(k, []).append((float(v), prec))
 
     merged: dict[str, float] = {}
@@ -254,8 +362,12 @@ class MotorArbiter:
         return self._human_task_active
 
     def should_suppress_substrate(self) -> bool:
-        """When human task is active, defer CPG/reflex direct motor injections."""
+        """When human task is active, defer direct locomotion/CPG substrate injections."""
         return self._human_task_active and motor_arbiter_enabled()
+
+    def should_suppress_stabilization(self) -> bool:
+        """Recovery/reflex stabilization always runs during human tasks."""
+        return False
 
     def begin_tick(self) -> None:
         self._intents.clear()

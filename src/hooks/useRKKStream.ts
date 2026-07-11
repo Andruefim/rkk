@@ -54,6 +54,15 @@ export interface SimEventData {
   type:  string;
 }
 
+export interface StreamScene {
+  skeleton?: Array<{ x?: number; y?: number; z?: number }>;
+  static_geometry?: unknown[];
+  ankleQuats?: Array<{ x?: number; y?: number; z?: number; w?: number }>;
+  cubes?: Array<{ x?: number; y?: number; z?: number }>;
+  fallen?: boolean;
+  [key: string]: unknown;
+}
+
 export interface StreamFrame {
   tick:          number;
   phase:         number;
@@ -63,6 +72,7 @@ export interface StreamFrame {
   tom_links:     ToMLink[];
   events:        SimEventData[];
   graph_deltas:  Record<number, EdgeData[]>;
+  scene?:        StreamScene;
 }
 
 const DEFAULT_FRAME: StreamFrame = {
@@ -150,7 +160,15 @@ export function useRKKStream(wsUrl = "ws://localhost:8000/ws/causal-stream") {
               ...a,
               edges: gd[i as keyof typeof gd] ?? prev.agents[i]?.edges ?? a.edges,
             }));
-            return { ...data, agents };
+            const prevScene = prev.scene ?? {};
+            const nextScene = data.scene ?? {};
+            const scene = {
+              ...prevScene,
+              ...nextScene,
+              static_geometry:
+                nextScene.static_geometry ?? prevScene.static_geometry,
+            };
+            return { ...data, agents, scene };
           });
         } catch (e) {
           console.error("[RKK] Parse error", e);

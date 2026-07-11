@@ -1,7 +1,14 @@
 """Tests for motor arbiter (Sprint 5.0)."""
 from __future__ import annotations
 
-from engine.motor_arbiter import MotorArbiter, MotorIntent, arbitrate
+from engine.motor_arbiter import (
+    MotorArbiter,
+    MotorIntent,
+    arbitrate,
+    clamp_torso_during_reach,
+    filter_human_task_targets,
+    is_balance_critical_intent_field,
+)
 
 
 def test_arbitrate_coupling_clamp_locomote() -> None:
@@ -56,9 +63,19 @@ def test_arbitrate_human_task_priority_over_cpg() -> None:
         MotorIntent(source="human_task", precision=0.88, stride=0.42, coupling=0.52),
     ]
     merged, conflicts = arbitrate(intents, human_task_active=True, current={})
-    assert merged["intent_stride"] < 0.55
-    assert merged["intent_gait_coupling"] < 0.65
+    # Balance fields: reflex/gait keep tier-1.0 weight; human_task balance prec is damped.
+    assert merged["intent_stride"] > 0.55
+    assert merged["intent_stride"] < 0.82
     assert conflicts >= 1
+
+
+def test_arbitrate_human_task_wins_on_reach() -> None:
+    intents = [
+        MotorIntent(source="reflex", precision=0.90, reach_right=0.35),
+        MotorIntent(source="human_task", precision=0.88, reach_right=0.82),
+    ]
+    merged, _ = arbitrate(intents, human_task_active=True, current={})
+    assert merged["intent_reach_right"] > 0.70
 
 
 def test_arbitrate_s2_wm_over_intention_cortex() -> None:
@@ -75,3 +92,110 @@ def test_motor_arbiter_human_task_mode() -> None:
     arb.set_human_task_active(True)
     assert arb.human_task_active()
     assert arb.should_suppress_substrate()
+    assert not arb.should_suppress_stabilization()
+
+
+def test_arbitrate_reflex_precision_on_balance_not_crushed() -> None:
+    """Reflex tier keeps multiplier 1.0 on balance-critical fields during human task."""
+    intents = [
+        MotorIntent(source="reflex", precision=0.90, support_left=0.72, support_right=0.28),
+        MotorIntent(source="human_task", precision=0.88, support_left=0.30, support_right=0.70),
+    ]
+    merged_active, _ = arbitrate(intents, human_task_active=True, current={})
+    # Old ladder crushed reflex to ×0.06 → merged support_left ≈ 0.31. Reflex must contribute now.
+    assert merged_active["intent_support_left"] > 0.45
+    assert merged_active["intent_support_left"] < 0.72
+
+
+def test_filter_human_task_targets_drops_balance_critical() -> None:
+    raw = {
+        "intent_reach_right": 0.82,
+        "intent_stride": 0.78,
+        "intent_support_left": 0.70,
+        "intent_torso_forward": 0.72,
+        "intent_grasp": 0.65,
+    }
+    filtered = filter_human_task_targets(raw)
+    assert "intent_reach_right" in filtered
+    assert "intent_grasp" in filtered
+    assert "intent_stride" not in filtered
+    assert "intent_support_left" not in filtered
+    assert "intent_torso_forward" not in filtered
+
+
+def test_clamp_torso_during_reach() -> None:
+    raw = {
+        "intent_reach_right": 0.75,
+        "intent_torso_forward": 0.85,
+        "intent_lean_forward": 0.80,
+    }
+    clamped = clamp_torso_during_reach(raw)
+    assert clamped["intent_torso_forward"] <= 0.5 + 0.08 + 1e-6
+    assert clamped["intent_torso_forward"] >= 0.5 - 0.08 - 1e-6
+    assert clamped["intent_lean_forward"] <= 0.5 + 0.08 + 1e-6
+
+
+def test_register_task_executive_skips_when_fallen() -> None:
+    """Gating: fallen / low posture / motor-hold must not register human_task."""
+
+    class _TickMixin:
+        tick = 100
+        _post_reset_motor_hold_until = 0
+        _motor_arbiter = MotorArbiter()
+        _task_binding = None
+        _task_tree_ctrl = None
+        _intention_state = None
+
+        def _canonical_motor_intent_key(self, k: str) -> str:
+            return str(k)
+
+        def _env_observe_cached(self) -> dict:
+            return {"posture_stability": 0.7}
+
+    from engine.features.simulation.mixin_tick import SimulationTickMixin
+
+    mixin = _TickMixin()
+    mixin._motor_arbiter.set_human_task_active(True)
+    registered: list[dict] = []
+    orig = mixin._motor_arbiter.register_from_dict
+
+    def _capture(source: str, values: dict, **kw):  # type: ignore[no-untyped-def]
+        if source == "human_task":
+            registered.append(dict(values))
+        orig(source, values, **kw)
+
+    mixin._motor_arbiter.register_from_dict = _capture  # type: ignore[method-assign]
+
+    def _call(fallen: bool) -> None:
+        registered.clear()
+        SimulationTickMixin._register_task_executive_motor_intents(mixin, fallen=fallen)
+
+    class _HT:
+        status = "active"
+        expected_state = {"intent_reach_right": 0.8, "intent_stride": 0.7}
+
+    class _TB:
+        active_task = _HT()
+
+    mixin._task_binding = _TB()
+    _call(fallen=True)
+    assert registered == []
+
+    _call(fallen=False)
+    assert registered and "intent_reach_right" in registered[0]
+    assert "intent_stride" not in registered[0]
+
+    mixin._post_reset_motor_hold_until = 200
+    _call(fallen=False)
+    assert registered == []
+
+    mixin._post_reset_motor_hold_until = 0
+    mixin._env_observe_cached = lambda: {"posture_stability": 0.40}  # type: ignore[method-assign, assignment]
+    _call(fallen=False)
+    assert registered == []
+
+
+def test_balance_critical_field_classification() -> None:
+    assert is_balance_critical_intent_field("intent_stride")
+    assert is_balance_critical_intent_field("intent_stop_recover")
+    assert not is_balance_critical_intent_field("intent_reach_left")

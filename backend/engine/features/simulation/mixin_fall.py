@@ -86,6 +86,18 @@ class SimulationFallMixin:
         self.agent.graph._obs_buffer.clear()
         self.agent.graph._int_buffer.clear()
         self._last_fall_reset_tick = self.tick
+        sync_fn = getattr(self, "_sync_graph_intents_to_defaults", None)
+        if callable(sync_fn):
+            try:
+                sync_fn()
+            except Exception:
+                pass
+        hold_fn = getattr(self, "_arm_post_reset_motor_hold", None)
+        if callable(hold_fn):
+            try:
+                hold_fn()
+            except Exception:
+                pass
         self._add_event("🔄 Сброс позы после падения", "#44aaff", "value")
         return True
 

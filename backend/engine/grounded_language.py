@@ -72,6 +72,7 @@ _TAG_PHRASE_RU: dict[str, str] = {
     "help": "Помоги мне",
     "stable": "Стабилен",
     "unstable": "Теряю равновесие",
+    "manipulate": "Двигаю объект",
 }
 
 # Longer phrases first — «встань» before bare «упал».
@@ -97,7 +98,38 @@ _TEXT_TAG_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("fell", "fallen"),
     ("стабилен", "stable"),
     ("stable", "stable"),
+    ("передвинь", "manipulate"),
+    ("передвинуть", "manipulate"),
+    ("толкни", "manipulate"),
+    ("сдвинь", "manipulate"),
+    ("shift", "manipulate"),
 )
+
+
+def command_kind_for_text(text: str, *, tag: str = "", fallen: bool = False) -> str:
+    """Classify human command for task-tree decomposition (no Ollama-only path)."""
+    from engine.object_resolver import (
+        GENERIC_POINTERS,
+        extract_content_tokens,
+        has_generic_object_pointer,
+        has_move_verb,
+    )
+
+    raw = str(text or "").strip()
+    low = raw.lower()
+    tg = str(tag or command_tag_for_text(raw)).strip().lower()
+    if tg == "recover" or fallen:
+        if any(k in low for k in ("встань", "get up", "stand up", "recover")):
+            return "recover"
+    if tg == "manipulate":
+        return "manipulate"
+    if has_move_verb(raw):
+        noun_tokens = [t for t in extract_content_tokens(raw) if t not in GENERIC_POINTERS]
+        if noun_tokens or has_generic_object_pointer(raw):
+            return "manipulate"
+    if tg == "recover":
+        return "recover"
+    return "generic"
 
 
 def command_tag_for_text(

@@ -150,15 +150,6 @@ def test_task_done_emits_verbal_report(agi_loop_sim: AgiLoopSim) -> None:
 
     sim = agi_loop_sim
     _patch_fallback_embed(sim)
-    sim.handle_human_command("готово")
-
-    tb = sim._ensure_task_binding()
-    task = tb.active_task
-    assert task is not None
-    task.tick_started = 10
-    task.expected_state = {"target_dist": 0.35, "posture_stability": 0.75}
-    task.max_prediction_error = 0.25
-
     verbal = SimpleNamespace(
         _messages=[],
         _on_message=[],
@@ -167,6 +158,14 @@ def test_task_done_emits_verbal_report(agi_loop_sim: AgiLoopSim) -> None:
     )
     sim._verbal = verbal
     sim.grounded_lang_generate = lambda obs=None: "Готово."  # type: ignore[method-assign]
+    sim.handle_human_command("готово")
+
+    tb = sim._ensure_task_binding()
+    task = tb.active_task
+    assert task is not None
+    task.tick_started = 10
+    task.expected_state = {"target_dist": 0.35, "posture_stability": 0.75}
+    task.max_prediction_error = 0.25
 
     match_obs = dict(sim._obs)
     for k, tgt in task.expected_state.items():

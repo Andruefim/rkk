@@ -63,9 +63,14 @@ class SimulationTickMixin:
     def _human_task_motor_active(self) -> bool:
         try:
             from engine.task_binding import task_binding_enabled
+            from engine.task_tree import task_tree_enabled
 
             if not task_binding_enabled():
                 return False
+            if task_tree_enabled():
+                tt = getattr(self, "_task_tree_ctrl", None)
+                if tt is not None and tt.is_active:
+                    return True
             tb = getattr(self, "_task_binding", None)
             ht = tb.active_task if tb is not None else None
             return ht is not None and str(getattr(ht, "status", "active")) == "active"
@@ -76,6 +81,34 @@ class SimulationTickMixin:
         arb = getattr(self, "_motor_arbiter", None)
         return arb is not None and arb.should_suppress_substrate()
 
+    def _arm_post_reset_motor_hold(self) -> None:
+        try:
+            from engine.motor_arbiter import task_motor_hold_ticks
+
+            n = task_motor_hold_ticks()
+        except Exception:
+            n = 60
+        self._post_reset_motor_hold_until = int(self.tick) + max(0, n)
+
+    def _sync_graph_intents_to_defaults(self) -> None:
+        try:
+            from engine.features.humanoid.constants import (
+                MOTOR_INTENT_DEFAULTS,
+                MOTOR_INTENT_VARS,
+            )
+        except Exception:
+            return
+        try:
+            nodes = self.agent.graph.nodes
+            for k in MOTOR_INTENT_VARS:
+                if k in nodes:
+                    nodes[k] = float(MOTOR_INTENT_DEFAULTS.get(k, 0.5))
+            for k in ("intent_reach_right", "intent_reach_left", "intent_grasp"):
+                if k in nodes:
+                    nodes[k] = float(MOTOR_INTENT_DEFAULTS.get(k, 0.5))
+        except Exception:
+            pass
+
     @staticmethod
     def _canonical_motor_intent_key(k: str) -> str:
         sk = str(k)
@@ -83,13 +116,33 @@ class SimulationTickMixin:
             return "intent_" + sk[len("phys_intent_") :]
         return sk
 
-    def _register_task_executive_motor_intents(self) -> None:
+    def _register_task_executive_motor_intents(self, *, fallen: bool = False) -> None:
         """Register human_task + S2 WM planner intents for arbiter finalize."""
         arb = getattr(self, "_motor_arbiter", None)
         if arb is None or not arb.human_task_active():
             return
 
+        hold_until = int(getattr(self, "_post_reset_motor_hold_until", 0) or 0)
+        if hold_until > 0 and int(self.tick) < hold_until:
+            return
+        if fallen:
+            return
+        try:
+            obs = self._env_observe_cached()
+            posture = float(
+                obs.get("posture_stability", obs.get("phys_posture_stability", 0.5))
+            )
+            if posture < 0.55:
+                return
+        except Exception:
+            pass
+
         targets: dict[str, float] = {}
+        if hasattr(self, "task_tree_motor_targets"):
+            tree_mt = self.task_tree_motor_targets()
+            if tree_mt:
+                targets.update(tree_mt)
+
         ic = getattr(self, "_intention_state", None)
         if ic is not None:
             primary = getattr(ic, "primary", None)
@@ -119,7 +172,14 @@ class SimulationTickMixin:
                     targets[ck] = float(v)
 
         if targets:
-            arb.register_from_dict("human_task", targets)
+            try:
+                from engine.motor_arbiter import filter_human_task_targets
+
+                targets = filter_human_task_targets(targets)
+            except Exception:
+                pass
+            if targets:
+                arb.register_from_dict("human_task", targets)
 
         s2 = getattr(self, "_system2", None)
         plan = getattr(s2, "_last_wm_plan", None) if s2 is not None else None
@@ -150,8 +210,6 @@ class SimulationTickMixin:
 
     def _maybe_post_release_stabilize_intents(self) -> None:
         """После снятия fixed_root — в окне stabilize_until усилить recover/support (плавный decay)."""
-        if self._motor_substrate_suppressed():
-            return
         if not is_humanoid_topology(self.current_world) or self._fixed_root_active:
             return
         if not getattr(self, "_curriculum_auto_fr_released", False):
@@ -192,8 +250,6 @@ class SimulationTickMixin:
 
     def _apply_hardcoded_reflexes(self, is_fallen: bool) -> None:
         """Apply genome-based spinal reflexes: fast reactive balance corrections."""
-        if self._motor_substrate_suppressed():
-            return
         base = self._unwrap_base_env(self.agent.env)
         fn = getattr(base, "apply_motor_intent_residuals", None)
         if not callable(fn) or getattr(base, "_intero_control_lost", False):
@@ -794,6 +850,8 @@ class SimulationTickMixin:
                     self._invalidate_env_observe_cache()
                     obs = self.agent.env.observe()
                     self._sync_motor_state(obs, source="reset", tick=self.tick)
+                    self._sync_graph_intents_to_defaults()
+                    self._arm_post_reset_motor_hold()
                     for nid in self.agent.graph._node_ids:
                         if nid in obs:
                             self.agent.graph.nodes[nid] = obs[nid]
@@ -1226,7 +1284,7 @@ class SimulationTickMixin:
                 self._hai_pe_ema = 0.0
         arb = getattr(self, "_motor_arbiter", None)
         if arb is not None and is_humanoid_topology(self.current_world):
-            self._register_task_executive_motor_intents()
+            self._register_task_executive_motor_intents(fallen=bool(fallen))
             arb.finalize(self)
         sg_obs = getattr(self, "_scene_graph", None)
         if sg_obs is not None and is_humanoid_topology(self.current_world):
@@ -1572,7 +1630,7 @@ class SimulationTickMixin:
                     self._neuro_pending = True
         self._prof_mark("sim.post_neuro", _pt)
 
-        # Scene: get_full_scene + _patch_scene_dynamics только при обновлении кэша
+        # Scene: тяжёлый get_full_scene реже; skeleton/динамика — каждый agent-тик (RKK_SKELETON_EVERY).
         scene_every = self._scene_cache_every()
         scene_fn = getattr(self.agent.env, "get_full_scene", None)
         scene_stale = (
@@ -1583,10 +1641,24 @@ class SimulationTickMixin:
         if scene_stale:
             self._cached_scene = scene_fn() if callable(scene_fn) else {}
             self._cached_scene_tick = int(self.tick)
+            self._cached_skeleton_tick = int(self.tick)
             from engine.tick_profiler import tick_profile
 
             with tick_profile("sim.scene_patch"):
-                self._patch_scene_dynamics(self._cached_scene)
+                self._patch_scene_skeleton_light(self._cached_scene)
+        else:
+            sk_every = self._skeleton_cache_every()
+            sk_stale = (
+                not hasattr(self, "_cached_skeleton_tick")
+                or int(self._cached_skeleton_tick) < 0
+                or (self.tick - int(self._cached_skeleton_tick)) >= sk_every
+            )
+            if sk_stale and getattr(self, "_cached_scene", None):
+                from engine.tick_profiler import tick_profile
+
+                with tick_profile("sim.scene_skeleton_patch"):
+                    self._patch_scene_skeleton_light(self._cached_scene)
+                self._cached_skeleton_tick = int(self.tick)
         scene = dict(getattr(self, "_cached_scene", {}) or {})
 
         # Vision state (кэш для /vision/slots; не на каждый agent-тик)
@@ -1683,8 +1755,14 @@ class SimulationTickMixin:
         except ValueError:
             return 4
 
-    def _patch_scene_dynamics(self, scene: dict) -> None:
-        """PyBullet-динамика сцены; вызывать только при обновлении _cached_scene (см. RKK_SCENE_CACHE_EVERY)."""
+    def _skeleton_cache_every(self) -> int:
+        try:
+            return max(1, int(os.environ.get("RKK_SKELETON_EVERY", "1")))
+        except ValueError:
+            return 1
+
+    def _patch_scene_skeleton_light(self, scene: dict) -> None:
+        """Лёгкий per-tick патч: skeleton, ankleQuats, динамические объекты (без rebuild static_geometry)."""
         env = getattr(self.agent, "env", None)
         if env is None:
             return

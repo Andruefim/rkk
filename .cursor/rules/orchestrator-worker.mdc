@@ -1,0 +1,26 @@
+---
+description: Strong model orchestrates; Composer 2.5 standard subagents do scoped work. Apply manually with @orchestrator-worker.
+---
+
+# Orchestrator / worker mode
+
+Activate only when this rule is attached.
+
+## Models
+
+- **Orchestrator (parent):** your strong model in the picker (e.g. `claude-opus-4-8-thinking-high`)
+- **Workers:** `composer-2.5[fast=false]` – pinned in `.cursor/agents/`
+
+## Parent
+
+Plan, decompose, delegate, and review. Give each worker one concern, enough context, a definition of done, and a short report. Run independent pieces in parallel. Review before merging. Keep work on the parent when judgment is the whole job.
+
+Do not spawn built-in `explore` or `generalPurpose` subagents – they default to Composer Fast.
+
+## Workers
+
+| Subagent      | Use for                                    |
+| ------------- | ------------------------------------------ |
+| `implementer` | Code edits, refactors, tests, file changes |
+| `auditor`     | Read-only audits and exploration           |
+| `verifier`    | Post-implementation review                 |

@@ -49,6 +49,16 @@ class SceneGraphObserver:
             return {}
 
         specs: list[tuple[str, dict, str]] = []
+        registry = extras.get("registry") or []
+        if isinstance(registry, dict):
+            registry = list(registry.values())
+        if isinstance(registry, list):
+            for i, row in enumerate(registry[:8]):
+                if isinstance(row, dict):
+                    ref = str(row.get("ref") or row.get("id") or f"registry_{i}")
+                    otype = str(row.get("semantic") or row.get("type") or "object")
+                    specs.append((ref, row, otype))
+
         ball = extras.get("ball")
         if isinstance(ball, dict):
             specs.append(("ball", ball, "sphere"))

@@ -61,6 +61,29 @@ async def _ws_send_json(websocket: WebSocket, conn_gen: int, payload: dict) -> N
         raise
 
 
+def _ws_static_every() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_WS_STATIC_EVERY", "30")))
+    except ValueError:
+        return 30
+
+
+def _ws_payload_for_send(payload: dict, ws_frames_sent: int) -> dict:
+    """Копия payload; static_geometry только на первом кадре и раз в RKK_WS_STATIC_EVERY."""
+    static_every = _ws_static_every()
+    include_static = ws_frames_sent == 0 or (ws_frames_sent % static_every) == 0
+    if include_static:
+        return payload
+    scene = payload.get("scene")
+    if not isinstance(scene, dict) or "static_geometry" not in scene:
+        return payload
+    out = dict(payload)
+    scene_copy = dict(scene)
+    scene_copy.pop("static_geometry", None)
+    out["scene"] = scene_copy
+    return out
+
+
 def _ws_hello_payload(sim: Simulation) -> dict:
     """Лёгкий кадр сразу после accept — UI не ждёт полный public_state()."""
     return {
@@ -672,6 +695,20 @@ async def causal_stream(websocket: WebSocket):
     ws_period = 0.05 if agent_hz <= 0 else max(1.0 / agent_hz, 0.033)
     print(f"[WS] Humanoid+Vision Singleton connected. d={sim.agent.graph._d}")
 
+    last_sent_tick = -1
+    ws_frames_sent = 0
+
+    async def _ws_send_frame(payload: dict) -> None:
+        nonlocal last_sent_tick, ws_frames_sent
+        tick = payload.get("tick")
+        if tick is not None and tick == last_sent_tick:
+            return
+        to_send = _ws_payload_for_send(payload, ws_frames_sent)
+        ws_frames_sent += 1
+        await _ws_send_json(websocket, conn_gen, to_send)
+        if tick is not None:
+            last_sent_tick = tick
+
     try:
         loop = asyncio.get_running_loop()
         sim._bg.ensure_rkk_agent_loop()
@@ -683,7 +720,7 @@ async def causal_stream(websocket: WebSocket):
             with sim._sim_step_lock:
                 payload0 = sim._agent_step_response
             if payload0 is not None:
-                await _ws_send_json(websocket, conn_gen, payload0)
+                await _ws_send_frame(payload0)
                 break
             await asyncio.sleep(0.025)
 
@@ -738,7 +775,7 @@ async def causal_stream(websocket: WebSocket):
                     with sim._sim_step_lock:
                         payload = sim._agent_step_response
                     if payload is not None:
-                        await _ws_send_json(websocket, conn_gen, payload)
+                        await _ws_send_frame(payload)
                 else:
                     def _run_ticks() -> dict:
                         out: dict | None = None
@@ -752,7 +789,7 @@ async def causal_stream(websocket: WebSocket):
                     payload = await loop.run_in_executor(None, _run_ticks)
                     if not _ws_conn_active(websocket, conn_gen):
                         raise WebSocketDisconnect(code=1000)
-                    await _ws_send_json(websocket, conn_gen, payload)
+                    await _ws_send_frame(payload)
             except WebSocketDisconnect:
                 raise
             except Exception as e:
