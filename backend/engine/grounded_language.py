@@ -75,6 +75,17 @@ _TAG_PHRASE_RU: dict[str, str] = {
     "manipulate": "Двигаю объект",
 }
 
+_TASK_STAGE_PHRASE_RU: dict[str, str] = {
+    "resolve_target": "Ищу объект",
+    "approach": "Иду к объекту",
+    "approach_target": "Иду к объекту",
+    "reach_contact": "Тянусь к объекту",
+    "reach_target": "Тянусь к объекту",
+    "verify_goal": "Проверяю задачу",
+    "verify_target": "Проверяю задачу",
+    "verify_posture": "Проверяю равновесие",
+}
+
 # Longer phrases first — «встань» before bare «упал».
 _TEXT_TAG_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("get up", "recover"),
@@ -153,6 +164,18 @@ def command_tag_for_text(
     return ""
 
 
+def embed_tag_trusted_for_text(text: str, tag: str) -> bool:
+    """Embed tags must agree with keywords — blocks false «unstable» on task commands."""
+    tg = str(tag or "").strip().lower()
+    if not tg:
+        return False
+    low = str(text or "").lower()
+    for needle, kw_tag in _TEXT_TAG_KEYWORDS:
+        if kw_tag == tg and needle in low:
+            return True
+    return False
+
+
 def motor_interventions_for_command(
     text: str,
     *,
@@ -169,8 +192,12 @@ def phrase_for_human_task(
     *,
     embed: np.ndarray | None = None,
     store: SemanticVectorStore | None = None,
+    stage_kind: str = "",
 ) -> str:
     """Grounded speech label for an active human command (not a hardcoded locomote)."""
+    sk = str(stage_kind or "").strip()
+    if sk in _TASK_STAGE_PHRASE_RU:
+        return _TASK_STAGE_PHRASE_RU[sk]
     tag = command_tag_for_text(human_task_text, embed=embed, store=store)
     if tag and tag in _TAG_PHRASE_RU:
         return _TAG_PHRASE_RU[tag]
@@ -218,13 +245,17 @@ def state_phrase_for_speech(
     fallen: bool | None = None,
     env: Any | None = None,
     human_task_text: str = "",
+    human_task_stage: str = "",
 ) -> str:
     """
     Embodied speech label — uses ``is_fallen()`` when available, not loose posture heuristics.
     Walking lowers posture_stability; that must not map to «Я упал».
     """
     if human_task_text.strip():
-        return phrase_for_human_task(human_task_text)
+        return phrase_for_human_task(
+            human_task_text,
+            stage_kind=human_task_stage,
+        )
 
     h = _resolve_humanoid_env(env)
     if fallen is None and h is not None:
@@ -567,7 +598,11 @@ class GroundedLanguageController:
             record_fn(obs_before, dict(graph.nodes))
         self._apply_attention_to_motor(graph)
         hits = self.store.nearest(emb_np, top_k=1)
-        tag = hits[0][1] if hits else ""
+        tag = command_tag_for_text(text)
+        if not tag and hits and hits[0][2] > 0.55:
+            candidate = str(hits[0][1])
+            if embed_tag_trusted_for_text(text, candidate):
+                tag = candidate
         if apply_motor_patch:
             motor_patch = self._motor_patch_for_tag(tag)
             for k, v in motor_patch.items():
@@ -607,6 +642,7 @@ class GroundedLanguageController:
         fallen: bool | None = None,
         env: Any | None = None,
         human_task_text: str = "",
+        human_task_stage: str = "",
     ) -> None:
         """Write intent_speak_* from physical state (inverse grounding for output path)."""
         self.ensure_graph_nodes(graph)
@@ -615,6 +651,7 @@ class GroundedLanguageController:
             fallen=fallen,
             env=env,
             human_task_text=human_task_text,
+            human_task_stage=human_task_stage,
         )
         emb = self.embedder.embed(phrase)
         if emb is None:

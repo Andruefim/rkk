@@ -216,7 +216,12 @@ def task_from_planning_context(ctx: dict[str, Any] | None, graph_nodes: dict[str
     )
 
 
-def _action_var_whitelist(task: S2WmTask, motor: list[str]) -> list[str]:
+def _action_var_whitelist(
+    task: S2WmTask,
+    motor: list[str],
+    *,
+    human_task_active: bool = False,
+) -> list[str]:
     m = task.macro
     recover_set = {
         "intent_torso_forward",
@@ -250,6 +255,11 @@ def _action_var_whitelist(task: S2WmTask, motor: list[str]) -> list[str]:
         allowed = explore_set
     else:
         allowed = set(motor)
+    if human_task_active:
+        from engine.motor_arbiter import BALANCE_CRITICAL_INTENT_FIELDS
+
+        allowed = {v for v in allowed if v not in BALANCE_CRITICAL_INTENT_FIELDS}
+
     out: list[str] = []
     for v in motor:
         bare = v[5:] if v.startswith("phys_intent_") else v
@@ -473,7 +483,9 @@ def plan_s2_wm_candidate(
             return fb_d
 
     motor = _action_var_whitelist(
-        task, planning_graph_motor_vars(agent.env, list(agent.graph._node_ids))
+        task,
+        planning_graph_motor_vars(agent.env, list(agent.graph._node_ids)),
+        human_task_active=human_task,
     )
     if not motor:
         return None

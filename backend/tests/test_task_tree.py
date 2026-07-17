@@ -18,19 +18,22 @@ def ctrl() -> TaskTreeController:
 
 
 def test_bind_goal_contact_decomposition(ctrl: TaskTreeController) -> None:
+    from engine.task_observation import nav_stop_m
+
+    near = nav_stop_m()
     goal = TaskGoal(
         text="touch ball",
         predicates=[
-            GoalPredicate(kind="reduce_distance", target_value=0.9, tolerance=0.25),
+            GoalPredicate(kind="reduce_distance", target_value=near, tolerance=0.25),
             GoalPredicate(kind="contact", target_value=1.0, tolerance=0.5),
         ],
         diagnostics={"needs_target": True},
     )
     tree = ctrl.bind_goal(goal, tick=1, needs_target=True, target_ref="ball")
     kinds = [tree.nodes[c].kind for c in tree.nodes[tree.root_id].children]
-    assert kinds == ["resolve_target", "approach", "reach_contact"]
+    assert kinds == ["resolve_target", "approach", "reach_contact", "verify_goal"]
     approach = tree.nodes[tree.nodes[tree.root_id].children[1]]
-    assert approach.expected_state.get("stop_distance") == 0.9
+    assert approach.expected_state.get("stop_distance") == pytest.approx(near, rel=0.01)
 
 
 def test_bind_goal_displace_decomposition(ctrl: TaskTreeController) -> None:

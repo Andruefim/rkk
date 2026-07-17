@@ -1,6 +1,8 @@
 """Tests for motor arbiter (Sprint 5.0)."""
 from __future__ import annotations
 
+import math
+
 from engine.motor_arbiter import (
     MotorArbiter,
     MotorIntent,
@@ -76,6 +78,26 @@ def test_arbitrate_human_task_wins_on_reach() -> None:
     ]
     merged, _ = arbitrate(intents, human_task_active=True, current={})
     assert merged["intent_reach_right"] > 0.70
+
+
+def test_arbitrate_navigation_wins_balance_during_human_task() -> None:
+    intents = [
+        MotorIntent(source="s2_wm", precision=0.90, stride=0.62, coupling=0.78),
+        MotorIntent(source="ns_bridge", precision=0.92, stride=0.64, coupling=0.76),
+        MotorIntent(
+            source="navigation",
+            precision=0.88,
+            stride=0.66,
+            coupling=0.28,
+            support_left=0.38,
+            support_right=0.62,
+        ),
+    ]
+    merged, conflicts = arbitrate(intents, human_task_active=True, current={})
+    assert math.isclose(merged["intent_stride"], 0.66, abs_tol=0.01)
+    assert merged["intent_gait_coupling"] < 0.35
+    assert merged["intent_support_right"] > merged["intent_support_left"]
+    assert conflicts >= 1
 
 
 def test_arbitrate_s2_wm_over_intention_cortex() -> None:

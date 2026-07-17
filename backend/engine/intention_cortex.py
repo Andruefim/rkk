@@ -185,6 +185,8 @@ class IntentionCortex:
         task: Any,
         obs: dict[str, float],
         tick: int,
+        *,
+        stage_kind: str = "",
     ) -> None:
         """
         Human chat command → intention stack + expected_state for S2/WM PE planning.
@@ -194,14 +196,23 @@ class IntentionCortex:
             return
         expected = dict(task.expected_state)
         task_text = str(getattr(task, "text", ""))
-        motor = motor_interventions_for_command(task_text)
+        goal = getattr(task, "goal", None)
+        try:
+            from engine.task_executive import motor_for_stage
+
+            motor = motor_for_stage(goal, str(stage_kind or ""))
+        except Exception:
+            motor = {}
+        if not motor:
+            motor = motor_interventions_for_command(task_text)
         tag = command_tag_for_text(task_text)
         self._last_context.expected_state = expected
         self._last_context.narrative = f"human: {task_text[:96]}"
         if tag == "recover":
             self._last_context.macro_hint = "RECOVER_POSTURE"
         else:
-            self._last_context.macro_hint = "EXPLORE"
+            # Navigation owns locomotion during human tasks — do not promote EXPLORE/LOCOMOTE.
+            self._last_context.macro_hint = "IDLE"
         self._last_context.horizon_ticks = max(
             self._last_context.horizon_ticks,
             _ei("RKK_TASK_DEADLINE_TICKS", 2400),
@@ -290,7 +301,10 @@ class IntentionCortex:
         ht = tb.active_task if tb is not None else None
         if ht is not None and ht.expected_state:
             self._last_context.expected_state = dict(ht.expected_state)
-            self._last_context.macro_hint = "EXPLORE" if not fallen else self._last_context.macro_hint
+            if fallen:
+                self._last_context.macro_hint = "RECOVER_POSTURE"
+            else:
+                self._last_context.macro_hint = "IDLE"
             if getattr(ht, "text", ""):
                 self._last_context.narrative = f"human: {str(ht.text)[:96]}"
 
@@ -933,6 +947,13 @@ class IntentionCortex:
         """Drive motor intents toward curriculum targets every tick (before CPG reads graph)."""
         if fallen or ctx.macro_hint == "RECOVER_POSTURE":
             return
+        try:
+            from engine.task_executive import human_task_executive_active
+
+            if sim is not None and human_task_executive_active(sim):
+                return
+        except Exception:
+            pass
         if ctx.macro_hint not in ("LOCOMOTE_DELIVERY", "EXPLORE"):
             return
         targets = self._intent_targets_for_context(primary, ctx)

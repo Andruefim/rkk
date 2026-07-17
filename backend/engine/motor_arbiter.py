@@ -129,6 +129,7 @@ DEFAULT_SOURCE_PRECISION: dict[str, float] = {
     "intention_cortex": 0.72,
     "grounded_language": 0.68,
     "navigation": 0.68,
+    "manipulation": 0.85,
     "ns_bridge": 0.92,
     "gait": 0.85,
     "hai": 0.58,
@@ -149,6 +150,7 @@ SOURCE_TIER: dict[str, int] = {
     "skill": 32,
     "grounded_language": 30,
     "navigation": 30,
+    "manipulation": 30,
     "ns_bridge": 28,
     "cpg": 20,
     "gait": 20,
@@ -300,9 +302,26 @@ def arbitrate(
                 prec *= human_task_field_precision(1.0, k)
             buckets.setdefault(k, []).append((float(v), prec))
 
+    nav_balance: dict[str, float] = {}
+    if human_task_active:
+        for mi in intents:
+            if str(mi.source) != "navigation":
+                continue
+            for k, v in mi.as_field_map().items():
+                if is_balance_critical_intent_field(k):
+                    nav_balance[k] = float(v)
+
     merged: dict[str, float] = {}
     conflicts = 0
     for k in INTENT_FIELDS:
+        if human_task_active and k in nav_balance:
+            merged[k] = float(nav_balance[k])
+            pairs = buckets.get(k, [])
+            if pairs:
+                vals = [p[0] for p in pairs]
+                if max(vals) - min(vals) > 0.12:
+                    conflicts += 1
+            continue
         pairs = buckets.get(k, [])
         if not pairs:
             if k in current:
@@ -394,6 +413,56 @@ class MotorArbiter:
         if not values:
             return
         self.register(MotorIntent.from_dict(source, values, precision=precision))
+
+    def early_finalize(
+        self,
+        sim: Any,
+        sources: frozenset[str],
+    ) -> dict[str, float]:
+        """Merge selected executive sources into graph/motor_state before CPG (same tick)."""
+        if not motor_arbiter_enabled() or not sources:
+            return {}
+        filtered = [mi for mi in self._intents if str(mi.source) in sources]
+        if not filtered:
+            return {}
+
+        agent = getattr(sim, "agent", None)
+        if agent is None:
+            return {}
+        base = getattr(agent.env, "base_env", None) or agent.env
+        ms = getattr(base, "_motor_state", None)
+        if not isinstance(ms, dict):
+            return {}
+
+        macro = ""
+        s2 = getattr(sim, "_system2_last", None) or {}
+        if isinstance(s2, dict):
+            macro = str(s2.get("macro") or "")
+        if not macro:
+            ic = getattr(sim, "_intention_state", None)
+            macro = str(getattr(ic, "macro_hint", "") or "")
+
+        merged, _ = arbitrate(
+            filtered,
+            macro=macro,
+            current=dict(ms),
+            human_task_active=self._human_task_active,
+        )
+        if not merged:
+            return {}
+
+        for k, v in merged.items():
+            ms[k] = v
+            if k in agent.graph.nodes:
+                agent.graph.nodes[k] = float(v)
+            pk = f"phys_{k}"
+            if pk in agent.graph.nodes:
+                agent.graph.nodes[pk] = float(v)
+
+        motor_state_obj = getattr(sim, "_motor_state", None)
+        if motor_state_obj is not None:
+            motor_state_obj.intents.update(merged)
+        return merged
 
     def finalize(self, sim: Any) -> dict[str, float]:
         if not motor_arbiter_enabled():

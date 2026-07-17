@@ -34,6 +34,19 @@ class _FallbackHumanoid(InstrumentalSandbox):
             ]
         )
         self.ball = np.array([1.8, 1.4, 0.14], dtype=np.float64)
+        self.ball_id = 9000
+        self._object_registry.append({
+            "ref": "ball",
+            "id": "ball",
+            "body_id": int(self.ball_id),
+            "semantic": "ball",
+            "movable": True,
+            "mass": 0.14,
+            "x": float(self.ball[0]),
+            "y": float(self.ball[1]),
+            "z": float(self.ball[2]),
+            "source": "sandbox_spawn",
+        })
         self._lever_center = np.array([-4.2, 2.5, 0.1], dtype=np.float64)
         self._target_pad = np.array([3.6, -3.9, 0.02], dtype=np.float64)
         self._vel = np.zeros(3)
@@ -175,8 +188,15 @@ class _FallbackHumanoid(InstrumentalSandbox):
                 entry["y"] = float(self._manip_chair[1])
                 entry["z"] = float(self._manip_chair[2])
             registry.append(entry)
+        ball = {
+            "x": float(self.ball[0]),
+            "y": float(self.ball[1]),
+            "z": float(self.ball[2]),
+        }
+        if getattr(self, "ball_id", None) is not None:
+            ball["body_id"] = int(self.ball_id)
         return {
-            "ball": {"x": float(self.ball[0]), "y": float(self.ball[1]), "z": float(self.ball[2])},
+            "ball": ball,
             "lever": {
                 "x": float(self._lever_center[0]),
                 "y": float(self._lever_center[1]),

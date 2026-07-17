@@ -8,6 +8,7 @@ follow physical constraints, not keyword tables.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 import math
 from typing import Any, Callable
@@ -20,6 +21,9 @@ from engine.task_goal import GoalPredicate, TaskGoal
 EmbedFn = Callable[[str], np.ndarray | None]
 
 _KINDS_NEEDING_TARGET = frozenset({"reduce_distance", "contact", "displace"})
+_MANIPULATION_KINDS = frozenset({"contact", "displace"})
+_EXCLUSIVE_KIND_GROUPS: tuple[frozenset[str], ...] = (frozenset({"contact", "displace"}),)
+_CONJUNCTION_RE = re.compile(r"\s+(?:и|and|,)\s+", flags=re.IGNORECASE)
 
 
 def _env_float(key: str, default: float) -> float:
@@ -30,11 +34,19 @@ def _env_float(key: str, default: float) -> float:
 
 
 def goal_near_m() -> float:
-    return _env_float("RKK_GOAL_NEAR_M", 0.9)
+    """Legacy alias; manipulation goals use task_observation.nav_stop_m()."""
+    from engine.task_observation import nav_stop_m
+
+    return nav_stop_m()
 
 
 def manip_min_disp_m() -> float:
     return _env_float("RKK_MANIP_MIN_DISP", 0.12)
+
+
+def composite_kind_margin() -> float:
+    """Kinds within this cosine margin of a clause top score join the composite goal."""
+    return _env_float("RKK_GOAL_COMPOSITE_MARGIN", 0.025)
 
 
 @dataclass(frozen=True)
@@ -57,8 +69,12 @@ _PREDICATE_CATALOG: tuple[_CatalogEntry, ...] = (
     _CatalogEntry("reduce_distance", "go to the target"),
     _CatalogEntry("reduce_distance", "approach the object"),
     _CatalogEntry("reduce_distance", "get closer"),
+    _CatalogEntry("reduce_distance", "подойди к объекту перед тобой"),
+    _CatalogEntry("reduce_distance", "go to the object in front"),
     # contact
     _CatalogEntry("contact", "дотронуться до объекта"),
+    _CatalogEntry("contact", "дотронься до объекта перед тобой"),
+    _CatalogEntry("contact", "touch the object in front of you"),
     _CatalogEntry("contact", "коснуться"),
     _CatalogEntry("contact", "дотронься"),
     _CatalogEntry("contact", "touch the object"),
@@ -92,7 +108,27 @@ _PREDICATE_CATALOG: tuple[_CatalogEntry, ...] = (
         "state_key", "повернись", key="intent_gait_coupling", target_value=0.72, tolerance=0.15
     ),
     _CatalogEntry(
+        "state_key",
+        "повернись налево",
+        key="intent_gait_coupling",
+        target_value=0.72,
+        tolerance=0.15,
+    ),
+    _CatalogEntry(
+        "state_key",
+        "повернись направо",
+        key="intent_gait_coupling",
+        target_value=0.72,
+        tolerance=0.15,
+    ),
+    _CatalogEntry(
         "state_key", "turn around", key="intent_gait_coupling", target_value=0.72, tolerance=0.15
+    ),
+    _CatalogEntry(
+        "state_key", "turn left", key="intent_gait_coupling", target_value=0.72, tolerance=0.15
+    ),
+    _CatalogEntry(
+        "state_key", "turn right", key="intent_gait_coupling", target_value=0.72, tolerance=0.15
     ),
     _CatalogEntry(
         "state_key",
@@ -188,6 +224,86 @@ def _kind_scores(
     return scores
 
 
+def _split_command_clauses(text: str) -> list[str]:
+    """Syntactic conjunction split — not verb-specific branching."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip(" .,;") for p in _CONJUNCTION_RE.split(raw) if p.strip(" .,;")]
+    return parts if parts else [raw]
+
+
+def _merge_kind_scores(scores_list: list[dict[str, float]]) -> dict[str, float]:
+    merged: dict[str, float] = {}
+    for scores in scores_list:
+        for kind, score in scores.items():
+            prev = merged.get(kind)
+            if prev is None or score > prev:
+                merged[kind] = float(score)
+    return merged
+
+
+def _select_kinds_for_clause(
+    kind_scores: dict[str, float],
+    *,
+    min_kind_score: float,
+    margin: float,
+) -> set[str]:
+    if not kind_scores:
+        return set()
+    ranked = sorted(kind_scores.items(), key=lambda kv: -kv[1])
+    top_score = ranked[0][1]
+    if top_score < min_kind_score:
+        return set()
+    floor = top_score - float(margin)
+    return {k for k, s in ranked if s >= min_kind_score and s >= floor}
+
+
+# Ontology tie-break among manipulation terminals (less invasive wins on embedding tie).
+_MANIPULATION_TIE_ORDER: tuple[str, ...] = ("contact", "displace")
+
+
+def _resolve_exclusive_kinds(
+    selected: set[str],
+    kind_scores: dict[str, float],
+    *,
+    margin: float,
+) -> set[str]:
+    """Mutually exclusive manipulation predicates — score winner, ontology tie-break."""
+    out = set(selected)
+    for group in _EXCLUSIVE_KIND_GROUPS:
+        overlap = out & group
+        if len(overlap) <= 1:
+            continue
+        top_score = max(kind_scores.get(k, -2.0) for k in overlap)
+        tied = [k for k in overlap if kind_scores.get(k, -2.0) >= top_score - float(margin)]
+        if len(tied) > 1:
+            winner = next((k for k in _MANIPULATION_TIE_ORDER if k in tied), tied[0])
+        else:
+            winner = max(overlap, key=lambda k: kind_scores.get(k, -2.0))
+        out = (out - overlap) | {winner}
+    return out
+
+
+def _apply_physical_prerequisites(kinds: set[str]) -> list[str]:
+    """Order predicates by physical dependency (approach before contact/displace)."""
+    ordered: list[str] = []
+    if "reduce_distance" in kinds or kinds & _MANIPULATION_KINDS:
+        ordered.append("reduce_distance")
+    if "contact" in kinds:
+        ordered.append("contact")
+    if "displace" in kinds:
+        ordered.append("displace")
+    if "state_key" in kinds:
+        ordered.append("state_key")
+    return ordered
+
+
+def warm_predicate_catalog(embed_fn: EmbedFn) -> int:
+    """Pre-cache predicate-description embeddings (avoids multi-second first command)."""
+    return len(_ensure_catalog_embeddings(embed_fn))
+
+
 def _best_entry_for_kind(
     kind: str, cmd_emb: np.ndarray, catalog: list[tuple[_CatalogEntry, np.ndarray]]
 ) -> _CatalogEntry | None:
@@ -224,7 +340,9 @@ def _fallback_state_key_predicate(text: str) -> GoalPredicate:
 
 
 def _build_predicate(kind: str, entry: _CatalogEntry | None) -> GoalPredicate:
-    near = goal_near_m()
+    from engine.task_observation import nav_stop_m
+
+    near = nav_stop_m()
     disp = manip_min_disp_m()
     if kind == "reduce_distance":
         return GoalPredicate(
@@ -291,17 +409,6 @@ def ground_command(
             diagnostics={"needs_target": False, "fallback": "command_tag"},
         )
 
-    cmd_emb = embed_fn(raw)
-    if cmd_emb is None:
-        pred = _fallback_state_key_predicate(raw)
-        return TaskGoal(
-            text=raw,
-            predicates=[pred],
-            confidence=0.0,
-            wm_trusted=False,
-            diagnostics={"needs_target": False, "fallback": "embed_failed"},
-        )
-
     catalog = _ensure_catalog_embeddings(embed_fn)
     if not catalog:
         pred = _fallback_state_key_predicate(raw)
@@ -313,48 +420,73 @@ def ground_command(
             diagnostics={"needs_target": False, "fallback": "empty_catalog"},
         )
 
-    cmd_emb = _normalize(cmd_emb)
-    kind_scores = _kind_scores(cmd_emb, catalog)
-    if not kind_scores:
+    clauses = _split_command_clauses(raw)
+    margin = composite_kind_margin()
+    clause_kind_scores: list[dict[str, float]] = []
+    selected: set[str] = set()
+    clause_diag: list[dict[str, Any]] = []
+
+    for clause in clauses:
+        clause_emb = embed_fn(clause)
+        if clause_emb is None:
+            continue
+        clause_emb = _normalize(clause_emb)
+        scores = _kind_scores(clause_emb, catalog)
+        if not scores:
+            continue
+        clause_kind_scores.append(scores)
+        picked = _select_kinds_for_clause(
+            scores, min_kind_score=min_kind_score, margin=margin
+        )
+        selected |= picked
+        clause_diag.append(
+            {
+                "clause": clause[:80],
+                "kind_scores": {k: round(v, 4) for k, v in scores.items()},
+                "selected": sorted(picked),
+            }
+        )
+
+    if not selected:
         pred = _fallback_state_key_predicate(raw)
+        merged_scores = _merge_kind_scores(clause_kind_scores)
         return TaskGoal(
             text=raw,
             predicates=[pred],
             confidence=0.0,
             wm_trusted=False,
-            diagnostics={"needs_target": False, "fallback": "no_scores"},
+            diagnostics={
+                "needs_target": False,
+                "fallback": "below_min_kind_score",
+                "kind_scores": {k: round(v, 4) for k, v in merged_scores.items()},
+                "clauses": clause_diag,
+            },
         )
 
-    ranked = sorted(kind_scores.items(), key=lambda kv: -kv[1])
-    confidence = float(np.clip((ranked[0][1] + 1.0) * 0.5, 0.0, 1.0))
+    kind_scores = _merge_kind_scores(clause_kind_scores)
+    selected = _resolve_exclusive_kinds(selected, kind_scores, margin=margin)
+    if (selected & _MANIPULATION_KINDS or "reduce_distance" in selected) and "state_key" in selected:
+        selected.discard("state_key")
+    ordered_kinds = _apply_physical_prerequisites(selected)
 
-    selected_kinds: list[str] = []
-    for kind, score in ranked[: max(1, top_k)]:
-        if score >= min_kind_score:
-            selected_kinds.append(kind)
-
-    if not selected_kinds:
-        selected_kinds = [ranked[0][0]]
+    full_emb = embed_fn(raw)
+    cmd_emb = _normalize(full_emb) if full_emb is not None else None
 
     predicates: list[GoalPredicate] = []
-    for kind in selected_kinds:
-        entry = _best_entry_for_kind(kind, cmd_emb, catalog)
+    for kind in ordered_kinds:
+        entry = _best_entry_for_kind(kind, cmd_emb, catalog) if cmd_emb is not None else None
         predicates.append(_build_predicate(kind, entry))
 
-    # Contact physically requires approach — prerequisite, not a verb heuristic.
-    kinds_present = {p.kind for p in predicates}
-    if "contact" in kinds_present and "reduce_distance" not in kinds_present:
-        near = goal_near_m()
-        predicates.insert(
-            0,
-            GoalPredicate(
-                kind="reduce_distance",
-                target_ref=None,
-                target_value=near,
-                tolerance=0.25,
-                weight=0.6,
-            ),
-        )
+    ranked = sorted(kind_scores.items(), key=lambda kv: -kv[1])
+    primary_kind = ordered_kinds[-1] if ordered_kinds else ranked[0][0]
+    if ordered_kinds:
+        manip = [k for k in ordered_kinds if k in _MANIPULATION_KINDS]
+        if manip:
+            primary_kind = manip[-1]
+        elif "reduce_distance" in ordered_kinds:
+            primary_kind = "reduce_distance"
+    primary_score = kind_scores.get(primary_kind, ranked[0][1] if ranked else 0.0)
+    confidence = float(np.clip((primary_score + 1.0) * 0.5, 0.0, 1.0))
 
     needs_target = any(p.kind in _KINDS_NEEDING_TARGET for p in predicates)
     kind_probs = dict(zip([k for k, _ in ranked], _softmax([s for _, s in ranked])))
@@ -368,22 +500,19 @@ def ground_command(
             "needs_target": needs_target,
             "kind_scores": {k: round(v, 4) for k, v in kind_scores.items()},
             "kind_probs": {k: round(v, 4) for k, v in kind_probs.items()},
-            "selected_kinds": selected_kinds,
+            "selected_kinds": list(ordered_kinds),
+            "primary_kind": primary_kind,
+            "clauses": clause_diag,
+            "composite": len(clauses) > 1,
         },
     )
 
 
 def goal_observation_keys(goal: TaskGoal | None) -> list[str]:
-    """Observation keys relevant to a TaskGoal (state_key preds + distance proxy)."""
-    if goal is None:
-        return []
-    keys: list[str] = []
-    for p in goal.predicates:
-        if p.kind == "state_key" and p.key:
-            keys.append(str(p.key))
-        elif p.kind == "reduce_distance":
-            keys.append("target_dist")
-    return list(dict.fromkeys(keys))
+    """Observation keys relevant to a TaskGoal (task-conditioned + state_key preds)."""
+    from engine.task_observation import task_observation_keys_for_goal
+
+    return task_observation_keys_for_goal(goal)
 
 
 # --- Manipulation push direction (geometry default + embedding text override) ---

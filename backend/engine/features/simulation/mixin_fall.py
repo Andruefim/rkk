@@ -76,6 +76,10 @@ class SimulationFallMixin:
 
     def _try_reset_pose_after_fall(self) -> bool:
         """Сброс позы гуманоида (база PyBullet), чтобы выйти из ловушки fallen + VL block."""
+        from engine.task_binding import human_task_embodiment_protected
+
+        if human_task_embodiment_protected(self):
+            return False
         env = self.agent.env
         fn = getattr(env, "reset_stance", None)
         if not callable(fn):
@@ -260,6 +264,12 @@ class SimulationFallMixin:
         timed_out = elapsed >= max_ticks
 
         if stalled or timed_out:
+            from engine.task_binding import human_task_embodiment_protected
+
+            if human_task_embodiment_protected(self):
+                # Genome recovery continues; no teleport reset mid-task.
+                self._fall_recovery_last_progress_tick = self.tick
+                return False
             self._clear_fall_recovery()
             return self._try_reset_pose_after_fall()
 

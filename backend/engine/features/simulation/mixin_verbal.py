@@ -70,10 +70,38 @@ class SimulationVerbalMixin:
                 except Exception:
                     fallen_flag = None
                 human_task = ""
+                human_task_stage = ""
                 tb = getattr(self, "_task_binding", None)
                 ht = tb.active_task if tb is not None else None
                 if ht is not None and getattr(ht, "status", "") == "active":
                     human_task = str(getattr(ht, "text", "") or "")
+                try:
+                    from engine.task_executive import active_tree_stage_kind
+
+                    human_task_stage = active_tree_stage_kind(self)
+                except Exception:
+                    pass
+                # During human tasks, speak the grounded stage phrase directly.
+                # Qwen paraphrase was inventing «Я потеряюсь» from store nearest.
+                if human_task.strip():
+                    phrase = state_phrase_for_speech(
+                        o,
+                        fallen=fallen_flag,
+                        env=env,
+                        human_task_text=human_task,
+                        human_task_stage=human_task_stage,
+                    )
+                    if phrase and len(phrase.strip()) >= 2:
+                        if gl is not None and hasattr(self, "agent"):
+                            gl.sync_speak_vector_from_state(
+                                self.agent.graph,
+                                o,
+                                fallen=fallen_flag,
+                                env=env,
+                                human_task_text=human_task,
+                                human_task_stage=human_task_stage,
+                            )
+                        return phrase.strip()
                 if gl is not None and hasattr(self, "agent"):
                     gl.sync_speak_vector_from_state(
                         self.agent.graph,
@@ -81,6 +109,7 @@ class SimulationVerbalMixin:
                         fallen=fallen_flag,
                         env=env,
                         human_task_text=human_task,
+                        human_task_stage=human_task_stage,
                     )
                 text = self.grounded_lang_generate(o)
                 if text and len(text.strip()) >= 3:
@@ -91,7 +120,11 @@ class SimulationVerbalMixin:
                         and gl is not None
                     ):
                         phrase = state_phrase_for_speech(
-                            o, fallen=False, env=env, human_task_text=human_task
+                            o,
+                            fallen=False,
+                            env=env,
+                            human_task_text=human_task,
+                            human_task_stage=human_task_stage,
                         )
                         gl.sync_speak_vector_from_state(
                             self.agent.graph,
@@ -99,6 +132,7 @@ class SimulationVerbalMixin:
                             fallen=False,
                             env=env,
                             human_task_text=human_task,
+                            human_task_stage=human_task_stage,
                         )
                         text = gl.generate_utterance(self.agent.graph, o)
                         if text and len(text.strip()) >= 3:

@@ -70,6 +70,25 @@ def _bind_displace_chair_task(sim: AgiLoopSim, text: str = "push the object") ->
     tt.complete_active(sim.tick)
 
 
+def test_sandbox_scene_extras_reads_from_sim(agi_loop_sim: AgiLoopSim) -> None:
+    """Scene extras must come from base._sim, not HumanoidEnvironment base."""
+    sim = agi_loop_sim
+    ball_scene = {
+        "ball": {
+            "x": 1.5,
+            "y": 0.0,
+            "z": 0.2,
+            "body_id": 100,
+            "movable": True,
+            "semantic": "ball",
+            "ref": "ball",
+        },
+    }
+    sim.agent.env.set_scene_extras(ball_scene)
+    assert not hasattr(sim.agent.env, "get_sandbox_scene_extras")
+    assert sim._sandbox_scene_extras() == ball_scene
+
+
 def test_manip_command_creates_predicate_tree_and_resolves(
     agi_loop_sim: AgiLoopSim, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -244,11 +263,14 @@ def test_contact_goal_navigation_and_done(agi_loop_sim: AgiLoopSim) -> None:
     sim._verbal = verbal
     sim.grounded_lang_generate = lambda obs=None: "Готово."  # type: ignore[method-assign]
 
+    from engine.task_observation import nav_stop_m, reach_start_m
+
+    near = nav_stop_m()
     goal = TaskGoal(
         text="touch ball",
         target_ref="ball",
         predicates=[
-            GoalPredicate(kind="reduce_distance", target_ref="ball", target_value=0.9),
+            GoalPredicate(kind="reduce_distance", target_ref="ball", target_value=near),
             GoalPredicate(kind="contact", target_ref="ball", target_value=1.0),
         ],
         diagnostics={"needs_target": True},
@@ -256,6 +278,7 @@ def test_contact_goal_navigation_and_done(agi_loop_sim: AgiLoopSim) -> None:
     tt = sim._ensure_task_tree()
     tt.bind_goal(goal, sim.tick, needs_target=True, target_ref="ball")
     sim._task_tree_kind = "goal"
+    sim._task_goal = goal
     sim._manip_resolved = ResolvedObject(
         ref="ball",
         obj_id="ball",
@@ -282,13 +305,23 @@ def test_contact_goal_navigation_and_done(agi_loop_sim: AgiLoopSim) -> None:
     sim.agent.env._obs["com_x"] = 0.98
     sim.agent.env._obs["com_y"] = 0.0
     sim.agent.env._contact_flag = True
-    for tick in range(111, 120):
+    for tick in range(111, 130):
         sim.tick = tick
         sim._tick_human_task(fallen=False)
         if tt.tree is not None and tt.tree.root_status == "done":
             break
 
     assert tt.tree is not None
+    assert tt.active_node is None or tt.tree.root_status == "done"
+    # Advance through reach_contact → verify_goal with contact satisfied.
+    if tt.tree.root_status != "done":
+        sim.agent.env._obs["com_x"] = near * 0.85
+        for tick in range(130, 145):
+            sim.tick = tick
+            sim._tick_human_task(fallen=False)
+            if tt.tree.root_status == "done":
+                break
+
     assert tt.tree.root_status == "done"
     sim._maybe_finalize_task_tree(sim.tick)
     assert len(verbal._messages) == 1

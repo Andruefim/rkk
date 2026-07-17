@@ -62,18 +62,9 @@ class SimulationTickMixin:
 
     def _human_task_motor_active(self) -> bool:
         try:
-            from engine.task_binding import task_binding_enabled
-            from engine.task_tree import task_tree_enabled
+            from engine.task_binding import human_task_execution_active
 
-            if not task_binding_enabled():
-                return False
-            if task_tree_enabled():
-                tt = getattr(self, "_task_tree_ctrl", None)
-                if tt is not None and tt.is_active:
-                    return True
-            tb = getattr(self, "_task_binding", None)
-            ht = tb.active_task if tb is not None else None
-            return ht is not None and str(getattr(ht, "status", "active")) == "active"
+            return human_task_execution_active(self)
         except Exception:
             return False
 
@@ -174,7 +165,13 @@ class SimulationTickMixin:
         if targets:
             try:
                 from engine.motor_arbiter import filter_human_task_targets
+                from engine.task_executive import (
+                    active_tree_stage_kind,
+                    filter_motor_targets_for_stage,
+                )
 
+                stage = active_tree_stage_kind(self)
+                targets = filter_motor_targets_for_stage(targets, stage)
                 targets = filter_human_task_targets(targets)
             except Exception:
                 pass
@@ -186,10 +183,19 @@ class SimulationTickMixin:
         if isinstance(plan, dict):
             var = self._canonical_motor_intent_key(str(plan.get("var", "")))
             if var.startswith("intent_"):
-                arb.register_from_dict(
-                    "s2_wm",
-                    {var: float(plan.get("val", 0.5))},
-                )
+                skip_s2_balance = False
+                if arb.human_task_active():
+                    try:
+                        from engine.motor_arbiter import is_balance_critical_intent_field
+
+                        skip_s2_balance = is_balance_critical_intent_field(var)
+                    except Exception:
+                        skip_s2_balance = False
+                if not skip_s2_balance:
+                    arb.register_from_dict(
+                        "s2_wm",
+                        {var: float(plan.get("val", 0.5))},
+                    )
 
     def _sync_temporal_blankets_to_graph(self) -> None:
         """Rebuild TemporalBlankets when |graph nodes| changes (inner_voice, concepts, neurogenesis)."""
@@ -276,6 +282,20 @@ class SimulationTickMixin:
             if k in ms and abs(v - ms[k]) > 0.01:
                 residuals[k] = v - ms[k]
 
+        arb_ht = getattr(self, "_motor_arbiter", None)
+        if residuals and arb_ht is not None and arb_ht.human_task_active():
+            try:
+                nav_on = float(self.agent.graph.nodes.get("task_nav_active", 0.0) or 0.0) > 0.45
+            except (TypeError, ValueError):
+                nav_on = False
+            if nav_on:
+                try:
+                    blend = float(os.environ.get("RKK_TASK_NAV_REFLEX_BLEND", "0.45"))
+                except ValueError:
+                    blend = 0.45
+                blend = float(np.clip(blend, 0.05, 1.0))
+                residuals = {k: float(v) * blend for k, v in residuals.items()}
+
         if residuals:
             fn(residuals)
 
@@ -330,6 +350,11 @@ class SimulationTickMixin:
 
     def _apply_genome_walk_intents(self, is_fallen: bool) -> None:
         if not self._genome_walk_active(is_fallen):
+            self._genome_walk_active_tick = False
+            return
+        arb = getattr(self, "_motor_arbiter", None)
+        if arb is not None and arb.should_suppress_substrate():
+            # Human task executive owns locomotion — do not inject genome walk into CPG nodes.
             self._genome_walk_active_tick = False
             return
         self._genome_walk_active_tick = True
@@ -515,6 +540,10 @@ class SimulationTickMixin:
         return True, "mastery+posture+bias"
 
     def _fr_try_reattach_after_fall(self, obs: dict) -> None:
+        from engine.task_binding import human_task_embodiment_protected
+
+        if human_task_embodiment_protected(self):
+            return
         if not self._curriculum_auto_fr_released or self._fixed_root_active:
             return
         if self._fr_reattach_active:
@@ -736,13 +765,16 @@ class SimulationTickMixin:
                 fr_retry_max = 16
             fr_retry_max = max(1, fr_retry_max)
             if self.tick <= fr_retry_max and not self._fixed_root_active:
-                r = self.enable_fixed_root()
-                if r.get("fixed_root") and not r.get("error") and self._fixed_root_active:
-                    self._add_event(
-                        "📌 Curriculum: fixed_root ON (phase 1, arms→cubes)",
-                        "#66ccaa",
-                        "phase",
-                    )
+                from engine.task_binding import human_task_embodiment_protected
+
+                if not human_task_embodiment_protected(self):
+                    r = self.enable_fixed_root()
+                    if r.get("fixed_root") and not r.get("error") and self._fixed_root_active:
+                        self._add_event(
+                            "📌 Curriculum: fixed_root ON (phase 1, arms→cubes)",
+                            "#66ccaa",
+                            "phase",
+                        )
             self._fr_maybe_end_reattach()
 
             if (
@@ -974,6 +1006,14 @@ class SimulationTickMixin:
                     _ht_ex,
                     exc_info=True,
                 )
+            if arb_ht is not None and arb_ht.human_task_active():
+                try:
+                    arb_ht.early_finalize(
+                        self,
+                        frozenset({"navigation", "manipulation"}),
+                    )
+                except Exception:
+                    pass
             try:
                 from engine.neuro_symbolic.motor_sync import sync_ns_motor_every_tick
 
@@ -981,6 +1021,14 @@ class SimulationTickMixin:
             except Exception:
                 self._ns_fast_applied = {}
             self._apply_genome_walk_intents(fallen_pre)
+            if arb_ht is not None and arb_ht.human_task_active():
+                try:
+                    arb_ht.early_finalize(
+                        self,
+                        frozenset({"navigation", "manipulation"}),
+                    )
+                except Exception:
+                    pass
         self._maybe_apply_cpg_locomotion(fallen_pre)
         self._publish_cpg_node_snapshot()
         if is_humanoid_topology(self.current_world) and not self._fixed_root_active:
@@ -1345,6 +1393,11 @@ class SimulationTickMixin:
                 sim=self,
             )
 
+            if _sleep_reason and not self._sleep_ctrl.is_sleeping:
+                from engine.task_binding import human_task_embodiment_protected
+
+                if human_task_embodiment_protected(self):
+                    _sleep_reason = None
             if _sleep_reason and not self._sleep_ctrl.is_sleeping:
                 self._sleep_attach_fixed_root()
                 self._sleep_ctrl.begin_sleep(self.tick, _sleep_reason, sim=self)

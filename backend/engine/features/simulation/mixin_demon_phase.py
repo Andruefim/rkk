@@ -9,6 +9,8 @@ class SimulationDemonPhaseMixin:
         """
         В кризисе эмбодимента не искажать W — иначе WM не сходится и «интеллект»
         (предсказание, compression, vision grounding) не растёт.
+        Also pause during active human tasks so adversarial edge noise cannot
+        fight navigation / approach.
         """
         if os.environ.get("RKK_DEMON_PAUSE_WHEN_UNSTABLE", "1").strip().lower() in (
             "0",
@@ -19,6 +21,13 @@ class SimulationDemonPhaseMixin:
             return False
         if snap.get("fallen"):
             return True
+        try:
+            from engine.task_executive import human_task_executive_active
+
+            if human_task_executive_active(self):
+                return True
+        except Exception:
+            pass
         return False
 
     def _step_demon(self, snap: dict):

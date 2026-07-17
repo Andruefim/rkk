@@ -308,7 +308,23 @@ class LocomotionController:
         suppress = float(np.clip(suppress, 0.0, 1.0))
         rec_gate = float(np.clip(max(recover_n, low_z * 0.9), 0.0, 1.0))
         if rec_gate > 0.35:
-            walk_gate *= float(1.0 - suppress * rec_gate)
+            suppress_eff = suppress
+            try:
+                task_nav = float(agent_nodes.get("task_nav_active", 0.0) or 0.0) > 0.45
+                posture = float(self._node(agent_nodes, "posture_stability"))
+                pause_ps = float(os.environ.get("RKK_TASK_NAV_PAUSE_POSTURE", "0.32"))
+            except (TypeError, ValueError):
+                task_nav = False
+                posture = 0.5
+                pause_ps = 0.32
+            if task_nav and posture >= pause_ps:
+                try:
+                    nav_blend = float(os.environ.get("RKK_CPG_TASK_NAV_RECOVER_BLEND", "0.35"))
+                except ValueError:
+                    nav_blend = 0.35
+                nav_blend = float(np.clip(nav_blend, 0.0, 1.0))
+                suppress_eff = suppress * (1.0 - nav_blend)
+            walk_gate *= float(1.0 - suppress_eff * rec_gate)
         bilateral_scale = float(1.0 - walk_gate)
 
         # CPG команды для ног
@@ -471,6 +487,22 @@ class LocomotionController:
         )
         targets["lhip"] = float(np.clip(targets["lhip"] + lean_bias * stance_l * walk_gate, 0.05, 0.95))
         targets["rhip"] = float(np.clip(targets["rhip"] + lean_bias * stance_r * walk_gate, 0.05, 0.95))
+
+        # Task navigation steering: heading error + gait coupling → differential hips/ankles.
+        try:
+            steer_gain = float(os.environ.get("RKK_CPG_NAV_STEER", "0.07"))
+        except ValueError:
+            steer_gain = 0.07
+        heading_err = float(agent_nodes.get("task_heading_err", 0.0) or 0.0)
+        coupling_steer = float(self._node(agent_nodes, "intent_gait_coupling") - 0.5) * 1.6
+        steer = float(np.clip(heading_err + coupling_steer, -1.0, 1.0))
+        if abs(steer) > 0.02 and stride_raw >= 0.52 and steer_gain > 0.0:
+            steer_scale = float(walk_gate if walk_gate > 0.08 else max(stride_n, 0.12))
+            delta = steer_gain * steer * steer_scale
+            targets["lhip"] = float(np.clip(targets["lhip"] + delta, 0.05, 0.95))
+            targets["rhip"] = float(np.clip(targets["rhip"] - delta, 0.05, 0.95))
+            targets["lankle"] = float(np.clip(targets["lankle"] + 0.5 * delta, 0.05, 0.95))
+            targets["rankle"] = float(np.clip(targets["rankle"] - 0.5 * delta, 0.05, 0.95))
 
         if static_penalty_applied:
             try:

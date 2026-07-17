@@ -109,10 +109,13 @@ class SimulationLocomotionMixin:
             from engine.features.humanoid.constants import LEG_VARS
 
             nodes = dict(self.agent.graph.nodes)
+            arb_ht = getattr(self, "_motor_arbiter", None)
+            task_exec_active = arb_ht is not None and arb_ht.human_task_active()
             if (
                 not fallen
                 and not self._fixed_root_active
                 and getattr(self, "_genome_walk_active_tick", False)
+                and not task_exec_active
             ):
                 try:
                     from engine.genome.priors import walk_intents_at_tick

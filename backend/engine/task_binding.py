@@ -39,6 +39,39 @@ def task_binding_enabled() -> bool:
     )
 
 
+def task_protect_embodiment_enabled() -> bool:
+    """When on, active human tasks defer hard pose reset and fixed_root re-attach."""
+    return os.environ.get("RKK_TASK_PROTECT_EMBODIMENT", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def human_task_execution_active(sim: Any) -> bool:
+    """True while a human command is bound and executing (tree or flat binding)."""
+    if not task_binding_enabled():
+        return False
+    try:
+        from engine.task_tree import task_tree_enabled
+
+        if task_tree_enabled():
+            tt = getattr(sim, "_task_tree_ctrl", None)
+            if tt is not None and bool(getattr(tt, "is_active", False)):
+                return True
+    except Exception:
+        pass
+    tb = getattr(sim, "_task_binding", None)
+    ht = tb.active_task if tb is not None else None
+    return ht is not None and str(getattr(ht, "status", "active")) == "active"
+
+
+def human_task_embodiment_protected(sim: Any) -> bool:
+    """Embodiment curriculum / fall reset must not interrupt an in-flight human task."""
+    return task_protect_embodiment_enabled() and human_task_execution_active(sim)
+
+
 def _env_int(key: str, default: int) -> int:
     try:
         return max(1, int(os.environ.get(key, str(default))))
@@ -225,9 +258,6 @@ class TaskBindingController:
         goal_keys = goal_observation_keys(goal)
         if goal is not None:
             goal_keys = list(dict.fromkeys(goal_keys + expected_state_keys_for_goal(goal)))
-        for k in motor:
-            if k not in goal_keys:
-                goal_keys.append(k)
 
         if goal is not None and goal_keys:
             raw = {k: float(state[k]) for k in goal_keys if k in state}
@@ -266,6 +296,9 @@ class TaskBindingController:
         *,
         embed_fn: Any | None = None,
         goal: TaskGoal | None = None,
+        agent_xy: tuple[float, float] | None = None,
+        target_xy: tuple[float, float] | None = None,
+        agent_forward: tuple[float, float] | None = None,
     ) -> HumanTask:
         ef = embed_fn
         if ef is None:
@@ -274,7 +307,13 @@ class TaskBindingController:
         if goal is None:
             goal = ground_command(str(text).strip(), ef)
         expected, wm_trusted, trust_diag = self.imagine_expected_state(
-            graph, obs, text=text, goal=goal
+            graph,
+            obs,
+            text=text,
+            goal=goal,
+            agent_xy=agent_xy,
+            target_xy=target_xy,
+            agent_forward=agent_forward,
         )
         goal.wm_trusted = wm_trusted
         goal.diagnostics.update(trust_diag)

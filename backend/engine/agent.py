@@ -938,6 +938,24 @@ class RKKAgent:
             return False
         return task_from_planning_context(ctx, dict(self.graph.nodes)).active
 
+    def _filter_human_task_balance_scores(self, scores: list[dict]) -> list[dict]:
+        """During human tasks, navigation owns balance intents — skip S2 stride/coupling."""
+        ctx = getattr(self, "_s2_planning_context", None) or {}
+        if not ctx.get("human_task_active") or ctx.get("fallen_override_active"):
+            return scores
+        from engine.motor_arbiter import is_balance_critical_intent_field
+
+        out: list[dict] = []
+        for cand in scores:
+            var = str(cand.get("variable", ""))
+            ck = var
+            if ck.startswith("phys_intent_"):
+                ck = "intent_" + ck[len("phys_intent_") :]
+            if is_balance_critical_intent_field(ck):
+                continue
+            out.append(cand)
+        return out
+
     def _maybe_goal_planned_candidate(self) -> dict | None:
         if self._s2_wm_task_active():
             return None
@@ -2088,6 +2106,8 @@ class RKKAgent:
             elif not fr_now:
                 self._repeat_same_top_scores = 0
 
+        scores = self._filter_human_task_balance_scores(scores)
+
         if not scores:
             _report_if_slow_tick()
             return {
@@ -2226,6 +2246,32 @@ class RKKAgent:
         # ── Выполняем допустимое действие ────────────────────────────────────
         var   = chosen["variable"]
         value = chosen["value"]
+
+        s2_ctx_exec = getattr(self, "_s2_planning_context", None) or {}
+        if s2_ctx_exec.get("human_task_active") and not s2_ctx_exec.get(
+            "fallen_override_active"
+        ):
+            from engine.motor_arbiter import is_balance_critical_intent_field
+
+            ck = str(var)
+            if ck.startswith("phys_intent_"):
+                ck = "intent_" + ck[len("phys_intent_") :]
+            if is_balance_critical_intent_field(ck):
+                _report_if_slow_tick()
+                return {
+                    "blocked": True,
+                    "blocked_count": blocked_count + 1,
+                    "reason": "human_task_balance_reserved",
+                    "variable": var,
+                    "value": float(value),
+                    "updated_edges": [],
+                    "compression_delta": 0.0,
+                    "prediction_error": 0.0,
+                    "cf_predicted": {},
+                    "cf_observed": {},
+                    "goal_planned": False,
+                    "from_system2": bool(chosen.get("from_system2")),
+                }
 
         # Global safety cap: motor intents stay near neutral to prevent falling
         if _is_motor_intent_var(var):

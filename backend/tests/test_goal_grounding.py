@@ -18,12 +18,15 @@ from engine.task_goal import GoalPredicate, TaskGoal
 @pytest.fixture(autouse=True)
 def _reset_catalog_cache():
     from engine.goal_grounding import clear_catalog_cache, clear_direction_cache
+    from engine.object_resolver import clear_deictic_cache
 
     clear_catalog_cache()
     clear_direction_cache()
+    clear_deictic_cache()
     yield
     clear_catalog_cache()
     clear_direction_cache()
+    clear_deictic_cache()
 
 
 def _hash_vec(text: str, dim: int = 32) -> np.ndarray:
@@ -53,7 +56,12 @@ class _PhraseEmbedder:
 
         phrase_kind: dict[str, str] = {
             # commands
+            "передвинь стул": "displace",
+            "передвинуть стул": "displace",
             "дотронься до шара": "contact",
+            "подойди": "reduce_distance",
+            "дотронься до объекта перед тобой": "contact",
+            "подойди и дотронься до объекта перед тобой": "contact",
             "подойди к кубу": "reduce_distance",
             "передвинь стул": "displace",
             "иди вперёд": "state_key",
@@ -69,6 +77,8 @@ class _PhraseEmbedder:
             "толкни": "displace",
             "иду вперёд": "state_key",
             "повернись": "state_key",
+            "повернись налево": "state_key",
+            "повернись направо": "state_key",
             "встань": "state_key",
             "стабилизируйся": "state_key",
             # catalog EN
@@ -85,6 +95,8 @@ class _PhraseEmbedder:
             "step forward": "state_key",
             "walk forward": "state_key",
             "turn around": "state_key",
+            "turn left": "state_key",
+            "turn right": "state_key",
             "get up": "state_key",
             "stand stable": "state_key",
         }
@@ -158,6 +170,19 @@ def test_ground_touch_ball_contact_and_approach() -> None:
     assert goal.confidence > 0.0
 
 
+def test_ground_composite_approach_and_touch() -> None:
+    emb = _PhraseEmbedder()
+    cmd = "подойди и дотронься до объекта перед тобой"
+    goal = ground_command(cmd, emb.embed)
+    kinds = [p.kind for p in goal.predicates]
+    assert "reduce_distance" in kinds
+    assert "contact" in kinds
+    assert "displace" not in kinds
+    assert goal.diagnostics.get("primary_kind") == "contact"
+    assert goal.diagnostics.get("composite") is True
+    assert len(goal.diagnostics.get("clauses") or []) >= 2
+
+
 def test_ground_approach_cube() -> None:
     emb = _PhraseEmbedder()
     goal = ground_command("подойди к кубу", emb.embed)
@@ -182,6 +207,15 @@ def test_ground_locomote_no_target() -> None:
     assert "state_key" in kinds
     assert goal.diagnostics.get("needs_target") is False
     assert any(p.key == "intent_stride" for p in goal.predicates)
+
+
+def test_ground_turn_left_state_key_only() -> None:
+    emb = _PhraseEmbedder()
+    goal = ground_command("повернись налево", emb.embed)
+    kinds = [p.kind for p in goal.predicates]
+    assert kinds == ["state_key"]
+    assert goal.diagnostics.get("needs_target") is False
+    assert any(p.key == "intent_gait_coupling" for p in goal.predicates)
 
 
 def test_ground_fallback_without_embed_fn() -> None:

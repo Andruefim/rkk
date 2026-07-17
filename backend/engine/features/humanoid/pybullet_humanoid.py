@@ -324,6 +324,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self.target_pad = np.array([3.6, -3.9, 0.02], dtype=np.float64)
         self.lever_trigger_r = 0.26
         self._ball_start = [1.8, 1.4, 0.1375]
+        self._object_registry: list[dict] = []
         br = 0.1125
         col_ball = pb.createCollisionShape(pb.GEOM_SPHERE, radius=br, physicsClientId=self.client)
         vis_ball = pb.createVisualShape(
@@ -342,6 +343,14 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             rollingFriction=0.02, physicsClientId=self.client,
         )
         self._ball_radius = float(br)
+        self._register_scene_object(
+            ref="ball",
+            body_id=int(self.ball_id),
+            semantic="ball",
+            position=tuple(self._ball_start),
+            mass=0.14,
+            source="sandbox_spawn",
+        )
         self._build_lever_pedestal()
         self._build_target_marker()
         self.prop_ids: list[int] = []
@@ -350,7 +359,6 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self._build_rich_environment()
         self._manip_chair_id: int | None = None
         self._manip_chair_start: list[float] = []
-        self._object_registry: list[dict] = []
         self._manip_pose_cache: dict[str, tuple[int, tuple[float, float, float]]] = {}
         self._physics_step_count: int = 0
         self._manip_contact_tick: int = 0
@@ -805,7 +813,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             {"pos": [-1.0, -2.8, 0.07], "half": 0.065, "mass": 0.3, "color": [0.75, 0.45, 0.85, 1.0]},
             {"pos": [0.5, 5.0, 0.08], "half": 0.06, "mass": 0.25, "color": [0.3, 0.85, 0.75, 1.0]},
         ]
-        for cfg in prop_cfgs:
+        for i, cfg in enumerate(prop_cfgs):
             hs = float(cfg["half"])
             colp = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=[hs, hs, hs], physicsClientId=cid)
             visp = pb.createVisualShape(
@@ -825,10 +833,20 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             self._prop_starts.append([float(pos[0]), float(pos[1]), float(pos[2])])
             self._prop_meta.append({
                 "half": hs,
+                "mass": float(cfg["mass"]),
+                "semantic": "prop",
                 "r": float(cfg["color"][0]),
                 "g": float(cfg["color"][1]),
                 "b": float(cfg["color"][2]),
             })
+            self._register_scene_object(
+                ref=f"prop_{i}",
+                body_id=int(bid),
+                semantic="prop",
+                position=(float(pos[0]), float(pos[1]), float(pos[2])),
+                mass=float(cfg["mass"]),
+                source="props",
+            )
 
     def _spawn_forward_xy(self, distance_m: float = 1.05) -> tuple[float, float]:
         """World XY one step in front of penthouse spawn (toward scene center)."""
@@ -877,18 +895,42 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         )
         self._manip_chair_id = int(bid)
         self._manip_chair_start = [float(pos[0]), float(pos[1]), float(pos[2])]
-        self._object_registry.append({
-            "ref": "manip_chair_front",
-            "id": "manip_chair_front",
-            "body_id": int(bid),
-            "semantic": "chair",
-            "movable": True,
-            "mass": float(mass),
-            "x": float(pos[0]),
-            "y": float(pos[1]),
-            "z": float(pos[2]),
-            "source": "manip_chair",
-        })
+        self._register_scene_object(
+            ref="manip_chair_front",
+            body_id=int(bid),
+            semantic="chair",
+            position=(float(pos[0]), float(pos[1]), float(pos[2])),
+            mass=float(mass),
+            source="manip_chair",
+        )
+
+    def _register_scene_object(
+        self,
+        *,
+        ref: str,
+        body_id: int,
+        semantic: str,
+        position: tuple[float, float, float],
+        movable: bool = True,
+        mass: float | None = None,
+        source: str,
+    ) -> None:
+        """Register a manipulable body for scene observation (portable to real robots)."""
+        x, y, z = position
+        row: dict = {
+            "ref": str(ref),
+            "id": str(ref),
+            "body_id": int(body_id),
+            "semantic": str(semantic),
+            "movable": bool(movable),
+            "x": float(x),
+            "y": float(y),
+            "z": float(z),
+            "source": str(source),
+        }
+        if mass is not None:
+            row["mass"] = float(mass)
+        self._object_registry.append(row)
 
     def _registry_snapshot(self) -> list[dict]:
         """Registry rows with live poses for one registered body each."""
@@ -928,6 +970,16 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 if bid is not None:
                     body_id = int(bid)
                 break
+        if body_id is None and key.startswith("prop_"):
+            try:
+                idx = int(key.split("_", 1)[1])
+                prop_ids = getattr(self, "prop_ids", []) or []
+                if 0 <= idx < len(prop_ids):
+                    body_id = int(prop_ids[idx])
+            except (IndexError, TypeError, ValueError):
+                pass
+        if body_id is None and key == "ball" and getattr(self, "ball_id", None) is not None:
+            body_id = int(self.ball_id)
         if body_id is None:
             return None
         with self._physics_lock:
@@ -959,6 +1011,32 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             if pts:
                 return True
         return False
+
+    def get_task_agent_pose(self) -> dict[str, Any]:
+        """COM XY + body forward for task navigation (root yaw — not chest−root noise)."""
+        import math
+
+        com, euler = self.get_com()
+        xy = (float(com[0]), float(com[1]))
+        yaw = float(euler[2]) if len(euler) > 2 else 0.0
+        # Prefer root/base orientation. Chest−root XY is near-vertical and noisy,
+        # which previously made heading_err random and approach orbit the target.
+        fwd = (math.cos(yaw), math.sin(yaw))
+        try:
+            links = self._named_link_world_positions()
+            # Optional: pelvis→chest projected only if horizontal span is meaningful.
+            if "chest" in links and "root" in links:
+                chest = links["chest"]
+                root = links["root"]
+                dx = float(chest[0]) - float(root[0])
+                dy = float(chest[1]) - float(root[1])
+                n = math.hypot(dx, dy)
+                if n > 0.08:
+                    fwd = (dx / n, dy / n)
+                    yaw = math.atan2(fwd[1], fwd[0])
+        except Exception:
+            pass
+        return {"xy": xy, "forward": fwd, "yaw": yaw}
 
     def apply_manipulation_push(
         self,
@@ -1845,7 +1923,12 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             ball = {"x": 0.0, "y": 0.0, "z": 0.12}
             if getattr(self, "ball_id", None) is not None:
                 p, _ = pb.getBasePositionAndOrientation(self.ball_id, physicsClientId=self.client)
-                ball = {"x": float(p[0]), "y": float(p[1]), "z": float(p[2])}
+                ball = {
+                    "x": float(p[0]),
+                    "y": float(p[1]),
+                    "z": float(p[2]),
+                    "body_id": int(self.ball_id),
+                }
             lp = self._compute_lever_pin()
             props_out: list[dict] = []
             for i, pid in enumerate(getattr(self, "prop_ids", []) or []):
@@ -1853,6 +1936,8 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 meta = (self._prop_meta[i] if i < len(self._prop_meta) else {"half": 0.07, "r": 0.5, "g": 0.5, "b": 0.5})
                 hs = float(meta.get("half", 0.07))
                 props_out.append({
+                    "ref": f"prop_{i}",
+                    "id": f"prop_{i}",
                     "x": float(p[0]), "y": float(p[1]), "z": float(p[2]),
                     "hx": hs, "hy": hs, "hz": hs,
                     "r": float(meta.get("r", 0.5)),

@@ -2,15 +2,30 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
 MOVE_VERBS = frozenset({"передвинь", "передвинуть", "move", "push", "толкни", "сдвинь", "shift"})
+INTERACTION_VERBS = MOVE_VERBS | frozenset({
+    "дотронься",
+    "дотронуться",
+    "коснись",
+    "коснуться",
+    "touch",
+    "reach",
+    "подойди",
+    "подойти",
+    "approach",
+    "иди",
+    "идти",
+    "walk",
+})
 
 STOP_WORDS = frozenset({
     "перед", "тобой", "тебя", "вперёд", "вперед", "ближе", "меня", "мной", "туда", "сюда",
-    "немного", "чуть", "пожалуйста", "please", "now", "сейчас",
+    "немного", "чуть", "пожалуйста", "please", "now", "сейчас", "до",
     "the", "a", "an", "forward", "ahead", "toward", "towards", "me", "you", "your", "my",
     "of", "to", "in", "on", "at", "by", "for", "and", "or",
 })
@@ -28,6 +43,32 @@ _DEFAULT_FORWARD_CONE_COS = 0.35
 _ARM_REACH_M = 0.95
 _LEXICAL_MATCH_THRESHOLD = 0.35
 _EMBED_MATCH_THRESHOLD = 0.45
+
+# Deictic reference phrases — embedding similarity, not keyword routing.
+_DEICTIC_FORWARD_PHRASES: tuple[str, ...] = (
+    "перед тобой",
+    "перед собой",
+    "впереди",
+    "прямо перед",
+    "in front of you",
+    "in front of me",
+    "ahead of you",
+    "straight ahead",
+    "object in front",
+)
+
+_deictic_emb_cache: dict[str, Any] = {}
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, str(default)))
+    except ValueError:
+        return default
+
+
+def deictic_forward_min_score() -> float:
+    return _env_float("RKK_DEICTIC_FORWARD_MIN", 0.38)
 
 
 @dataclass(frozen=True)
@@ -60,18 +101,27 @@ def _norm_token(token: str) -> str:
     return _ru_stem(str(token or "").lower())
 
 
+def _is_generic_token(token: str) -> bool:
+    nt = _norm_token(str(token or ""))
+    return nt in GENERIC_POINTERS or nt in {"object", "obj", "thing", "item", "prop"}
+
+
 def extract_content_tokens(query: str) -> list[str]:
     """Content tokens from a command (verbs and stop-words removed)."""
     tokens = _tokenize(query)
-    return [t for t in tokens if t not in MOVE_VERBS and t not in STOP_WORDS]
+    return [
+        t
+        for t in tokens
+        if t not in INTERACTION_VERBS and t not in STOP_WORDS
+    ]
 
 
 def has_generic_object_pointer(query: str) -> bool:
     q = str(query or "").strip().lower()
     if not q:
         return False
-    tokens = set(_tokenize(q))
-    if tokens & GENERIC_POINTERS:
+    tokens = _tokenize(q)
+    if any(_is_generic_token(t) for t in tokens):
         return True
     return any(ptr in q for ptr in GENERIC_POINTERS)
 
@@ -169,7 +219,7 @@ def infer_semantic_from_query(query: str) -> str | None:
     if not has_move_verb(query):
         return None
     tokens = extract_content_tokens(query)
-    noun_tokens = [t for t in tokens if t not in GENERIC_POINTERS]
+    noun_tokens = [t for t in tokens if not _is_generic_token(t)]
     if noun_tokens:
         return _norm_token(noun_tokens[0])
     if has_generic_object_pointer(query):
@@ -346,6 +396,95 @@ def _normalize_xy(v: tuple[float, float]) -> tuple[float, float]:
     return x / n, y / n
 
 
+def _forward_alignment(
+    row: dict,
+    *,
+    agent_xy: tuple[float, float],
+    agent_forward: tuple[float, float] | None,
+) -> float:
+    if agent_forward is None:
+        return 0.0
+    ox, oy = float(row["x"]), float(row["y"])
+    dx, dy = ox - agent_xy[0], oy - agent_xy[1]
+    dist = math.hypot(dx, dy)
+    if dist < 1e-6:
+        return 1.0
+    fx, fy = _normalize_xy(agent_forward)
+    return float((dx * fx + dy * fy) / dist)
+
+
+def clear_deictic_cache() -> None:
+    """Test helper: reset cached deictic phrase embeddings."""
+    _deictic_emb_cache.clear()
+
+
+def deictic_forward_strength(
+    query: str,
+    embed_fn: Callable[[str], list[float] | tuple[float, ...] | None] | None,
+    *,
+    min_score: float | None = None,
+) -> float:
+    """Max cosine between query and deictic forward-reference paraphrases."""
+    if embed_fn is None:
+        return 0.0
+    raw = str(query or "").strip()
+    if not raw:
+        return 0.0
+    q_vec = embed_fn(raw)
+    if q_vec is None:
+        return 0.0
+    thresh = float(min_score if min_score is not None else deictic_forward_min_score())
+    best = -2.0
+    for phrase in _DEICTIC_FORWARD_PHRASES:
+        if phrase not in _deictic_emb_cache:
+            emb = embed_fn(phrase)
+            if emb is None:
+                continue
+            _deictic_emb_cache[phrase] = emb
+        sim = _cosine(q_vec, _deictic_emb_cache[phrase])
+        best = max(best, sim)
+    return float(best) if best >= thresh else 0.0
+
+
+def _pool_for_interaction(
+    candidates: list[dict],
+    *,
+    require_movable: bool,
+    interaction_kinds: frozenset[str] | None,
+) -> list[dict]:
+    movable_only = bool(require_movable)
+    if interaction_kinds is not None:
+        if "displace" in interaction_kinds:
+            movable_only = True
+        elif interaction_kinds & {"contact", "reduce_distance"}:
+            movable_only = False
+    if movable_only:
+        return [c for c in candidates if bool(c.get("movable"))]
+    return list(candidates)
+
+
+def _filter_forward_cone(
+    pool: list[dict],
+    *,
+    agent_xy: tuple[float, float],
+    agent_forward: tuple[float, float] | None,
+    forward_cone_cos: float,
+) -> list[tuple[dict, float]]:
+    if agent_forward is None or not pool:
+        return [(c, _forward_alignment(c, agent_xy=agent_xy, agent_forward=agent_forward)) for c in pool]
+    cos_min = float(forward_cone_cos)
+    for _ in range(4):
+        in_cone: list[tuple[dict, float]] = []
+        for c in pool:
+            cos_a = _forward_alignment(c, agent_xy=agent_xy, agent_forward=agent_forward)
+            if cos_a >= cos_min:
+                in_cone.append((c, cos_a))
+        if in_cone:
+            return in_cone
+        cos_min = max(0.0, cos_min - 0.12)
+    return [(c, _forward_alignment(c, agent_xy=agent_xy, agent_forward=agent_forward)) for c in pool]
+
+
 def _score_candidate(
     row: dict,
     *,
@@ -381,6 +520,26 @@ def _score_candidate(
     return score
 
 
+def _score_candidate_deictic(
+    row: dict,
+    *,
+    agent_xy: tuple[float, float],
+    forward_cos: float,
+    lexical_match: float,
+    prefer_movable: bool,
+) -> float:
+    ox, oy = float(row["x"]), float(row["y"])
+    dist = math.hypot(ox - agent_xy[0], oy - agent_xy[1])
+    score = -dist + 2.5 * float(forward_cos)
+    if lexical_match > 0.0:
+        score += 1.5 * lexical_match
+    if prefer_movable and bool(row.get("movable")):
+        score += 0.6
+    if dist <= _ARM_REACH_M:
+        score += 0.25
+    return score
+
+
 def resolve_manipulation_target(
     query: str,
     scene_extras: dict | None,
@@ -390,6 +549,7 @@ def resolve_manipulation_target(
     require_movable: bool = True,
     forward_cone_cos: float = _DEFAULT_FORWARD_CONE_COS,
     embed_fn: Callable[[str], list[float] | tuple[float, ...] | None] | None = None,
+    interaction_kinds: frozenset[str] | None = None,
 ) -> tuple[ResolvedObject | None, dict[str, Any]]:
     """
     Resolve a manipulation target from scene data.
@@ -398,9 +558,20 @@ def resolve_manipulation_target(
     """
     q = str(query or "")
     content_tokens = extract_content_tokens(q)
-    noun_tokens = [t for t in content_tokens if t not in GENERIC_POINTERS]
+    noun_tokens = [t for t in content_tokens if not _is_generic_token(t)]
     has_noun = bool(noun_tokens)
     generic_ptr = has_generic_object_pointer(q)
+    deictic_strength = deictic_forward_strength(q, embed_fn)
+    deictic_forward = (
+        deictic_strength > 0.0
+        or (generic_ptr and not has_noun and not has_move_verb(q))
+        or (
+            generic_ptr
+            and interaction_kinds is not None
+            and "displace" not in interaction_kinds
+            and not has_noun
+        )
+    )
 
     candidates = collect_scene_candidates(scene_extras)
     diag: dict[str, Any] = {
@@ -409,6 +580,9 @@ def resolve_manipulation_target(
         "noun_tokens": noun_tokens,
         "has_noun": has_noun,
         "generic_pointer": generic_ptr,
+        "deictic_forward": bool(deictic_forward),
+        "deictic_strength": round(float(deictic_strength), 4) if deictic_strength else 0.0,
+        "interaction_kinds": sorted(interaction_kinds) if interaction_kinds else [],
         "candidate_count": len(candidates),
         "agent_xy": [float(agent_xy[0]), float(agent_xy[1])],
         "reason": "",
@@ -466,32 +640,64 @@ def resolve_manipulation_target(
         else:
             pool = matched
     else:
-        pool = [c for c in candidates if bool(c.get("movable"))] if require_movable else list(candidates)
-        if require_movable and not pool:
+        pool = _pool_for_interaction(
+            candidates,
+            require_movable=require_movable,
+            interaction_kinds=interaction_kinds,
+        )
+        if require_movable and not pool and interaction_kinds is None:
             static_matched = [c for c in candidates if not bool(c.get("movable"))]
             if static_matched and (generic_ptr or has_move_verb(q)):
                 diag["reason"] = "target_not_movable"
                 diag["matched_static_count"] = len(static_matched)
                 return None, diag
-            diag["reason"] = "no_movable_candidates"
+        if not pool:
+            diag["reason"] = "no_movable_candidates" if require_movable else "no_matching_candidates"
             return None, diag
 
     if not pool:
         diag["reason"] = "no_matching_candidates"
         return None, diag
 
-    ranked = sorted(
-        pool,
-        key=lambda c: _score_candidate(
-            c,
-            lexical_match=_effective_match(str(c["ref"])),
+    prefer_movable = bool(
+        require_movable
+        or (interaction_kinds is not None and "displace" in interaction_kinds)
+    )
+
+    if deictic_forward:
+        cone_pool = _filter_forward_cone(
+            pool,
             agent_xy=agent_xy,
             agent_forward=agent_forward,
             forward_cone_cos=forward_cone_cos,
-        ),
-        reverse=True,
-    )
-    best = ranked[0]
+        )
+        ranked = sorted(
+            cone_pool,
+            key=lambda item: _score_candidate_deictic(
+                item[0],
+                agent_xy=agent_xy,
+                forward_cos=item[1],
+                lexical_match=_effective_match(str(item[0]["ref"])),
+                prefer_movable=prefer_movable,
+            ),
+            reverse=True,
+        )
+        best = ranked[0][0]
+        diag["resolution_mode"] = "deictic_forward_cone"
+    else:
+        ranked = sorted(
+            pool,
+            key=lambda c: _score_candidate(
+                c,
+                lexical_match=_effective_match(str(c["ref"])),
+                agent_xy=agent_xy,
+                agent_forward=agent_forward,
+                forward_cone_cos=forward_cone_cos,
+            ),
+            reverse=True,
+        )
+        best = ranked[0]
+        diag["resolution_mode"] = "spatial_lexical"
     pos = _obj_xyz(best)
     body_id = best.get("body_id")
     resolved = ResolvedObject(
@@ -510,6 +716,9 @@ def resolve_manipulation_target(
     diag["chosen_movable"] = resolved.movable
     diag["chosen_distance_m"] = round(
         math.hypot(pos[0] - agent_xy[0], pos[1] - agent_xy[1]), 4
+    )
+    diag["chosen_forward_cos"] = round(
+        _forward_alignment(best, agent_xy=agent_xy, agent_forward=agent_forward), 4
     )
     diag["lexical_match"] = round(_effective_match(resolved.ref), 4)
     return resolved, diag

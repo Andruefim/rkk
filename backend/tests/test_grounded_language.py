@@ -13,8 +13,10 @@ from engine.grounded_language import (
     GroundedLanguageController,
     OllamaEmbeddingClient,
     SemanticVectorStore,
+    command_tag_for_text,
     intent_speak_node_ids,
     motor_intents_from_tag,
+    phrase_for_human_task,
     sensory_node_ids,
 )
 
@@ -224,3 +226,36 @@ def test_pending_grounded_motor_cleared_after_drain() -> None:
     sim._drain_pending_grounded_motor()
     assert sim._pending_grounded_motor is None
     assert len(sim._motor_arbiter._intents) == 1
+
+
+def test_ingest_command_keyword_beats_embed_false_positive() -> None:
+    class _G:
+        nodes: dict[str, float] = {}
+
+        def set_node(self, k: str, v: float) -> None:
+            self.nodes[k] = float(v)
+
+        def set_edge(self, a: str, b: str, w: float, *, alpha: float = 0.1) -> None:
+            pass
+
+    gl = GroundedLanguageController(device=torch.device("cpu"))
+    unstable = np.random.randn(64).astype(np.float32)
+    unstable /= np.linalg.norm(unstable) + 1e-9
+    gl.embedder.embed = lambda _t: unstable  # type: ignore[method-assign]
+    gl.store.add("Теряю равновесие", "unstable", unstable)
+    graph = _G()
+    graph.nodes = {"intent_stop_recover": 0.5, "intent_stride": 0.5}
+    cmd = "подойди к объекту перед тобой и дотронься его"
+    out = gl.ingest_command(graph, cmd, apply_motor_patch=False)
+    assert out["ok"] is True
+    assert out.get("tag") != "unstable"
+    assert command_tag_for_text(cmd) == ""
+
+
+def test_phrase_for_human_task_uses_stage_not_balance_tag() -> None:
+    phrase = phrase_for_human_task(
+        "подойди к объекту перед тобой и дотронься его",
+        stage_kind="approach",
+    )
+    assert phrase == "Иду к объекту"
+    assert "равновес" not in phrase.lower()

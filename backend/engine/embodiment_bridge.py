@@ -40,6 +40,35 @@ class EmbodimentBridge:
     def is_fallen(self) -> bool:
         return embodied_is_fallen(self._env)
 
+    def get_scene_extras(self) -> dict:
+        """Portable scene observation API for task target resolution."""
+        env = self._env
+        for name in (
+            "get_scene_extras",
+            "get_sandbox_scene_extras",
+            "get_physics_object_positions",
+        ):
+            fn = getattr(env, name, None)
+            if callable(fn):
+                try:
+                    return dict(fn() or {})
+                except Exception:
+                    continue
+        sim = getattr(env, "_sim", None)
+        if sim is not None and sim is not env:
+            for name in (
+                "get_scene_extras",
+                "get_sandbox_scene_extras",
+                "get_physics_object_positions",
+            ):
+                fn = getattr(sim, name, None)
+                if callable(fn):
+                    try:
+                        return dict(fn() or {})
+                    except Exception:
+                        continue
+        return {}
+
     def _on_action_out(self, action: dict[str, float]) -> None:
         """Override to publish commands to hardware (ROS topics, etc.)."""
 

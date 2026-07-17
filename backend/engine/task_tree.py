@@ -158,8 +158,10 @@ def _decompose_from_goal(goal: TaskGoal, *, needs_target: bool) -> tuple[str, ..
         kinds.append("resolve_target")
 
     preds = _sort_predicates(list(goal.predicates or []))
+    pred_kinds = {str(p.kind) for p in preds}
     has_displace_flow = False
     has_generic_flow = False
+    has_contact = "contact" in pred_kinds
 
     for pred in preds:
         pk = str(pred.kind)
@@ -167,7 +169,7 @@ def _decompose_from_goal(goal: TaskGoal, *, needs_target: bool) -> tuple[str, ..
             kinds.append("approach")
         elif pk == "contact":
             kinds.append("reach_contact")
-        elif pk == "displace":
+        elif pk == "displace" and "contact" not in pred_kinds:
             if "approach" not in kinds:
                 kinds.append("approach")
             if not has_displace_flow:
@@ -177,6 +179,9 @@ def _decompose_from_goal(goal: TaskGoal, *, needs_target: bool) -> tuple[str, ..
             if not has_generic_flow:
                 kinds.extend(["imagine_goal", "execute_goal", "verify_goal"])
                 has_generic_flow = True
+
+    if has_contact and "verify_goal" not in kinds:
+        kinds.append("verify_goal")
 
     if not kinds and not needs_target:
         kinds.extend(list(DECOMPOSE_GENERIC))
@@ -214,7 +219,7 @@ def _predicate_for_kind(kind: str, goal: TaskGoal) -> GoalPredicate | None:
         for p in preds:
             if p.kind == "displace":
                 return p
-    if kind in ("imagine_goal", "execute_goal", "verify_goal"):
+    if kind in ("imagine_goal", "execute_goal"):
         for p in preds:
             if p.kind == "state_key":
                 return p

@@ -409,7 +409,7 @@ def sync_ns_motor_every_tick(sim: Any) -> dict[str, float]:
         priors = dict((ns_ctx or {}).get("motor_priors") or {})
         if not priors and applied:
             priors = {k: float(v) for k, v in applied.items() if str(k).startswith("intent_")}
-        if priors:
+        if priors and not suppress:
             canon = {}
             for k, v in priors.items():
                 ck = _canonical_intent_key(k)

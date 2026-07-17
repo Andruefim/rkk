@@ -5,6 +5,14 @@ from engine.features.simulation.mixin_imports import *
 
 
 class SimulationSkillsMixin:
+    def _human_task_suppresses_autonomous_locomotion(self) -> bool:
+        try:
+            from engine.task_executive import human_task_suppresses_autonomous_locomotion
+
+            return human_task_suppresses_autonomous_locomotion(self)
+        except Exception:
+            return False
+
     def _skill_library_enabled(self) -> bool:
         v = os.environ.get("RKK_SKILL_LIBRARY", "0").strip().lower()
         return v in ("1", "true", "yes", "on")
@@ -95,6 +103,8 @@ class SimulationSkillsMixin:
         return True
 
     def _start_skill_if_due(self, engine_tick: int) -> bool:
+        if self._human_task_suppresses_autonomous_locomotion():
+            return False
         if not self._skill_library_enabled():
             return False
         if self._skill_exec is not None:
@@ -621,6 +631,9 @@ class SimulationSkillsMixin:
     def _run_agent_or_skill_step(self, engine_tick: int) -> dict:
         """Curiosity-driven exploration; optional Active Inference every K ticks."""
         self._abort_stance_skill_for_locomote()
+        if self._human_task_suppresses_autonomous_locomotion():
+            self._skill_exec = None
+            self._skill_chain = []
         if self._skill_exec is not None:
             return self._execute_skill_frame()
         ai_on = os.environ.get("RKK_ACTIVE_INFERENCE", "0").strip().lower() in (

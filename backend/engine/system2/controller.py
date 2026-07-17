@@ -551,6 +551,16 @@ class System2Controller:
         """Keep S2 macro aligned with Intention Cortex between planning ticks."""
         if self._s2_override_active:
             return
+        try:
+            from engine.task_executive import human_task_suppresses_s2_locomote
+
+            if human_task_suppresses_s2_locomote(sim):
+                if str(self._active_macro or "IDLE").upper() not in ("IDLE", "RECOVER_POSTURE"):
+                    self._active_macro = "IDLE"
+                    self._last_source = "human_task_executive"
+                return
+        except Exception:
+            pass
         intent_ctx = self._intention_from_sim(sim)
         if intent_ctx is None:
             return
@@ -609,7 +619,7 @@ class System2Controller:
                 human_task_active = True
                 human_task_text = str(ht.text or "")[:120]
                 if not fallen:
-                    macro = "EXPLORE"
+                    macro = "IDLE"
                 if ht.max_prediction_error is not None:
                     max_pe_out = ht.max_prediction_error
 
@@ -1642,6 +1652,15 @@ class System2Controller:
                 intent_horizon,
                 int(getattr(intent_ctx, "horizon_ticks", intent_horizon)),
             )
+
+        try:
+            from engine.task_executive import human_task_suppresses_s2_locomote
+
+            if human_task_suppresses_s2_locomote(sim) and not self._s2_override_active:
+                macro = "IDLE"
+                source = "human_task_executive"
+        except Exception:
+            pass
 
         self._episode_plan_distill_extra = {}
         proposal_effective: System2Proposal | None = None

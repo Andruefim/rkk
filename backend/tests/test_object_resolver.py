@@ -122,6 +122,44 @@ def test_resolver_rejects_static_only_targets() -> None:
     assert diag["reason"] == "target_not_movable"
 
 
+def test_resolver_deictic_generic_object_in_front() -> None:
+    extras = {
+        "props": [
+            {
+                "ref": "prop_behind",
+                "semantic": "prop",
+                "movable": True,
+                "mass": 1.0,
+                "x": -1.0,
+                "y": 0.1,
+                "z": 0.2,
+            },
+            {
+                "ref": "prop_front",
+                "semantic": "prop",
+                "movable": True,
+                "mass": 1.0,
+                "x": 1.4,
+                "y": 0.05,
+                "z": 0.2,
+            },
+        ],
+    }
+    resolved, diag = resolve_manipulation_target(
+        "дотронься до объекта перед тобой",
+        extras,
+        agent_xy=(0.0, 0.0),
+        agent_forward=(1.0, 0.0),
+        require_movable=False,
+        interaction_kinds=frozenset({"contact", "reduce_distance"}),
+    )
+    assert resolved is not None, diag
+    assert resolved.ref == "prop_front"
+    assert diag.get("deictic_forward") is True
+    assert diag.get("resolution_mode") == "deictic_forward_cone"
+    assert float(diag.get("chosen_forward_cos", 0.0)) > 0.5
+
+
 def test_resolver_prefers_forward_cone_without_noun() -> None:
     extras = {
         "registry": [
@@ -208,6 +246,42 @@ def test_collect_scene_candidates_includes_generic_ball_extra() -> None:
     assert cands[0]["ref"] == "ball"
     assert cands[0]["semantic"] == "ball"
     assert cands[0]["movable"] is True
+
+
+def test_resolver_push_ball_from_extras() -> None:
+    extras = {
+        "ball": {
+            "x": 1.5,
+            "y": 0.0,
+            "z": 0.2,
+            "body_id": 100,
+            "movable": True,
+            "semantic": "ball",
+            "ref": "ball",
+        },
+    }
+    fb = FallbackEmbeddingClient(embed_dim=64)
+
+    def _ru_ball_embed(text: str):
+        vec = fb.embed(text)
+        if vec is None:
+            return None
+        if "шар" in text.lower():
+            return fb.embed("ball")
+        return vec
+
+    resolved, diag = resolve_manipulation_target(
+        "толкни шарик",
+        extras,
+        agent_xy=(0.0, 0.0),
+        agent_forward=(1.0, 0.0),
+        embed_fn=_ru_ball_embed,
+        require_movable=True,
+    )
+    assert resolved is not None, diag
+    assert resolved.ref == "ball"
+    assert resolved.movable is True
+    assert resolved.body_id == 100
 
 
 def test_resolver_ball_lexical_and_ru_embed() -> None:

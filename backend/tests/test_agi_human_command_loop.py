@@ -28,6 +28,7 @@ def _patch_fallback_embed(sim: AgiLoopSim) -> None:
     for phrase in ("осмотрись", "готово"):
         emb._anchors[phrase] = emb._anchors["иди вперёд"]
     gl.embedder.embed = emb.embed  # type: ignore[method-assign]
+    clear_catalog_cache()  # drop any Ollama-warmed vectors from _ensure_grounded_language
     probe = emb.embed("подойди ближе")
     if probe is not None:
         gl.store.add("подойди", "approach", probe)
@@ -37,6 +38,22 @@ def test_command_ingest_bind_writes_wm(agi_loop_sim: AgiLoopSim) -> None:
     """handle_human_command: ingest → bind → non-empty expected_state + WM slots."""
     sim = agi_loop_sim
     _patch_fallback_embed(sim)
+    sim.agent.env.set_scene_extras(
+        {
+            "registry": [
+                {
+                    "ref": "approach_target",
+                    "semantic": "object",
+                    "movable": True,
+                    "mass": 1.0,
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.4,
+                    "body_id": 8801,
+                }
+            ],
+        }
+    )
 
     out = sim.handle_human_command("подойди ближе")
 

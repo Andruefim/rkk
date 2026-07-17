@@ -42,6 +42,19 @@ from engine.motor_arbiter import MotorArbiter
 from engine.system2.controller import System2Controller
 
 
+class _AgiLoopSimInner:
+    """PyBullet-like inner sim: scene extras live here, not on HumanoidEnvironment base."""
+
+    def __init__(self, parent: AgiLoopEnv) -> None:
+        self._parent = parent
+
+    def get_state(self) -> dict[str, float]:
+        return self._parent.get_state()
+
+    def get_sandbox_scene_extras(self) -> dict:
+        return dict(self._parent._scene_extras)
+
+
 class AgiLoopEnv:
     """Minimal env.observe() source for task-binding integration tests."""
 
@@ -61,6 +74,7 @@ class AgiLoopEnv:
         self._contact_flag = False
         self._ball_body_id = 9100
         self._ball_pos = [1.2, 0.0, 0.25]
+        self._sim = _AgiLoopSimInner(self)
 
     @property
     def base_env(self) -> AgiLoopEnv:
@@ -79,9 +93,6 @@ class AgiLoopEnv:
             "com_z": float(self._obs.get("com_z", 0.5)),
             "torso_yaw": float(self._obs.get("torso_yaw", 0.0)),
         }
-
-    def get_sandbox_scene_extras(self) -> dict:
-        return dict(self._scene_extras)
 
     def set_scene_extras(self, extras: dict) -> None:
         self._scene_extras = dict(extras)

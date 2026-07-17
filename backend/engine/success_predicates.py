@@ -106,8 +106,12 @@ def _predicate_satisfaction(
     if kind == "reduce_distance":
         dist = _distance_m(ctx)
         if dist is None:
-            dist = _obs_f(obs, "target_dist", default=2.0)
-            detail["source"] = "obs_target_dist"
+            if "task_target_dist_m" in obs:
+                dist = _obs_f(obs, "task_target_dist_m", default=2.0)
+                detail["source"] = "obs_task_target_dist"
+            else:
+                dist = _obs_f(obs, "target_dist", default=2.0)
+                detail["source"] = "obs_target_dist"
         else:
             detail["source"] = "ctx_distance_m"
         detail["distance_m"] = round(float(dist), 4)
@@ -121,6 +125,7 @@ def _predicate_satisfaction(
         contact = ctx.get("contact")
         if contact is None:
             contact = max(
+                _obs_f(obs, "task_contact", 0.0),
                 _obs_f(obs, "contact_signal", 0.0),
                 _obs_f(obs, "grasp_contact", 0.0),
             )
@@ -210,12 +215,6 @@ def evaluate_goal(
 
 def expected_state_keys_for_goal(goal: TaskGoal | None) -> list[str]:
     """Keys for narrowed PE verification when wm_trusted."""
-    if goal is None:
-        return []
-    keys: list[str] = []
-    for p in goal.predicates:
-        if p.kind == "state_key" and p.key:
-            keys.append(str(p.key))
-        elif p.kind == "reduce_distance":
-            keys.append("target_dist")
-    return list(dict.fromkeys(keys))
+    from engine.task_observation import task_observation_keys_for_goal
+
+    return task_observation_keys_for_goal(goal)
