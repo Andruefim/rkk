@@ -281,6 +281,9 @@ def agi_loop_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RKK_GROUNDED_LANG", "1")
     monkeypatch.setenv("RKK_TASK_BINDING", "1")
     monkeypatch.setenv("RKK_TASK_TREE", "1")
+    # Legacy integration fixtures use privileged registry XY.
+    monkeypatch.setenv("RKK_TASK_RESOLVE", "oracle")
+    monkeypatch.setenv("RKK_TASK_TREE_LLM", "0")
     monkeypatch.setenv("RKK_INTENTION_CORTEX", "1")
     monkeypatch.setenv("RKK_MOTOR_ARBITER", "1")
     monkeypatch.setenv("RKK_TASK_MIN_TICKS", "1")

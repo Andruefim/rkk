@@ -339,10 +339,26 @@ def step():
 # ── Camera ────────────────────────────────────────────────────────────────────
 @app.get("/camera/frame")
 def camera_frame(view: str | None = Query(default=None)):
-    frame = get_sim().get_camera_frame(view=view)
+    sim = get_sim()
+    frame = sim.get_camera_frame(view=view)
     if frame is None:
-        return JSONResponse({"frame": None, "available": False})
-    return JSONResponse({"frame": frame, "available": True, "view": view})
+        return JSONResponse({"frame": None, "available": False, "overlay": None})
+    overlay = None
+    try:
+        fn = getattr(sim, "get_vision_overlay", None)
+        if callable(fn):
+            overlay = fn()
+    except Exception:
+        overlay = None
+    return JSONResponse(
+        {"frame": frame, "available": True, "view": view, "overlay": overlay}
+    )
+
+
+@app.get("/vision/overlay")
+def vision_overlay():
+    """Scene-memory HUD for camera preview (UV, range, active target)."""
+    return get_sim().get_vision_overlay()
 
 
 # ── Full scene ────────────────────────────────────────────────────────────────
@@ -550,6 +566,17 @@ def humanoid_reset_stance():
     sim = get_sim()
     if not is_humanoid_topology(sim.current_world):
         return {"ok": False, "error": "not_humanoid"}
+    try:
+        from engine.task_binding import human_task_embodiment_protected
+
+        if human_task_embodiment_protected(sim):
+            return {
+                "ok": False,
+                "error": "human_task_protected",
+                "tick": int(getattr(sim, "tick", 0) or 0),
+            }
+    except Exception:
+        pass
     sim.disable_fixed_root()
     base = sim.agent.env
     for _ in range(8):

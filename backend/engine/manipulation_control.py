@@ -18,6 +18,35 @@ def _proximity_gain(dist: float, start_m: float) -> float:
     return float(max(0.35, min(1.0, 1.0 - dist / start)))
 
 
+def manipulation_intents_from_bearing_range(
+    bearing: float,
+    range_m: float,
+    *,
+    reach_start: float | None = None,
+    fallen: bool = False,
+) -> dict[str, float]:
+    """Reach/grasp from ego bearing + metric range (vision path)."""
+    if fallen:
+        return {}
+    start = float(reach_start if reach_start is not None else reach_start_m())
+    dist = float(range_m)
+    if not math.isfinite(dist) or dist > start:
+        return {}
+    gain = _proximity_gain(dist, start)
+    if gain <= 0.0:
+        return {}
+
+    b = float(max(-1.0, min(1.0, bearing)))
+    reach_key = "intent_reach_right" if b >= 0.0 else "intent_reach_left"
+    return {
+        reach_key: float(max(0.0, min(0.94, _REACH_VAL * gain))),
+        "intent_grasp": float(max(0.0, min(0.94, _GRASP_VAL * gain))),
+        "intent_head_yaw": float(max(0.0, min(1.0, 0.5 + 0.22 * b))),
+        "vision_bearing": b,
+        "vision_range_m": dist,
+    }
+
+
 def manipulation_intents(
     agent_xy: tuple[float, float],
     agent_forward: tuple[float, float],

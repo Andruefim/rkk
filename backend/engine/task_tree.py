@@ -153,6 +153,19 @@ def _sort_predicates(predicates: list[GoalPredicate]) -> list[GoalPredicate]:
 
 def _decompose_from_goal(goal: TaskGoal, *, needs_target: bool) -> tuple[str, ...]:
     """Build stage kinds from observable predicates (not command_kind)."""
+    try:
+        from engine.task_tree_llm import llm_decompose_stages
+
+        llm_kinds = llm_decompose_stages(
+            goal,
+            command_text=str(getattr(goal, "text", "") or ""),
+            needs_target=needs_target,
+        )
+        if llm_kinds:
+            return llm_kinds
+    except Exception:
+        pass
+
     kinds: list[str] = []
     if needs_target:
         kinds.append("resolve_target")

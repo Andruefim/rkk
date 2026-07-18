@@ -172,7 +172,10 @@ export default function RKKHumanoid() {
   const [seedText,     setSeedText]      = useState('[\n  {"from_": "lshoulder", "to": "cube0_x", "weight": 0.6}\n]');
   const [status,       setStatus]        = useState("");
   const [camFrame,     setCamFrame]      = useState(null);
+  const [camOverlay,   setCamOverlay]    = useState(null);
   const [showCam,      setShowCam]       = useState(false);
+  const camCanvasRef = useRef(null);
+  const camImgRef = useRef(null);
   const [showCubes,    setShowCubes]     = useState(true);
   const [seedLoading,  setSeedLoading]   = useState(false);
 
@@ -225,17 +228,98 @@ export default function RKKHumanoid() {
     fixedRootRef.current = f.fixedRoot;
   }, [wsFrame]);
 
-  // Camera polling
+  // Camera polling (+ vision overlay HUD)
   useEffect(() => {
     if (!connected || !showCam) return;
     const iv = setInterval(async () => {
       try {
         const d = await fetch(`${API}/camera/frame?view=${CAM_VIEW}`).then(r=>r.json());
-        if (d.available) setCamFrame(d.frame);
+        if (d.available) {
+          setCamFrame(d.frame);
+          setCamOverlay(d.overlay || null);
+        }
       } catch {}
     }, CAMERA_PREVIEW_MS);
     return () => clearInterval(iv);
   }, [connected, showCam]);
+
+  // Draw object markers / distance on camera canvas
+  useEffect(() => {
+    if (!showCam || !camFrame || !camCanvasRef.current || !camImgRef.current) return;
+    const canvas = camCanvasRef.current;
+    const img = camImgRef.current;
+    const draw = () => {
+      const w = img.clientWidth || 280;
+      const h = img.clientHeight || 160;
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.clearRect(0, 0, w, h);
+      const ov = camOverlay;
+      if (!ov) return;
+      const entities = Array.isArray(ov.entities) ? ov.entities : [];
+      const active = ov.active;
+
+      const paintMarker = (e, isActive) => {
+        if (!e || typeof e.u !== "number" || typeof e.v !== "number") return;
+        const x = e.u * w;
+        const y = e.v * h;
+        const col = isActive ? "#44ffcc" : "#88aacc";
+        const r = isActive ? 8 : 5;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.strokeStyle = col;
+        ctx.lineWidth = isActive ? 2 : 1;
+        ctx.stroke();
+        if (isActive) {
+          ctx.beginPath();
+          ctx.moveTo(x - 12, y);
+          ctx.lineTo(x + 12, y);
+          ctx.moveTo(x, y - 12);
+          ctx.lineTo(x, y + 12);
+          ctx.stroke();
+        }
+        const label = `${e.label || e.slot_id || "?"}${e.range_m != null ? ` ${Number(e.range_m).toFixed(1)}m` : ""}`;
+        ctx.font = isActive ? "bold 11px monospace" : "10px monospace";
+        ctx.fillStyle = "rgba(0,0,0,0.65)";
+        const tw = ctx.measureText(label).width;
+        const lx = Math.max(2, Math.min(w - tw - 6, x + 10));
+        const ly = Math.max(12, Math.min(h - 4, y - 10));
+        ctx.fillRect(lx - 2, ly - 10, tw + 4, 12);
+        ctx.fillStyle = col;
+        ctx.fillText(label, lx, ly);
+      };
+
+      entities.forEach(e => {
+        if (active && e.id === active.id) return;
+        paintMarker(e, false);
+      });
+      if (active) paintMarker(active, true);
+
+      // Top HUD strip: stage + distance + note if looking straight at target
+      const lines = [];
+      if (ov.stage?.kind) {
+        lines.push(`${ov.stage.kind}${ov.stage.progress != null ? ` ${(ov.stage.progress * 100).toFixed(0)}%` : ""}`);
+      }
+      if (active?.range_m != null) {
+        const brg = Number(active.bearing || 0);
+        const ahead = Math.abs(brg) < 0.12 ? "ahead" : (brg > 0 ? "right" : "left");
+        lines.push(`tgt ${Number(active.range_m).toFixed(2)}m · ${ahead} · conf ${((active.conf || 0) * 100).toFixed(0)}%`);
+      } else if (ov.n_entities) {
+        lines.push(`scene ${ov.n_entities} ent`);
+      }
+      if (lines.length) {
+        ctx.fillStyle = "rgba(0,8,12,0.72)";
+        ctx.fillRect(0, 0, w, 15 * lines.length + 4);
+        ctx.font = "10px monospace";
+        ctx.fillStyle = "#44ffcc";
+        lines.forEach((t, i) => ctx.fillText(t, 4, 13 + i * 15));
+      }
+    };
+    if (img.complete) draw();
+    else img.onload = draw;
+  }, [showCam, camFrame, camOverlay]);
 
   // Vision polling
   useEffect(() => {
@@ -1150,12 +1234,31 @@ export default function RKKHumanoid() {
 
       {/* Camera overlay */}
       {showCam&&camFrame&&(
-        <div style={{position:"absolute",bottom:120,right:14,border:`1px solid ${wCol}55`,borderRadius:3,overflow:"hidden",width:280}}>
-          <div style={{display:"flex",gap:4,padding:"3px 6px",background:"rgba(0,0,0,0.7)",fontSize:8}}>
-            <span style={{color:wCol,fontSize:7}}>FP view</span>
-            {isFR&&<span style={{color:frColor,fontSize:7}}>📌 fixed</span>}
+        <div style={{position:"absolute",bottom:100,right:14,border:`1px solid ${wCol}55`,borderRadius:3,overflow:"hidden",width:440,boxShadow:"0 8px 28px rgba(0,0,0,0.45)"}}>
+          <div style={{display:"flex",gap:6,padding:"4px 8px",background:"rgba(0,0,0,0.78)",fontSize:9,justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{color:wCol,fontSize:8}}>FP + vision HUD</span>
+            {camOverlay?.active?.range_m!=null&&(
+              <span style={{color:"#44ffcc",fontSize:11,fontWeight:"bold"}}>
+                {Number(camOverlay.active.range_m).toFixed(2)}m
+              </span>
+            )}
+            {isFR&&<span style={{color:frColor,fontSize:8}}>📌 fixed</span>}
           </div>
-          <img src={`data:image/jpeg;base64,${camFrame}`} style={{width:"100%",display:"block"}} alt="cam"/>
+          <div style={{position:"relative",width:"100%",lineHeight:0}}>
+            <img ref={camImgRef} src={`data:image/jpeg;base64,${camFrame}`} style={{width:"100%",display:"block"}} alt="cam"/>
+            <canvas ref={camCanvasRef} style={{position:"absolute",inset:0,width:"100%",height:"100%",pointerEvents:"none"}}/>
+          </div>
+          {camOverlay?.active&&(
+            <div style={{padding:"4px 8px",background:"rgba(0,10,14,0.9)",fontSize:8,color:"#88aacc",display:"flex",justifyContent:"space-between",gap:8}}>
+              <span style={{color:"#44ffcc"}}>
+                {camOverlay.active.label||camOverlay.active.slot_id} · brg {(camOverlay.active.bearing??0).toFixed(2)}
+              </span>
+              <span style={{color:(camOverlay.active.conf||0)<0.35?"#ff8866":"#66bbaa"}}>
+                conf {((camOverlay.active.conf||0)*100).toFixed(0)}%
+                {camOverlay.active.holding?" · HOLD":""}
+              </span>
+            </div>
+          )}
         </div>
       )}
 

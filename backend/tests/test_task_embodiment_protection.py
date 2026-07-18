@@ -89,3 +89,28 @@ def test_maybe_recover_hard_reset_when_not_protected(monkeypatch: pytest.MonkeyP
     }
     assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is True
     assert reset_calls == [1]
+
+
+def test_s2_force_reset_deferred_during_human_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engine.system2.controller import System2Controller
+
+    ctrl = System2Controller.__new__(System2Controller)
+    reset_calls: list[int] = []
+
+    class _Base:
+        def reset_stance(self) -> None:
+            reset_calls.append(1)
+
+    monkeypatch.setattr(
+        "engine.task_binding.human_task_embodiment_protected",
+        lambda _sim: True,
+    )
+    assert ctrl._force_reset_stance_base(_Base(), sim=object()) is False
+    assert reset_calls == []
+
+    monkeypatch.setattr(
+        "engine.task_binding.human_task_embodiment_protected",
+        lambda _sim: False,
+    )
+    assert ctrl._force_reset_stance_base(_Base(), sim=object()) is True
+    assert reset_calls == [1]

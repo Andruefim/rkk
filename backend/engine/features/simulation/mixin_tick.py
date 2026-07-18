@@ -310,6 +310,19 @@ class SimulationTickMixin:
     def _genome_walk_active(self, is_fallen: bool) -> bool:
         if is_fallen or not is_humanoid_topology(self.current_world):
             return False
+        # Freeze autonomous walk while vision resolve / approach hold is in flight.
+        if getattr(self, "_deferred_vision_resolve", None):
+            return False
+        try:
+            from engine.task_executive import active_tree_stage_kind
+
+            stage = active_tree_stage_kind(self)
+            if stage in ("resolve_target", "verify_goal", "verify_target", "verify_posture"):
+                return False
+        except Exception:
+            pass
+        if self._nav_hold_active(int(getattr(self, "tick", 0) or 0)):
+            return False
         if self._fixed_root_active:
             try:
                 from engine.genome.priors import genome_walk_during_fixed_root_enabled

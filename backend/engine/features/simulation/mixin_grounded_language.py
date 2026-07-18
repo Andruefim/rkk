@@ -12,10 +12,18 @@ from engine.grounded_language import (
     grounded_language_enabled,
     motor_intents_from_tag,
 )
-from engine.goal_navigation import navigation_intents
-from engine.manipulation_control import manipulation_intents
+from engine.goal_navigation import (
+    navigation_intents,
+    navigation_intents_from_bearing_range,
+    navigation_intents_from_ego_xy,
+)
+from engine.manipulation_control import (
+    manipulation_intents,
+    manipulation_intents_from_bearing_range,
+)
 from engine.manipulation_verify import ManipulationEpisode, verify_manipulation
 from engine.object_resolver import ResolvedObject, resolve_manipulation_target
+from engine.object_working_memory import LatentSceneMemory, ObjectWorkingMemory
 from engine.success_predicates import evaluate_goal
 from engine.task_binding import TaskBindingController, task_binding_enabled
 from engine.task_goal import TaskGoal
@@ -28,6 +36,9 @@ from engine.task_observation import (
     sync_task_obs_to_graph,
 )
 from engine.task_tree import TERMINAL_STATUSES, TaskTreeController, task_tree_enabled
+from engine.vision_depth import ArrayDepthCamera, DepthFrame, attach_range_to_target
+from engine.vision_resolve import collect_vision_slots, resolve_visual_target, track_visual_target
+from engine.vision_target import VisualTarget, bearing_from_u, vision_resolve_enabled
 
 
 def _grounded_lang_every() -> int:
@@ -398,6 +409,44 @@ class SimulationGroundedLanguageMixin:
             pass
         if obs.get("task_target_dist_m") is not None:
             fields["task_target_dist_m"] = obs.get("task_target_dist_m")
+        # Vision OWM range + oracle eval distance + closing velocity
+        try:
+            owm = getattr(self, "_obj_working_memory", None)
+            if owm is not None and float(getattr(owm, "range_m", 0.0) or 0.0) > 0.05:
+                fields["vision_range_m"] = round(float(owm.range_m), 4)
+                fields["vision_bearing"] = round(float(owm.bearing), 4)
+                fields["hard_lock"] = bool(
+                    getattr(getattr(owm, "scene", None), "hard_lock_active", False)
+                )
+                scene = getattr(owm, "scene", None)
+                if scene is not None and bool(
+                    getattr(scene, "last_odom_discontinuity", False)
+                ):
+                    fields["odom_discontinuity"] = True
+                    fields["odom_jump_m"] = round(
+                        float(getattr(scene, "last_odom_jump_m", 0.0) or 0.0), 3
+                    )
+            oref = None
+            resolved = getattr(self, "_manip_resolved", None)
+            if resolved is not None:
+                oref = str(getattr(resolved, "ref", "") or "")
+            if not oref:
+                diag = getattr(self, "_manip_diag", None) or {}
+                oref = str((diag.get("oracle_eval") or {}).get("ref") or "")
+            if oref and not str(oref).startswith("vision:"):
+                od = self._oracle_dist_m_for_eval(oref)
+                if od is not None:
+                    fields["oracle_dist_m"] = round(float(od), 4)
+            # Closing: decrease in vision range over progress samples
+            prev = getattr(self, "_task_log_prev_vision_range", None)
+            if fields.get("vision_range_m") is not None and prev is not None:
+                fields["closing_vel"] = round(
+                    float(prev) - float(fields["vision_range_m"]), 4
+                )
+            if fields.get("vision_range_m") is not None:
+                self._task_log_prev_vision_range = float(fields["vision_range_m"])
+        except Exception:
+            pass
         arb = getattr(self, "_motor_arbiter", None)
         if arb is not None:
             snap = getattr(arb, "_last_diag", None) or {}
@@ -421,6 +470,7 @@ class SimulationGroundedLanguageMixin:
             tick=int(tick),
             fall_count=int(self._task_log_fall_count),
         )
+        self._arm_nav_hold(int(tick), reason="fall")
 
     def _humanoid_base_env(self) -> Any | None:
         env = getattr(getattr(self, "agent", None), "env", None)
@@ -468,6 +518,15 @@ class SimulationGroundedLanguageMixin:
                             xy = (float(raw_xy[0]), float(raw_xy[1]))
                         if raw_fwd is not None and len(raw_fwd) >= 2:
                             fwd = (float(raw_fwd[0]), float(raw_fwd[1]))
+                            if vision_resolve_enabled():
+                                cam_fwd_fn = getattr(base, "get_ego_camera_forward_xy", None)
+                                if callable(cam_fwd_fn):
+                                    try:
+                                        cf = cam_fwd_fn()
+                                        if cf is not None and len(cf) >= 2:
+                                            fwd = (float(cf[0]), float(cf[1]))
+                                    except Exception:
+                                        pass
                             return xy, fwd
             except Exception:
                 pass
@@ -506,6 +565,18 @@ class SimulationGroundedLanguageMixin:
             target_xy=ctx.get("target_xy"),
             contact=float(ctx.get("contact", 0.0)),
         )
+        # Ego memory distance when vision path has no world target_xy
+        if "task_target_dist_m" not in task_obs and ctx.get("distance_m") is not None:
+            task_obs["task_target_dist_m"] = float(ctx["distance_m"])
+        for k in (
+            "task_target_x",
+            "task_target_y",
+            "task_target_conf",
+            "vision_bearing",
+            "vision_range_m",
+        ):
+            if k in ctx:
+                task_obs[k] = float(ctx[k])
         merged = inject_task_observations(obs, task_obs)
         try:
             sync_task_obs_to_graph(self.agent.graph, task_obs)
@@ -541,6 +612,8 @@ class SimulationGroundedLanguageMixin:
             tt.cancel(int(tick), "preempted")
         self._manip_episode = None
         self._manip_resolved = None
+        self._manip_resolved_visual = None
+        self._clear_object_working_memory()
         self._manip_diag = {}
         self._task_tree_kind = ""
         self._task_goal = None
@@ -566,6 +639,8 @@ class SimulationGroundedLanguageMixin:
         self._clear_human_command_state(tick)
         self._manip_episode = None
         self._manip_resolved = None
+        self._manip_resolved_visual = None
+        self._clear_object_working_memory()
         self._task_tree_kind = ""
         self._task_goal = None
         self._task_goal_verified = False
@@ -805,6 +880,15 @@ class SimulationGroundedLanguageMixin:
                     break
             if reason.startswith("no_target") or "static" in reason:
                 body = "Не вижу цель или не могу сдвинуть объект."
+            elif reason in (
+                "low_vision_confidence",
+                "resolve_failed_vision",
+                "no_language_vision_link",
+                "missing_or_invalid_range",
+                "floor_lock_rejected",
+                "no_vision_slots",
+            ):
+                body = "Не вижу цель в камере (зрение не закрепило объект)."
             else:
                 body = f"Не удалось: {cmd[:60]}"
             self._emit_task_report(tick, cmd, done=False, body=body)
@@ -887,19 +971,475 @@ class SimulationGroundedLanguageMixin:
             return bool(fn(int(body_id)))
         return False
 
+    def _visual_env_ref(self) -> Any | None:
+        return getattr(self, "_visual_env", None)
+
+    def _depth_camera_from_sim(self) -> ArrayDepthCamera | None:
+        """Capture ego RGB-D and wrap as DepthCamera (sim backend)."""
+        base = self._humanoid_base_env()
+        if base is None:
+            return None
+        fn = getattr(base, "get_ego_rgbd", None)
+        if not callable(fn):
+            sim = getattr(base, "_sim", None)
+            fn = getattr(sim, "get_ego_rgbd", None) if sim is not None else None
+        if not callable(fn):
+            return None
+        try:
+            pack = fn(view="ego", width=160, height=120)
+        except Exception:
+            return None
+        if not isinstance(pack, dict) or pack.get("depth_m") is None:
+            return None
+        try:
+            import numpy as np
+
+            frame = DepthFrame(
+                depth_m=np.asarray(pack["depth_m"], dtype=np.float32),
+                near_m=float(pack.get("near_m", 0.1)),
+                far_m=float(pack.get("far_m", 15.0)),
+            )
+            return ArrayDepthCamera(frame)
+        except Exception:
+            return None
+
+    def _latent_scene_memory(self) -> LatentSceneMemory:
+        scene = getattr(self, "_latent_scene", None)
+        if scene is None:
+            scene = LatentSceneMemory()
+            self._latent_scene = scene
+            # Keep facade in sync for any legacy readers
+            self._obj_working_memory = ObjectWorkingMemory(scene)
+        return scene
+
+    def _object_working_memory(self) -> ObjectWorkingMemory:
+        self._latent_scene_memory()
+        owm = getattr(self, "_obj_working_memory", None)
+        if owm is None:
+            owm = ObjectWorkingMemory(self._latent_scene_memory())
+            self._obj_working_memory = owm
+        return owm
+
+    def _clear_object_working_memory(self) -> None:
+        scene = getattr(self, "_latent_scene", None)
+        if scene is not None:
+            scene.reset()
+        else:
+            self._latent_scene = LatentSceneMemory()
+        self._obj_working_memory = ObjectWorkingMemory(self._latent_scene)
+        self._deferred_vision_resolve = None
+        self._task_log_prev_vision_range = None
+
+    def _inject_owm_into_graph(self, owm: ObjectWorkingMemory | LatentSceneMemory) -> None:
+        if isinstance(owm, LatentSceneMemory):
+            payload = owm.graph_payload(tick=int(getattr(self, "tick", 0)))
+        else:
+            payload = owm.graph_payload()
+        nodes = self.agent.graph.nodes
+        for k, v in payload.items():
+            nodes[k] = float(v)
+            pk = f"phys_{k}"
+            if pk in nodes:
+                nodes[pk] = float(v)
+
+    def _bind_object_working_memory(self, vt: VisualTarget, tick: int) -> None:
+        agent_xy, agent_fwd = self._agent_xy_forward()
+        scene = self._latent_scene_memory()
+        scene.bind_visual_target(
+            vt, tick=int(tick), agent_xy=agent_xy, agent_forward=agent_fwd
+        )
+        self._inject_owm_into_graph(scene)
+
+    def _collect_scene_percepts(self) -> list[dict[str, Any]]:
+        """
+        Metric percepts for scene memory.
+
+        Active hard-lock: skip vision refresh for active (odometry only).
+        Other slots: only if attention is spatially peaked.
+        """
+        cam = self._depth_camera_from_sim()
+        if cam is None:
+            return []
+        scene = self._latent_scene_memory()
+        slots = collect_vision_slots(self._visual_env_ref())
+        by_id = {str(s.get("slot_id") or ""): s for s in slots}
+        out: list[dict[str, Any]] = []
+        active_ids = set(scene.active_ids)
+        hard_lock = bool(getattr(scene, "hard_lock_active", False))
+
+        # 1) Refresh active entities at tracked UV — skipped under hard-lock
+        if not hard_lock:
+            for eid in list(scene.active_ids):
+                ent = scene.entities.get(eid)
+                if ent is None:
+                    continue
+                u, v = float(ent.u), float(ent.v)
+                s = by_id.get(eid) or by_id.get(ent.slot_id)
+                peaked = bool(s and s.get("uv_valid"))
+                range_m = None
+                conf = float(ent.confidence)
+                try:
+                    if peaked and s is not None:
+                        mask = s.get("attn_mask")
+                        guided = getattr(cam, "range_from_attention", None)
+                        if callable(guided) and mask is not None:
+                            gu, gv, r, _var, rconf = guided(mask)
+                            if r is not None and gu is not None and gv is not None:
+                                u = 0.7 * u + 0.3 * float(gu)
+                                v = 0.7 * v + 0.3 * float(gv)
+                                range_m = float(r)
+                                if rconf is not None:
+                                    conf = max(conf, float(rconf))
+                    if range_m is None:
+                        r, _var, rconf = cam.range_at_uv(u, v, window=4)
+                        range_m = r
+                        if rconf is not None:
+                            conf = max(conf, float(rconf))
+                except Exception:
+                    range_m = None
+                if range_m is None or float(range_m) <= 0.05:
+                    continue
+                label = str((s or {}).get("label") or ent.label or "")
+                out.append(
+                    {
+                        "slot_id": str(ent.slot_id or eid),
+                        "u": u,
+                        "v": v,
+                        "bearing": bearing_from_u(u),
+                        "range_m": float(range_m),
+                        "label": label,
+                        "activation": float(
+                            (s or {}).get("activation") or ent.activation or 0.5
+                        ),
+                        "confidence": conf,
+                    }
+                )
+
+        # 2) Discover other peaked slots (scene context), skip diffuse ones
+        for s in slots:
+            sid = str(s.get("slot_id") or "")
+            if not sid or sid in active_ids:
+                continue
+            if not s.get("uv_valid"):
+                continue
+            u = float(s.get("u", 0.5))
+            v = float(s.get("v", 0.5))
+            range_m = None
+            conf = float(s.get("activation") or 0.0)
+            try:
+                mask = s.get("attn_mask")
+                guided = getattr(cam, "range_from_attention", None)
+                if callable(guided) and mask is not None:
+                    gu, gv, r, _var, rconf = guided(mask)
+                    if r is not None:
+                        u, v = float(gu), float(gv)
+                        range_m = float(r)
+                        if rconf is not None:
+                            conf = max(conf, float(rconf))
+                if range_m is None:
+                    r, _var, rconf = cam.range_at_uv(u, v)
+                    range_m = r
+                    if rconf is not None:
+                        conf = max(conf, float(rconf))
+            except Exception:
+                continue
+            if range_m is None or float(range_m) <= 0.05:
+                continue
+            out.append(
+                {
+                    "slot_id": sid,
+                    "u": u,
+                    "v": v,
+                    "bearing": bearing_from_u(u),
+                    "range_m": float(range_m),
+                    "label": str(s.get("label") or ""),
+                    "activation": float(s.get("activation") or 0.0),
+                    "confidence": conf,
+                }
+            )
+        return out
+
+    def _update_object_working_memory(self, tick: int) -> ObjectWorkingMemory | None:
+        scene = self._latent_scene_memory()
+        agent_xy, agent_fwd = self._agent_xy_forward()
+        # Prefer full scene percepts; fall back to active visual track only
+        percepts = []
+        try:
+            percepts = self._collect_scene_percepts()
+        except Exception:
+            percepts = []
+        if not percepts:
+            vt = None
+            try:
+                vt = self._refresh_visual_target()
+            except Exception:
+                vt = getattr(self, "_manip_resolved_visual", None)
+            if vt is not None and vt.is_ready(require_range=True):
+                percepts = [
+                    {
+                        "slot_id": vt.slot_id,
+                        "bearing": vt.bearing,
+                        "range_m": vt.range_m,
+                        "label": vt.label,
+                        "confidence": vt.confidence,
+                        "activation": vt.confidence,
+                    }
+                ]
+        scene.update(
+            tick=int(tick),
+            percepts=percepts,
+            agent_xy=agent_xy,
+            agent_forward=agent_fwd,
+        )
+        if bool(getattr(scene, "hard_lock_active", False)) and scene.active_ids:
+            try:
+                cam = self._depth_camera_from_sim()
+                if cam is not None:
+                    scene.refresh_active_from_live_camera(
+                        cam, tick=int(tick), blend=0.78
+                    )
+            except Exception:
+                pass
+        if bool(getattr(scene, "last_odom_discontinuity", False)):
+            jump = float(getattr(scene, "last_odom_jump_m", 0.0) or 0.0)
+            prev_logged = int(getattr(self, "_last_odom_disc_log_tick", -9999))
+            if int(tick) - prev_logged >= 5:
+                self._last_odom_disc_log_tick = int(tick)
+                try:
+                    task_log_event(
+                        "com_teleport",
+                        tick=int(tick),
+                        jump_m=round(jump, 3),
+                        hard_lock=bool(scene.hard_lock_active),
+                        com_x_m=round(float(agent_xy[0]), 4),
+                        com_y_m=round(float(agent_xy[1]), 4),
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._add_event(
+                        f"⚠ COM teleport {jump:.2f}m (stance reset?) — OWM hold",
+                        "#ff8866",
+                        "value",
+                    )
+                except Exception:
+                    pass
+        self._inject_owm_into_graph(scene)
+        owm = self._object_working_memory()
+        return owm if owm.is_usable(tick) else None
+
+    def _oracle_dist_m_for_eval(self, ref: str) -> float | None:
+        """Privileged distance for metrics only — never used as control input in vision mode."""
+        agent_xy, _ = self._agent_xy_forward()
+        target_xy = self._target_xy(ref) if ref else None
+        if target_xy is None:
+            return None
+        return float(math.hypot(target_xy[0] - agent_xy[0], target_xy[1] - agent_xy[1]))
+
+    def _refresh_visual_target(self) -> VisualTarget | None:
+        vt = getattr(self, "_manip_resolved_visual", None)
+        if vt is None:
+            return None
+        cam = self._depth_camera_from_sim()
+        embed_fn = None
+        gl = getattr(self, "_grounded_lang", None)
+        if gl is not None and getattr(gl, "embedder", None) is not None:
+            embed_fn = gl.embedder.embed
+        try:
+            updated = track_visual_target(
+                vt,
+                visual_env=self._visual_env_ref(),
+                depth_camera=cam,
+                embed_fn=embed_fn,
+            )
+        except Exception:
+            updated = attach_range_to_target(vt, cam) if cam is not None else vt
+        self._manip_resolved_visual = updated
+        return updated
+
+    def _task_control_distance(self, oracle_dist: float) -> float:
+        """Distance used for stage gates / obs: OWM range, else vision, else oracle."""
+        if vision_resolve_enabled():
+            owm = getattr(self, "_obj_working_memory", None)
+            if owm is not None and owm.range_m > 0.05 and owm.confidence > 0.05:
+                return float(owm.range_m)
+            vt = getattr(self, "_manip_resolved_visual", None)
+            if vt is not None and vt.range_m is not None and float(vt.range_m) > 0.05:
+                return float(vt.range_m)
+        return float(oracle_dist)
+
+    def _slot_concept_project_fn(self) -> Any | None:
+        """NeuralConceptProjector: slot_vec → concept names (language space)."""
+        nlg = getattr(self, "_neural_lang", None)
+        if nlg is None:
+            nlg = getattr(self, "_neural_language", None)
+        projector = getattr(nlg, "concept_projector", None) if nlg is not None else None
+        if projector is None:
+            return None
+        concept_store = None
+        iv = getattr(self, "_inner_voice", None)
+        if iv is not None:
+            concept_store = getattr(iv, "concept_store", None)
+        idx_to_name = getattr(concept_store, "idx_to_name", None) if concept_store else None
+
+        def _project(vec: Any) -> list[tuple[str, float]]:
+            import torch
+
+            from engine.vision_resolve import _is_visual_concept
+
+            try:
+                t = torch.as_tensor(vec, dtype=torch.float32, device=getattr(nlg, "device", "cpu"))
+                hits = projector.project(t, top_k=8, threshold=0.25)
+            except Exception:
+                return []
+            out: list[tuple[str, float]] = []
+            for concept_idx, score in hits or []:
+                name = None
+                if idx_to_name is not None:
+                    name = idx_to_name.get(int(concept_idx))
+                if not name:
+                    name = f"concept_{int(concept_idx)}"
+                if not _is_visual_concept(str(name)):
+                    continue
+                out.append((str(name), float(score)))
+            return out
+
+        return _project
+
+    def _resolve_command_target(
+        self,
+        text: str,
+        *,
+        embed_fn: Any | None,
+        require_movable: bool,
+        interaction_kinds: frozenset[str],
+    ) -> tuple[ResolvedObject | None, VisualTarget | None, dict[str, Any]]:
+        """
+        Bind-time resolve. Vision mode never falls back to registry for control.
+        Returns (oracle_resolved_or_None, visual_target_or_None, diag).
+        """
+        if vision_resolve_enabled():
+            # Ensure visual cortex is on for AGI vision path
+            if not getattr(self, "_visual_mode", False):
+                try:
+                    enable = getattr(self, "enable_visual", None)
+                    if callable(enable):
+                        enable(n_slots=8, mode="hybrid")
+                except Exception:
+                    pass
+            # Refresh encode so slot vectors/attn exist at bind
+            ven = self._visual_env_ref()
+            if ven is not None:
+                try:
+                    refresh = getattr(ven, "_refresh", None)
+                    if callable(refresh):
+                        # force_sync=True can stall the tick/API for tens of seconds
+                        refresh(run_encode=True, force_sync=False)
+                except Exception:
+                    pass
+                try:
+                    sync = getattr(self, "_phase_m_sync_from_vision", None)
+                    if callable(sync):
+                        sync()
+                except Exception:
+                    pass
+            cam = self._depth_camera_from_sim()
+            if embed_fn is None:
+                return None, None, {
+                    "reason": "no_embed_fn",
+                    "resolve_mode": "vision",
+                }
+            vt, diag = resolve_visual_target(
+                text,
+                visual_env=ven,
+                depth_camera=cam,
+                embed_fn=embed_fn,
+                concept_project_fn=self._slot_concept_project_fn(),
+                require_range=True,
+            )
+            diag = dict(diag)
+            diag["resolve_mode"] = "vision"
+            if vt is None:
+                diag["reason"] = str(diag.get("reason") or "resolve_failed_vision")
+                return None, None, diag
+            # Eval-only: try to attach oracle ref if label matches registry (metrics)
+            oracle = None
+            try:
+                agent_xy, agent_fwd = self._agent_xy_forward()
+                extras = self._sandbox_scene_extras()
+                oracle, odiag = resolve_manipulation_target(
+                    text,
+                    extras,
+                    agent_xy=agent_xy,
+                    agent_forward=agent_fwd,
+                    embed_fn=embed_fn,
+                    require_movable=require_movable,
+                    interaction_kinds=interaction_kinds,
+                )
+                diag["oracle_eval"] = {
+                    "ref": getattr(oracle, "ref", None),
+                    "reason": odiag.get("reason"),
+                }
+                if oracle is not None:
+                    od = self._oracle_dist_m_for_eval(oracle.ref)
+                    diag["oracle_dist_m"] = od
+                    diag["vision_range_m"] = vt.range_m
+            except Exception as exc:
+                diag["oracle_eval_error"] = str(exc)
+            return oracle, vt, diag
+
+        agent_xy, agent_fwd = self._agent_xy_forward()
+        extras = self._sandbox_scene_extras()
+        resolved, diag = resolve_manipulation_target(
+            text,
+            extras,
+            agent_xy=agent_xy,
+            agent_forward=agent_fwd,
+            embed_fn=embed_fn,
+            require_movable=require_movable,
+            interaction_kinds=interaction_kinds,
+        )
+        diag = dict(diag)
+        diag["resolve_mode"] = "oracle"
+        return resolved, None, diag
+
     def _human_task_verify_ctx(self) -> dict[str, Any]:
         """Scene context for goal predicate verification (distance, contact, displace)."""
         resolved = getattr(self, "_manip_resolved", None)
+        vt = getattr(self, "_manip_resolved_visual", None)
+        owm = getattr(self, "_obj_working_memory", None)
         episode = getattr(self, "_manip_episode", None)
         agent_xy, _ = self._agent_xy_forward()
         ctx: dict[str, Any] = {"agent_xy": agent_xy}
-        ref = str(getattr(resolved, "ref", "") or "")
-        target_xy = self._target_xy(ref) if ref else None
-        if target_xy is not None:
-            ctx["target_xy"] = target_xy
-            ctx["distance_m"] = math.hypot(
-                target_xy[0] - agent_xy[0], target_xy[1] - agent_xy[1]
-            )
+        if vision_resolve_enabled() and owm is not None and owm.range_m > 0.05:
+            ctx["distance_m"] = float(owm.range_m)
+            ctx["vision_bearing"] = float(owm.bearing)
+            ctx["vision_range_m"] = float(owm.range_m)
+            ctx["task_target_x"] = float(owm.x_fwd)
+            ctx["task_target_y"] = float(owm.y_right)
+            ctx["task_target_conf"] = float(owm.confidence)
+            ref = str(getattr(resolved, "ref", "") or "")
+            if ref:
+                od = self._oracle_dist_m_for_eval(ref)
+                if od is not None:
+                    ctx["oracle_dist_m"] = od
+        elif vision_resolve_enabled() and vt is not None and vt.range_m is not None:
+            ctx["distance_m"] = float(vt.range_m)
+            ctx["vision_bearing"] = float(vt.bearing)
+            ctx["vision_range_m"] = float(vt.range_m)
+            ref = str(getattr(resolved, "ref", "") or "")
+            if ref:
+                od = self._oracle_dist_m_for_eval(ref)
+                if od is not None:
+                    ctx["oracle_dist_m"] = od
+        else:
+            ref = str(getattr(resolved, "ref", "") or "")
+            target_xy = self._target_xy(ref) if ref else None
+            if target_xy is not None:
+                ctx["target_xy"] = target_xy
+                ctx["distance_m"] = math.hypot(
+                    target_xy[0] - agent_xy[0], target_xy[1] - agent_xy[1]
+                )
         baseline = getattr(episode, "baseline_xy", None) if episode is not None else None
         if baseline is not None:
             ctx["baseline_xy"] = baseline
@@ -920,6 +1460,23 @@ class SimulationGroundedLanguageMixin:
         if str(active.kind) not in ("reach_contact", "reach_target"):
             return
 
+        arb = getattr(self, "_motor_arbiter", None)
+        if vision_resolve_enabled():
+            tick = int(getattr(self, "tick", 0))
+            owm = self._update_object_working_memory(tick)
+            if owm is None or not owm.is_usable(tick):
+                return
+            intents = manipulation_intents_from_bearing_range(
+                float(owm.bearing),
+                float(owm.range_m),
+                fallen=fallen,
+            )
+            if arb is not None and intents:
+                intents.pop("vision_bearing", None)
+                intents.pop("vision_range_m", None)
+                arb.register_from_dict("manipulation", intents, precision=0.85)
+            return
+
         resolved = getattr(self, "_manip_resolved", None)
         ref = str(getattr(resolved, "ref", "") or getattr(active, "target_ref", "") or "")
         target_xy = self._target_xy(ref) if ref else None
@@ -934,7 +1491,6 @@ class SimulationGroundedLanguageMixin:
             float(dist),
             fallen=fallen,
         )
-        arb = getattr(self, "_motor_arbiter", None)
         if arb is not None and intents:
             arb.register_from_dict("manipulation", intents, precision=0.85)
 
@@ -960,6 +1516,197 @@ class SimulationGroundedLanguageMixin:
             if hk in nodes:
                 nodes[hk] = 0.0
 
+    def _arm_nav_hold(self, tick: int, *, reason: str = "hold") -> None:
+        from engine.motor_arbiter import task_motor_hold_ticks
+
+        # Always anchor to the live sim tick — command handlers may finish
+        # many wall-seconds later with a stale bind-time tick.
+        live = int(getattr(self, "tick", 0) or 0)
+        now = max(int(tick), live)
+        until = now + int(task_motor_hold_ticks())
+        prev = int(getattr(self, "_nav_hold_until_tick", -1) or -1)
+        self._nav_hold_until_tick = max(prev, until)
+        try:
+            task_log_event(
+                "nav_hold",
+                tick=now,
+                until_tick=int(self._nav_hold_until_tick),
+                reason=str(reason),
+                bind_tick=int(tick),
+                live_tick=live,
+            )
+        except Exception:
+            pass
+
+    def _nav_hold_active(self, tick: int) -> bool:
+        until = int(getattr(self, "_nav_hold_until_tick", -1) or -1)
+        return until > 0 and int(tick) < until
+
+    def _live_tick(self, tick: int | None = None) -> int:
+        live = int(getattr(self, "tick", 0) or 0)
+        if tick is None:
+            return live
+        return max(int(tick), live)
+
+    def _release_scene_hard_lock(self) -> None:
+        scene = getattr(self, "_latent_scene", None)
+        if scene is not None and hasattr(scene, "release_hard_lock"):
+            scene.release_hard_lock()
+
+    def _maybe_rebind_vision_on_divergence(
+        self,
+        tick: int,
+        *,
+        oracle_dist: float,
+        kind: str,
+    ) -> None:
+        """Re-lock via depth saliency when walking away from oracle eval target."""
+        if not vision_resolve_enabled():
+            return
+        if kind not in ("approach", "approach_target"):
+            return
+        if float(oracle_dist) >= 900.0:
+            return
+        diag = getattr(self, "_manip_diag", None) or {}
+        if not str((diag.get("oracle_eval") or {}).get("ref") or ""):
+            return
+
+        prev = getattr(self, "_vision_oracle_dist_prev", None)
+        self._vision_oracle_dist_prev = float(oracle_dist)
+        if prev is None:
+            return
+        if float(oracle_dist) - float(prev) <= 0.10:
+            self._vision_walkaway_streak = 0
+            return
+
+        owm = getattr(self, "_obj_working_memory", None)
+        if owm is None or not owm.is_usable(int(tick)):
+            return
+        if abs(float(owm.bearing)) > 0.22:
+            self._vision_walkaway_streak = 0
+            return
+
+        streak = int(getattr(self, "_vision_walkaway_streak", 0)) + 1
+        self._vision_walkaway_streak = streak
+        if streak < 4:
+            return
+        self._vision_walkaway_streak = 0
+
+        vt = getattr(self, "_manip_resolved_visual", None)
+        if vt is None:
+            return
+        cam = self._depth_camera_from_sim()
+        if cam is None:
+            return
+
+        self._release_scene_hard_lock()
+        diags = dict(vt.diagnostics or {})
+        diags["geometry"] = "objectness_peak"
+        diags["rebind_reason"] = "oracle_divergence"
+        vt2 = VisualTarget(
+            slot_id=str(vt.slot_id),
+            u=float(vt.u),
+            v=float(vt.v),
+            label=str(vt.label),
+            confidence=float(vt.confidence),
+            bearing=float(vt.bearing),
+            diagnostics=diags,
+        )
+        from engine.vision_resolve import _cap_spatial_confidence
+
+        vt2 = attach_range_to_target(vt2, cam, attn_mask=None)
+        vt2 = _cap_spatial_confidence(vt2)
+        if not vt2.is_ready(require_range=True):
+            return
+        self._manip_resolved_visual = vt2
+        self._bind_object_working_memory(vt2, int(tick))
+        self._task_log_prev_vision_range = None
+        try:
+            task_log_event(
+                "vision_rebind",
+                tick=int(tick),
+                reason="oracle_divergence",
+                u=round(float(vt2.u), 3),
+                v=round(float(vt2.v), 3),
+                range_m=round(float(vt2.range_m or 0.0), 3),
+                oracle_dist_m=round(float(oracle_dist), 3),
+            )
+        except Exception:
+            pass
+
+    def _maybe_correct_vision_range_mismatch(
+        self,
+        tick: int,
+        *,
+        oracle_dist: float,
+        kind: str,
+    ) -> None:
+        """Release inflated floor-lock range (vision >> oracle eval distance)."""
+        if not vision_resolve_enabled():
+            return
+        if kind not in ("approach", "approach_target"):
+            return
+        if float(oracle_dist) >= 900.0:
+            return
+        scene = getattr(self, "_latent_scene", None)
+        if scene is None or not bool(getattr(scene, "hard_lock_active", False)):
+            return
+        owm = getattr(self, "_obj_working_memory", None)
+        if owm is None:
+            return
+        vr = float(owm.range_m)
+        od = float(oracle_dist)
+        if vr <= od * 1.28 + 0.35:
+            self._vision_range_mismatch_streak = 0
+            return
+        streak = int(getattr(self, "_vision_range_mismatch_streak", 0)) + 1
+        self._vision_range_mismatch_streak = streak
+        if streak < 2:
+            return
+        self._vision_range_mismatch_streak = 0
+
+        vt = getattr(self, "_manip_resolved_visual", None)
+        cam = self._depth_camera_from_sim()
+        if vt is None or cam is None:
+            self._release_scene_hard_lock()
+            return
+
+        self._release_scene_hard_lock()
+        diags = dict(vt.diagnostics or {})
+        diags["geometry"] = "objectness_peak"
+        diags["rebind_reason"] = "range_mismatch"
+        vt2 = VisualTarget(
+            slot_id=str(vt.slot_id),
+            u=float(vt.u),
+            v=float(vt.v),
+            label=str(vt.label),
+            confidence=float(vt.confidence),
+            bearing=float(vt.bearing),
+            diagnostics=diags,
+        )
+        from engine.vision_resolve import _cap_spatial_confidence
+
+        vt2 = attach_range_to_target(vt2, cam, attn_mask=None)
+        vt2 = _cap_spatial_confidence(vt2)
+        if vt2.is_ready(require_range=True):
+            self._manip_resolved_visual = vt2
+            self._bind_object_working_memory(vt2, int(tick))
+            scene.refresh_active_from_live_camera(cam, tick=int(tick), blend=1.0)
+            self._task_log_prev_vision_range = None
+            try:
+                task_log_event(
+                    "vision_rebind",
+                    tick=int(tick),
+                    reason="range_mismatch",
+                    vision_range_m=round(vr, 3),
+                    oracle_dist_m=round(od, 3),
+                    new_range_m=round(float(vt2.range_m or 0.0), 3),
+                )
+            except Exception:
+                pass
+        else:
+            self._task_log_prev_vision_range = None
+
     def _register_task_navigation(
         self,
         *,
@@ -969,11 +1716,71 @@ class SimulationGroundedLanguageMixin:
         fallen: bool,
         obs: dict[str, float] | None = None,
     ) -> None:
-        if fallen or active is None:
+        tick = int(getattr(self, "tick", 0))
+        if fallen or active is None or self._nav_hold_active(tick):
             self._set_task_nav_graph_flags(nav_active=False)
             return
         kind = str(active.kind)
         if kind not in ("approach", "reach_contact", "approach_target", "reach_target"):
+            return
+
+        stop = float(active.expected_state.get("stop_distance", approach_m))
+        if kind == "reach_contact":
+            stop = min(stop, reach_start_m())
+
+        obs_r = dict(obs or {})
+        posture = float(
+            obs_r.get(
+                "posture_stability",
+                obs_r.get("phys_posture_stability", 0.6),
+            )
+        )
+        arb = getattr(self, "_motor_arbiter", None)
+        intents: dict[str, float] = {}
+
+        if vision_resolve_enabled():
+            tick = int(getattr(self, "tick", 0))
+            owm = self._update_object_working_memory(tick)
+            if owm is None or not owm.is_usable(tick):
+                # Stale / no memory → pause (no oracle fallback)
+                self._set_task_nav_graph_flags(nav_active=False)
+                return
+            range_m = float(owm.range_m)
+            need_nav = kind in ("approach", "approach_target") or (
+                kind == "reach_contact" and range_m > reach_start_m()
+            ) or (kind == "reach_target" and range_m > approach_m)
+            if need_nav:
+                intents = navigation_intents_from_ego_xy(
+                    float(owm.x_fwd),
+                    float(owm.y_right),
+                    stop,
+                    fallen=fallen,
+                    posture_stability=posture,
+                )
+            if intents:
+                heading_err = intents.pop("task_heading_err", None)
+                intents.pop("task_closing_vel", None)
+                intents.pop("task_nav_active", None)
+                vb = intents.pop("vision_bearing", None)
+                vr = intents.pop("vision_range_m", None)
+                intents.pop("task_target_x", None)
+                intents.pop("task_target_y", None)
+                self._set_task_nav_graph_flags(
+                    nav_active=True,
+                    heading_err=float(heading_err) if heading_err is not None else None,
+                )
+                nodes = self.agent.graph.nodes
+                if vb is not None:
+                    nodes["vision_bearing"] = float(vb)
+                if vr is not None:
+                    nodes["vision_range_m"] = float(vr)
+                    if "task_target_dist_m" in nodes:
+                        nodes["task_target_dist_m"] = float(vr)
+            else:
+                self._set_task_nav_graph_flags(nav_active=False)
+            if arb is not None and intents:
+                prec = 0.88 if kind in ("approach", "approach_target", "reach_contact") else 0.68
+                arb.register_from_dict("navigation", intents, precision=prec)
             return
 
         resolved = getattr(self, "_manip_resolved", None)
@@ -983,20 +1790,8 @@ class SimulationGroundedLanguageMixin:
             self._set_task_nav_graph_flags(nav_active=False)
             return
 
-        stop = float(active.expected_state.get("stop_distance", approach_m))
-        if kind == "reach_contact":
-            stop = min(stop, reach_start_m())
-
         agent_xy, agent_fwd = self._agent_xy_forward()
-        obs_r = dict(obs or {})
-        posture = float(
-            obs_r.get(
-                "posture_stability",
-                obs_r.get("phys_posture_stability", 0.6),
-            )
-        )
         prev_xy = getattr(self, "_task_nav_prev_xy", None)
-        intents: dict[str, float] = {}
         if kind in ("approach", "approach_target") or (
             kind == "reach_contact" and float(dist) > reach_start_m()
         ) or (kind == "reach_target" and float(dist) > approach_m):
@@ -1011,7 +1806,6 @@ class SimulationGroundedLanguageMixin:
             )
         self._task_nav_prev_xy = (float(agent_xy[0]), float(agent_xy[1]))
 
-        arb = getattr(self, "_motor_arbiter", None)
         if intents:
             heading_err = intents.pop("task_heading_err", None)
             closing_vel = intents.pop("task_closing_vel", None)
@@ -1041,6 +1835,16 @@ class SimulationGroundedLanguageMixin:
             for node in tt.tree.nodes.values():
                 node.target_ref = resolved.ref
 
+    def _apply_goal_visual_ref(self, goal: TaskGoal, vt: VisualTarget) -> None:
+        goal.target_ref = vt.ref
+        for pred in goal.predicates:
+            if pred.kind in _KINDS_NEEDING_TARGET:
+                pred.target_ref = vt.ref
+        tt = getattr(self, "_task_tree_ctrl", None)
+        if tt is not None and tt.tree is not None:
+            for node in tt.tree.nodes.values():
+                node.target_ref = vt.ref
+
     def _ground_command_goal(
         self,
         text: str,
@@ -1058,6 +1862,88 @@ class SimulationGroundedLanguageMixin:
             return set()
         return {str(p.kind) for p in (goal.predicates or [])}
 
+    def _tick_deferred_vision_resolve(self, *, tick: int, fallen: bool) -> None:
+        """Finish resolve_target after command (async) / stance recovers."""
+        pending = getattr(self, "_deferred_vision_resolve", None)
+        if not isinstance(pending, dict):
+            return
+        # Only wait for fallen — nav_hold blocks walking, not resolve itself.
+        if fallen:
+            return
+        tt = self._ensure_task_tree()
+        active = tt.active_node
+        if active is None or str(active.kind) != "resolve_target":
+            self._deferred_vision_resolve = None
+            return
+        text = str(pending.get("text") or "")
+        gl = getattr(self, "_grounded_lang", None)
+        embed_fn = gl.embedder.embed if gl is not None and getattr(gl, "embedder", None) else None
+        pred_kinds = set(pending.get("interaction_kinds") or [])
+        require_movable = bool(pending.get("require_movable", False))
+        try:
+            resolved, visual, diag = self._resolve_command_target(
+                text,
+                embed_fn=embed_fn,
+                require_movable=require_movable,
+                interaction_kinds=frozenset(str(k) for k in pred_kinds),
+            )
+        except Exception as exc:
+            diag = {"reason": f"resolver_error:{exc}", "resolve_mode": "vision"}
+            resolved, visual = None, None
+        self._manip_diag = dict(diag)
+        live = self._live_tick(tick)
+        self._task_log_target_resolution(live, text, resolved, diag)
+        self._deferred_vision_resolve = None
+
+        vision_ok = visual is not None and visual.is_ready(require_range=True)
+        if vision_resolve_enabled() and not vision_ok:
+            self._tt_fail_active(
+                tt, live, str(diag.get("reason", "resolve_failed_vision")), retryable=False
+            )
+            self._maybe_finalize_task_tree(live)
+            return
+        if vision_resolve_enabled() and visual is not None:
+            goal = getattr(self, "_task_goal", None)
+            if goal is not None:
+                self._apply_goal_visual_ref(goal, visual)
+            self._manip_resolved_visual = visual
+            self._bind_object_working_memory(visual, live)
+            if resolved is not None:
+                self._manip_resolved = resolved
+                if "displace" in pred_kinds and bool(getattr(resolved, "movable", False)):
+                    try:
+                        direction = self._infer_manip_direction(
+                            text,
+                            target_xy=(
+                                float(resolved.position[0]),
+                                float(resolved.position[1]),
+                            ),
+                            embed_fn=embed_fn,
+                        )
+                        self._manip_episode = ManipulationEpisode.begin(
+                            resolved, requested_direction=direction
+                        )
+                    except Exception:
+                        pass
+            for node in (tt.tree.nodes.values() if tt.tree is not None else ()):
+                if not getattr(node, "target_ref", None):
+                    node.target_ref = visual.ref
+            self._arm_nav_hold(live, reason="post_resolve")
+            self._tt_complete_active(
+                tt,
+                live,
+                diagnostics={"resolved": visual.ref, "vision": visual.to_dict(), "deferred": True},
+            )
+            self._task_tree_stage_enter_tick = live
+        elif resolved is not None:
+            goal = getattr(self, "_task_goal", None)
+            if goal is not None:
+                self._apply_goal_target_ref(goal, resolved)
+            self._manip_resolved = resolved
+            self._arm_nav_hold(live, reason="post_resolve")
+            self._tt_complete_active(tt, live, diagnostics={"resolved": resolved.ref, "deferred": True})
+            self._task_tree_stage_enter_tick = live
+
     def _tick_task_tree_goal(self, *, tick: int, obs: dict[str, float], fallen: bool) -> None:
         tt = self._ensure_task_tree()
         active = tt.active_node
@@ -1065,6 +1951,11 @@ class SimulationGroundedLanguageMixin:
         resolved = getattr(self, "_manip_resolved", None)
         if active is None:
             self._maybe_finalize_task_tree(tick)
+            return
+
+        kind = str(active.kind)
+        if kind == "resolve_target":
+            self._tick_deferred_vision_resolve(tick=int(tick), fallen=bool(fallen))
             return
 
         base = self._humanoid_base_env()
@@ -1087,11 +1978,34 @@ class SimulationGroundedLanguageMixin:
 
         agent_xy, _ = self._agent_xy_forward()
         ref = str(getattr(resolved, "ref", "") or active.target_ref or "")
-        target_xy = self._target_xy(ref) if ref else None
-        dist = (
+        target_xy = self._target_xy(ref) if ref and not str(ref).startswith("vision:") else None
+        oracle_dist = (
             math.hypot(target_xy[0] - agent_xy[0], target_xy[1] - agent_xy[1])
             if target_xy is not None
             else 999.0
+        )
+        if vision_resolve_enabled():
+            owm = self._update_object_working_memory(int(tick))
+            if owm is not None and owm.is_usable(int(tick)):
+                dist = float(owm.range_m)
+            else:
+                vt = getattr(self, "_manip_resolved_visual", None)
+                if vt is not None and vt.range_m is not None:
+                    dist = float(vt.range_m)
+                else:
+                    dist = float(oracle_dist)
+        else:
+            dist = float(oracle_dist)
+
+        self._maybe_rebind_vision_on_divergence(
+            int(tick),
+            oracle_dist=float(oracle_dist),
+            kind=str(kind),
+        )
+        self._maybe_correct_vision_range_mismatch(
+            int(tick),
+            oracle_dist=float(oracle_dist),
+            kind=str(kind),
         )
 
         kind = active.kind
@@ -1100,7 +2014,23 @@ class SimulationGroundedLanguageMixin:
         if fallen and kind in ("approach", "approach_target", "reach_contact", "reach_target"):
             streak = int(getattr(self, "_task_fall_streak", 0)) + 1
             self._task_fall_streak = streak
-            if streak >= 3 and active.tick_deadline and tick > stage_enter + 30:
+            if streak == 1:
+                self._arm_nav_hold(int(tick), reason="fallen_during_approach")
+            # Do not fail/clear the task on brief falls — hard reset is already
+            # deferred by embodiment protection; keep approach alive.
+            protected = False
+            try:
+                from engine.task_binding import human_task_embodiment_protected
+
+                protected = bool(human_task_embodiment_protected(self))
+            except Exception:
+                protected = False
+            if (
+                not protected
+                and streak >= 3
+                and active.tick_deadline
+                and tick > stage_enter + 30
+            ):
                 self._tt_fail_active(tt, tick, "fallen_during_approach", retryable=True)
                 self._maybe_finalize_task_tree(tick)
                 return
@@ -1140,6 +2070,7 @@ class SimulationGroundedLanguageMixin:
             self._nav_arrival_streak = streak
             if streak >= _nav_arrival_streak_needed():
                 self._nav_arrival_streak = 0
+                self._release_scene_hard_lock()
                 self._tt_complete_active(tt, tick)
                 self._task_tree_stage_enter_tick = tick
             elif active.tick_deadline and tick > int(active.tick_deadline):
@@ -1507,76 +2438,102 @@ class SimulationGroundedLanguageMixin:
             out["task_tree"] = tt.snapshot(tick)
 
             resolved: ResolvedObject | None = getattr(self, "_manip_resolved", None)
+            visual: VisualTarget | None = getattr(self, "_manip_resolved_visual", None)
             hard_fail = False
             fail_reason = "no_target"
             diag: dict[str, Any] = {}
             if needs_target:
-                embed_fn = gl.embedder.embed if gl is not None else None
-                agent_xy, agent_fwd = self._agent_xy_forward()
-                extras = self._sandbox_scene_extras()
-                try:
-                    resolved, diag = resolve_manipulation_target(
-                        text,
-                        extras,
-                        agent_xy=agent_xy,
-                        agent_forward=agent_fwd,
-                        embed_fn=embed_fn,
-                        require_movable="displace" in pred_kinds,
-                        interaction_kinds=frozenset(pred_kinds),
+                # Vision resolve is heavy (encode + depth) and must not block the
+                # command/API thread — that freezes UI and lets sim ticks race ahead
+                # of a stale nav_hold. Always finish on the tick path.
+                if vision_resolve_enabled():
+                    reason = "fallen" if fallen_flag else "async_vision"
+                    self._deferred_vision_resolve = {
+                        "text": text,
+                        "require_movable": "displace" in pred_kinds,
+                        "interaction_kinds": list(pred_kinds),
+                    }
+                    live = self._live_tick(tick)
+                    self._arm_nav_hold(live, reason="command_while_fallen" if fallen_flag else "resolve_pending")
+                    diag = {
+                        "reason": f"deferred_{reason}",
+                        "resolve_mode": "vision",
+                    }
+                    self._manip_diag = dict(diag)
+                    out["manipulation"] = dict(diag)
+                    task_log_event(
+                        "resolve_deferred",
+                        tick=live,
+                        reason=reason,
                     )
-                except Exception as exc:
-                    diag = {"reason": f"resolver_error:{exc}"}
-                self._manip_diag = dict(diag)
-                out["manipulation"] = dict(diag)
-                self._task_log_target_resolution(tick, text, resolved, diag)
-
-                if resolved is None or (
-                    "displace" in pred_kinds and resolved is not None and not resolved.movable
-                ):
-                    if "displace" in pred_kinds:
-                        hard_fail = True
-                        fail_reason = str(diag.get("reason", "no_target"))
-                    elif resolved is None and pred_kinds & {
-                        "reduce_distance",
-                        "contact",
-                        "displace",
-                    }:
-                        hard_fail = True
-                        fail_reason = str(diag.get("reason", "no_target"))
-
-                if hard_fail:
-                    self._tt_fail_active(tt, tick, fail_reason, retryable=False)
-                    out["task_tree"] = tt.snapshot(tick)
-                    self._task_tree_reported = True
-                    fail_body = "Не вижу цель или не могу сдвинуть объект."
-                    self._emit_task_report(tick, text, done=False, body=fail_body)
-                    self._apply_task_outcome_affect(False)
-                    self._task_log_finished(tick, status="failed", reason=fail_reason)
-                    tt.clear(tick)
-                    self._task_tree_cleared_pending_ack = True
-                    out["ok"] = True
-                    out["task_binding"] = False
-                    return out
-
-                if resolved is not None:
-                    self._apply_goal_target_ref(goal, resolved)
-                    self._manip_resolved = resolved
-                    if "displace" in pred_kinds:
-                        target_xy = (float(resolved.position[0]), float(resolved.position[1]))
-                        embed_fn = gl.embedder.embed if gl is not None else None
-                        direction = self._infer_manip_direction(
-                            text, target_xy=target_xy, embed_fn=embed_fn
+                    # Leave resolve_target stage active; tick will finish it.
+                else:
+                    embed_fn = gl.embedder.embed if gl is not None else None
+                    try:
+                        resolved, visual, diag = self._resolve_command_target(
+                            text,
+                            embed_fn=embed_fn,
+                            require_movable="displace" in pred_kinds,
+                            interaction_kinds=frozenset(pred_kinds),
                         )
-                        self._manip_episode = ManipulationEpisode.begin(
-                            resolved, requested_direction=direction
-                        )
-                    if tt.active_node is not None and tt.active_node.kind == "resolve_target":
-                        self._tt_complete_active(
-                            tt,
-                            tick,
-                            diagnostics={"resolved": resolved.ref},
-                        )
-                    out["manipulation_target"] = resolved.ref
+                    except Exception as exc:
+                        diag = {
+                            "reason": f"resolver_error:{exc}",
+                            "resolve_mode": "oracle",
+                        }
+                        resolved, visual = None, None
+                    self._manip_diag = dict(diag)
+                    out["manipulation"] = dict(diag)
+                    self._task_log_target_resolution(tick, text, resolved, diag)
+
+                    if resolved is None or (
+                        "displace" in pred_kinds and resolved is not None and not resolved.movable
+                    ):
+                        if "displace" in pred_kinds:
+                            hard_fail = True
+                            fail_reason = str(diag.get("reason", "no_target"))
+                        elif resolved is None and pred_kinds & {
+                            "reduce_distance",
+                            "contact",
+                            "displace",
+                        }:
+                            hard_fail = True
+                            fail_reason = str(diag.get("reason", "no_target"))
+
+                    if hard_fail:
+                        self._tt_fail_active(tt, tick, fail_reason, retryable=False)
+                        out["task_tree"] = tt.snapshot(tick)
+                        self._task_tree_reported = True
+                        fail_body = "Не вижу цель или не могу сдвинуть объект."
+                        self._emit_task_report(tick, text, done=False, body=fail_body)
+                        self._apply_task_outcome_affect(False)
+                        self._task_log_finished(tick, status="failed", reason=fail_reason)
+                        tt.clear(tick)
+                        self._task_tree_cleared_pending_ack = True
+                        out["ok"] = True
+                        out["task_binding"] = False
+                        return out
+
+                    if resolved is not None:
+                        self._apply_goal_target_ref(goal, resolved)
+                        self._manip_resolved = resolved
+                        self._manip_resolved_visual = None
+                        if "displace" in pred_kinds:
+                            target_xy = (float(resolved.position[0]), float(resolved.position[1]))
+                            embed_fn = gl.embedder.embed if gl is not None else None
+                            direction = self._infer_manip_direction(
+                                text, target_xy=target_xy, embed_fn=embed_fn
+                            )
+                            self._manip_episode = ManipulationEpisode.begin(
+                                resolved, requested_direction=direction
+                            )
+                        if tt.active_node is not None and tt.active_node.kind == "resolve_target":
+                            self._tt_complete_active(
+                                tt,
+                                tick,
+                                diagnostics={"resolved": resolved.ref},
+                            )
+                        out["manipulation_target"] = resolved.ref
 
             if use_tb:
                 tb = self._ensure_task_binding()
@@ -1588,6 +2545,12 @@ class SimulationGroundedLanguageMixin:
                         float(resolved.position[0]),
                         float(resolved.position[1]),
                     )
+                # Vision path: synthetic target ahead for WM binding only
+                if vision_resolve_enabled() and visual is not None and bind_target_xy is None:
+                    ax, ay = bind_agent_xy
+                    fx, fy = bind_agent_fwd
+                    r = float(visual.range_m or 1.0)
+                    bind_target_xy = (ax + fx * r, ay + fy * r)
                 task = tb.bind_command(
                     self.agent.graph,
                     obs,
@@ -1665,56 +2628,84 @@ class SimulationGroundedLanguageMixin:
 
             if cmd_kind == "manipulate":
                 resolved: ResolvedObject | None = None
+                visual: VisualTarget | None = None
                 diag: dict[str, Any] = {}
-                embed_fn = gl.embedder.embed if gl is not None else None
-                agent_xy, agent_fwd = self._agent_xy_forward()
-                extras = self._sandbox_scene_extras()
-                try:
-                    resolved, diag = resolve_manipulation_target(
-                        text,
-                        extras,
-                        agent_xy=agent_xy,
-                        agent_forward=agent_fwd,
-                        embed_fn=embed_fn,
+                if vision_resolve_enabled():
+                    self._deferred_vision_resolve = {
+                        "text": text,
+                        "require_movable": True,
+                        "interaction_kinds": [
+                            "displace",
+                            "contact",
+                            "reduce_distance",
+                        ],
+                    }
+                    live = self._live_tick(tick)
+                    self._arm_nav_hold(live, reason="resolve_pending")
+                    diag = {"reason": "deferred_async_vision", "resolve_mode": "vision"}
+                    self._manip_diag = dict(diag)
+                    out["manipulation"] = dict(diag)
+                    task_log_event(
+                        "resolve_deferred",
+                        tick=live,
+                        reason="async_vision",
                     )
-                except Exception as exc:
-                    diag = {"reason": f"resolver_error:{exc}"}
-                self._manip_diag = dict(diag)
-                out["manipulation"] = dict(diag)
-                self._task_log_target_resolution(tick, text, resolved, diag)
+                else:
+                    embed_fn = gl.embedder.embed if gl is not None else None
+                    try:
+                        resolved, visual, diag = self._resolve_command_target(
+                            text,
+                            embed_fn=embed_fn,
+                            require_movable=True,
+                            interaction_kinds=frozenset(
+                                {"displace", "contact", "reduce_distance"}
+                            ),
+                        )
+                    except Exception as exc:
+                        diag = {"reason": f"resolver_error:{exc}"}
+                    self._manip_diag = dict(diag)
+                    out["manipulation"] = dict(diag)
+                    self._task_log_target_resolution(tick, text, resolved, diag)
 
-                if resolved is None or not resolved.movable:
-                    reason = str(diag.get("reason", "no_target"))
-                    self._tt_fail_active(tt, tick, reason, retryable=False)
-                    out["task_tree"] = tt.snapshot(tick)
-                    self._task_tree_reported = True
-                    fail_body = "Не вижу цель или не могу сдвинуть объект."
-                    self._emit_task_report(tick, text, done=False, body=fail_body)
-                    self._apply_task_outcome_affect(False)
-                    self._task_log_finished(tick, status="failed", reason=reason)
-                    tt.clear(tick)
-                    self._task_tree_cleared_pending_ack = True
-                    out["ok"] = True
-                    out["task_binding"] = False
-                    return out
+                    fail_oracle = resolved is None or not resolved.movable
+                    if fail_oracle:
+                        reason = str(diag.get("reason", "no_target"))
+                        self._tt_fail_active(tt, tick, reason, retryable=False)
+                        out["task_tree"] = tt.snapshot(tick)
+                        self._task_tree_reported = True
+                        fail_body = "Не вижу цель или не могу сдвинуть объект."
+                        self._emit_task_report(tick, text, done=False, body=fail_body)
+                        self._apply_task_outcome_affect(False)
+                        self._task_log_finished(tick, status="failed", reason=reason)
+                        tt.clear(tick)
+                        self._task_tree_cleared_pending_ack = True
+                        out["ok"] = True
+                        out["task_binding"] = False
+                        return out
 
-                direction = self._infer_manip_direction(
-                    text,
-                    target_xy=(float(resolved.position[0]), float(resolved.position[1])),
-                    embed_fn=embed_fn,
-                )
-                episode = ManipulationEpisode.begin(
-                    resolved, requested_direction=direction
-                )
-                self._manip_episode = episode
-                self._manip_resolved = resolved
-                for node in tree.nodes.values():
-                    node.target_ref = resolved.ref
-                self._tt_complete_active(
-                    tt,
-                    tick,
-                    diagnostics={"resolved": resolved.ref},
-                )
+                    if resolved is not None and resolved.movable:
+                        direction = self._infer_manip_direction(
+                            text,
+                            target_xy=(
+                                float(resolved.position[0]),
+                                float(resolved.position[1]),
+                            ),
+                            embed_fn=embed_fn,
+                        )
+                        self._manip_episode = ManipulationEpisode.begin(
+                            resolved, requested_direction=direction
+                        )
+                        self._manip_resolved = resolved
+                        for node in tree.nodes.values():
+                            node.target_ref = resolved.ref
+                        if tt.active_node is not None and tt.active_node.kind == "resolve_target":
+                            self._tt_complete_active(
+                                tt,
+                                tick,
+                                diagnostics={"resolved": resolved.ref},
+                            )
+                        out["manipulation_target"] = resolved.ref
+
                 out["task_tree"] = tt.snapshot(tick)
 
                 from engine.system2.controller import write_human_command_wm
@@ -1727,7 +2718,6 @@ class SimulationGroundedLanguageMixin:
                 except Exception:
                     pass
                 out["task_binding"] = False
-                out["manipulation_target"] = resolved.ref
                 return out
 
             if cmd_kind == "generic":

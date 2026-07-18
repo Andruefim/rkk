@@ -1325,13 +1325,23 @@ class System2Controller:
         except Exception:
             return False
 
-    def _force_reset_stance_base(self, base: Any) -> None:
+    def _force_reset_stance_base(self, base: Any, *, sim: Any | None = None) -> bool:
+        """Hard pose reset. Returns False when deferred for an active human task."""
+        try:
+            from engine.task_binding import human_task_embodiment_protected
+
+            if sim is not None and human_task_embodiment_protected(sim):
+                return False
+        except Exception:
+            pass
         fn = getattr(base, "reset_stance", None)
         if callable(fn):
             try:
                 fn()
+                return True
             except Exception:
-                pass
+                return False
+        return False
 
     def _build_override_diag(
         self,
@@ -1536,7 +1546,21 @@ class System2Controller:
                 self._clear_override_session()
                 return diag
             if age >= max_age:
-                self._force_reset_stance_base(base)
+                did_reset = self._force_reset_stance_base(base, sim=sim)
+                if not did_reset:
+                    # Active human task: keep recovering in place — never teleport.
+                    # Slide the override window forward so age does not instantly re-hit.
+                    self._s2_override_start_tick = int(sim_tick) - max(1, max_age // 2)
+                    diag = self._build_override_diag(
+                        sim_tick,
+                        fallen,
+                        age,
+                        max_age,
+                        max_reset=False,
+                    )
+                    diag["reset_deferred_human_task"] = True
+                    diag["override_extended"] = True
+                    return diag
                 self._record_override_distill_neuro(
                     sim_tick=sim_tick,
                     agent=agent,

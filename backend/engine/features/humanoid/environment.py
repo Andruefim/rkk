@@ -994,6 +994,18 @@ class EnvironmentHumanoid:
     def get_frame_base64(self, view: str | None = None, **kwargs) -> str | None:
         return self._sim.get_frame_base64(view, **kwargs)
 
+    def get_ego_rgbd(self, view: str | None = None, **kwargs) -> dict | None:
+        fn = getattr(self._sim, "get_ego_rgbd", None)
+        if callable(fn):
+            return fn(view, **kwargs)
+        return None
+
+    def get_ego_camera_forward_xy(self) -> tuple[float, float] | None:
+        fn = getattr(self._sim, "get_ego_camera_forward_xy", None)
+        if callable(fn):
+            return fn()
+        return None
+
     def get_joint_positions_world(self) -> list[dict]:
         return self._sim.get_all_link_positions()
 

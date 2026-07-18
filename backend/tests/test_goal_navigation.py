@@ -86,7 +86,7 @@ def test_posture_pause_suppresses_navigation() -> None:
         (1.0, 0.0),
         (3.0, 0.0),
         stop_distance=0.5,
-        posture_stability=0.28,
+        posture_stability=0.40,
     )
     assert intents == {}
 
@@ -97,15 +97,33 @@ def test_posture_marginal_reduces_stride() -> None:
         (1.0, 0.0),
         (3.0, 0.0),
         stop_distance=0.5,
-        posture_stability=0.62,
+        posture_stability=0.70,
     )
     marginal = navigation_intents(
         (0.0, 0.0),
         (1.0, 0.0),
         (3.0, 0.0),
         stop_distance=0.5,
-        posture_stability=0.44,
+        posture_stability=0.52,
     )
     assert full and marginal
     assert marginal["intent_stride"] < full["intent_stride"]
     assert marginal["intent_stride"] >= 0.5
+
+
+def test_nav_hold_uses_live_tick_not_stale_bind_tick() -> None:
+    """Regression: long sync resolve left nav_hold anchored at bind tick → expired."""
+    from engine.features.simulation.mixin_grounded_language import (
+        SimulationGroundedLanguageMixin,
+    )
+
+    class _S(SimulationGroundedLanguageMixin):
+        def __init__(self) -> None:
+            self.tick = 700
+            self._nav_hold_until_tick = -1
+
+    s = _S()
+    s._arm_nav_hold(547, reason="post_resolve")  # stale bind tick
+    assert s._nav_hold_until_tick > 700
+    assert s._nav_hold_active(700) is True
+    assert s._nav_hold_active(s._nav_hold_until_tick) is False

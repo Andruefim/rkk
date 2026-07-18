@@ -7,6 +7,7 @@ import threading
 import time
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -1038,6 +1039,21 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             pass
         return {"xy": xy, "forward": fwd, "yaw": yaw}
 
+    def get_ego_camera_forward_xy(self) -> tuple[float, float] | None:
+        """Horizontal unit forward of the ego RGB-D camera (matches FP preview)."""
+        import math
+
+        rt = self._ego_camera_rt()
+        if rt is None:
+            return None
+        eye, target, _up = rt
+        dx = float(target[0]) - float(eye[0])
+        dy = float(target[1]) - float(eye[1])
+        n = math.hypot(dx, dy)
+        if n < 1e-5:
+            return None
+        return (dx / n, dy / n)
+
     def apply_manipulation_push(
         self,
         body_id: int,
@@ -1363,6 +1379,11 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         Сброс позы. Если fixed_root был активен — временно снимаем constraint,
         сбрасываем, и заново применяем.
         """
+        self._stance_reset_count = int(getattr(self, "_stance_reset_count", 0) or 0) + 1
+        print(
+            f"[HumanoidEnv] reset_stance #{self._stance_reset_count} "
+            f"(teleport to spawn pose)"
+        )
         with self._physics_lock:
             self._reset_stance_locked()
 
@@ -2024,6 +2045,136 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         target = eye + 2.4 * sk * fwd
         return eye.tolist(), target.tolist(), up.tolist()
 
+    def _camera_view_proj(
+        self,
+        view: str | None,
+        width: int,
+        height: int,
+        *,
+        near_m: float = 0.1,
+        far_m: float = 15.0,
+    ) -> tuple[Any, Any, bool] | None:
+        """Return (view_matrix, proj_matrix, ego_cam) or None."""
+        vkey = str(view or "ego").strip().lower()
+        use_exo = vkey in (
+            "exo",
+            "third",
+            "third_person",
+            "side",
+            "orbit",
+            "world",
+        )
+        if use_exo:
+            vm = pb.computeViewMatrix(
+                [2.2, -2.2, 1.6], [0, 0, 0.75], [0, 0, 1],
+                physicsClientId=self.client,
+            )
+            ego_cam = False
+        else:
+            eg = self._ego_camera_rt()
+            if eg is None:
+                vm = pb.computeViewMatrix(
+                    [2.2, -2.2, 1.6], [0, 0, 0.75], [0, 0, 1],
+                    physicsClientId=self.client,
+                )
+                ego_cam = False
+            else:
+                eye, tgt, cup = eg
+                vm = pb.computeViewMatrix(
+                    eye, tgt, cup, physicsClientId=self.client
+                )
+                ego_cam = True
+        pm = pb.computeProjectionMatrixFOV(
+            fov=60,
+            aspect=width / max(height, 1),
+            nearVal=float(near_m),
+            farVal=float(far_m),
+            physicsClientId=self.client,
+        )
+        return vm, pm, ego_cam
+
+    def get_ego_rgbd(
+        self,
+        view: str | None = None,
+        width: int = 160,
+        height: int = 120,
+        *,
+        near_m: float | None = None,
+        far_m: float | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Ego RGB-D capture for vision-first tasks.
+        Returns dict with rgb (H,W,3) uint8, depth_m (H,W) float32, near_m, far_m, ego_cam.
+        """
+        try:
+            from engine.vision_depth import (
+                buffer_to_metric_depth,
+                camera_far_m,
+                camera_near_m,
+            )
+        except ImportError:
+            buffer_to_metric_depth = None  # type: ignore[assignment]
+            camera_near_m = lambda: 0.1  # type: ignore[assignment,misc]
+            camera_far_m = lambda: 15.0  # type: ignore[assignment,misc]
+
+        near = float(near_m if near_m is not None else camera_near_m())
+        far = float(far_m if far_m is not None else camera_far_m())
+        try:
+            with self._physics_lock:
+                vp = self._camera_view_proj(
+                    view, width, height, near_m=near, far_m=far
+                )
+                if vp is None:
+                    return None
+                vm, pm, ego_cam = vp
+                need = width * height * 4
+                rgba = None
+                depth_buf = None
+                hwgl = getattr(pb, "ER_BULLET_HARDWARE_OPENGL", None)
+                for renderer in (hwgl, pb.ER_TINY_RENDERER):
+                    if renderer is None:
+                        continue
+                    try:
+                        _, _, rgba_try, depth_try, _ = pb.getCameraImage(
+                            width,
+                            height,
+                            vm,
+                            pm,
+                            renderer=renderer,
+                            physicsClientId=self.client,
+                        )
+                        pix_try = np.asarray(rgba_try, dtype=np.uint8).reshape(-1)
+                        if pix_try.size >= need:
+                            rgba = rgba_try
+                            depth_buf = depth_try
+                            break
+                    except Exception:
+                        continue
+                if rgba is None or depth_buf is None:
+                    raise ValueError("getCameraImage RGB-D failed")
+                pix = np.asarray(rgba, dtype=np.uint8).reshape(-1)
+                rgb = pix[:need].reshape((height, width, 4))[:, :, :3]
+                d_raw = np.asarray(depth_buf, dtype=np.float32).reshape(height, width)
+                if ego_cam:
+                    rgb = np.ascontiguousarray(rgb[:, ::-1, :])
+                    d_raw = np.ascontiguousarray(d_raw[:, ::-1])
+                if buffer_to_metric_depth is not None:
+                    depth_m = buffer_to_metric_depth(d_raw, near_m=near, far_m=far)
+                else:
+                    depth_m = d_raw
+                return {
+                    "rgb": rgb,
+                    "depth_m": depth_m,
+                    "near_m": near,
+                    "far_m": far,
+                    "ego_cam": bool(ego_cam),
+                    "width": int(width),
+                    "height": int(height),
+                }
+        except Exception as e:
+            print(f"[HumanoidEnv] RGB-D camera error: {e}")
+            return None
+
     def get_frame_base64(
         self,
         view: str | None = None,
@@ -2035,38 +2186,10 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             return None
         try:
             with self._physics_lock:
-                vkey = str(view or "ego").strip().lower()
-                use_exo = vkey in (
-                    "exo",
-                    "third",
-                    "third_person",
-                    "side",
-                    "orbit",
-                    "world",
-                )
-                if use_exo:
-                    vm = pb.computeViewMatrix(
-                        [2.2, -2.2, 1.6], [0, 0, 0.75], [0, 0, 1],
-                        physicsClientId=self.client,
-                    )
-                    ego_cam = False
-                else:
-                    eg = self._ego_camera_rt()
-                    if eg is None:
-                        vm = pb.computeViewMatrix(
-                            [2.2, -2.2, 1.6], [0, 0, 0.75], [0, 0, 1],
-                            physicsClientId=self.client,
-                        )
-                        ego_cam = False
-                    else:
-                        eye, tgt, cup = eg
-                        vm = pb.computeViewMatrix(
-                            eye, tgt, cup, physicsClientId=self.client
-                        )
-                        ego_cam = True
-                pm = pb.computeProjectionMatrixFOV(
-                    fov=60, aspect=width/height, nearVal=0.1, farVal=15.0,
-                    physicsClientId=self.client)
+                vp = self._camera_view_proj(view, width, height)
+                if vp is None:
+                    return None
+                vm, pm, ego_cam = vp
                 need = width * height * 4
                 rgba = None
                 hwgl = getattr(pb, "ER_BULLET_HARDWARE_OPENGL", None)

@@ -41,15 +41,18 @@ RKK is a two-part AGI simulation platform: a **Python backend** (FastAPI + PyBul
 
 ### AGI humanoid validation loop
 
-The tracked `.env` enables the command/task-tree/manipulation validation path. Set these to `0` for legacy autonomous-only runs:
+The tracked `.env` enables the **vision-first** command/task-tree path (camera + depth for control; registry for sim eval only). Set binding/tree to `0` for legacy autonomous-only runs:
 
 - **`RKK_TASK_BINDING=1`**: human chat → counterfactual WM goal → PE verify → REPORT (requires `RKK_GROUNDED_LANG=1`).
-- **`RKK_TASK_TREE=1`**: hierarchical task tree (manipulate / recover / generic decomposition) on top of task binding; default on when binding is on unless `RKK_TASK_TREE=0`.
-- **`RKK_MANIP_CHAIR=1`**: spawn movable chair proxy for manipulation tests; resolver uses the cached scene registry.
-- **`RKK_AUTO_VISUAL=1`**: auto `enable_visual()` on humanoid sim init. With `0`, visual cortex can still turn on via `RKK_VISUAL_GROUNDING=1` or `POST /api/visual/enable`.
-- The validation profile keeps `RKK_AUTO_VISUAL=0`, `RKK_VISUAL_GROUNDING=0`, and `RKK_SCENE_CACHE_EVERY=6`; enable vision explicitly when testing visual grounding.
-- **`RKK_TASK_MOTOR_BODYSPLIT=1`** (default): during active human tasks, register only upper-body intents (`reach`/`grasp`/`wave`/head) as `human_task`; balance-critical fields (`stride`, `support_*`, `torso_forward`, etc.) stay with reflex/gait. Set `0` for legacy full WM intent override.
-- **`RKK_TASK_MOTOR_HOLD_TICKS=60`**: after fall hard-reset, skip `human_task` motor registration for N ticks so reflexes can recover stance before reach resumes.
+- **`RKK_TASK_TREE=1`**: hierarchical task tree on top of task binding; optional LLM stage decompose via `RKK_TASK_TREE_LLM=1` (falls back to predicate ontology if Ollama unavailable).
+- **`RKK_TASK_RESOLVE=vision`**: bind/control from ego camera slots + metric depth (`VisualTarget.bearing` + `range_m`). Use `oracle` only for ablation/legacy tests (privileged registry XY).
+- **`RKK_AUTO_VISUAL=1`** / **`RKK_SLOT_LABEL_ENABLED=1`**: SlotAttention continuous + bind-time scene labels for vision resolve.
+- **`RKK_MANIP_CHAIR=1`**: spawn movable chair for **sim metrics / oracle ablation**; control path must not require registry when `RKK_TASK_RESOLVE=vision`.
+- **`RKK_VISUAL_GROUNDING`**: slot↔body (self) grounding — separate from scene-object resolve.
+- **`RKK_TASK_MOTOR_BODYSPLIT=1`** (default): during active human tasks, register only upper-body intents as `human_task`; balance-critical fields stay with reflex/gait.
+- **`RKK_TASK_MOTOR_HOLD_TICKS=60`**: after fall hard-reset, skip `human_task` motor registration for N ticks.
+
+Depth: sim uses PyBullet ego depth buffer (`get_ego_rgbd` → `DepthCamera.range_at_uv`). Same API for real-robot RGB-D/stereo later.
 
 ### Key gotchas
 

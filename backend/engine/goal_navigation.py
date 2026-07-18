@@ -20,11 +20,12 @@ def _ef(key: str, default: float) -> float:
 
 
 def task_nav_pause_posture() -> float:
-    return _ef("RKK_TASK_NAV_PAUSE_POSTURE", 0.32)
+    # Pause stride below this — brief post-resolve wobble must not walk.
+    return _ef("RKK_TASK_NAV_PAUSE_POSTURE", 0.45)
 
 
 def task_nav_full_posture() -> float:
-    return _ef("RKK_TASK_NAV_FULL_POSTURE", 0.55)
+    return _ef("RKK_TASK_NAV_FULL_POSTURE", 0.62)
 
 
 def posture_stride_scale(posture_stability: float) -> float:
@@ -39,12 +40,9 @@ def posture_stride_scale(posture_stability: float) -> float:
         return 1.0
     if ps <= pause:
         return 0.0
-    if ps < 0.40:
-        # Marginal band: short cautious steps.
-        t = (ps - pause) / max(0.40 - pause, 1e-6)
-        return float(0.30 + 0.25 * t)
-    t = (ps - 0.40) / max(full - 0.40, 1e-6)
-    return float(0.55 + 0.45 * t)
+    t = (ps - pause) / max(full - pause, 1e-6)
+    # Cautious ramp: never jump to full stride from the pause floor.
+    return float(0.35 + 0.65 * t)
 
 
 def apply_posture_to_navigation(
@@ -84,6 +82,103 @@ def _normalize_xy(v: tuple[float, float]) -> tuple[float, float]:
     if n < 1e-9:
         return 1.0, 0.0
     return x / n, y / n
+
+
+def navigation_intents_from_ego_xy(
+    x_fwd: float,
+    y_right: float,
+    stop_distance: float,
+    *,
+    fallen: bool = False,
+    posture_stability: float | None = None,
+    bearing_turn_thr: float | None = None,
+) -> dict[str, float]:
+    """
+    Navigate toward egocentric target (x_fwd, y_right) in meters.
+    +x = forward, +y = right of the agent.
+    """
+    from engine.object_working_memory import bearing_range_from_ego
+
+    bearing, range_m = bearing_range_from_ego(float(x_fwd), float(y_right))
+    out = navigation_intents_from_bearing_range(
+        bearing,
+        range_m,
+        stop_distance,
+        fallen=fallen,
+        posture_stability=posture_stability,
+        bearing_turn_thr=bearing_turn_thr,
+    )
+    if out:
+        out["task_target_x"] = float(x_fwd)
+        out["task_target_y"] = float(y_right)
+    return out
+
+
+def navigation_intents_from_bearing_range(
+    bearing: float,
+    range_m: float,
+    stop_distance: float,
+    *,
+    fallen: bool = False,
+    posture_stability: float | None = None,
+    bearing_turn_thr: float | None = None,
+) -> dict[str, float]:
+    """
+    Ego-frame navigation from vision bearing + metric range_m.
+    bearing in [-1, 1] (left…right); range_m in meters.
+    """
+    if fallen:
+        return {}
+    dist = float(range_m)
+    if not math.isfinite(dist) or dist <= 0.05:
+        return {}
+    stop = max(0.05, float(stop_distance))
+    if dist <= stop:
+        return {}
+
+    b = float(max(-1.0, min(1.0, bearing)))
+    heading_err = b * math.pi * 0.5
+    turn_thr = float(bearing_turn_thr) if bearing_turn_thr is not None else _HEADING_TURN_RAD
+
+    out: dict[str, float] = {
+        "task_heading_err": float(max(-1.0, min(1.0, heading_err / math.pi))),
+        "task_closing_vel": 0.0,
+        "vision_bearing": b,
+        "vision_range_m": float(dist),
+    }
+
+    if abs(heading_err) > turn_thr:
+        if heading_err > 0.0:
+            out["intent_gait_coupling"] = _TURN_COUPLING
+            out["intent_support_left"] = 0.62
+            out["intent_support_right"] = 0.38
+        else:
+            out["intent_gait_coupling"] = 1.0 - _TURN_COUPLING
+            out["intent_support_left"] = 0.38
+            out["intent_support_right"] = 0.62
+        span = max(dist - stop, 0.05)
+        gain = min(1.0, span / max(dist, 1e-6))
+        fwd_stride = _STRIDE_MIN + gain * (_STRIDE_MAX - _STRIDE_MIN)
+        out["intent_stride"] = float(
+            max(_TURN_STRIDE, 0.55 * _TURN_STRIDE + 0.45 * fwd_stride)
+        )
+        out["intent_torso_forward"] = 0.54
+    else:
+        span = max(dist - stop, 0.05)
+        gain = min(1.0, span / max(dist, 1e-6))
+        stride = _STRIDE_MIN + gain * (_STRIDE_MAX - _STRIDE_MIN)
+        out["intent_stride"] = float(stride)
+        out["intent_torso_forward"] = 0.55
+
+    if posture_stability is not None:
+        scaled, active = apply_posture_to_navigation(out, float(posture_stability))
+        if not active:
+            return {}
+        out = scaled
+        out["task_nav_active"] = 1.0
+    else:
+        out["task_nav_active"] = 1.0
+    return out
 
 
 def navigation_intents(
