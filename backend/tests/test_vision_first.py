@@ -13,7 +13,9 @@ from engine.vision_depth import (
     attention_guided_range,
     buffer_to_metric_depth,
     depth_at_uv,
+    live_uv_range_at_bearing,
     salient_objectness_peak,
+    salient_objectness_peak_near_bearing,
 )
 from engine.vision_resolve import resolve_visual_target
 from engine.vision_target import (
@@ -557,6 +559,28 @@ def test_live_uv_at_bearing_tracks_protrusion() -> None:
     assert u is not None and r is not None
     assert u > 0.55
     assert r < 2.5
+
+
+def test_salient_peak_near_bearing_respects_window() -> None:
+    h, w = 48, 64
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    depth[8:20, 50:60] = 1.4  # right protrusion in bearing window
+    frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
+    u_peak, v_peak, r, _, _, _ = salient_objectness_peak_near_bearing(frame, 0.35)
+    assert u_peak is not None and r is not None
+    assert u_peak > 0.52
+    assert r < 2.0
+
+
+def test_live_uv_rejects_floor_when_hint_closer() -> None:
+    h, w = 48, 64
+    depth = np.full((h, w), 3.2, dtype=np.float32)
+    depth[10:22, 30:38] = 1.1
+    frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
+    u, v, r, conf = live_uv_range_at_bearing(
+        ArrayDepthCamera(frame), 0.0, range_hint=1.2
+    )
+    assert r is not None and r < 1.8
 
 
 def test_ontology_objectness_fallback_when_scores_crushed(

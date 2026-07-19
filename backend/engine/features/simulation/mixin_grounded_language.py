@@ -1029,6 +1029,8 @@ class SimulationGroundedLanguageMixin:
         self._obj_working_memory = ObjectWorkingMemory(self._latent_scene)
         self._deferred_vision_resolve = None
         self._task_log_prev_vision_range = None
+        self._owm_cached_tick = -1
+        self._owm_cached = None
 
     def _inject_owm_into_graph(self, owm: ObjectWorkingMemory | LatentSceneMemory) -> None:
         if isinstance(owm, LatentSceneMemory):
@@ -1049,6 +1051,8 @@ class SimulationGroundedLanguageMixin:
             vt, tick=int(tick), agent_xy=agent_xy, agent_forward=agent_fwd
         )
         self._inject_owm_into_graph(scene)
+        self._owm_cached_tick = -1
+        self._owm_cached = None
 
     def _collect_scene_percepts(self) -> list[dict[str, Any]]:
         """
@@ -1160,6 +1164,12 @@ class SimulationGroundedLanguageMixin:
         return out
 
     def _update_object_working_memory(self, tick: int) -> ObjectWorkingMemory | None:
+        tick_i = int(tick)
+        if int(getattr(self, "_owm_cached_tick", -1)) == tick_i:
+            cached = getattr(self, "_owm_cached", None)
+            if cached is not None:
+                return cached
+
         scene = self._latent_scene_memory()
         agent_xy, agent_fwd = self._agent_xy_forward()
         # Prefer full scene percepts; fall back to active visual track only
@@ -1195,8 +1205,12 @@ class SimulationGroundedLanguageMixin:
             try:
                 cam = self._depth_camera_from_sim()
                 if cam is not None:
+                    range_hint = self._eval_oracle_dist_m()
                     scene.refresh_active_from_live_camera(
-                        cam, tick=int(tick), blend=0.78
+                        cam,
+                        tick=int(tick),
+                        range_hint=range_hint,
+                        blend=0.78,
                     )
             except Exception:
                 pass
@@ -1226,7 +1240,13 @@ class SimulationGroundedLanguageMixin:
                     pass
         self._inject_owm_into_graph(scene)
         owm = self._object_working_memory()
-        return owm if owm.is_usable(tick) else None
+        if owm.is_usable(tick_i):
+            self._owm_cached_tick = tick_i
+            self._owm_cached = owm
+            return owm
+        self._owm_cached_tick = tick_i
+        self._owm_cached = None
+        return None
 
     def _oracle_dist_m_for_eval(self, ref: str) -> float | None:
         """Privileged distance for metrics only — never used as control input in vision mode."""
@@ -1454,6 +1474,7 @@ class SimulationGroundedLanguageMixin:
         active: Any,
         dist: float,
         fallen: bool,
+        owm: ObjectWorkingMemory | None = None,
     ) -> None:
         if fallen or active is None:
             return
@@ -1463,7 +1484,8 @@ class SimulationGroundedLanguageMixin:
         arb = getattr(self, "_motor_arbiter", None)
         if vision_resolve_enabled():
             tick = int(getattr(self, "tick", 0))
-            owm = self._update_object_working_memory(tick)
+            if owm is None:
+                owm = self._update_object_working_memory(tick)
             if owm is None or not owm.is_usable(tick):
                 return
             intents = manipulation_intents_from_bearing_range(
@@ -1548,6 +1570,72 @@ class SimulationGroundedLanguageMixin:
             return live
         return max(int(tick), live)
 
+    def _eval_oracle_dist_m(self) -> float | None:
+        """Privileged eval distance — depth gating / metrics only, not control."""
+        resolved = getattr(self, "_manip_resolved", None)
+        if resolved is not None:
+            od = self._oracle_dist_m_for_eval(str(getattr(resolved, "ref", "") or ""))
+            if od is not None:
+                return float(od)
+        diag = getattr(self, "_manip_diag", None) or {}
+        oref = str((diag.get("oracle_eval") or {}).get("ref") or "")
+        if oref:
+            od = self._oracle_dist_m_for_eval(oref)
+            if od is not None:
+                return float(od)
+        return None
+
+    def _rebind_vision_objectness_peak(
+        self,
+        tick: int,
+        *,
+        reason: str,
+        oracle_dist: float | None = None,
+        bearing_hint: float | None = None,
+    ) -> bool:
+        vt = getattr(self, "_manip_resolved_visual", None)
+        cam = self._depth_camera_from_sim()
+        if vt is None or cam is None:
+            return False
+
+        self._release_scene_hard_lock()
+        diags = dict(vt.diagnostics or {})
+        diags["geometry"] = "objectness_peak"
+        diags["rebind_reason"] = reason
+        if bearing_hint is not None:
+            diags["bearing_hint"] = float(bearing_hint)
+        vt2 = VisualTarget(
+            slot_id=str(vt.slot_id),
+            u=float(vt.u),
+            v=float(vt.v),
+            label=str(vt.label),
+            confidence=float(vt.confidence),
+            bearing=float(bearing_hint if bearing_hint is not None else vt.bearing),
+            diagnostics=diags,
+        )
+        from engine.vision_resolve import _cap_spatial_confidence
+
+        vt2 = attach_range_to_target(vt2, cam, attn_mask=None)
+        vt2 = _cap_spatial_confidence(vt2)
+        if not vt2.is_ready(require_range=True):
+            return False
+        self._manip_resolved_visual = vt2
+        self._bind_object_working_memory(vt2, int(tick))
+        self._task_log_prev_vision_range = None
+        try:
+            task_log_event(
+                "vision_rebind",
+                tick=int(tick),
+                reason=str(reason),
+                u=round(float(vt2.u), 3),
+                v=round(float(vt2.v), 3),
+                range_m=round(float(vt2.range_m or 0.0), 3),
+                oracle_dist_m=round(float(oracle_dist), 3) if oracle_dist is not None else None,
+            )
+        except Exception:
+            pass
+        return True
+
     def _release_scene_hard_lock(self) -> None:
         scene = getattr(self, "_latent_scene", None)
         if scene is not None and hasattr(scene, "release_hard_lock"):
@@ -1592,47 +1680,15 @@ class SimulationGroundedLanguageMixin:
             return
         self._vision_walkaway_streak = 0
 
-        vt = getattr(self, "_manip_resolved_visual", None)
-        if vt is None:
+        owm = getattr(self, "_obj_working_memory", None)
+        bearing_hint = float(owm.bearing) if owm is not None else None
+        if not self._rebind_vision_objectness_peak(
+            int(tick),
+            reason="oracle_divergence",
+            oracle_dist=float(oracle_dist),
+            bearing_hint=bearing_hint,
+        ):
             return
-        cam = self._depth_camera_from_sim()
-        if cam is None:
-            return
-
-        self._release_scene_hard_lock()
-        diags = dict(vt.diagnostics or {})
-        diags["geometry"] = "objectness_peak"
-        diags["rebind_reason"] = "oracle_divergence"
-        vt2 = VisualTarget(
-            slot_id=str(vt.slot_id),
-            u=float(vt.u),
-            v=float(vt.v),
-            label=str(vt.label),
-            confidence=float(vt.confidence),
-            bearing=float(vt.bearing),
-            diagnostics=diags,
-        )
-        from engine.vision_resolve import _cap_spatial_confidence
-
-        vt2 = attach_range_to_target(vt2, cam, attn_mask=None)
-        vt2 = _cap_spatial_confidence(vt2)
-        if not vt2.is_ready(require_range=True):
-            return
-        self._manip_resolved_visual = vt2
-        self._bind_object_working_memory(vt2, int(tick))
-        self._task_log_prev_vision_range = None
-        try:
-            task_log_event(
-                "vision_rebind",
-                tick=int(tick),
-                reason="oracle_divergence",
-                u=round(float(vt2.u), 3),
-                v=round(float(vt2.v), 3),
-                range_m=round(float(vt2.range_m or 0.0), 3),
-                oracle_dist_m=round(float(oracle_dist), 3),
-            )
-        except Exception:
-            pass
 
     def _maybe_correct_vision_range_mismatch(
         self,
@@ -1641,71 +1697,91 @@ class SimulationGroundedLanguageMixin:
         oracle_dist: float,
         kind: str,
     ) -> None:
-        """Release inflated floor-lock range (vision >> oracle eval distance)."""
+        """Soft-correct inflated floor-lock range via live camera (no rebind storm)."""
         if not vision_resolve_enabled():
             return
         if kind not in ("approach", "approach_target"):
             return
         if float(oracle_dist) >= 900.0:
             return
-        scene = getattr(self, "_latent_scene", None)
-        if scene is None or not bool(getattr(scene, "hard_lock_active", False)):
+        until = int(getattr(self, "_vision_range_correct_until_tick", -1) or -1)
+        if int(tick) < until:
             return
+
         owm = getattr(self, "_obj_working_memory", None)
         if owm is None:
             return
         vr = float(owm.range_m)
         od = float(oracle_dist)
-        if vr <= od * 1.28 + 0.35:
+        ratio = vr / max(od, 0.25)
+        if vr <= od * 1.32 + 0.30:
             self._vision_range_mismatch_streak = 0
             return
+
         streak = int(getattr(self, "_vision_range_mismatch_streak", 0)) + 1
         self._vision_range_mismatch_streak = streak
-        if streak < 2:
+        need_streak = 3 if ratio > 1.75 else 5
+        if streak < need_streak:
             return
         self._vision_range_mismatch_streak = 0
+        self._vision_range_correct_until_tick = int(tick) + 40
 
-        vt = getattr(self, "_manip_resolved_visual", None)
+        scene = getattr(self, "_latent_scene", None)
         cam = self._depth_camera_from_sim()
-        if vt is None or cam is None:
-            self._release_scene_hard_lock()
+        if scene is None or cam is None:
             return
 
         self._release_scene_hard_lock()
-        diags = dict(vt.diagnostics or {})
-        diags["geometry"] = "objectness_peak"
-        diags["rebind_reason"] = "range_mismatch"
-        vt2 = VisualTarget(
-            slot_id=str(vt.slot_id),
-            u=float(vt.u),
-            v=float(vt.v),
-            label=str(vt.label),
-            confidence=float(vt.confidence),
-            bearing=float(vt.bearing),
-            diagnostics=diags,
-        )
-        from engine.vision_resolve import _cap_spatial_confidence
+        try:
+            from engine.object_working_memory import ego_from_bearing_range
+            from engine.vision_depth import live_uv_range_at_bearing
 
-        vt2 = attach_range_to_target(vt2, cam, attn_mask=None)
-        vt2 = _cap_spatial_confidence(vt2)
-        if vt2.is_ready(require_range=True):
-            self._manip_resolved_visual = vt2
-            self._bind_object_working_memory(vt2, int(tick))
-            scene.refresh_active_from_live_camera(cam, tick=int(tick), blend=1.0)
-            self._task_log_prev_vision_range = None
+            scene.refresh_active_from_live_camera(
+                cam,
+                tick=int(tick),
+                range_hint=float(od),
+                blend=1.0,
+            )
+        except Exception:
+            return
+
+        ent = scene.active()
+        if ent is not None and float(ent.range_m) > od * 1.25 + 0.20:
             try:
-                task_log_event(
-                    "vision_rebind",
-                    tick=int(tick),
-                    reason="range_mismatch",
-                    vision_range_m=round(vr, 3),
-                    oracle_dist_m=round(od, 3),
-                    new_range_m=round(float(vt2.range_m or 0.0), 3),
+                _u, _v, lr, _conf = live_uv_range_at_bearing(
+                    cam, float(ent.bearing), range_hint=float(od)
                 )
+                if lr is not None and float(lr) < float(ent.range_m):
+                    ent.range_m = float(lr)
+                    ent.x_fwd, ent.y_right = ego_from_bearing_range(
+                        float(ent.bearing), float(ent.range_m)
+                    )
             except Exception:
                 pass
-        else:
-            self._task_log_prev_vision_range = None
+
+        ent = scene.active()
+        if ent is not None and float(ent.range_m) > od * 1.40 + 0.15:
+            self._rebind_vision_objectness_peak(
+                int(tick),
+                reason="floor_lock",
+                oracle_dist=float(od),
+                bearing_hint=float(ent.bearing),
+            )
+            ent = scene.active()
+
+        self._owm_cached_tick = -1
+        self._task_log_prev_vision_range = None
+        try:
+            ent = scene.active()
+            task_log_event(
+                "vision_range_correct",
+                tick=int(tick),
+                vision_range_m=round(vr, 3),
+                oracle_dist_m=round(od, 3),
+                corrected_range_m=round(float(ent.range_m), 3) if ent else None,
+            )
+        except Exception:
+            pass
 
     def _register_task_navigation(
         self,
@@ -1715,6 +1791,7 @@ class SimulationGroundedLanguageMixin:
         approach_m: float,
         fallen: bool,
         obs: dict[str, float] | None = None,
+        owm: ObjectWorkingMemory | None = None,
     ) -> None:
         tick = int(getattr(self, "tick", 0))
         if fallen or active is None or self._nav_hold_active(tick):
@@ -1740,7 +1817,8 @@ class SimulationGroundedLanguageMixin:
 
         if vision_resolve_enabled():
             tick = int(getattr(self, "tick", 0))
-            owm = self._update_object_working_memory(tick)
+            if owm is None:
+                owm = self._update_object_working_memory(tick)
             if owm is None or not owm.is_usable(tick):
                 # Stale / no memory → pause (no oracle fallback)
                 self._set_task_nav_graph_flags(nav_active=False)
@@ -1750,9 +1828,9 @@ class SimulationGroundedLanguageMixin:
                 kind == "reach_contact" and range_m > reach_start_m()
             ) or (kind == "reach_target" and range_m > approach_m)
             if need_nav:
-                intents = navigation_intents_from_ego_xy(
-                    float(owm.x_fwd),
-                    float(owm.y_right),
+                intents = navigation_intents_from_bearing_range(
+                    float(owm.bearing),
+                    range_m,
                     stop,
                     fallen=fallen,
                     posture_stability=posture,
@@ -1979,11 +2057,15 @@ class SimulationGroundedLanguageMixin:
         agent_xy, _ = self._agent_xy_forward()
         ref = str(getattr(resolved, "ref", "") or active.target_ref or "")
         target_xy = self._target_xy(ref) if ref and not str(ref).startswith("vision:") else None
-        oracle_dist = (
-            math.hypot(target_xy[0] - agent_xy[0], target_xy[1] - agent_xy[1])
-            if target_xy is not None
-            else 999.0
-        )
+        oracle_eval = self._eval_oracle_dist_m()
+        if oracle_eval is not None:
+            oracle_dist = float(oracle_eval)
+        elif target_xy is not None:
+            oracle_dist = float(
+                math.hypot(target_xy[0] - agent_xy[0], target_xy[1] - agent_xy[1])
+            )
+        else:
+            oracle_dist = 999.0
         if vision_resolve_enabled():
             owm = self._update_object_working_memory(int(tick))
             if owm is not None and owm.is_usable(int(tick)):
@@ -1994,8 +2076,10 @@ class SimulationGroundedLanguageMixin:
                     dist = float(vt.range_m)
                 else:
                     dist = float(oracle_dist)
+                    owm = None
         else:
             dist = float(oracle_dist)
+            owm = None
 
         self._maybe_rebind_vision_on_divergence(
             int(tick),
@@ -2043,11 +2127,13 @@ class SimulationGroundedLanguageMixin:
             approach_m=approach_m,
             fallen=fallen,
             obs=obs,
+            owm=owm,
         )
         self._register_task_manipulation(
             active=active,
             dist=dist,
             fallen=fallen,
+            owm=owm,
         )
 
         ctx = self._human_task_verify_ctx()

@@ -490,9 +490,9 @@ class LocomotionController:
 
         # Task navigation steering: heading error + gait coupling → differential hips/ankles.
         try:
-            steer_gain = float(os.environ.get("RKK_CPG_NAV_STEER", "0.07"))
+            steer_gain = float(os.environ.get("RKK_CPG_NAV_STEER", "0.18"))
         except ValueError:
-            steer_gain = 0.07
+            steer_gain = 0.18
         heading_err = float(agent_nodes.get("task_heading_err", 0.0) or 0.0)
         coupling_steer = float(self._node(agent_nodes, "intent_gait_coupling") - 0.5) * 1.6
         steer = float(np.clip(heading_err + coupling_steer, -1.0, 1.0))

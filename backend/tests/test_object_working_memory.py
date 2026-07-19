@@ -10,6 +10,7 @@ from engine.goal_navigation import navigation_intents_from_ego_xy
 from engine.object_working_memory import (
     LatentSceneMemory,
     ObjectWorkingMemory,
+    SceneEntity,
     bearing_range_from_ego,
     ego_from_bearing_range,
 )
@@ -220,6 +221,56 @@ def test_bind_sets_exclusive_active() -> None:
     owm = ObjectWorkingMemory(scene)
     assert owm.slot_id == "slot_a"
     assert owm.is_usable(2)
+
+
+def test_apply_odometry_includes_lateral_shift() -> None:
+    from engine.object_working_memory import _apply_odometry_to_ego
+
+    xf, yr = 2.0, 0.4
+    prev_xy = (0.0, 0.0)
+    prev_fwd = (1.0, 0.0)
+    agent_xy = (0.0, 0.1)
+    agent_fwd = (1.0, 0.0)
+    xf2, yr2 = _apply_odometry_to_ego(
+        xf,
+        yr,
+        prev_xy=prev_xy,
+        prev_fwd=prev_fwd,
+        agent_xy=agent_xy,
+        agent_forward=agent_fwd,
+    )
+    assert yr2 < yr
+
+
+def test_refresh_active_syncs_ego_with_bearing() -> None:
+    from engine.vision_depth import ArrayDepthCamera, DepthFrame
+    from engine.vision_target import bearing_from_u
+
+    scene = LatentSceneMemory()
+    ent = scene.entities.setdefault(
+        "slot_0",
+        SceneEntity(entity_id="slot_0"),
+    )
+    scene.active_ids = ["slot_0"]
+    ent.x_fwd, ent.y_right = 4.5, 0.6
+    ent.bearing = 0.14
+    ent.range_m = 4.8
+    ent.u, ent.v = 0.5, 0.55
+    ent.confidence = 0.8
+    ent.last_vision_tick = 1
+
+    h, w = 40, 48
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    depth[8:22, 10:20] = 1.5
+    cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
+    ok = scene.refresh_active_from_live_camera(cam, tick=2, blend=1.0)
+    assert ok
+    act = scene.active()
+    assert act is not None
+    xf, yr = ego_from_bearing_range(act.bearing, act.range_m)
+    assert abs(act.x_fwd - xf) < 1e-4
+    assert abs(act.y_right - yr) < 1e-4
+    assert abs(act.bearing - bearing_from_u(act.u)) < 0.05
 
 
 def test_refresh_active_from_live_camera_updates_uv() -> None:

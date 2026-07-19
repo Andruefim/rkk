@@ -1,0 +1,4614 @@
+{
+  "tick": 1590,
+  "phase": 4,
+  "max_phase": 4,
+  "entropy": 39.6,
+  "behavioral": {
+    "behavioral_score": 0.6042,
+    "com_x_vel_ema": 0.0001,
+    "com_x_displacement": 0.14882,
+    "fall_rate": 0.0,
+    "upright_rate": 1.0,
+    "locomotion_reward_ema": 0.19143,
+    "recovery_success_rate": 0.0,
+    "step_3_substate": "3a_learning",
+    "ticks_in_step3": 831
+  },
+  "curriculum_step_3_substate": "3a_learning",
+  "smoothed_dr": 0.5,
+  "agents": [
+    {
+      "id": 0,
+      "name": "Nova",
+      "env_type": "humanoid_variant",
+      "activation": "relu",
+      "graph_mdl": 1337.067,
+      "compression_gain": 13.8103,
+      "alpha_mean": 0.025,
+      "post_fr_wm_lr_active": false,
+      "post_fr_wm_lr_mult": 1.0,
+      "phi": 0.9997,
+      "phi_raw": 0.9997,
+      "node_count": 239,
+      "total_interventions": 29,
+      "total_blocked": 0,
+      "last_do": "do(phys_intent_wave=0.54)",
+      "from_system2": false,
+      "last_blocked_reason": "",
+      "discovery_rate": 0.5,
+      "structural_discovery": 0.5,
+      "behavioral_score": 0.6042,
+      "peak_discovery_rate": 0.5,
+      "h_W": 0.0055,
+      "notears": {
+        "steps": 1,
+        "loss": 2.82889,
+        "h_W": 0.0055,
+        "l_int": 0.23752
+      },
+      "temporal": {
+        "fast_steps": 8,
+        "slow_steps": 0,
+        "phi": 0.9997,
+        "h_fast_norm": 14.9251,
+        "h_slow_norm": 0.0,
+        "context_norm": 0.0
+      },
+      "system1": {
+        "buffer_size": 9,
+        "mean_loss": 0.0
+      },
+      "value_layer": {
+        "total_checked": 29,
+        "total_blocked": 0,
+        "block_rate": 0.0,
+        "block_reasons": {
+          "ok": 0,
+          "var_out_of_range": 0,
+          "phi_too_low": 0,
+          "entropy_spike": 0,
+          "autonomy_harm": 0,
+          "repeated_fail": 0,
+          "read_only_macro": 0,
+          "critical_veto": 0
+        },
+        "phi_min": 0.03,
+        "var_range": [
+          0.05,
+          0.95
+        ],
+        "vl_phase": "steady",
+        "vl_strictness": 1.0,
+        "warmup_end_tick": 800,
+        "blend_end_tick": 1200,
+        "env_entropy_limit": 0.65,
+        "predict_band": [
+          0.015,
+          0.985
+        ],
+        "imagination_checks": 7,
+        "imagination_blocks": 0,
+        "teacher_vl_active": false,
+        "teacher_vl_ttl_ticks": 0,
+        "fixed_root_mode": false,
+        "imagination_horizon": 12
+      },
+      "teacher": {
+        "weight": 0.0,
+        "rules": 0
+      },
+      "h_W_edge_entropy": 26518.1035,
+      "rsi_lite": {
+        "enabled": true,
+        "plateau_count": 0,
+        "ref_discovery": 0.0,
+        "adjustments": 0,
+        "LAMBDA_L1": 0.003,
+        "graph_BUFFER_SIZE": 128,
+        "imagination_horizon": 12
+      },
+      "progressive_scope": {
+        "enabled": true,
+        "phase": 0,
+        "max_phase": 3,
+        "phase_ticks": 29,
+        "total_ticks": 29,
+        "mastery": 0.0,
+        "fallen_rate": 0.0,
+        "n_vars_in_scope": 13,
+        "n_vars_total": 40,
+        "phase_history": [],
+        "mastery_quality": 0.0
+      },
+      "trajectory": {
+        "enabled": true,
+        "segments": 0
+      },
+      "edge_count": 201,
+      "edges": [],
+      "wm": {
+        "mechanism_hidden": 24,
+        "type": "gnn"
+      },
+      "graph_ensemble": {
+        "N": 4,
+        "d": 72,
+        "entropy": 9e-05,
+        "weights": [
+          0.99999,
+          1e-05,
+          0.0,
+          0.0
+        ],
+        "map_idx": 0
+      },
+      "discovery_new_frac": 1.0,
+      "discovery_new_count": 1,
+      "discovery_reactivated_count": 0,
+      "edge_age_at_activation": [
+        0
+      ],
+      "l_bridge_last": 0.0,
+      "w_meta": {
+        "enabled": true,
+        "ensemble_n": 3,
+        "meta_prediction_error": 0.1901,
+        "meta_prediction_error_rolling_500": 0.1901,
+        "success_rate_after_meta_do": 0.7572203278541565,
+        "suggested_intervention": {
+          "variable": "curriculum_phase",
+          "value": 0.75,
+          "predicted_success": 0.7572
+        },
+        "last_do": {
+          "variable": "wm_lr_mult",
+          "value": 0.75,
+          "predicted_success": 0.7161,
+          "meta_prediction_error": 0.2161,
+          "applied_live": false
+        },
+        "effects": {
+          "learning_rate_eff_effect": 0.0,
+          "exploration_rate_effect": 0.0,
+          "curriculum_phase_effect": 0.0,
+          "wm_lr_mult_effect": 0.0
+        },
+        "obs_buffer_len": 256,
+        "last_update_tick": 1589
+      },
+      "meta_prediction_error": 0.1900760875940323,
+      "replay_buffer_len": 29,
+      "meta": {
+        "role_types": {
+          "com_x": "posture",
+          "com_y": "posture",
+          "com_z": "posture",
+          "torso_roll": "posture",
+          "torso_pitch": "posture",
+          "spine_yaw": "proprioceptive",
+          "spine_pitch": "proprioceptive",
+          "neck_yaw": "proprioceptive",
+          "neck_pitch": "proprioceptive",
+          "vestibular_gx": "proprioceptive",
+          "vestibular_gy": "proprioceptive",
+          "vestibular_gz": "proprioceptive",
+          "lhip": "proprioceptive",
+          "lknee": "proprioceptive",
+          "lankle": "proprioceptive",
+          "rhip": "proprioceptive",
+          "rknee": "proprioceptive",
+          "rankle": "proprioceptive",
+          "lshoulder": "proprioceptive",
+          "lelbow": "proprioceptive",
+          "rshoulder": "proprioceptive",
+          "relbow": "proprioceptive",
+          "lfoot_z": "contact",
+          "rfoot_z": "contact",
+          "cube0_x": "proprioceptive",
+          "cube0_y": "proprioceptive",
+          "cube0_z": "proprioceptive",
+          "cube1_x": "proprioceptive",
+          "cube1_y": "proprioceptive",
+          "cube1_z": "proprioceptive",
+          "cube2_x": "proprioceptive",
+          "cube2_y": "proprioceptive",
+          "cube2_z": "proprioceptive",
+          "ball_x": "proprioceptive",
+          "ball_y": "proprioceptive",
+          "ball_z": "proprioceptive",
+          "lever_pin": "proprioceptive",
+          "target_dist": "proprioceptive",
+          "floor_friction": "proprioceptive",
+          "stack_height": "proprioceptive",
+          "stability_score": "proprioceptive",
+          "intent_stride": "intent",
+          "intent_support_left": "intent",
+          "intent_support_right": "intent",
+          "intent_torso_forward": "intent",
+          "intent_gait_coupling": "intent",
+          "intent_arm_counterbalance": "intent",
+          "intent_stop_recover": "intent",
+          "intent_reach_right": "intent",
+          "intent_reach_left": "intent",
+          "intent_grasp": "intent",
+          "intent_look_at": "intent",
+          "intent_lean_forward": "intent",
+          "intent_wave": "intent",
+          "gait_phase_l": "motor",
+          "gait_phase_r": "motor",
+          "foot_contact_l": "contact",
+          "foot_contact_r": "contact",
+          "support_bias": "posture",
+          "motor_drive_l": "motor",
+          "motor_drive_r": "motor",
+          "posture_stability": "posture",
+          "intero_energy": "posture",
+          "intero_stress": "posture",
+          "self_intention_larm": "intent",
+          "self_intention_rarm": "intent",
+          "self_energy": "posture",
+          "self_attention": "posture",
+          "self_com_z_target": "posture",
+          "self_posture_target": "posture",
+          "self_goal_target_dist": "posture",
+          "self_goal_active": "posture",
+          "l1_left_leg_lhip_mean": "proprioceptive",
+          "l1_left_leg_lhip_std": "proprioceptive",
+          "l1_left_leg_lknee_mean": "proprioceptive",
+          "l1_left_leg_lknee_std": "proprioceptive",
+          "l1_left_leg_lankle_mean": "proprioceptive",
+          "l1_left_leg_lankle_std": "proprioceptive",
+          "l1_right_leg_rhip_mean": "proprioceptive",
+          "l1_right_leg_rhip_std": "proprioceptive",
+          "l1_right_leg_rknee_mean": "proprioceptive",
+          "l1_right_leg_rknee_std": "proprioceptive",
+          "l1_right_leg_rankle_mean": "proprioceptive",
+          "l1_right_leg_rankle_std": "proprioceptive",
+          "l1_left_arm_lshoulder_mean": "proprioceptive",
+          "l1_left_arm_lshoulder_std": "proprioceptive",
+          "l1_left_arm_lelbow_mean": "proprioceptive",
+          "l1_left_arm_lelbow_std": "proprioceptive",
+          "l1_right_arm_rshoulder_mean": "proprioceptive",
+          "l1_right_arm_rshoulder_std": "proprioceptive",
+          "l1_right_arm_relbow_mean": "proprioceptive",
+          "l1_right_arm_relbow_std": "proprioceptive",
+          "l1_spine_spine_yaw_mean": "proprioceptive",
+          "l1_spine_spine_yaw_std": "proprioceptive",
+          "l1_spine_spine_pitch_mean": "proprioceptive",
+          "l1_spine_spine_pitch_std": "proprioceptive",
+          "l1_spine_neck_yaw_mean": "proprioceptive",
+          "l1_spine_neck_yaw_std": "proprioceptive",
+          "l1_spine_neck_pitch_mean": "proprioceptive",
+          "l1_spine_neck_pitch_std": "proprioceptive",
+          "l1_motor_gait_phase_l_mean": "motor",
+          "l1_motor_gait_phase_l_std": "motor",
+          "l1_motor_gait_phase_r_mean": "motor",
+          "l1_motor_gait_phase_r_std": "motor",
+          "l1_motor_foot_contact_l_mean": "contact",
+          "l1_motor_foot_contact_l_std": "contact",
+          "l1_motor_foot_contact_r_mean": "contact",
+          "l1_motor_foot_contact_r_std": "contact",
+          "l1_motor_support_bias_mean": "posture",
+          "l1_motor_support_bias_std": "posture",
+          "l1_motor_motor_drive_l_mean": "motor",
+          "l1_motor_motor_drive_l_std": "motor",
+          "l1_motor_motor_drive_r_mean": "motor",
+          "l1_motor_motor_drive_r_std": "motor",
+          "l1_motor_posture_stability_mean": "posture",
+          "l1_motor_posture_stability_std": "posture",
+          "l1_motor_intent_stride_mean": "motor",
+          "l1_motor_intent_stride_std": "motor",
+          "l1_motor_intent_support_left_mean": "posture",
+          "l1_motor_intent_support_left_std": "posture",
+          "l1_motor_intent_support_right_mean": "posture",
+          "l1_motor_intent_support_right_std": "posture",
+          "l1_motor_intent_torso_forward_mean": "motor",
+          "l1_motor_intent_torso_forward_std": "motor",
+          "l1_motor_intent_gait_coupling_mean": "motor",
+          "l1_motor_intent_gait_coupling_std": "motor",
+          "l1_motor_intent_arm_counterbalance_mean": "motor",
+          "l1_motor_intent_arm_counterbalance_std": "motor",
+          "l1_motor_intent_stop_recover_mean": "motor",
+          "l1_motor_intent_stop_recover_std": "motor",
+          "l1_motor_intent_reach_right_mean": "motor",
+          "l1_motor_intent_reach_right_std": "motor",
+          "l1_motor_intent_reach_left_mean": "motor",
+          "l1_motor_intent_reach_left_std": "motor",
+          "l1_motor_intent_grasp_mean": "motor",
+          "l1_motor_intent_grasp_std": "motor",
+          "l1_motor_intent_look_at_mean": "motor",
+          "l1_motor_intent_look_at_std": "motor",
+          "l1_motor_intent_lean_forward_mean": "motor",
+          "l1_motor_intent_lean_forward_std": "motor",
+          "l1_motor_intent_wave_mean": "motor",
+          "l1_motor_intent_wave_std": "motor",
+          "mc_walk_drive": "proprioceptive",
+          "mc_balance_signal": "proprioceptive",
+          "mc_cpg_weight": "proprioceptive",
+          "mc_cortex_ready": "proprioceptive",
+          "mc_upper_drive": "proprioceptive",
+          "proprio_empowerment": "proprioceptive",
+          "concept_vis_single_object": "concept",
+          "concept_vis_open_scene": "concept",
+          "concept_vis_slot_changed": "concept",
+          "concept_vis_object_static": "concept",
+          "concept_vis_changed_since_last": "concept",
+          "concept_vis_high_visual_surprise": "concept",
+          "concept_vis_multiple_objects": "concept",
+          "concept_vis_first_time_seeing": "concept",
+          "concept_vis_symmetric_scene": "concept",
+          "concept_vis_low_visual_surprise": "concept",
+          "concept_vis_same_as_last": "concept"
+        }
+      },
+      "fallen": false,
+      "fall_count": 0,
+      "symbolic_rules": [
+        "com_y -> com_z",
+        "com_y -> spine_pitch",
+        "com_y -> vestibular_gx",
+        "com_y -> lhip",
+        "com_y -> rhip",
+        "com_y -> rankle",
+        "com_y -> lshoulder",
+        "com_y -> rshoulder",
+        "com_y -> lfoot_z",
+        "com_y -> rfoot_z",
+        "com_y -> cube0_z",
+        "com_y -> cube1_x",
+        "com_y -> cube1_y",
+        "com_y -> cube2_z",
+        "com_y -> intent_stride",
+        "com_y -> intent_support_left"
+      ],
+      "symbolic_rules_n": 1142,
+      "intention_cortex": {
+        "enabled": true,
+        "tick": 1590,
+        "context": {
+          "macro_hint": "LOCOMOTE_DELIVERY",
+          "graph_patch": {
+            "self_goal_active": 0.88,
+            "self_attention": 0.7425,
+            "intent_stride": 0.549,
+            "intent_torso_forward": 0.528,
+            "intent_gait_coupling": 0.598,
+            "intent_arm_counterbalance": 0.521
+          },
+          "intent_residuals": {
+            "intent_stride": 0.0742,
+            "intent_torso_forward": 0.0424,
+            "intent_gait_coupling": 0.1484,
+            "intent_arm_counterbalance": 0.0318
+          },
+          "horizon_ticks": 371,
+          "primary": {
+            "subgoal_id": "xfer_humanoid_variant_seed_0.2_forward_lean",
+            "var_id": "intent",
+            "target_val": 0.65,
+            "intent_targets": {
+              "intent": 0.65
+            },
+            "world_id": "humanoid_variant",
+            "tick_start": 0,
+            "tick_deadline": 1961,
+            "min_ticks": 400,
+            "source": "curriculum_pending",
+            "priority": 0.55,
+            "status": "active"
+          },
+          "stack_depth": 5,
+          "narrative": "[LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+          "expected_state": {}
+        },
+        "stack": [
+          {
+            "subgoal_id": "xfer_humanoid_variant_seed_0.2_forward_lean",
+            "var_id": "intent",
+            "target_val": 0.65,
+            "intent_targets": {
+              "intent": 0.65
+            },
+            "world_id": "humanoid_variant",
+            "tick_start": 0,
+            "tick_deadline": 1961,
+            "min_ticks": 400,
+            "source": "curriculum_pending",
+            "priority": 0.55,
+            "status": "active"
+          },
+          {
+            "subgoal_id": "xfer_humanoid_variant_seed_0.3_arm_balance",
+            "var_id": "intent",
+            "target_val": 0.7,
+            "intent_targets": {
+              "intent": 0.7
+            },
+            "world_id": "humanoid_variant",
+            "tick_start": 0,
+            "tick_deadline": 2261,
+            "min_ticks": 300,
+            "source": "curriculum_pending",
+            "priority": 0.55,
+            "status": "pending"
+          },
+          {
+            "subgoal_id": "xfer_humanoid_variant_seed_1.0_slow_step",
+            "var_id": "intent",
+            "target_val": 0.58,
+            "intent_targets": {
+              "intent": 0.58
+            },
+            "world_id": "humanoid_variant",
+            "tick_start": 0,
+            "tick_deadline": 2861,
+            "min_ticks": 600,
+            "source": "curriculum_pending",
+            "priority": 0.55,
+            "status": "pending"
+          },
+          {
+            "subgoal_id": "xfer_humanoid_variant_seed_1.1_continuous_walk",
+            "var_id": "intent",
+            "target_val": 0.65,
+            "intent_targets": {
+              "intent": 0.65
+            },
+            "world_id": "humanoid_variant",
+            "tick_start": 0,
+            "tick_deadline": 3661,
+            "min_ticks": 800,
+            "source": "curriculum_pending",
+            "priority": 0.55,
+            "status": "pending"
+          },
+          {
+            "subgoal_id": "xfer_humanoid_variant_seed_1.2_walk_backward",
+            "var_id": "intent",
+            "target_val": 0.55,
+            "intent_targets": {
+              "intent": 0.55
+            },
+            "world_id": "humanoid_variant",
+            "tick_start": 0,
+            "tick_deadline": 4261,
+            "min_ticks": 600,
+            "source": "curriculum_pending",
+            "priority": 0.55,
+            "status": "pending"
+          }
+        ],
+        "completed_recent": [
+          {
+            "subgoal_id": "seed_2.4_kneel_to_stand",
+            "var_id": "intent_torso_forward",
+            "target_val": 0.64,
+            "intent_targets": {
+              "intent_torso_forward": 0.64,
+              "intent_stride": 0.56,
+              "intent_support_left": 0.7,
+              "intent_gait_coupling": 0.8
+            },
+            "world_id": "humanoid",
+            "tick_start": 0,
+            "tick_deadline": 1449,
+            "min_ticks": 500,
+            "source": "curriculum_pending",
+            "priority": 0.55,
+            "status": "completed"
+          },
+          {
+            "subgoal_id": "seed_2.3_sit_to_stand",
+            "var_id": "intent_torso_forward",
+            "target_val": 0.68,
+            "intent_targets": {
+              "intent_torso_forward": 0.68,
+              "intent_stride": 0.5,
+              "intent_gait_coupling": 0.72,
+              "intent_stop_recover": 0.55
+            },
+            "world_id": "humanoid",
+            "tick_start": 947,
+            "tick_deadline": 1455,
+            "min_ticks": 500,
+            "source": "curriculum_active",
+            "priority": 0.9,
+            "status": "completed"
+          },
+          {
+            "subgoal_id": "gen_com_z_1000",
+            "var_id": "com_z",
+            "target_val": 0.4467,
+            "intent_targets": {},
+            "world_id": "humanoid",
+            "tick_start": 1000,
+            "tick_deadline": 1400,
+            "min_ticks": 120,
+            "source": "generated",
+            "priority": 0.674,
+            "status": "completed"
+          },
+          {
+            "subgoal_id": "gen_com_z_1000",
+            "var_id": "com_z",
+            "target_val": 0.4467,
+            "intent_targets": {
+              "com_z": 0.4467
+            },
+            "world_id": "humanoid",
+            "tick_start": 1000,
+            "tick_deadline": 1206,
+            "min_ticks": 200,
+            "source": "curriculum_active",
+            "priority": 0.9,
+            "status": "completed"
+          },
+          {
+            "subgoal_id": "gen_com_z_1200",
+            "var_id": "com_z",
+            "target_val": 0.4466,
+            "intent_targets": {},
+            "world_id": "humanoid",
+            "tick_start": 1200,
+            "tick_deadline": 1600,
+            "min_ticks": 120,
+            "source": "generated",
+            "priority": 0.6731,
+            "status": "completed"
+          },
+          {
+            "subgoal_id": "gen_com_z_1400",
+            "var_id": "com_z",
+            "target_val": 0.4448,
+            "intent_targets": {},
+            "world_id": "humanoid_variant",
+            "tick_start": 1400,
+            "tick_deadline": 1800,
+            "min_ticks": 120,
+            "source": "generated",
+            "priority": 0.6733,
+            "status": "completed"
+          }
+        ],
+        "narrative": [
+          "t1585: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+          "t1586: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+          "t1587: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+          "t1588: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+          "t1589: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+          "t1590: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)"
+        ],
+        "goal_generator": {
+          "enabled": true,
+          "active": [],
+          "completed": [
+            {
+              "var_id": "intent_speak_7",
+              "score": 0.3397,
+              "target_val": 0.5,
+              "world_id": "humanoid",
+              "source": "generated",
+              "meta_success_pred": 0.6262,
+              "tick_proposed": 200,
+              "tick_completed": 200,
+              "success_rate": 0.72,
+              "status": "completed"
+            },
+            {
+              "var_id": "phys_intent_lean_forward",
+              "score": 0.2166,
+              "target_val": 0.5,
+              "world_id": "humanoid",
+              "source": "generated",
+              "meta_success_pred": 0.6227,
+              "tick_proposed": 400,
+              "tick_completed": 400,
+              "success_rate": 0.72,
+              "status": "completed"
+            },
+            {
+              "var_id": "intent_speak_7",
+              "score": 0.3428,
+              "target_val": 0.5,
+              "world_id": "humanoid",
+              "source": "generated",
+              "meta_success_pred": 0.6262,
+              "tick_proposed": 600,
+              "tick_completed": 600,
+              "success_rate": 0.72,
+              "status": "completed"
+            },
+            {
+              "var_id": "com_z",
+              "score": 0.8457,
+              "target_val": 0.4432718784315397,
+              "world_id": "humanoid",
+              "source": "generated",
+              "meta_success_pred": 0.6403,
+              "tick_proposed": 800,
+              "tick_completed": 800,
+              "success_rate": 0.72,
+              "status": "completed"
+            },
+            {
+              "var_id": "com_z",
+              "score": 0.838,
+              "target_val": 0.4467186379615192,
+              "world_id": "humanoid",
+              "source": "generated",
+              "meta_success_pred": 0.64,
+              "tick_proposed": 1000,
+              "tick_completed": 1000,
+              "success_rate": 0.72,
+              "status": "completed"
+            },
+            {
+              "var_id": "com_z",
+              "score": 0.7481,
+              "target_val": 0.4466357782020731,
+              "world_id": "humanoid",
+              "source": "generated",
+              "meta_success_pred": 0.6376,
+              "tick_proposed": 1200,
+              "tick_completed": 1200,
+              "success_rate": 0.72,
+              "status": "completed"
+            },
+            {
+              "var_id": "com_z",
+              "score": 0.7656,
+              "target_val": 0.44476624476434024,
+              "world_id": "humanoid_variant",
+              "source": "generated",
+              "meta_success_pred": 0.638,
+              "tick_proposed": 1400,
+              "tick_completed": 1400,
+              "success_rate": 0.72,
+              "status": "completed"
+            }
+          ],
+          "blocked_log": [],
+          "last_propose_tick": 1400,
+          "autonomous_goals_count": 7,
+          "autonomous_goals_mean_success": 0.72,
+          "autonomous_goals_worlds": [
+            "humanoid",
+            "humanoid_variant"
+          ],
+          "autonomous_goals_crossworld_pass": true
+        },
+        "curriculum_graph": {
+          "enabled": true,
+          "frozen_human_curriculum": true,
+          "active_node": "gen_com_z_1400",
+          "active_intent_targets": {
+            "com_z": 0.44476624476434024
+          },
+          "node_count": 54,
+          "generated_count": 7,
+          "completed_generated": [
+            {
+              "node_id": "gen_phys_intent_lean_forward_400",
+              "var_id": "phys_intent_lean_forward",
+              "prerequisites": [
+                "seed_0.0_static_stance"
+              ],
+              "world_id": "humanoid",
+              "source": "generated",
+              "intent_targets": {
+                "phys_intent_lean_forward": 0.5
+              },
+              "min_ticks": 200,
+              "status": "completed",
+              "success_rate": 0.72,
+              "tick_started": 0,
+              "tick_completed": 610
+            },
+            {
+              "node_id": "gen_intent_speak_7_600",
+              "var_id": "intent_speak_7",
+              "prerequisites": [
+                "seed_0.1_weight_shift"
+              ],
+              "world_id": "humanoid",
+              "source": "generated",
+              "intent_targets": {
+                "intent_speak_7": 0.5
+              },
+              "min_ticks": 200,
+              "status": "completed",
+              "success_rate": 0.72,
+              "tick_started": 0,
+              "tick_completed": 612
+            },
+            {
+              "node_id": "gen_com_z_800",
+              "var_id": "com_z",
+              "prerequisites": [
+                "seed_2.1_squat_hold"
+              ],
+              "world_id": "humanoid",
+              "source": "generated",
+              "intent_targets": {
+                "com_z": 0.4432718784315397
+              },
+              "min_ticks": 200,
+              "status": "completed",
+              "success_rate": 0.72,
+              "tick_started": 0,
+              "tick_completed": 948
+            },
+            {
+              "node_id": "gen_com_z_1000",
+              "var_id": "com_z",
+              "prerequisites": [],
+              "world_id": "humanoid",
+              "source": "generated",
+              "intent_targets": {
+                "com_z": 0.4467186379615192
+              },
+              "min_ticks": 200,
+              "status": "completed",
+              "success_rate": 0.72,
+              "tick_started": 1000,
+              "tick_completed": 1006
+            },
+            {
+              "node_id": "gen_com_z_1200",
+              "var_id": "com_z",
+              "prerequisites": [],
+              "world_id": "humanoid",
+              "source": "generated",
+              "intent_targets": {
+                "com_z": 0.4466357782020731
+              },
+              "min_ticks": 200,
+              "status": "completed",
+              "success_rate": 0.55,
+              "tick_started": 1200,
+              "tick_completed": 1400
+            }
+          ],
+          "pending_count": 26,
+          "completed_count": 27
+        }
+      }
+    }
+  ],
+  "n_agents": 1,
+  "demon": {
+    "energy": 0.7360000000000021,
+    "cooldown": 27,
+    "last_target": 0,
+    "last_action_complexity": 0.6,
+    "mode": "targeted",
+    "success_rate": 0.0,
+    "mean_recent_reward": -0.085,
+    "memory": [
+      {
+        "agent": 0,
+        "success": 0,
+        "fail": 1,
+        "phi_drop": 0.0
+      }
+    ]
+  },
+  "tom_links": [],
+  "events": [
+    {
+      "tick": 1507,
+      "text": "\ud83d\udcac \u0418\u0434\u0443 \u043a \u043e\u0431\u044a\u0435\u043a\u0442\u0443",
+      "color": "#88ffcc",
+      "type": "speech"
+    },
+    {
+      "tick": 1357,
+      "text": "\ud83d\udcac \u0418\u0434\u0443 \u043a \u043e\u0431\u044a\u0435\u043a\u0442\u0443",
+      "color": "#88ffcc",
+      "type": "speech"
+    },
+    {
+      "tick": 1207,
+      "text": "\ud83d\udcac \u0418\u0434\u0443 \u043a \u043e\u0431\u044a\u0435\u043a\u0442\u0443",
+      "color": "#88ffcc",
+      "type": "speech"
+    },
+    {
+      "tick": 1057,
+      "text": "\ud83d\udcac \u0418\u0434\u0443 \u043a \u043e\u0431\u044a\u0435\u043a\u0442\u0443",
+      "color": "#88ffcc",
+      "type": "speech"
+    },
+    {
+      "tick": 1024,
+      "text": "Nova: do(phys_intent_wave=0.54) CG+276.205",
+      "color": "#44ffcc",
+      "type": "discovery"
+    },
+    {
+      "tick": 1005,
+      "text": "Nova: do(phys_intent_wave=0.54) CG+0.000",
+      "color": "#44ffcc",
+      "type": "discovery"
+    },
+    {
+      "tick": 984,
+      "text": "Nova: do(phys_intent_wave=0.54) CG+0.000",
+      "color": "#44ffcc",
+      "type": "discovery"
+    },
+    {
+      "tick": 983,
+      "text": "Nova: do(phys_intent_wave=0.54) CG+0.000",
+      "color": "#44ffcc",
+      "type": "discovery"
+    },
+    {
+      "tick": 982,
+      "text": "Nova: do(phys_intent_wave=0.54) CG+0.000",
+      "color": "#44ffcc",
+      "type": "discovery"
+    },
+    {
+      "tick": 954,
+      "text": "Nova: do(phys_intent_wave=0.54) CG+0.000",
+      "color": "#44ffcc",
+      "type": "discovery"
+    },
+    {
+      "tick": 945,
+      "text": "Nova: do(phys_intent_wave=0.54) CG+0.000",
+      "color": "#44ffcc",
+      "type": "discovery"
+    },
+    {
+      "tick": 916,
+      "text": "Nova: do(phys_intent_reach_left=0.44) CG+0.000",
+      "color": "#44ffcc",
+      "type": "discovery"
+    },
+    {
+      "tick": 907,
+      "text": "\ud83d\udcac \u0418\u0434\u0443 \u043a \u043e\u0431\u044a\u0435\u043a\u0442\u0443",
+      "color": "#88ffcc",
+      "type": "speech"
+    },
+    {
+      "tick": 757,
+      "text": "\ud83d\udcac \u0418\u0434\u0443 \u043a \u043e\u0431\u044a\u0435\u043a\u0442\u0443",
+      "color": "#88ffcc",
+      "type": "speech"
+    },
+    {
+      "tick": 659,
+      "text": "\ud83e\uddbf Skill [step_forward_R] do(intent_support_right=0.62) \u2026",
+      "color": "#66ccff",
+      "type": "skill"
+    },
+    {
+      "tick": 658,
+      "text": "\ud83e\uddbf Skill [step_forward_R] do(intent_stride=0.78) \u2026",
+      "color": "#66ccff",
+      "type": "skill"
+    },
+    {
+      "tick": 657,
+      "text": "\ud83e\uddbf Skill [step_forward_R] do(intent_support_left=0.68) \u2026",
+      "color": "#66ccff",
+      "type": "skill"
+    },
+    {
+      "tick": 656,
+      "text": "\ud83e\uddbf Skill [step_forward_R] do(intent_support_left=0.56) \u2713",
+      "color": "#66ccff",
+      "type": "skill"
+    },
+    {
+      "tick": 655,
+      "text": "\ud83e\uddbf Skill [step_forward_R] do(intent_support_right=0.62) \u2026",
+      "color": "#66ccff",
+      "type": "skill"
+    },
+    {
+      "tick": 654,
+      "text": "\ud83e\uddbf Skill [step_forward_R] do(intent_stride=0.76) \u2026",
+      "color": "#66ccff",
+      "type": "skill"
+    },
+    {
+      "tick": 653,
+      "text": "\ud83e\uddbf Skill [step_forward_R] do(intent_support_left=0.68) \u2026",
+      "color": "#66ccff",
+      "type": "skill"
+    },
+    {
+      "tick": 647,
+      "text": "Nova: do(intent_stride=0.62) CG+0.000",
+      "color": "#44ffcc",
+      "type": "discovery"
+    },
+    {
+      "tick": 646,
+      "text": "\ud83e\uddbf Skill [step_forward_R] do(intent_support_left=0.56) \u2713",
+      "color": "#66ccff",
+      "type": "skill"
+    },
+    {
+      "tick": 645,
+      "text": "\ud83e\uddbf Skill [step_forward_R] do(intent_support_right=0.62) \u2026",
+      "color": "#66ccff",
+      "type": "skill"
+    }
+  ],
+  "graph_deltas": {},
+  "value_layer": {
+    "total_blocked_all": 0,
+    "block_rates": [
+      0.0
+    ],
+    "imagination_horizon": 12,
+    "imagination_checks": 7,
+    "imagination_blocks": 0
+  },
+  "byzantine": null,
+  "motif": null,
+  "multiprocess": false,
+  "singleton": true,
+  "current_world": "humanoid_variant",
+  "world_label": "Humanoid (variant)",
+  "world_color": "#aa66ff",
+  "worlds": {
+    "humanoid": {
+      "label": "Humanoid",
+      "color": "#cc44ff"
+    },
+    "humanoid_variant": {
+      "label": "Humanoid (variant)",
+      "color": "#aa66ff"
+    },
+    "cartpole": {
+      "label": "Cartpole (stub)",
+      "color": "#44aaff"
+    },
+    "grid_nav": {
+      "label": "Grid nav (stub)",
+      "color": "#44ff88"
+    },
+    "symbolic_control": {
+      "label": "Symbolic control (stub)",
+      "color": "#ffaa44"
+    }
+  },
+  "switch_history": [],
+  "gnn_d": 159,
+  "fallen": false,
+  "fall_count": 0,
+  "fall_recovery": {
+    "active": false,
+    "start_tick": 0,
+    "last_progress_tick": 0,
+    "best_score": 0.0
+  },
+  "fixed_root": false,
+  "curriculum_step": 3,
+  "curriculum_stabilize_until": 760,
+  "scene": {
+    "skeleton": [
+      {
+        "x": 3.785402774810791,
+        "y": -1.1396324634552002,
+        "z": 1.3575184345245361
+      },
+      {
+        "x": 3.7730443477630615,
+        "y": -1.145817518234253,
+        "z": 1.2104538679122925
+      },
+      {
+        "x": 3.7473204135894775,
+        "y": -1.1587116718292236,
+        "z": 0.9040290713310242
+      },
+      {
+        "x": 3.7369399070739746,
+        "y": -1.163846731185913,
+        "z": 0.7983937859535217
+      },
+      {
+        "x": 3.8613121509552,
+        "y": -1.2868260145187378,
+        "z": 1.2267001867294312
+      },
+      {
+        "x": 3.7270989418029785,
+        "y": -0.9857953190803528,
+        "z": 1.2252999544143677
+      },
+      {
+        "x": 3.843440532684326,
+        "y": -1.303000807762146,
+        "z": 0.9805681705474854
+      },
+      {
+        "x": 3.7038373947143555,
+        "y": -0.990244448184967,
+        "z": 0.979127049446106
+      },
+      {
+        "x": 3.826613187789917,
+        "y": -1.3182369470596313,
+        "z": 0.7486240267753601
+      },
+      {
+        "x": 3.682006359100342,
+        "y": -0.9943974018096924,
+        "z": 0.7471367120742798
+      },
+      {
+        "x": 3.7758800983428955,
+        "y": -1.2511827945709229,
+        "z": 0.798812747001648
+      },
+      {
+        "x": 3.6979994773864746,
+        "y": -1.0765106678009033,
+        "z": 0.7979749441146851
+      },
+      {
+        "x": 3.738224744796753,
+        "y": -1.2696819305419922,
+        "z": 0.4217480421066284
+      },
+      {
+        "x": 3.661139965057373,
+        "y": -1.0951564311981201,
+        "z": 0.4208388328552246
+      },
+      {
+        "x": 3.7275469303131104,
+        "y": -1.2695508003234863,
+        "z": 0.05301991477608681
+      },
+      {
+        "x": 3.652963876724243,
+        "y": -1.102137804031372,
+        "z": 0.05211283266544342
+      },
+      {
+        "x": 3.704064514724503,
+        "y": -1.4273759126321748,
+        "z": -0.014740271877831154
+      },
+      {
+        "x": 3.593012395987406,
+        "y": -1.2523469128824167,
+        "z": -0.010294509756226977
+      }
+    ],
+    "ankleQuats": [
+      {
+        "x": -0.2056726054699024,
+        "y": 0.6829709961688025,
+        "z": 0.663156564632104,
+        "w": 0.2268761083427724
+      },
+      {
+        "x": -0.12427905770966996,
+        "y": 0.6914528510399155,
+        "z": 0.6970756551251721,
+        "w": 0.1432941088648837
+      }
+    ],
+    "cubes": [
+      {
+        "x": -3.8000030724027116,
+        "y": 2.6003461821332445,
+        "z": 0.07498860634207948
+      },
+      {
+        "x": 0.8610834355444513,
+        "y": -1.2245158206048783,
+        "z": 0.06248572152722104
+      },
+      {
+        "x": -1.800003097232609,
+        "y": -3.499654270997404,
+        "z": 0.09998860638869901
+      }
+    ],
+    "target": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.8
+    },
+    "fallen": false,
+    "com_z": 0.44355212159077406,
+    "fixed_root": false,
+    "ball": {
+      "x": 1.8,
+      "y": 1.3999999999999995,
+      "z": 0.11248999999999902,
+      "body_id": 4
+    },
+    "lever": {
+      "x": -4.2,
+      "y": 2.5,
+      "z": 0.1,
+      "pressed": false,
+      "pin": 0.0
+    },
+    "delivery_target": {
+      "x": 3.6,
+      "y": -3.9,
+      "z": 0.02
+    },
+    "static_geometry": [
+      {
+        "kind": "box",
+        "tx": -4.2,
+        "ty": 0.1,
+        "tz": 2.5,
+        "hx": 0.07,
+        "hy": 0.055,
+        "hz": 0.07,
+        "r": 0.88,
+        "g": 0.62,
+        "b": 0.15,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0
+      },
+      {
+        "kind": "box",
+        "tx": 3.6,
+        "ty": 0.02,
+        "tz": -3.9,
+        "hx": 0.22,
+        "hy": 0.012,
+        "hz": 0.22,
+        "r": 0.15,
+        "g": 0.85,
+        "b": 0.55,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0
+      },
+      {
+        "kind": "cylinder",
+        "tx": 0.0,
+        "ty": 0.11,
+        "tz": 0.0,
+        "radius": 1.42,
+        "height": 0.22,
+        "r": 0.94,
+        "g": 0.96,
+        "b": 0.98,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "planter"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 0.0,
+        "ty": 0.55,
+        "tz": 0.0,
+        "radius": 0.16,
+        "height": 1.1,
+        "r": 0.24,
+        "g": 0.16,
+        "b": 0.1,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "wood"
+      },
+      {
+        "kind": "sphere",
+        "tx": 0.0,
+        "ty": 1.55,
+        "tz": 0.0,
+        "radius": 1.15,
+        "r": 0.15,
+        "g": 0.48,
+        "b": 0.22,
+        "style": "plant"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -5.0,
+        "ty": 0.78,
+        "tz": 3.0,
+        "radius": 0.38,
+        "height": 0.025,
+        "r": 0.95,
+        "g": 0.97,
+        "b": 1.0,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "glass"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -5.0,
+        "ty": 0.38,
+        "tz": 3.0,
+        "radius": 0.06,
+        "height": 0.76,
+        "r": 0.9,
+        "g": 0.92,
+        "b": 0.94,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": -4.493416453298413,
+        "ty": 0.42,
+        "tz": 3.214180088269758,
+        "hx": 0.07,
+        "hy": 0.03,
+        "hz": 0.07,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -4.493416453298413,
+        "ty": 0.6,
+        "tz": 3.214180088269758,
+        "radius": 0.015,
+        "height": 0.38,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": -5.2141800882697575,
+        "ty": 0.42,
+        "tz": 3.506583546701587,
+        "hx": 0.07,
+        "hy": 0.03,
+        "hz": 0.07,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -5.2141800882697575,
+        "ty": 0.6,
+        "tz": 3.506583546701587,
+        "radius": 0.015,
+        "height": 0.38,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": -5.506583546701587,
+        "ty": 0.42,
+        "tz": 2.7858199117302425,
+        "hx": 0.07,
+        "hy": 0.03,
+        "hz": 0.07,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -5.506583546701587,
+        "ty": 0.6,
+        "tz": 2.7858199117302425,
+        "radius": 0.015,
+        "height": 0.38,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": -4.7858199117302425,
+        "ty": 0.42,
+        "tz": 2.4934164532984133,
+        "hx": 0.07,
+        "hy": 0.03,
+        "hz": 0.07,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -4.7858199117302425,
+        "ty": 0.6,
+        "tz": 2.4934164532984133,
+        "radius": 0.015,
+        "height": 0.38,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 4.0,
+        "ty": 0.741,
+        "tz": -4.0,
+        "radius": 0.361,
+        "height": 0.02375,
+        "r": 0.95,
+        "g": 0.97,
+        "b": 1.0,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "glass"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 4.0,
+        "ty": 0.361,
+        "tz": -4.0,
+        "radius": 0.056999999999999995,
+        "height": 0.722,
+        "r": 0.9,
+        "g": 0.92,
+        "b": 0.94,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": 4.481254369366508,
+        "ty": 0.39899999999999997,
+        "tz": -3.79652891614373,
+        "hx": 0.0665,
+        "hy": 0.028499999999999998,
+        "hz": 0.0665,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 4.481254369366508,
+        "ty": 0.57,
+        "tz": -3.79652891614373,
+        "radius": 0.014249999999999999,
+        "height": 0.361,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": 3.79652891614373,
+        "ty": 0.39899999999999997,
+        "tz": -3.5187456306334925,
+        "hx": 0.0665,
+        "hy": 0.028499999999999998,
+        "hz": 0.0665,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 3.79652891614373,
+        "ty": 0.57,
+        "tz": -3.5187456306334925,
+        "radius": 0.014249999999999999,
+        "height": 0.361,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": 3.5187456306334925,
+        "ty": 0.39899999999999997,
+        "tz": -4.20347108385627,
+        "hx": 0.0665,
+        "hy": 0.028499999999999998,
+        "hz": 0.0665,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 3.5187456306334925,
+        "ty": 0.57,
+        "tz": -4.20347108385627,
+        "radius": 0.014249999999999999,
+        "height": 0.361,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": 4.20347108385627,
+        "ty": 0.39899999999999997,
+        "tz": -4.481254369366507,
+        "hx": 0.0665,
+        "hy": 0.028499999999999998,
+        "hz": 0.0665,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 4.20347108385627,
+        "ty": 0.57,
+        "tz": -4.481254369366507,
+        "radius": 0.014249999999999999,
+        "height": 0.361,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -3.0,
+        "ty": 0.78,
+        "tz": -5.0,
+        "radius": 0.38,
+        "height": 0.025,
+        "r": 0.95,
+        "g": 0.97,
+        "b": 1.0,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "glass"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -3.0,
+        "ty": 0.38,
+        "tz": -5.0,
+        "radius": 0.06,
+        "height": 0.76,
+        "r": 0.9,
+        "g": 0.92,
+        "b": 0.94,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": -2.493416453298413,
+        "ty": 0.42,
+        "tz": -4.7858199117302425,
+        "hx": 0.07,
+        "hy": 0.03,
+        "hz": 0.07,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -2.493416453298413,
+        "ty": 0.6,
+        "tz": -4.7858199117302425,
+        "radius": 0.015,
+        "height": 0.38,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": -3.2141800882697575,
+        "ty": 0.42,
+        "tz": -4.493416453298413,
+        "hx": 0.07,
+        "hy": 0.03,
+        "hz": 0.07,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -3.2141800882697575,
+        "ty": 0.6,
+        "tz": -4.493416453298413,
+        "radius": 0.015,
+        "height": 0.38,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": -3.506583546701587,
+        "ty": 0.42,
+        "tz": -5.2141800882697575,
+        "hx": 0.07,
+        "hy": 0.03,
+        "hz": 0.07,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -3.506583546701587,
+        "ty": 0.6,
+        "tz": -5.2141800882697575,
+        "radius": 0.015,
+        "height": 0.38,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": -2.785819911730242,
+        "ty": 0.42,
+        "tz": -5.506583546701587,
+        "hx": 0.07,
+        "hy": 0.03,
+        "hz": 0.07,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": -2.785819911730242,
+        "ty": 0.6,
+        "tz": -5.506583546701587,
+        "radius": 0.015,
+        "height": 0.38,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 6.0,
+        "ty": 0.7020000000000001,
+        "tz": 2.0,
+        "radius": 0.342,
+        "height": 0.022500000000000003,
+        "r": 0.95,
+        "g": 0.97,
+        "b": 1.0,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "glass"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 6.0,
+        "ty": 0.342,
+        "tz": 2.0,
+        "radius": 0.054,
+        "height": 0.684,
+        "r": 0.9,
+        "g": 0.92,
+        "b": 0.94,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": 6.455925192031428,
+        "ty": 0.378,
+        "tz": 2.1927620794427822,
+        "hx": 0.06300000000000001,
+        "hy": 0.027,
+        "hz": 0.06300000000000001,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 6.455925192031428,
+        "ty": 0.54,
+        "tz": 2.1927620794427822,
+        "radius": 0.0135,
+        "height": 0.342,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": 5.807237920557218,
+        "ty": 0.378,
+        "tz": 2.4559251920314282,
+        "hx": 0.06300000000000001,
+        "hy": 0.027,
+        "hz": 0.06300000000000001,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 5.807237920557218,
+        "ty": 0.54,
+        "tz": 2.4559251920314282,
+        "radius": 0.0135,
+        "height": 0.342,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": 5.544074807968572,
+        "ty": 0.378,
+        "tz": 1.807237920557218,
+        "hx": 0.06300000000000001,
+        "hy": 0.027,
+        "hz": 0.06300000000000001,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 5.544074807968572,
+        "ty": 0.54,
+        "tz": 1.807237920557218,
+        "radius": 0.0135,
+        "height": 0.342,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "box",
+        "tx": 6.192762079442782,
+        "ty": 0.378,
+        "tz": 1.5440748079685718,
+        "hx": 0.06300000000000001,
+        "hy": 0.027,
+        "hz": 0.06300000000000001,
+        "r": 0.12,
+        "g": 0.14,
+        "b": 0.17,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "seat"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 6.192762079442782,
+        "ty": 0.54,
+        "tz": 1.5440748079685718,
+        "radius": 0.0135,
+        "height": 0.342,
+        "r": 0.88,
+        "g": 0.9,
+        "b": 0.92,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "torus",
+        "tx": -7.0,
+        "ty": 0.85,
+        "tz": -6.0,
+        "radius": 1.2,
+        "tube": 0.08,
+        "r": 0.9,
+        "g": 0.92,
+        "b": 0.95,
+        "rx": 1.3659098493868667,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "chrome"
+      },
+      {
+        "kind": "torus",
+        "tx": -4.0,
+        "ty": 0.85,
+        "tz": -6.0,
+        "radius": 1.5,
+        "tube": 0.08,
+        "r": 0.9,
+        "g": 0.92,
+        "b": 0.95,
+        "rx": 1.3659098493868667,
+        "ry": 0.0,
+        "rz": 0.9,
+        "style": "chrome"
+      },
+      {
+        "kind": "torus",
+        "tx": -1.0,
+        "ty": 0.85,
+        "tz": -6.0,
+        "radius": 1.7999999999999998,
+        "tube": 0.08,
+        "r": 0.9,
+        "g": 0.92,
+        "b": 0.95,
+        "rx": 1.3659098493868667,
+        "ry": 0.0,
+        "rz": 1.8,
+        "style": "chrome"
+      },
+      {
+        "kind": "cylinder",
+        "tx": 7.2,
+        "ty": 0.45,
+        "tz": -2.5,
+        "radius": 0.55,
+        "height": 0.9,
+        "r": 0.96,
+        "g": 0.98,
+        "b": 1.0,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "planter"
+      },
+      {
+        "kind": "box",
+        "tx": 7.2,
+        "ty": 0.98,
+        "tz": -2.5,
+        "hx": 0.42,
+        "hy": 0.32,
+        "hz": 0.02,
+        "r": 0.4,
+        "g": 0.85,
+        "b": 0.95,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "default"
+      },
+      {
+        "kind": "box",
+        "tx": -5.5,
+        "ty": 0.22,
+        "tz": -4.5,
+        "hx": 1.1,
+        "hy": 0.11,
+        "hz": 0.35,
+        "r": 0.96,
+        "g": 0.97,
+        "b": 0.99,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "default"
+      },
+      {
+        "kind": "box",
+        "tx": 5.5,
+        "ty": 0.22,
+        "tz": 4.0,
+        "hx": 1.0,
+        "hy": 0.11,
+        "hz": 0.38,
+        "r": 0.96,
+        "g": 0.97,
+        "b": 0.99,
+        "rx": 0.0,
+        "ry": 0.0,
+        "rz": 0.0,
+        "style": "default"
+      }
+    ],
+    "props": [
+      {
+        "ref": "prop_0",
+        "id": "prop_0",
+        "x": -4.2000030031065325,
+        "y": 4.000325936533183,
+        "z": 0.06998860634038338,
+        "hx": 0.07,
+        "hy": 0.07,
+        "hz": 0.07,
+        "r": 0.9,
+        "g": 0.35,
+        "b": 0.25,
+        "movable": true,
+        "mass": 0.35,
+        "semantic": "prop",
+        "body_id": 102,
+        "source": "props"
+      },
+      {
+        "ref": "prop_1",
+        "id": "prop_1",
+        "x": 4.4999969993135895,
+        "y": -0.4996739809449768,
+        "z": 0.06498860632596848,
+        "hx": 0.065,
+        "hy": 0.065,
+        "hz": 0.065,
+        "r": 0.35,
+        "g": 0.55,
+        "b": 0.95,
+        "movable": true,
+        "mass": 0.28,
+        "semantic": "prop",
+        "body_id": 103,
+        "source": "props"
+      },
+      {
+        "ref": "prop_2",
+        "id": "prop_2",
+        "x": -2.4000029945408783,
+        "y": -4.4996739936504975,
+        "z": 0.05998860630923117,
+        "hx": 0.06,
+        "hy": 0.06,
+        "hz": 0.06,
+        "r": 0.45,
+        "g": 0.85,
+        "b": 0.4,
+        "movable": true,
+        "mass": 0.22,
+        "semantic": "prop",
+        "body_id": 104,
+        "source": "props"
+      },
+      {
+        "ref": "prop_3",
+        "id": "prop_3",
+        "x": 2.999996994049354,
+        "y": 4.2003260299336915,
+        "z": 0.06998860634033684,
+        "hx": 0.07,
+        "hy": 0.07,
+        "hz": 0.07,
+        "r": 0.95,
+        "g": 0.75,
+        "b": 0.2,
+        "movable": true,
+        "mass": 0.4,
+        "semantic": "prop",
+        "body_id": 105,
+        "source": "props"
+      },
+      {
+        "ref": "prop_4",
+        "id": "prop_4",
+        "x": -1.000003003457246,
+        "y": -2.799673722034283,
+        "z": 0.06498860632581577,
+        "hx": 0.065,
+        "hy": 0.065,
+        "hz": 0.065,
+        "r": 0.75,
+        "g": 0.45,
+        "b": 0.85,
+        "movable": true,
+        "mass": 0.3,
+        "semantic": "prop",
+        "body_id": 106,
+        "source": "props"
+      },
+      {
+        "ref": "prop_5",
+        "id": "prop_5",
+        "x": 0.49999700829789556,
+        "y": 5.000325912960776,
+        "z": 0.05998860630928548,
+        "hx": 0.06,
+        "hy": 0.06,
+        "hz": 0.06,
+        "r": 0.3,
+        "g": 0.85,
+        "b": 0.75,
+        "movable": true,
+        "mass": 0.25,
+        "semantic": "prop",
+        "body_id": 107,
+        "source": "props"
+      }
+    ],
+    "registry": [
+      {
+        "ref": "ball",
+        "id": "ball",
+        "body_id": 4,
+        "semantic": "ball",
+        "movable": true,
+        "x": 1.8,
+        "y": 1.3999999999999995,
+        "z": 0.11248999999999902,
+        "source": "sandbox_spawn",
+        "mass": 0.14
+      },
+      {
+        "ref": "prop_0",
+        "id": "prop_0",
+        "body_id": 102,
+        "semantic": "prop",
+        "movable": true,
+        "x": -4.200002997400914,
+        "y": 4.0003243923276575,
+        "z": 0.06998860634126114,
+        "source": "props",
+        "mass": 0.35
+      },
+      {
+        "ref": "prop_1",
+        "id": "prop_1",
+        "body_id": 103,
+        "semantic": "prop",
+        "movable": true,
+        "x": 4.499997004965457,
+        "y": -0.4996755250486854,
+        "z": 0.0649886063269125,
+        "source": "props",
+        "mass": 0.28
+      },
+      {
+        "ref": "prop_2",
+        "id": "prop_2",
+        "body_id": 104,
+        "semantic": "prop",
+        "movable": true,
+        "x": -2.400002988951559,
+        "y": -4.499675537635599,
+        "z": 0.059988606310252504,
+        "source": "props",
+        "mass": 0.22
+      },
+      {
+        "ref": "prop_3",
+        "id": "prop_3",
+        "body_id": 105,
+        "semantic": "prop",
+        "movable": true,
+        "x": 2.9999969997547846,
+        "y": 4.20032448572849,
+        "z": 0.06998860634121525,
+        "source": "props",
+        "mass": 0.4
+      },
+      {
+        "ref": "prop_4",
+        "id": "prop_4",
+        "body_id": 106,
+        "semantic": "prop",
+        "movable": true,
+        "x": -1.0000029978059946,
+        "y": -2.7996752661369175,
+        "z": 0.06498860632675922,
+        "source": "props",
+        "mass": 0.3
+      },
+      {
+        "ref": "prop_5",
+        "id": "prop_5",
+        "body_id": 107,
+        "semantic": "prop",
+        "movable": true,
+        "x": 0.4999970138874329,
+        "y": 5.000324368975292,
+        "z": 0.05998860631030643,
+        "source": "props",
+        "mass": 0.25
+      },
+      {
+        "ref": "manip_chair_front",
+        "id": "manip_chair_front",
+        "body_id": 108,
+        "semantic": "chair",
+        "movable": true,
+        "x": 1.6449710151772066,
+        "y": -0.9676307350169759,
+        "z": 0.39998809048394945,
+        "source": "manip_chair",
+        "mass": 5.5
+      }
+    ],
+    "objects_tracked": 9,
+    "objects_in_reach": 0,
+    "affordances_available": [
+      "ApproachObject"
+    ],
+    "objects": [
+      {
+        "id": "ball",
+        "type": "sphere",
+        "dist": 2.28,
+        "in_reach": false
+      },
+      {
+        "id": "prop_0",
+        "type": "box",
+        "dist": 5.8,
+        "in_reach": false
+      },
+      {
+        "id": "prop_1",
+        "type": "box",
+        "dist": 4.528,
+        "in_reach": false
+      },
+      {
+        "id": "prop_2",
+        "type": "box",
+        "dist": 5.1,
+        "in_reach": false
+      },
+      {
+        "id": "prop_3",
+        "type": "box",
+        "dist": 5.162,
+        "in_reach": false
+      },
+      {
+        "id": "prop_4",
+        "type": "box",
+        "dist": 2.973,
+        "in_reach": false
+      },
+      {
+        "id": "prop_5",
+        "type": "box",
+        "dist": 5.025,
+        "in_reach": false
+      },
+      {
+        "id": "manip_chair_front",
+        "type": "chair",
+        "dist": 1.908,
+        "in_reach": false
+      },
+      {
+        "id": "target",
+        "type": "target",
+        "dist": 5.308,
+        "in_reach": false
+      }
+    ]
+  },
+  "visual_mode": true,
+  "vision_ticks": 1590,
+  "vision": {
+    "n_slots": 8,
+    "n_encode": 32,
+    "n_train": 27,
+    "mean_loss": 0.10973569902556914,
+    "mean_pred_loss": 0.08065,
+    "variability": [
+      0.1582,
+      0.1575,
+      0.1568,
+      0.1582,
+      0.1566,
+      0.1575,
+      0.1558,
+      0.1561
+    ],
+    "active_slots": 8
+  },
+  "system2": {
+    "enabled": true,
+    "macro": "IDLE",
+    "until": 1961,
+    "sim_tick": 1590,
+    "macro_horizon_expired": false,
+    "macro_outcome_deferred": false,
+    "idle": true,
+    "outcome_ema": 0.5,
+    "student_conf": 0.0,
+    "last_source": "human_task_executive",
+    "last_neuro_node": null,
+    "recovery_steps_loaded": 0,
+    "distill_window": 3,
+    "distill_success_rate": 0.0,
+    "distill_recover_success_rate": null,
+    "distill_recover_conf_median": null,
+    "distill_blend_ready": false,
+    "distill_quality_warn": true,
+    "script_override_frac_post_warmup": 0.0,
+    "emergency_override_frac_post_warmup": 0.0,
+    "s2_override_frac": 0.0,
+    "fallen_override_frac_post_warmup": 0.0
+  },
+  "agent_loop": {
+    "hz": 15.0,
+    "decoupled": true,
+    "l3_hz": 4.0,
+    "l3_last_tick": 1588,
+    "l4_worker": true,
+    "l4_pending": false,
+    "l4_last_submit_tick": 1560,
+    "l4_last_apply_tick": 0,
+    "l1_last_cmd_tick": 1590,
+    "l1_last_apply_tick": 1590
+  },
+  "locomotion": {
+    "cpg_steps": 17458,
+    "amplitude_mean": 0.4964,
+    "frequency_mean_hz": 2.223,
+    "reward_recent_mean": 0.577,
+    "com_x_vel": 0.0,
+    "last_command_size": 6,
+    "last_intent_stride": 0.5776,
+    "cpg_com_lag": 0.0,
+    "cpg_weight": 1.0,
+    "swing_l": 0.0871,
+    "swing_r": 0.0,
+    "pitch_add": -0.00158,
+    "decoupled_loop_hz": 60.0
+  },
+  "motor_state": {
+    "tick": 1590,
+    "source": "cpg",
+    "intents": {
+      "intent_stride": 0.5,
+      "intent_support_left": 0.65,
+      "intent_support_right": 0.5,
+      "intent_torso_forward": 0.5,
+      "intent_gait_coupling": 0.5,
+      "intent_arm_counterbalance": 0.5,
+      "intent_stop_recover": 0.5,
+      "intent_reach_right": 0.5,
+      "intent_reach_left": 0.5,
+      "intent_grasp": 0.5,
+      "intent_look_at": 0.5,
+      "intent_lean_forward": 0.5,
+      "intent_wave": 0.5
+    },
+    "joint_targets": {
+      "lhip": 0.46908110223715155,
+      "rhip": 0.4206893702391735,
+      "lknee": 0.5466737814473445,
+      "rknee": 0.5670431955384548,
+      "lankle": 0.5555773746915018,
+      "rankle": 0.5346209228950922
+    },
+    "gait_phase_l": 0.5027946512060376,
+    "gait_phase_r": 0.1675081158838771,
+    "foot_contact_l": 0.6381053287121985,
+    "foot_contact_r": 0.6318061473882861,
+    "support_bias": 1.0,
+    "motor_drive_l": 0.851196809789505,
+    "motor_drive_r": 0.9745550595321855,
+    "posture_stability": 0.9278001239362781,
+    "support_leg": "left",
+    "history_len": 160
+  },
+  "hierarchical_pe": null,
+  "skills": {
+    "enabled": true,
+    "active": null,
+    "n_skills": 8,
+    "skills": [
+      {
+        "name": "stand_up",
+        "uses": 0,
+        "success_rate": 0.5,
+        "goals": [
+          "stand"
+        ]
+      },
+      {
+        "name": "stabilize_stance",
+        "uses": 1,
+        "success_rate": 0.55,
+        "goals": [
+          "stand"
+        ]
+      },
+      {
+        "name": "hold_stance",
+        "uses": 1,
+        "success_rate": 0.45,
+        "goals": [
+          "stand"
+        ]
+      },
+      {
+        "name": "step_forward_L",
+        "uses": 73,
+        "success_rate": 1.0,
+        "goals": [
+          "walk"
+        ]
+      },
+      {
+        "name": "step_forward_R",
+        "uses": 75,
+        "success_rate": 1.0,
+        "goals": [
+          "walk"
+        ]
+      },
+      {
+        "name": "reach_object",
+        "uses": 0,
+        "success_rate": 0.5,
+        "goals": [
+          "delivery",
+          "manipulate"
+        ]
+      },
+      {
+        "name": "grasp_object",
+        "uses": 0,
+        "success_rate": 0.5,
+        "goals": [
+          "delivery",
+          "manipulate"
+        ]
+      },
+      {
+        "name": "place_object",
+        "uses": 0,
+        "success_rate": 0.5,
+        "goals": [
+          "delivery",
+          "manipulate"
+        ]
+      }
+    ],
+    "history_len": 150,
+    "chain": [],
+    "chain_max_depth": 4,
+    "chain_pe_max": 0.25
+  },
+  "motor_cortex": {
+    "cpg_weight": 1.0,
+    "annealing_enabled": false,
+    "quality_ema": 0.7882,
+    "posture_ema": 0.9534,
+    "total_uses": 960,
+    "annealing_ticks": 0,
+    "n_programs": 7,
+    "spawn_history": [
+      "walk",
+      "balance",
+      "recovery",
+      "reach_right",
+      "reach_left",
+      "head_gaze",
+      "spine_posture"
+    ],
+    "abstract_nodes": {
+      "mc_walk_drive": 0.7884,
+      "mc_balance_signal": 0.9278,
+      "mc_cpg_weight": 0.95,
+      "mc_cortex_ready": 0.95,
+      "mc_upper_drive": 0.65
+    },
+    "programs": {
+      "walk": {
+        "name": "walk",
+        "uses": 960,
+        "train_steps": 119,
+        "mean_reward": 0.5779,
+        "performance": 0.577,
+        "active": true,
+        "buffer_size": 256
+      },
+      "balance": {
+        "name": "balance",
+        "uses": 960,
+        "train_steps": 119,
+        "mean_reward": 0.5779,
+        "performance": 0.577,
+        "active": true,
+        "buffer_size": 256
+      },
+      "recovery": {
+        "name": "recovery",
+        "uses": 960,
+        "train_steps": 119,
+        "mean_reward": 0.5779,
+        "performance": 0.577,
+        "active": true,
+        "buffer_size": 256
+      },
+      "reach_right": {
+        "name": "reach_right",
+        "uses": 960,
+        "train_steps": 119,
+        "mean_reward": 0.5779,
+        "performance": 0.577,
+        "active": true,
+        "buffer_size": 256
+      },
+      "reach_left": {
+        "name": "reach_left",
+        "uses": 960,
+        "train_steps": 119,
+        "mean_reward": 0.5779,
+        "performance": 0.577,
+        "active": true,
+        "buffer_size": 256
+      },
+      "head_gaze": {
+        "name": "head_gaze",
+        "uses": 960,
+        "train_steps": 119,
+        "mean_reward": 0.5779,
+        "performance": 0.577,
+        "active": true,
+        "buffer_size": 256
+      },
+      "spine_posture": {
+        "name": "spine_posture",
+        "uses": 960,
+        "train_steps": 119,
+        "mean_reward": 0.5779,
+        "performance": 0.577,
+        "active": true,
+        "buffer_size": 256
+      }
+    }
+  },
+  "concepts": [
+    {
+      "id": "c0",
+      "pattern": [
+        "intent_stride",
+        "@hip",
+        "@knee",
+        "@ankle"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.716,
+      "graph_node": null
+    },
+    {
+      "id": "c1",
+      "pattern": [
+        "@hip",
+        "@knee",
+        "com_z",
+        "posture_stability"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.4468,
+      "graph_node": null
+    },
+    {
+      "id": "c2",
+      "pattern": [
+        "intent_stride",
+        "@hip",
+        "@knee",
+        "com_z"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.4282,
+      "graph_node": null
+    },
+    {
+      "id": "c3",
+      "pattern": [
+        "concept_vis_open_scene",
+        "intent_stride",
+        "@hip",
+        "@knee"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.4032,
+      "graph_node": null
+    },
+    {
+      "id": "c4",
+      "pattern": [
+        "l1_motor_support_bias_mean",
+        "intent_stop_recover",
+        "@knee",
+        "@ankle"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.3974,
+      "graph_node": null
+    },
+    {
+      "id": "c5",
+      "pattern": [
+        "@shoulder",
+        "intent_stop_recover",
+        "@knee",
+        "@ankle"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.3953,
+      "graph_node": null
+    },
+    {
+      "id": "c6",
+      "pattern": [
+        "concept_vis_open_scene",
+        "intent_stride",
+        "@knee",
+        "@ankle"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.376,
+      "graph_node": null
+    },
+    {
+      "id": "c7",
+      "pattern": [
+        "intent_stride",
+        "@hip",
+        "com_z",
+        "posture_stability"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.1575,
+      "graph_node": null
+    },
+    {
+      "id": "c8",
+      "pattern": [
+        "intent_stop_recover",
+        "@knee",
+        "com_z",
+        "posture_stability"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.1558,
+      "graph_node": null
+    },
+    {
+      "id": "c9",
+      "pattern": [
+        "intent_stride",
+        "@knee",
+        "com_z",
+        "posture_stability"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.1355,
+      "graph_node": null
+    },
+    {
+      "id": "c10",
+      "pattern": [
+        "@knee",
+        "com_z",
+        "posture_stability",
+        "l1_motor_intent_reach_left_mean"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.135,
+      "graph_node": null
+    },
+    {
+      "id": "c11",
+      "pattern": [
+        "@hip",
+        "com_z",
+        "posture_stability",
+        "l1_motor_intent_reach_left_mean"
+      ],
+      "uses": 2,
+      "alpha_mean": 0.1297,
+      "graph_node": null
+    }
+  ],
+  "memory": {
+    "autosave_every": 2500,
+    "default_path": "C:\\Users\\Andrey\\Desktop\\agi\\rkk\\backend\\state\\autosave.rkk"
+  },
+  "embodied_reward": null,
+  "visual_grounding": {
+    "enabled": false,
+    "total_updates": 0,
+    "total_edges_injected": 0,
+    "n_grounding_pairs": 0,
+    "n_confirmed": 0,
+    "slot_to_joint": {},
+    "slot_to_score": {},
+    "last_tick": -999999
+  },
+  "episodic_memory": {
+    "enabled": true,
+    "living_trace": true,
+    "total_falls": 0,
+    "total_successes": 0,
+    "buffered_falls": 0,
+    "buffered_successes": 0,
+    "in_recovery": false,
+    "n_patterns": 0,
+    "patterns": [],
+    "recent_fall_causes": [],
+    "timeline_len": 1024,
+    "semantic_narrative_preview": [
+      "[window 282\u2013401] mean_posture=0.97, falls_window=0/120",
+      "[window 682\u2013801] mean_posture=0.96, falls_window=0/120",
+      "[window 1082\u20131201] mean_posture=0.95, falls_window=0/120"
+    ]
+  },
+  "proprioception": {
+    "enabled": true,
+    "abstracts": {
+      "proprio_balance": 0.4823,
+      "proprio_gait_phase": 0.4729,
+      "proprio_left_leg_load": 0.4996,
+      "proprio_right_leg_load": 0.4905,
+      "proprio_arm_counterbalance": 0.5053,
+      "proprio_anomaly": 0.5269
+    },
+    "anomaly": 0.5269,
+    "empowerment": 0.5,
+    "train_steps": 32,
+    "mean_loss": 0.0,
+    "empowerment_estimator": {
+      "mean_empowerment": 0.5,
+      "k_steps": 4,
+      "m_samples": 8,
+      "history_len": 0
+    }
+  },
+  "reward_coordinator": {
+    "enabled": false,
+    "replaced_by": "intrinsic_objective"
+  },
+  "intrinsic_objective": {
+    "enabled": true,
+    "total_steps": 29,
+    "recent_reward": 0.564609,
+    "causal_surprise": {
+      "total_computations": 29,
+      "total_discoveries": 1,
+      "discovery_rate": 0.0345,
+      "compression_ema": 0.00856,
+      "surprise_ema": 0.38196,
+      "recent_reward_mean": 0.44173,
+      "surprise_is_high": false,
+      "compression_stagnant": false
+    },
+    "goal_imagination": {
+      "current_goal": {
+        "target_var": "intent_reach_left",
+        "target_val": 0.8,
+        "expected_gain": 1.636835200713449e-08,
+        "n_interventions_at_gen": 21
+      },
+      "goal_age": 8,
+      "goal_ttl": 20,
+      "total_goals_generated": 2,
+      "imagination_accuracy": 0.0,
+      "recent_goals": [
+        {
+          "target_var": "phys_intent_lean_forward",
+          "target_val": 0.2,
+          "expected_gain": 8.999912637364105e-08,
+          "n_interventions_at_gen": 1
+        },
+        {
+          "target_var": "intent_reach_left",
+          "target_val": 0.8,
+          "expected_gain": 1.636835200713449e-08,
+          "n_interventions_at_gen": 21
+        }
+      ]
+    },
+    "variable_discovery": {
+      "total_discoveries": 0,
+      "nodes_tracked": 96,
+      "high_error_nodes": [
+        [
+          "phys_support_bias",
+          0.9849
+        ],
+        [
+          "phys_posture_stability",
+          0.9678
+        ],
+        [
+          "phys_target_dist",
+          0.9669
+        ]
+      ],
+      "recent_discoveries": []
+    },
+    "affective_drive": {
+      "w_stress": 4.0,
+      "w_energy": 0.15
+    }
+  },
+  "timescale": {
+    "enabled": true,
+    "tick_count": 1584,
+    "dispatcher": {
+      "periods": {
+        "0": 3,
+        "1": 30,
+        "2": 300,
+        "3": 3600
+      },
+      "run_counts": {
+        "0": 528,
+        "1": 53,
+        "2": 6,
+        "3": 0
+      },
+      "last_run": {
+        "0": 1588,
+        "1": 1567,
+        "2": 1507,
+        "3": -9999
+      }
+    },
+    "propagator": {},
+    "pe_boundary": {
+      "pe_ema": 0.0,
+      "dynamic_period": null,
+      "n_boundaries": 0
+    },
+    "buffers": {
+      "reflex": {
+        "level": 0,
+        "name": "reflex",
+        "buf_len": 64,
+        "last_obs_keys": [
+          "foot_contact_l",
+          "foot_contact_r",
+          "gait_phase_l",
+          "gait_phase_r",
+          "com_z",
+          "torso_pitch"
+        ],
+        "ema_keys": [
+          "foot_contact_l",
+          "foot_contact_r",
+          "gait_phase_l",
+          "gait_phase_r",
+          "proprio_balance",
+          "proprio_gait_phase",
+          "proprio_left_leg_load",
+          "proprio_right_leg_load",
+          "proprio_arm_counterbalance",
+          "proprio_anomaly",
+          "com_z",
+          "torso_pitch"
+        ]
+      },
+      "motor": {
+        "level": 1,
+        "name": "motor",
+        "buf_len": 32,
+        "last_obs_keys": [
+          "posture_stability",
+          "support_bias",
+          "com_x",
+          "mc_walk_drive",
+          "mc_balance_signal",
+          "intent_stride",
+          "intent_torso_forward",
+          "intent_support_left",
+          "intent_support_right"
+        ],
+        "ema_keys": [
+          "posture_stability",
+          "support_bias",
+          "intent_stride",
+          "intent_torso_forward",
+          "intent_support_left",
+          "intent_support_right",
+          "com_x",
+          "mc_walk_drive",
+          "mc_balance_signal"
+        ]
+      },
+      "cognit": {
+        "level": 2,
+        "name": "cognit",
+        "buf_len": 6,
+        "last_obs_keys": [
+          "intent_gait_coupling",
+          "intent_arm_counterbalance",
+          "intent_stop_recover",
+          "proprio_empowerment"
+        ],
+        "ema_keys": [
+          "intent_gait_coupling",
+          "intent_arm_counterbalance",
+          "intent_stop_recover",
+          "proprio_empowerment"
+        ]
+      },
+      "reflect": {
+        "level": 3,
+        "name": "reflect",
+        "buf_len": 0,
+        "last_obs_keys": [],
+        "ema_keys": []
+      }
+    }
+  },
+  "inner_voice": {
+    "enabled": true,
+    "total_inferences": 6,
+    "train_steps": 0,
+    "distill_loss_mean": 0.0,
+    "active_concepts": [],
+    "concept_str": "UNKNOWN",
+    "active_concept_nodes": 0,
+    "train_buf_len": 27,
+    "concept_store": {
+      "vocab_size": 512,
+      "concept_dim": 64,
+      "n_domains": 13,
+      "defined_concepts": 70,
+      "latent_slots": 442
+    }
+  },
+  "sleep": {
+    "enabled": true,
+    "is_sleeping": false,
+    "current_phase": "AWAKE",
+    "sleep_count": 0,
+    "last_sleep_tick": 0,
+    "total_sleep_ticks": 0,
+    "falls_since_sleep": 0,
+    "fall_threshold": 50,
+    "every_ticks": 2000,
+    "recent_sessions": []
+  },
+  "physical_curriculum": {
+    "mastered": [],
+    "failed": [],
+    "active_skill": null,
+    "unlocked_count": 1,
+    "total_skills": 21,
+    "progress_pct": 0.0
+  },
+  "persistence": null,
+  "verbal": {
+    "enabled": true,
+    "total_messages": 11,
+    "total_asks": 0,
+    "total_replies": 0,
+    "total_verbal_reward": 0.0,
+    "pending_ask": false,
+    "last_message": {
+      "id": "1507_OBSERVE",
+      "tick": 1507,
+      "type": "OBSERVE",
+      "text": "\u0418\u0434\u0443 \u043a \u043e\u0431\u044a\u0435\u043a\u0442\u0443",
+      "concepts": [],
+      "curiosity": 0.5,
+      "posture": 0.95,
+      "timestamp": 1784443805.4893384,
+      "human_replied": false,
+      "human_reply": "",
+      "reward": 0.0
+    }
+  },
+  "grounded_language": {
+    "enabled": true,
+    "n_channels": 8,
+    "embed_dim": 64,
+    "store_size": 14,
+    "nodes_wired": true,
+    "align_steps": 1,
+    "last_input": "\u043f\u043e\u0434\u043e\u0439\u0434\u0438 \u043a \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u043e\u043c\u0443 \u043e\u0431\u044c\u0435\u043a\u0442\u0443 \u0441 \u043f\u043b\u043e\u0441\u043a\u0438\u043c \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u043c \u0441\u0432\u0435\u0440\u0445\u0443 \u0438 \u0434\u043e\u0442\u0440\u043e\u043d\u044c\u0441\u044f \u0434\u043e \u043d\u0435\u0433\u043e",
+    "last_output": "\u042f \u0431\u0443\u0434\u0443 \u0434\u0432\u0438\u0433\u0430\u0442\u044c\u0441\u044f \u0432\u043f\u0435\u0440\u0435\u0434.",
+    "embed_model": "nomic-embed-text:latest",
+    "speech_model": "qwen3.5:0.8b",
+    "task_binding": {
+      "enabled": true,
+      "active": {
+        "text": "\u043f\u043e\u0434\u043e\u0439\u0434\u0438 \u043a \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u043e\u043c\u0443 \u043e\u0431\u044c\u0435\u043a\u0442\u0443 \u0441 \u043f\u043b\u043e\u0441\u043a\u0438\u043c \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u043c \u0441\u0432\u0435\u0440\u0445\u0443 \u0438 \u0434\u043e\u0442\u0440\u043e\u043d\u044c\u0441\u044f \u0434\u043e \u043d\u0435\u0433\u043e.",
+        "status": "active",
+        "tick_started": 645,
+        "tick_deadline": 3045,
+        "last_pe": 1.0,
+        "n_expected_keys": 0,
+        "expected_state": {},
+        "diag": {},
+        "goal": {
+          "text": "\u043f\u043e\u0434\u043e\u0439\u0434\u0438 \u043a \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u043e\u043c\u0443 \u043e\u0431\u044c\u0435\u043a\u0442\u0443 \u0441 \u043f\u043b\u043e\u0441\u043a\u0438\u043c \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u043c \u0441\u0432\u0435\u0440\u0445\u0443 \u0438 \u0434\u043e\u0442\u0440\u043e\u043d\u044c\u0441\u044f \u0434\u043e \u043d\u0435\u0433\u043e.",
+          "target_ref": "vision:slot_7",
+          "predicates": [
+            {
+              "kind": "reduce_distance",
+              "target_ref": "vision:slot_7",
+              "key": null,
+              "target_value": 0.55,
+              "tolerance": 0.25,
+              "weight": 1.0
+            },
+            {
+              "kind": "contact",
+              "target_ref": "vision:slot_7",
+              "key": null,
+              "target_value": 1.0,
+              "tolerance": 0.5,
+              "weight": 1.0
+            }
+          ],
+          "confidence": 0.9569124579429626,
+          "wm_trusted": true,
+          "diagnostics": {
+            "needs_target": true,
+            "kind_scores": {
+              "reduce_distance": 0.877,
+              "contact": 0.9138,
+              "displace": 0.8333,
+              "state_key": 0.813
+            },
+            "kind_probs": {
+              "contact": 0.2638,
+              "reduce_distance": 0.2543,
+              "displace": 0.2434,
+              "state_key": 0.2385
+            },
+            "selected_kinds": [
+              "reduce_distance",
+              "contact"
+            ],
+            "primary_kind": "contact",
+            "clauses": [
+              {
+                "clause": "\u043f\u043e\u0434\u043e\u0439\u0434\u0438 \u043a \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u043e\u043c\u0443 \u043e\u0431\u044c\u0435\u043a\u0442\u0443 \u0441 \u043f\u043b\u043e\u0441\u043a\u0438\u043c \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u043c \u0441\u0432\u0435\u0440\u0445\u0443",
+                "kind_scores": {
+                  "reduce_distance": 0.877,
+                  "contact": 0.8297,
+                  "displace": 0.8333,
+                  "state_key": 0.813
+                },
+                "selected": [
+                  "reduce_distance"
+                ]
+              },
+              {
+                "clause": "\u0434\u043e\u0442\u0440\u043e\u043d\u044c\u0441\u044f \u0434\u043e \u043d\u0435\u0433\u043e",
+                "kind_scores": {
+                  "reduce_distance": 0.7898,
+                  "contact": 0.9138,
+                  "displace": 0.7834,
+                  "state_key": 0.8019
+                },
+                "selected": [
+                  "contact"
+                ]
+              }
+            ],
+            "composite": true,
+            "wm_trust_pe_thresh": 0.35,
+            "anchor_pe_mean": 0.0166,
+            "degenerate": false,
+            "n_expected_keys": 0,
+            "interventions": [
+              "intent_grasp",
+              "intent_reach_left",
+              "intent_reach_right",
+              "intent_stride",
+              "intent_torso_forward"
+            ],
+            "anchored_keys": 164
+          }
+        }
+      },
+      "goal": {
+        "confidence": 0.9569124579429626,
+        "wm_trusted": true,
+        "n_predicates": 2,
+        "kinds": [
+          "reduce_distance",
+          "contact"
+        ],
+        "needs_target": true
+      }
+    },
+    "task_tree": {
+      "active": true,
+      "session_id": "a7f6b59e-e82c-4e56-b25f-ac6470b92747",
+      "command_text": "\u043f\u043e\u0434\u043e\u0439\u0434\u0438 \u043a \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u043e\u043c\u0443 \u043e\u0431\u044c\u0435\u043a\u0442\u0443 \u0441 \u043f\u043b\u043e\u0441\u043a\u0438\u043c \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u043c \u0441\u0432\u0435\u0440\u0445\u0443 \u0438 \u0434\u043e\u0442\u0440\u043e\u043d\u044c\u0441\u044f \u0434\u043e \u043d\u0435\u0433\u043e.",
+      "root_status": "active",
+      "current_node_id": "n3",
+      "progress": 0.25,
+      "nodes": [
+        {
+          "id": "n1",
+          "label": "\u043f\u043e\u0434\u043e\u0439\u0434\u0438 \u043a \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u043e\u043c\u0443 \u043e\u0431\u044c\u0435\u043a\u0442\u0443 \u0441 \u043f\u043b\u043e\u0441\u043a\u0438\u043c \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u043c \u0441\u0432\u0435\u0440\u0445\u0443 \u0438 \u0434\u043e\u0442\u0440\u043e\u043d\u044c\u0441\u044f \u0434\u043e \u043d\u0435\u0433\u043e.",
+          "kind": "goal",
+          "status": "active",
+          "target_ref": "vision:slot_7",
+          "tick_started": 645,
+          "tick_deadline": 3045,
+          "last_pe": null,
+          "attempts": 0,
+          "failure_reason": null,
+          "motor_targets": {},
+          "expected_state": {},
+          "children": [
+            {
+              "id": "n2",
+              "label": "Resolve target",
+              "kind": "resolve_target",
+              "status": "done",
+              "target_ref": "vision:slot_7",
+              "tick_started": 645,
+              "tick_deadline": 3045,
+              "last_pe": null,
+              "attempts": 1,
+              "failure_reason": null,
+              "motor_targets": {},
+              "expected_state": {},
+              "children": []
+            },
+            {
+              "id": "n3",
+              "label": "Approach",
+              "kind": "approach",
+              "status": "active",
+              "target_ref": "vision:slot_7",
+              "tick_started": 660,
+              "tick_deadline": 3045,
+              "last_pe": null,
+              "attempts": 1,
+              "failure_reason": null,
+              "motor_targets": {
+                "intent_stride": 0.62,
+                "intent_torso_forward": 0.55
+              },
+              "expected_state": {
+                "stop_distance": 0.55
+              },
+              "children": []
+            },
+            {
+              "id": "n4",
+              "label": "Reach and contact",
+              "kind": "reach_contact",
+              "status": "pending",
+              "target_ref": "vision:slot_7",
+              "tick_started": null,
+              "tick_deadline": null,
+              "last_pe": null,
+              "attempts": 0,
+              "failure_reason": null,
+              "motor_targets": {
+                "intent_reach_right": 0.58,
+                "intent_grasp": 0.45
+              },
+              "expected_state": {
+                "contact_threshold": 1.0
+              },
+              "children": []
+            },
+            {
+              "id": "n5",
+              "label": "Verify goal",
+              "kind": "verify_goal",
+              "status": "pending",
+              "target_ref": "vision:slot_7",
+              "tick_started": null,
+              "tick_deadline": null,
+              "last_pe": null,
+              "attempts": 0,
+              "failure_reason": null,
+              "motor_targets": {},
+              "expected_state": {},
+              "children": []
+            }
+          ]
+        }
+      ],
+      "cleared": false,
+      "tick": 1590,
+      "enabled": true,
+      "manipulation": {
+        "mode": "vision",
+        "reason": "ok",
+        "candidates": [
+          {
+            "slot_id": "slot_7",
+            "score": 0.1164,
+            "label": "cylinder",
+            "u": 0.5006457761550943,
+            "v": 0.49940827482690414,
+            "match_label": 0.0,
+            "match_concept": 0.0,
+            "uv_valid": false
+          },
+          {
+            "slot_id": "slot_3",
+            "score": 0.1159,
+            "label": "cylinder",
+            "u": 0.5005197594563167,
+            "v": 0.5009733269611994,
+            "match_label": 0.0,
+            "match_concept": 0.0,
+            "uv_valid": false
+          },
+          {
+            "slot_id": "slot_1",
+            "score": 0.1157,
+            "label": "cylinder",
+            "u": 0.5002569784255078,
+            "v": 0.50195587707373,
+            "match_label": 0.0,
+            "match_concept": 0.0,
+            "uv_valid": false
+          },
+          {
+            "slot_id": "slot_0",
+            "score": 0.1155,
+            "label": "cylinder",
+            "u": 0.49869015061606964,
+            "v": 0.49884907496161757,
+            "match_label": 0.0,
+            "match_concept": 0.0,
+            "uv_valid": false
+          },
+          {
+            "slot_id": "slot_2",
+            "score": 0.1154,
+            "label": "cylinder",
+            "u": 0.5021590050154676,
+            "v": 0.5003140377967308,
+            "match_label": 0.0,
+            "match_concept": 0.0,
+            "uv_valid": false
+          }
+        ],
+        "ontology": {
+          "catalog_size": 19,
+          "best_key": "cylinder",
+          "best_description": "\u0446\u0438\u043b\u0438\u043d\u0434\u0440 \u043a\u043e\u043b\u043e\u043d\u043d\u0430 \u0431\u043e\u0447\u043a\u0430 \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u0430\u044f \u0444\u043e\u0440\u043c\u0430",
+          "best_score": 1.1082761734724045
+        },
+        "geometry_fallback": "objectness_peak",
+        "ontology_score": 1.1083,
+        "slot_id": "slot_7",
+        "label": "cylinder",
+        "range_m": 3.809274435043335,
+        "range_conf": 0.6727701931851845,
+        "u": 0.9748427672955975,
+        "v": 0.5042016806722689,
+        "resolved": "vision:slot_7",
+        "guided_uv": {
+          "u": 0.9748427672955975,
+          "v": 0.5042016806722689
+        },
+        "resolve_mode": "vision",
+        "oracle_eval": {
+          "ref": "prop_1",
+          "reason": "resolved"
+        },
+        "oracle_dist_m": 2.165733108688589,
+        "vision_range_m": 3.809274435043335
+      }
+    }
+  },
+  "task_tree": {
+    "active": true,
+    "session_id": "a7f6b59e-e82c-4e56-b25f-ac6470b92747",
+    "command_text": "\u043f\u043e\u0434\u043e\u0439\u0434\u0438 \u043a \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u043e\u043c\u0443 \u043e\u0431\u044c\u0435\u043a\u0442\u0443 \u0441 \u043f\u043b\u043e\u0441\u043a\u0438\u043c \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u043c \u0441\u0432\u0435\u0440\u0445\u0443 \u0438 \u0434\u043e\u0442\u0440\u043e\u043d\u044c\u0441\u044f \u0434\u043e \u043d\u0435\u0433\u043e.",
+    "root_status": "active",
+    "current_node_id": "n3",
+    "progress": 0.25,
+    "nodes": [
+      {
+        "id": "n1",
+        "label": "\u043f\u043e\u0434\u043e\u0439\u0434\u0438 \u043a \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u043e\u043c\u0443 \u043e\u0431\u044c\u0435\u043a\u0442\u0443 \u0441 \u043f\u043b\u043e\u0441\u043a\u0438\u043c \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u043c \u0441\u0432\u0435\u0440\u0445\u0443 \u0438 \u0434\u043e\u0442\u0440\u043e\u043d\u044c\u0441\u044f \u0434\u043e \u043d\u0435\u0433\u043e.",
+        "kind": "goal",
+        "status": "active",
+        "target_ref": "vision:slot_7",
+        "tick_started": 645,
+        "tick_deadline": 3045,
+        "last_pe": null,
+        "attempts": 0,
+        "failure_reason": null,
+        "motor_targets": {},
+        "expected_state": {},
+        "children": [
+          {
+            "id": "n2",
+            "label": "Resolve target",
+            "kind": "resolve_target",
+            "status": "done",
+            "target_ref": "vision:slot_7",
+            "tick_started": 645,
+            "tick_deadline": 3045,
+            "last_pe": null,
+            "attempts": 1,
+            "failure_reason": null,
+            "motor_targets": {},
+            "expected_state": {},
+            "children": []
+          },
+          {
+            "id": "n3",
+            "label": "Approach",
+            "kind": "approach",
+            "status": "active",
+            "target_ref": "vision:slot_7",
+            "tick_started": 660,
+            "tick_deadline": 3045,
+            "last_pe": null,
+            "attempts": 1,
+            "failure_reason": null,
+            "motor_targets": {
+              "intent_stride": 0.62,
+              "intent_torso_forward": 0.55
+            },
+            "expected_state": {
+              "stop_distance": 0.55
+            },
+            "children": []
+          },
+          {
+            "id": "n4",
+            "label": "Reach and contact",
+            "kind": "reach_contact",
+            "status": "pending",
+            "target_ref": "vision:slot_7",
+            "tick_started": null,
+            "tick_deadline": null,
+            "last_pe": null,
+            "attempts": 0,
+            "failure_reason": null,
+            "motor_targets": {
+              "intent_reach_right": 0.58,
+              "intent_grasp": 0.45
+            },
+            "expected_state": {
+              "contact_threshold": 1.0
+            },
+            "children": []
+          },
+          {
+            "id": "n5",
+            "label": "Verify goal",
+            "kind": "verify_goal",
+            "status": "pending",
+            "target_ref": "vision:slot_7",
+            "tick_started": null,
+            "tick_deadline": null,
+            "last_pe": null,
+            "attempts": 0,
+            "failure_reason": null,
+            "motor_targets": {},
+            "expected_state": {},
+            "children": []
+          }
+        ]
+      }
+    ],
+    "cleared": false,
+    "tick": 1590,
+    "enabled": true,
+    "manipulation": {
+      "mode": "vision",
+      "reason": "ok",
+      "candidates": [
+        {
+          "slot_id": "slot_7",
+          "score": 0.1164,
+          "label": "cylinder",
+          "u": 0.5006457761550943,
+          "v": 0.49940827482690414,
+          "match_label": 0.0,
+          "match_concept": 0.0,
+          "uv_valid": false
+        },
+        {
+          "slot_id": "slot_3",
+          "score": 0.1159,
+          "label": "cylinder",
+          "u": 0.5005197594563167,
+          "v": 0.5009733269611994,
+          "match_label": 0.0,
+          "match_concept": 0.0,
+          "uv_valid": false
+        },
+        {
+          "slot_id": "slot_1",
+          "score": 0.1157,
+          "label": "cylinder",
+          "u": 0.5002569784255078,
+          "v": 0.50195587707373,
+          "match_label": 0.0,
+          "match_concept": 0.0,
+          "uv_valid": false
+        },
+        {
+          "slot_id": "slot_0",
+          "score": 0.1155,
+          "label": "cylinder",
+          "u": 0.49869015061606964,
+          "v": 0.49884907496161757,
+          "match_label": 0.0,
+          "match_concept": 0.0,
+          "uv_valid": false
+        },
+        {
+          "slot_id": "slot_2",
+          "score": 0.1154,
+          "label": "cylinder",
+          "u": 0.5021590050154676,
+          "v": 0.5003140377967308,
+          "match_label": 0.0,
+          "match_concept": 0.0,
+          "uv_valid": false
+        }
+      ],
+      "ontology": {
+        "catalog_size": 19,
+        "best_key": "cylinder",
+        "best_description": "\u0446\u0438\u043b\u0438\u043d\u0434\u0440 \u043a\u043e\u043b\u043e\u043d\u043d\u0430 \u0431\u043e\u0447\u043a\u0430 \u0446\u0438\u043b\u0438\u043d\u0434\u0440\u0438\u0447\u0435\u0441\u043a\u0430\u044f \u0444\u043e\u0440\u043c\u0430",
+        "best_score": 1.1082761734724045
+      },
+      "geometry_fallback": "objectness_peak",
+      "ontology_score": 1.1083,
+      "slot_id": "slot_7",
+      "label": "cylinder",
+      "range_m": 3.809274435043335,
+      "range_conf": 0.6727701931851845,
+      "u": 0.9748427672955975,
+      "v": 0.5042016806722689,
+      "resolved": "vision:slot_7",
+      "guided_uv": {
+        "u": 0.9748427672955975,
+        "v": 0.5042016806722689
+      },
+      "resolve_mode": "vision",
+      "oracle_eval": {
+        "ref": "prop_1",
+        "reason": "resolved"
+      },
+      "oracle_dist_m": 2.165733108688589,
+      "vision_range_m": 3.809274435043335
+    }
+  },
+  "latent_confounder": {
+    "c4_enabled": false,
+    "c4_active": false
+  },
+  "learned_roles": {
+    "enabled": false,
+    "promote_min_worlds": 2,
+    "entries": []
+  },
+  "visual_voice": {
+    "enabled": true,
+    "total_updates": 27,
+    "active_visual_concepts": [
+      [
+        "MULTIPLE_OBJECTS",
+        0.7
+      ],
+      [
+        "LOW_VISUAL_SURPRISE",
+        0.6
+      ],
+      [
+        "SYMMETRIC_SCENE",
+        0.55
+      ],
+      [
+        "SAME_AS_LAST",
+        0.5
+      ],
+      [
+        "OBJECT_STATIC",
+        0.48
+      ]
+    ],
+    "world_description": "\u041d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u043e\u0431\u044a\u0435\u043a\u0442\u043e\u0432.",
+    "injected_nodes": 5,
+    "observe_key": null
+  },
+  "slot_labeler": {
+    "enabled": true,
+    "total_updates": 27,
+    "active_concepts": [
+      [
+        "MULTIPLE_OBJECTS",
+        0.7
+      ],
+      [
+        "LOW_VISUAL_SURPRISE",
+        0.6
+      ],
+      [
+        "SYMMETRIC_SCENE",
+        0.55
+      ],
+      [
+        "SAME_AS_LAST",
+        0.5
+      ],
+      [
+        "OBJECT_STATIC",
+        0.48
+      ]
+    ],
+    "n_slots_tracked": 2,
+    "world_description": "\u041d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u043e\u0431\u044a\u0435\u043a\u0442\u043e\u0432."
+  },
+  "world_bridge": {
+    "enabled": false
+  },
+  "phase1": {
+    "read_only_macro_prefix": "concept_",
+    "discovery_plateau_ticks": 1583,
+    "discovery_plateau_required": 0,
+    "concept_edge_alpha_min": 0.0,
+    "urdf_frozen_pairs": 9,
+    "dag_mask_frozen": true
+  },
+  "phase2": {
+    "hierarchical_graph_env": true,
+    "active": true,
+    "discovery_new_frac": 1.0,
+    "discovery_new_count": 1,
+    "discovery_reactivated_count": 0,
+    "edge_age_at_activation": [
+      0
+    ],
+    "l_bridge_last": 0.0,
+    "l1_chains": [
+      "left_leg",
+      "right_leg",
+      "left_arm",
+      "right_arm",
+      "spine",
+      "motor"
+    ],
+    "l1_step": 1587,
+    "virtual_nodes": 70,
+    "l1_agg_window": 6,
+    "active_goal": {
+      "var": "intent_torso_forward",
+      "value": 0.68,
+      "horizon": 48
+    },
+    "concept_goals": {},
+    "concept_store": {
+      "kind": "visual_l4",
+      "n_slots": 8,
+      "n_tracked": 0,
+      "queue": 0,
+      "injected": 0
+    },
+    "l4_worker": {
+      "enabled": true,
+      "pending": false,
+      "last_submit_tick": 1560,
+      "last_apply_tick": 0
+    }
+  },
+  "phase5": {
+    "intention_cortex_enabled": true,
+    "meta_causal_enabled": true,
+    "goal_gen_enabled": true,
+    "curriculum_graph_enabled": true,
+    "enabled": true,
+    "tick": 1590,
+    "context": {
+      "macro_hint": "LOCOMOTE_DELIVERY",
+      "graph_patch": {
+        "self_goal_active": 0.88,
+        "self_attention": 0.7425,
+        "intent_stride": 0.549,
+        "intent_torso_forward": 0.528,
+        "intent_gait_coupling": 0.598,
+        "intent_arm_counterbalance": 0.521
+      },
+      "intent_residuals": {
+        "intent_stride": 0.0742,
+        "intent_torso_forward": 0.0424,
+        "intent_gait_coupling": 0.1484,
+        "intent_arm_counterbalance": 0.0318
+      },
+      "horizon_ticks": 371,
+      "primary": {
+        "subgoal_id": "xfer_humanoid_variant_seed_0.2_forward_lean",
+        "var_id": "intent",
+        "target_val": 0.65,
+        "intent_targets": {
+          "intent": 0.65
+        },
+        "world_id": "humanoid_variant",
+        "tick_start": 0,
+        "tick_deadline": 1961,
+        "min_ticks": 400,
+        "source": "curriculum_pending",
+        "priority": 0.55,
+        "status": "active"
+      },
+      "stack_depth": 5,
+      "narrative": "[LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+      "expected_state": {}
+    },
+    "stack": [
+      {
+        "subgoal_id": "xfer_humanoid_variant_seed_0.2_forward_lean",
+        "var_id": "intent",
+        "target_val": 0.65,
+        "intent_targets": {
+          "intent": 0.65
+        },
+        "world_id": "humanoid_variant",
+        "tick_start": 0,
+        "tick_deadline": 1961,
+        "min_ticks": 400,
+        "source": "curriculum_pending",
+        "priority": 0.55,
+        "status": "active"
+      },
+      {
+        "subgoal_id": "xfer_humanoid_variant_seed_0.3_arm_balance",
+        "var_id": "intent",
+        "target_val": 0.7,
+        "intent_targets": {
+          "intent": 0.7
+        },
+        "world_id": "humanoid_variant",
+        "tick_start": 0,
+        "tick_deadline": 2261,
+        "min_ticks": 300,
+        "source": "curriculum_pending",
+        "priority": 0.55,
+        "status": "pending"
+      },
+      {
+        "subgoal_id": "xfer_humanoid_variant_seed_1.0_slow_step",
+        "var_id": "intent",
+        "target_val": 0.58,
+        "intent_targets": {
+          "intent": 0.58
+        },
+        "world_id": "humanoid_variant",
+        "tick_start": 0,
+        "tick_deadline": 2861,
+        "min_ticks": 600,
+        "source": "curriculum_pending",
+        "priority": 0.55,
+        "status": "pending"
+      },
+      {
+        "subgoal_id": "xfer_humanoid_variant_seed_1.1_continuous_walk",
+        "var_id": "intent",
+        "target_val": 0.65,
+        "intent_targets": {
+          "intent": 0.65
+        },
+        "world_id": "humanoid_variant",
+        "tick_start": 0,
+        "tick_deadline": 3661,
+        "min_ticks": 800,
+        "source": "curriculum_pending",
+        "priority": 0.55,
+        "status": "pending"
+      },
+      {
+        "subgoal_id": "xfer_humanoid_variant_seed_1.2_walk_backward",
+        "var_id": "intent",
+        "target_val": 0.55,
+        "intent_targets": {
+          "intent": 0.55
+        },
+        "world_id": "humanoid_variant",
+        "tick_start": 0,
+        "tick_deadline": 4261,
+        "min_ticks": 600,
+        "source": "curriculum_pending",
+        "priority": 0.55,
+        "status": "pending"
+      }
+    ],
+    "completed_recent": [
+      {
+        "subgoal_id": "seed_2.4_kneel_to_stand",
+        "var_id": "intent_torso_forward",
+        "target_val": 0.64,
+        "intent_targets": {
+          "intent_torso_forward": 0.64,
+          "intent_stride": 0.56,
+          "intent_support_left": 0.7,
+          "intent_gait_coupling": 0.8
+        },
+        "world_id": "humanoid",
+        "tick_start": 0,
+        "tick_deadline": 1449,
+        "min_ticks": 500,
+        "source": "curriculum_pending",
+        "priority": 0.55,
+        "status": "completed"
+      },
+      {
+        "subgoal_id": "seed_2.3_sit_to_stand",
+        "var_id": "intent_torso_forward",
+        "target_val": 0.68,
+        "intent_targets": {
+          "intent_torso_forward": 0.68,
+          "intent_stride": 0.5,
+          "intent_gait_coupling": 0.72,
+          "intent_stop_recover": 0.55
+        },
+        "world_id": "humanoid",
+        "tick_start": 947,
+        "tick_deadline": 1455,
+        "min_ticks": 500,
+        "source": "curriculum_active",
+        "priority": 0.9,
+        "status": "completed"
+      },
+      {
+        "subgoal_id": "gen_com_z_1000",
+        "var_id": "com_z",
+        "target_val": 0.4467,
+        "intent_targets": {},
+        "world_id": "humanoid",
+        "tick_start": 1000,
+        "tick_deadline": 1400,
+        "min_ticks": 120,
+        "source": "generated",
+        "priority": 0.674,
+        "status": "completed"
+      },
+      {
+        "subgoal_id": "gen_com_z_1000",
+        "var_id": "com_z",
+        "target_val": 0.4467,
+        "intent_targets": {
+          "com_z": 0.4467
+        },
+        "world_id": "humanoid",
+        "tick_start": 1000,
+        "tick_deadline": 1206,
+        "min_ticks": 200,
+        "source": "curriculum_active",
+        "priority": 0.9,
+        "status": "completed"
+      },
+      {
+        "subgoal_id": "gen_com_z_1200",
+        "var_id": "com_z",
+        "target_val": 0.4466,
+        "intent_targets": {},
+        "world_id": "humanoid",
+        "tick_start": 1200,
+        "tick_deadline": 1600,
+        "min_ticks": 120,
+        "source": "generated",
+        "priority": 0.6731,
+        "status": "completed"
+      },
+      {
+        "subgoal_id": "gen_com_z_1400",
+        "var_id": "com_z",
+        "target_val": 0.4448,
+        "intent_targets": {},
+        "world_id": "humanoid_variant",
+        "tick_start": 1400,
+        "tick_deadline": 1800,
+        "min_ticks": 120,
+        "source": "generated",
+        "priority": 0.6733,
+        "status": "completed"
+      }
+    ],
+    "narrative": [
+      "t1585: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+      "t1586: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+      "t1587: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+      "t1588: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+      "t1589: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+      "t1590: [LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)"
+    ],
+    "goal_generator": {
+      "enabled": true,
+      "active": [],
+      "completed": [
+        {
+          "var_id": "intent_speak_7",
+          "score": 0.3397,
+          "target_val": 0.5,
+          "world_id": "humanoid",
+          "source": "generated",
+          "meta_success_pred": 0.6262,
+          "tick_proposed": 200,
+          "tick_completed": 200,
+          "success_rate": 0.72,
+          "status": "completed"
+        },
+        {
+          "var_id": "phys_intent_lean_forward",
+          "score": 0.2166,
+          "target_val": 0.5,
+          "world_id": "humanoid",
+          "source": "generated",
+          "meta_success_pred": 0.6227,
+          "tick_proposed": 400,
+          "tick_completed": 400,
+          "success_rate": 0.72,
+          "status": "completed"
+        },
+        {
+          "var_id": "intent_speak_7",
+          "score": 0.3428,
+          "target_val": 0.5,
+          "world_id": "humanoid",
+          "source": "generated",
+          "meta_success_pred": 0.6262,
+          "tick_proposed": 600,
+          "tick_completed": 600,
+          "success_rate": 0.72,
+          "status": "completed"
+        },
+        {
+          "var_id": "com_z",
+          "score": 0.8457,
+          "target_val": 0.4432718784315397,
+          "world_id": "humanoid",
+          "source": "generated",
+          "meta_success_pred": 0.6403,
+          "tick_proposed": 800,
+          "tick_completed": 800,
+          "success_rate": 0.72,
+          "status": "completed"
+        },
+        {
+          "var_id": "com_z",
+          "score": 0.838,
+          "target_val": 0.4467186379615192,
+          "world_id": "humanoid",
+          "source": "generated",
+          "meta_success_pred": 0.64,
+          "tick_proposed": 1000,
+          "tick_completed": 1000,
+          "success_rate": 0.72,
+          "status": "completed"
+        },
+        {
+          "var_id": "com_z",
+          "score": 0.7481,
+          "target_val": 0.4466357782020731,
+          "world_id": "humanoid",
+          "source": "generated",
+          "meta_success_pred": 0.6376,
+          "tick_proposed": 1200,
+          "tick_completed": 1200,
+          "success_rate": 0.72,
+          "status": "completed"
+        },
+        {
+          "var_id": "com_z",
+          "score": 0.7656,
+          "target_val": 0.44476624476434024,
+          "world_id": "humanoid_variant",
+          "source": "generated",
+          "meta_success_pred": 0.638,
+          "tick_proposed": 1400,
+          "tick_completed": 1400,
+          "success_rate": 0.72,
+          "status": "completed"
+        }
+      ],
+      "blocked_log": [],
+      "last_propose_tick": 1400,
+      "autonomous_goals_count": 7,
+      "autonomous_goals_mean_success": 0.72,
+      "autonomous_goals_worlds": [
+        "humanoid",
+        "humanoid_variant"
+      ],
+      "autonomous_goals_crossworld_pass": true
+    },
+    "curriculum_graph": {
+      "enabled": true,
+      "frozen_human_curriculum": true,
+      "active_node": "gen_com_z_1400",
+      "active_intent_targets": {
+        "com_z": 0.44476624476434024
+      },
+      "node_count": 54,
+      "generated_count": 7,
+      "completed_generated": [
+        {
+          "node_id": "gen_phys_intent_lean_forward_400",
+          "var_id": "phys_intent_lean_forward",
+          "prerequisites": [
+            "seed_0.0_static_stance"
+          ],
+          "world_id": "humanoid",
+          "source": "generated",
+          "intent_targets": {
+            "phys_intent_lean_forward": 0.5
+          },
+          "min_ticks": 200,
+          "status": "completed",
+          "success_rate": 0.72,
+          "tick_started": 0,
+          "tick_completed": 610
+        },
+        {
+          "node_id": "gen_intent_speak_7_600",
+          "var_id": "intent_speak_7",
+          "prerequisites": [
+            "seed_0.1_weight_shift"
+          ],
+          "world_id": "humanoid",
+          "source": "generated",
+          "intent_targets": {
+            "intent_speak_7": 0.5
+          },
+          "min_ticks": 200,
+          "status": "completed",
+          "success_rate": 0.72,
+          "tick_started": 0,
+          "tick_completed": 612
+        },
+        {
+          "node_id": "gen_com_z_800",
+          "var_id": "com_z",
+          "prerequisites": [
+            "seed_2.1_squat_hold"
+          ],
+          "world_id": "humanoid",
+          "source": "generated",
+          "intent_targets": {
+            "com_z": 0.4432718784315397
+          },
+          "min_ticks": 200,
+          "status": "completed",
+          "success_rate": 0.72,
+          "tick_started": 0,
+          "tick_completed": 948
+        },
+        {
+          "node_id": "gen_com_z_1000",
+          "var_id": "com_z",
+          "prerequisites": [],
+          "world_id": "humanoid",
+          "source": "generated",
+          "intent_targets": {
+            "com_z": 0.4467186379615192
+          },
+          "min_ticks": 200,
+          "status": "completed",
+          "success_rate": 0.72,
+          "tick_started": 1000,
+          "tick_completed": 1006
+        },
+        {
+          "node_id": "gen_com_z_1200",
+          "var_id": "com_z",
+          "prerequisites": [],
+          "world_id": "humanoid",
+          "source": "generated",
+          "intent_targets": {
+            "com_z": 0.4466357782020731
+          },
+          "min_ticks": 200,
+          "status": "completed",
+          "success_rate": 0.55,
+          "tick_started": 1200,
+          "tick_completed": 1400
+        }
+      ],
+      "pending_count": 26,
+      "completed_count": 27
+    },
+    "w_meta": {
+      "enabled": true,
+      "ensemble_n": 3,
+      "meta_prediction_error": 0.19,
+      "meta_prediction_error_rolling_500": 0.19,
+      "success_rate_after_meta_do": 0.7572203278541565,
+      "suggested_intervention": {
+        "variable": "curriculum_phase",
+        "value": 0.75,
+        "predicted_success": 0.7572
+      },
+      "last_do": {
+        "variable": "wm_lr_mult",
+        "value": 0.75,
+        "predicted_success": 0.7161,
+        "meta_prediction_error": 0.2161,
+        "applied_live": false
+      },
+      "effects": {
+        "learning_rate_eff_effect": 0.0,
+        "exploration_rate_effect": 0.0,
+        "curriculum_phase_effect": 0.0,
+        "wm_lr_mult_effect": 0.0
+      },
+      "obs_buffer_len": 256,
+      "last_update_tick": 1590
+    },
+    "meta_prediction_error": 0.18997448682785034,
+    "intention_context": {
+      "macro_hint": "LOCOMOTE_DELIVERY",
+      "graph_patch": {
+        "self_goal_active": 0.88,
+        "self_attention": 0.7425,
+        "intent_stride": 0.549,
+        "intent_torso_forward": 0.528,
+        "intent_gait_coupling": 0.598,
+        "intent_arm_counterbalance": 0.521
+      },
+      "intent_residuals": {
+        "intent_stride": 0.0742,
+        "intent_torso_forward": 0.0424,
+        "intent_gait_coupling": 0.1484,
+        "intent_arm_counterbalance": 0.0318
+      },
+      "horizon_ticks": 371,
+      "primary": {
+        "subgoal_id": "xfer_humanoid_variant_seed_0.2_forward_lean",
+        "var_id": "intent",
+        "target_val": 0.65,
+        "intent_targets": {
+          "intent": 0.65
+        },
+        "world_id": "humanoid_variant",
+        "tick_start": 0,
+        "tick_deadline": 1961,
+        "min_ticks": 400,
+        "source": "curriculum_pending",
+        "priority": 0.55,
+        "status": "active"
+      },
+      "stack_depth": 5,
+      "narrative": "[LOCOMOTE_DELIVERY] curriculum_pending:intent\u21920.65 stack=5 intent\u21920.65 | NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+      "expected_state": {}
+    }
+  },
+  "phase6": {
+    "symbolic_grounding_enabled": true,
+    "ewc_enabled": false,
+    "health_monitor_enabled": false,
+    "meta_cb_enabled": false,
+    "symbolic_grounding": {
+      "enabled": true,
+      "n_rules": 1142,
+      "rules": [
+        "com_y -> com_z",
+        "com_y -> spine_pitch",
+        "com_y -> vestibular_gx",
+        "com_y -> lhip",
+        "com_y -> rhip",
+        "com_y -> rankle",
+        "com_y -> lshoulder",
+        "com_y -> rshoulder",
+        "com_y -> lfoot_z",
+        "com_y -> rfoot_z",
+        "com_y -> cube0_z",
+        "com_y -> cube1_x",
+        "com_y -> cube1_y",
+        "com_y -> cube2_z",
+        "com_y -> intent_stride",
+        "com_y -> intent_support_left"
+      ],
+      "rule_cmi": {
+        "com_y -> com_z": 1.0,
+        "com_y -> spine_pitch": 1.0,
+        "com_y -> vestibular_gx": 1.0,
+        "com_y -> lhip": 1.0,
+        "com_y -> rhip": 1.0,
+        "com_y -> rankle": 1.0,
+        "com_y -> lshoulder": 1.0,
+        "com_y -> rshoulder": 1.0,
+        "com_y -> lfoot_z": 1.0,
+        "com_y -> rfoot_z": 1.0,
+        "com_y -> cube0_z": 1.0,
+        "com_y -> cube1_x": 1.0,
+        "com_y -> cube1_y": 1.0,
+        "com_y -> cube2_z": 1.0,
+        "com_y -> intent_stride": 1.0,
+        "com_y -> intent_support_left": 1.0
+      },
+      "prior_w": 0.2,
+      "rule_thresh": 0.12
+    },
+    "ewc": {
+      "enabled": false,
+      "packnet": false,
+      "roles_only": true,
+      "lambda": 1000.0,
+      "stable_age_min": 200,
+      "graph_change_thresh": 0.2,
+      "ewc_enabled": 0,
+      "ewc_stable_edge_count": 0,
+      "ewc_recompute_count": 0,
+      "continual_forgetting_ratio": 0.0,
+      "ewc_penalty_last": 0.0,
+      "ewc_archived_edges": 0
+    },
+    "continual_forgetting_ratio": 0.0,
+    "ewc_stable_edge_count": 0,
+    "ewc_recompute_count": 0,
+    "health_monitor": {
+      "enabled": false,
+      "check_every": 100,
+      "dry_run": true,
+      "detection_rate": 0.0,
+      "check_count": 0,
+      "detection_count": 0,
+      "last_degraded": false,
+      "last_symptoms": [],
+      "last_repair_action": null
+    },
+    "meta_circuit_breaker": {
+      "enabled": false,
+      "state": "closed",
+      "ema_pe": 0.0,
+      "ticks_in_open": 0,
+      "wmeta_active": true,
+      "recovery_start_tick": null,
+      "meta_recovery_ticks": null,
+      "transitions": []
+    },
+    "meta_recovery_ticks": null,
+    "wmeta_active": true
+  },
+  "neuro_symbolic": {
+    "enabled": true,
+    "symbolic_engine_enabled": true,
+    "slow_every": 10,
+    "bridge": {
+      "enabled": true,
+      "facts": {
+        "IsStanding": 0.9304,
+        "IsFallen": 0.0,
+        "IsStable": 1.0,
+        "BothFeetContact": 0.7549,
+        "StrideHigh": 0.0,
+        "TargetNear": 0.0,
+        "GoalActive": 0.88,
+        "HumanNear": 0.4951,
+        "PathBlocked": 0.0,
+        "HasTarget": 1.0,
+        "InReach": 0.0,
+        "CanInteract": 0.0,
+        "Grasping": 0.0,
+        "AtDeliveryZone": 0.0,
+        "ConceptActive(concept_vis_single_object)": 0.56,
+        "ConceptActive(concept_vis_high_visual_surprise)": 0.56,
+        "ConceptActive(concept_vis_multiple_objects)": 0.7,
+        "ConceptActive(concept_vis_low_visual_surprise)": 0.6
+      },
+      "plan": {
+        "macro": "LOCOMOTE_DELIVERY",
+        "steps": [
+          "StepForward"
+        ],
+        "motor_priors": {
+          "intent_stride": 0.64,
+          "intent_torso_forward": 0.58,
+          "intent_gait_coupling": 0.78,
+          "intent_arm_counterbalance": 0.56
+        },
+        "narrative": "NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+        "safety_veto": true,
+        "plan_invalidated": false,
+        "invalidation_reasons": []
+      },
+      "skeleton_rules": [
+        "com_y -> com_z",
+        "com_y -> spine_pitch",
+        "com_y -> vestibular_gx",
+        "com_y -> lhip",
+        "com_y -> rhip",
+        "com_y -> rankle",
+        "com_y -> lshoulder",
+        "com_y -> rshoulder"
+      ],
+      "knowledge_graph": {
+        "n_triples": 2560,
+        "runtime_facts": {
+          "PathBlocked": 0.0,
+          "distance_to_human": 0.5048743715097584
+        },
+        "sample": [
+          {
+            "s": "Human",
+            "p": "subclass_of",
+            "o": "Agent",
+            "c": 1.0
+          },
+          {
+            "s": "FragileMaterial",
+            "p": "subclass_of",
+            "o": "Material",
+            "c": 1.0
+          },
+          {
+            "s": "Glass",
+            "p": "subclass_of",
+            "o": "FragileMaterial",
+            "c": 1.0
+          },
+          {
+            "s": "FragileMaterial",
+            "p": "effect_of",
+            "o": "HandleGently",
+            "c": 1.0
+          },
+          {
+            "s": "Human",
+            "p": "effect_of",
+            "o": "MaintainSafeDistance",
+            "c": 1.0
+          },
+          {
+            "s": "HumanProximity",
+            "p": "requires",
+            "o": "MaintainSafeDistance",
+            "c": 1.0
+          },
+          {
+            "s": "distance_to_human",
+            "p": "measures",
+            "o": "HumanProximity",
+            "c": 1.0
+          },
+          {
+            "s": "LocomoteGoal",
+            "p": "subclass_of",
+            "o": "MotorGoal",
+            "c": 1.0
+          },
+          {
+            "s": "LocomoteGoal",
+            "p": "requires",
+            "o": "IsStable",
+            "c": 1.0
+          },
+          {
+            "s": "RecoverGoal",
+            "p": "subclass_of",
+            "o": "MotorGoal",
+            "c": 1.0
+          },
+          {
+            "s": "RecoverGoal",
+            "p": "triggered_by",
+            "o": "IsFallen",
+            "c": 1.0
+          },
+          {
+            "s": "PathBlocked",
+            "p": "subclass_of",
+            "o": "SpatialConstraint",
+            "c": 1.0
+          },
+          {
+            "s": "StepForward",
+            "p": "requires",
+            "o": "NOT PathBlocked",
+            "c": 1.0
+          },
+          {
+            "s": "ApproachTarget",
+            "p": "requires",
+            "o": "NOT PathBlocked",
+            "c": 1.0
+          },
+          {
+            "s": "Turn",
+            "p": "effect_of",
+            "o": "NOT PathBlocked",
+            "c": 1.0
+          },
+          {
+            "s": "Turn",
+            "p": "triggered_by",
+            "o": "PathBlocked",
+            "c": 1.0
+          },
+          {
+            "s": "slot_0",
+            "p": "causes",
+            "o": "slot_1",
+            "c": 0.7
+          },
+          {
+            "s": "slot_0",
+            "p": "causes",
+            "o": "slot_2",
+            "c": 0.7
+          },
+          {
+            "s": "slot_0",
+            "p": "causes",
+            "o": "slot_3",
+            "c": 0.7
+          },
+          {
+            "s": "slot_0",
+            "p": "causes",
+            "o": "slot_4",
+            "c": 0.7
+          },
+          {
+            "s": "slot_0",
+            "p": "causes",
+            "o": "slot_5",
+            "c": 0.7
+          },
+          {
+            "s": "slot_0",
+            "p": "causes",
+            "o": "slot_6",
+            "c": 0.7
+          },
+          {
+            "s": "slot_0",
+            "p": "causes",
+            "o": "slot_7",
+            "c": 0.7
+          },
+          {
+            "s": "slot_0",
+            "p": "causes",
+            "o": "phys_lshoulder",
+            "c": 0.7
+          }
+        ]
+      }
+    },
+    "engine": {
+      "enabled": true,
+      "n_axioms": 4,
+      "axioms": [
+        "com_above_floor",
+        "joint_limits",
+        "no_fall_while_locomoting",
+        "human_proximity"
+      ],
+      "n_physics_constraints": 7,
+      "veto_count": 1746,
+      "last_veto": {
+        "allowed": true,
+        "violations": [],
+        "hard": false
+      }
+    },
+    "last_context": {
+      "tick": 1590,
+      "macro": "LOCOMOTE_DELIVERY",
+      "plan_steps": [
+        "StepForward"
+      ],
+      "motor_priors": {
+        "intent_stride": 0.64,
+        "intent_torso_forward": 0.58,
+        "intent_gait_coupling": 0.78,
+        "intent_arm_counterbalance": 0.56
+      },
+      "narrative": "NS[LOCOMOTE_DELIVERY] StepForward priors(stride=0.64,forward=0.58,coupling=0.78,counterbalance=0.56)",
+      "safety_veto": true,
+      "plan_invalidated": false,
+      "path_blocked": 0.0
+    }
+  },
+  "motor_primitives": {
+    "total_created": 0,
+    "active_count": 0,
+    "active_primitive": null,
+    "pattern_detector": {
+      "total_detected": 0,
+      "tracked_sequences": 0,
+      "top_sequences": []
+    },
+    "primitives": []
+  },
+  "variable_registry": {
+    "bootstrap_mode": false,
+    "active_count": 72,
+    "undiscovered_count": 0,
+    "total_discoveries": 0,
+    "discovered_groups": [],
+    "group_pressure": {},
+    "recent_discoveries": []
+  },
+  "tick_profile": {
+    "enabled": true,
+    "tick": 1590,
+    "window_ticks": 200,
+    "window_max": 200,
+    "last_wall_ms": 325.53,
+    "effective_hz": 3.072,
+    "last_tick_spans_ms": {
+      "sim.wall": 325.53,
+      "bg.cpg_loop": 205.85,
+      "sim.post_visual_ui": 185.03,
+      "sim.cpg_prep": 108.52,
+      "sim.build_response": 7.71,
+      "sim.agent_snapshot": 6.91,
+      "sim.agent_step": 2.58,
+      "sim.post_cognition": 2.46,
+      "sim.post_scene_vision": 2.37,
+      "sim.scene_skeleton_patch": 2.32,
+      "sim.post_neuro": 2.27,
+      "sim.fall_curriculum": 1.97,
+      "sim.post_episodic": 0.8,
+      "sim.post_motor_cortex": 0.2,
+      "sim.system2": 0.14,
+      "sim.post_rsi": 0.05,
+      "sim.post_vec_snap": 0.05,
+      "sim.post_sleep": 0.02,
+      "sim.post_persist": 0.02,
+      "sim.teacher_vision": 0.02,
+      "sim.post_reflex_cereb": 0.02,
+      "sim.post_l4": 0.01,
+      "sim.post_tick_log": 0.01
+    },
+    "ranked": [
+      {
+        "name": "bg.agent_loop",
+        "avg_ms": 420.575,
+        "pct": 111.41,
+        "max_ms": 33279.669,
+        "last_ms": 328.579,
+        "count": 1589
+      },
+      {
+        "name": "bg.agent_inner",
+        "avg_ms": 377.59,
+        "pct": 100.02,
+        "max_ms": 33277.743,
+        "last_ms": 325.565,
+        "count": 1583
+      },
+      {
+        "name": "sim.wall",
+        "avg_ms": 377.518,
+        "pct": 100.0,
+        "max_ms": 33277.298,
+        "last_ms": 325.532,
+        "count": 1589
+      },
+      {
+        "name": "agent.step_total",
+        "avg_ms": 249.446,
+        "pct": 66.08,
+        "max_ms": 1181.37,
+        "last_ms": 1181.37,
+        "count": 29
+      },
+      {
+        "name": "sim.post_visual_ui",
+        "avg_ms": 197.41,
+        "pct": 52.29,
+        "max_ms": 317.134,
+        "last_ms": 174.401,
+        "count": 1584
+      },
+      {
+        "name": "agent.value_layer",
+        "avg_ms": 144.101,
+        "pct": 38.17,
+        "max_ms": 540.021,
+        "last_ms": 528.398,
+        "count": 29
+      },
+      {
+        "name": "sim.cpg_prep",
+        "avg_ms": 136.354,
+        "pct": 36.12,
+        "max_ms": 33046.406,
+        "last_ms": 149.958,
+        "count": 1587
+      },
+      {
+        "name": "agent.train_step",
+        "avg_ms": 46.453,
+        "pct": 12.3,
+        "max_ms": 580.668,
+        "last_ms": 580.668,
+        "count": 29
+      },
+      {
+        "name": "bg.cpg_loop",
+        "avg_ms": 17.661,
+        "pct": 4.68,
+        "max_ms": 316.663,
+        "last_ms": 22.357,
+        "count": 17458
+      },
+      {
+        "name": "agent.intervene",
+        "avg_ms": 17.25,
+        "pct": 4.57,
+        "max_ms": 23.538,
+        "last_ms": 18.994,
+        "count": 29
+      },
+      {
+        "name": "sim.build_response",
+        "avg_ms": 8.046,
+        "pct": 2.13,
+        "max_ms": 462.099,
+        "last_ms": 10.012,
+        "count": 1584
+      },
+      {
+        "name": "sim.teacher_vision",
+        "avg_ms": 8.041,
+        "pct": 2.13,
+        "max_ms": 201.247,
+        "last_ms": 0.022,
+        "count": 1590
+      },
+      {
+        "name": "sim.agent_snapshot",
+        "avg_ms": 4.891,
+        "pct": 1.3,
+        "max_ms": 50.582,
+        "last_ms": 3.806,
+        "count": 1584
+      },
+      {
+        "name": "sim.post_scene_vision",
+        "avg_ms": 3.177,
+        "pct": 0.84,
+        "max_ms": 30.948,
+        "last_ms": 3.355,
+        "count": 1584
+      },
+      {
+        "name": "sim.scene_patch",
+        "avg_ms": 2.782,
+        "pct": 0.74,
+        "max_ms": 5.004,
+        "last_ms": 2.987,
+        "count": 264
+      },
+      {
+        "name": "sim.scene_skeleton_patch",
+        "avg_ms": 2.552,
+        "pct": 0.68,
+        "max_ms": 30.856,
+        "last_ms": 3.306,
+        "count": 1320
+      },
+      {
+        "name": "sim.post_motor_cortex",
+        "avg_ms": 2.338,
+        "pct": 0.62,
+        "max_ms": 26.272,
+        "last_ms": 14.134,
+        "count": 1584
+      },
+      {
+        "name": "sim.agent_step",
+        "avg_ms": 2.296,
+        "pct": 0.61,
+        "max_ms": 1190.122,
+        "last_ms": 4.649,
+        "count": 1584
+      },
+      {
+        "name": "sim.post_cognition",
+        "avg_ms": 2.259,
+        "pct": 0.6,
+        "max_ms": 117.226,
+        "last_ms": 2.262,
+        "count": 1584
+      },
+      {
+        "name": "sim.post_neuro",
+        "avg_ms": 2.221,
+        "pct": 0.59,
+        "max_ms": 32.329,
+        "last_ms": 2.079,
+        "count": 1584
+      },
+      {
+        "name": "sim.fall_curriculum",
+        "avg_ms": 2.026,
+        "pct": 0.54,
+        "max_ms": 1312.608,
+        "last_ms": 2.113,
+        "count": 1590
+      },
+      {
+        "name": "sim.post_persist",
+        "avg_ms": 2.006,
+        "pct": 0.53,
+        "max_ms": 239.059,
+        "last_ms": 0.021,
+        "count": 1584
+      },
+      {
+        "name": "bg.sanitize",
+        "avg_ms": 1.674,
+        "pct": 0.44,
+        "max_ms": 257.385,
+        "last_ms": 1.823,
+        "count": 1583
+      }
+    ]
+  },
+  "motor_arbiter": {
+    "intents_registered": 0,
+    "coupling_final": 0.5,
+    "stride_final": 0.5,
+    "arbiter_conflicts": 0,
+    "sources": [],
+    "human_task_active": true
+  },
+  "s2_learning": {
+    "episodes_collected": 3,
+    "student_conf": 0.0,
+    "distill_window": 3
+  },
+  "locomotion_eval": {
+    "window_ticks": 150,
+    "window_60s_pass": false,
+    "displacement_per_60s": 0.1422,
+    "scores": {
+      "com_x_vel_ema": 0.0012,
+      "pe_fwd_ema": -0.9611,
+      "support_asymmetry": 0.15,
+      "fall_rate": 0.0,
+      "displacement_per_60s": 0.1422
+    },
+    "failures": [
+      "com_x_vel_ema",
+      "pe_fwd_ema",
+      "displacement_per_60s"
+    ]
+  },
+  "interaction_eval": {
+    "passed": true,
+    "scores": {
+      "approach_success_rate": 0.0,
+      "grasp_success_rate": 0.0,
+      "place_success_rate": 0.0
+    },
+    "n_approach": 0,
+    "n_grasp": 0,
+    "n_place": 0
+  },
+  "_json_sanitized": true,
+  "world": "humanoid_variant"
+}

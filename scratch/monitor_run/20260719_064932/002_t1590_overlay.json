@@ -1,0 +1,38 @@
+{
+  "tick": 1597,
+  "n_entities": 1,
+  "n_active": 1,
+  "active": {
+    "id": "slot_7",
+    "slot_id": "slot_7",
+    "label": "cylinder",
+    "u": 1.0,
+    "v": 0.5792738323143233,
+    "range_m": 2.99,
+    "bearing": 1.0,
+    "conf": 0.861,
+    "holding": true
+  },
+  "entities": [
+    {
+      "id": "slot_7",
+      "slot_id": "slot_7",
+      "label": "cylinder",
+      "u": 1.0,
+      "v": 0.5792738323143233,
+      "range_m": 2.99,
+      "bearing": 1.0,
+      "conf": 0.861,
+      "active": true,
+      "holding": true
+    }
+  ],
+  "stage": {
+    "kind": "approach",
+    "label": "Approach",
+    "progress": 0.25
+  },
+  "hard_lock": false,
+  "odom_discontinuity": false,
+  "odom_jump_m": 0.0
+}

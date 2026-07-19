@@ -383,6 +383,100 @@ def salient_objectness_peak(
     return u, v, float(r), var, conf, peak_strength
 
 
+def salient_objectness_peak_near_bearing(
+    depth: DepthFrame | np.ndarray,
+    bearing: float,
+    *,
+    fov_u_half: float = 0.28,
+    near_m: float | None = None,
+    far_m: float | None = None,
+    floor_v_max: float | None = None,
+) -> tuple[float | None, float | None, float | None, float | None, float | None, float]:
+    """Salient peak restricted to a horizontal window around ego bearing."""
+    if isinstance(depth, DepthFrame):
+        z = np.asarray(depth.depth_m, dtype=np.float64)
+        near = float(depth.near_m)
+        far = float(depth.far_m)
+        vmask = depth.valid_mask
+        frame = depth
+    else:
+        z = np.asarray(depth, dtype=np.float64)
+        near = float(near_m if near_m is not None else camera_near_m())
+        far = float(far_m if far_m is not None else camera_far_m())
+        vmask = None
+        frame = DepthFrame(depth_m=np.asarray(z, dtype=np.float32), near_m=near, far_m=far)
+
+    if z.ndim != 2 or z.size == 0:
+        return None, None, None, None, None, 0.0
+
+    h, w = int(z.shape[0]), int(z.shape[1])
+    lo = near * 1.05
+    hi = depth_hi_m(far)
+    foreground = np.isfinite(z) & (z > lo) & (z < hi)
+    if vmask is not None:
+        foreground &= np.asarray(vmask, dtype=bool)
+
+    obj = _objectness_map(z, foreground, near=near)
+    inv_z = 1.0 / np.maximum(z, near)
+    score = obj * inv_z * foreground.astype(np.float64)
+
+    ys = np.linspace(0.0, 1.0, h, dtype=np.float64)[:, None]
+    xs = np.linspace(0.0, 1.0, w, dtype=np.float64)[None, :]
+    floor_v = float(floor_v_max if floor_v_max is not None else objectness_floor_v_max())
+    score = np.where(ys < floor_v, score, 0.0)
+
+    u0 = max(0.05, min(0.95, 0.5 + 0.5 * float(bearing)))
+    u_lo = max(0.0, u0 - float(fov_u_half))
+    u_hi = min(1.0, u0 + float(fov_u_half))
+    score = np.where((xs >= u_lo) & (xs <= u_hi), score, 0.0)
+
+    cx, cy, gw, gh = 0.5, 0.55, 0.10, 0.12
+    center = np.exp(-(((xs - cx) / gw) ** 2 + ((ys - cy) / gh) ** 2))
+    score = score * (1.0 - 0.92 * center)
+
+    peak_val = float(score.max())
+    if peak_val < 1e-8 or int(np.count_nonzero(score > 0)) < 3:
+        return salient_objectness_peak(
+            frame, near_m=near, far_m=far, floor_v_max=floor_v_max
+        )
+
+    yi, xi = np.unravel_index(int(np.argmax(score)), score.shape)
+    u = float(xs[0, xi])
+    v = float(ys[yi, 0])
+    upper = ys < floor_v
+    med = float(np.median(score[upper & (score > 0)])) if np.any(upper & (score > 0)) else peak_val
+    peak_strength = float(min(1.0, peak_val / max(med * 2.5, 1e-6)))
+
+    r, var, conf = depth_at_uv(frame, u, v, window=3)
+    if r is None:
+        return None, None, None, None, None, peak_strength
+    u_col = max(0.05, min(0.95, u0))
+    u_lo_i = max(0, int((u_col - float(fov_u_half)) * (w - 1)))
+    u_hi_i = min(w - 1, int((u_col + float(fov_u_half)) * (w - 1)))
+    v_hi_i = min(h - 1, int(floor_v * (h - 1)))
+    best_r: float | None = None
+    best_u = best_v = 0.5
+    for yi2 in range(0, v_hi_i + 1):
+        for xi2 in range(u_lo_i, u_hi_i + 1):
+            ru = float(xi2) / max(w - 1, 1)
+            rv = float(yi2) / max(h - 1, 1)
+            rr, _vr, _rc = depth_at_uv(frame, ru, rv, window=1)
+            if rr is None or float(rr) <= lo or float(rr) >= hi * 0.98:
+                continue
+            if best_r is None or float(rr) < best_r:
+                best_r = float(rr)
+                best_u, best_v = ru, rv
+    if best_r is not None and float(best_r) < float(r) * 0.82:
+        u, v = best_u, best_v
+        r = float(best_r)
+        _r2, var, conf = depth_at_uv(frame, u, v, window=1)
+        if _r2 is not None:
+            r = float(_r2)
+    if conf is not None:
+        conf = float(max(0.0, min(1.0, float(conf) * (0.25 + 0.75 * peak_strength))))
+    return u, v, float(r), var, conf, peak_strength
+
+
 def live_uv_range_at_bearing(
     camera: DepthCamera | ArrayDepthCamera,
     bearing: float,
@@ -416,6 +510,8 @@ def live_uv_range_at_bearing(
 
     best: tuple[float, float, float, float] | None = None
     best_score = -1.0
+    min_hit: tuple[float, float, float, float] | None = None
+    hint = float(range_hint) if range_hint is not None and float(range_hint) > 0.1 else None
     for yi in range(v_lo, v_hi + 1):
         v = float(yi) / max(h - 1, 1)
         for xi in range(u_lo, u_hi + 1):
@@ -426,17 +522,25 @@ def live_uv_range_at_bearing(
             if float(r) >= hi * 0.98 or float(r) <= lo:
                 continue
             rel = 0.0
-            if range_hint is not None and float(range_hint) > 0.1:
-                rel = abs(float(r) - float(range_hint)) / max(float(range_hint), 0.3)
-                # Always allow significantly closer hits (floor-lock correction).
-                if float(r) >= float(range_hint) * 0.78 and rel > 0.55:
+            if hint is not None:
+                rel = abs(float(r) - hint) / max(hint, 0.3)
+                # Reject floor/background lock when eval hint says target is closer.
+                if float(r) > hint * 1.32 and rel > 0.22:
+                    continue
+                if float(r) >= hint * 0.78 and rel > 0.55:
                     continue
             score = float(conf) * (1.0 / max(float(r), 0.25)) * (1.0 / (1.0 + 2.0 * rel))
             if score > best_score:
                 best_score = score
                 best = (u, v, float(r), float(conf))
+            if min_hit is None or float(r) < min_hit[2]:
+                min_hit = (u, v, float(r), float(conf))
+    if best is None and min_hit is not None:
+        best = min_hit
     if best is None:
         return None, None, None, None
+    if hint is not None and min_hit is not None and min_hit[2] < best[2] * 0.82:
+        best = min_hit
     return best[0], best[1], best[2], best[3]
 
 
@@ -478,6 +582,16 @@ class ArrayDepthCamera:
         self,
     ) -> tuple[float | None, float | None, float | None, float | None, float | None, float]:
         return salient_objectness_peak(self._frame)
+
+    def range_from_objectness_peak_near_bearing(
+        self,
+        bearing: float,
+        *,
+        fov_u_half: float = 0.28,
+    ) -> tuple[float | None, float | None, float | None, float | None, float | None, float]:
+        return salient_objectness_peak_near_bearing(
+            self._frame, float(bearing), fov_u_half=fov_u_half
+        )
 
     def live_at_bearing(
         self,
@@ -556,8 +670,14 @@ def attach_range_to_target(
         return tgt.with_range(r, range_var=var, range_conf=conf)
 
     if geom == "objectness_peak" and callable(peak_fn):
+        diags = dict(getattr(target, "diagnostics", None) or {})
+        bearing_hint = diags.get("bearing_hint")
+        near_fn = getattr(camera, "range_from_objectness_peak_near_bearing", None)
         try:
-            gu, gv, r, var, conf, pstr = peak_fn()
+            if bearing_hint is not None and callable(near_fn):
+                gu, gv, r, var, conf, pstr = near_fn(float(bearing_hint))
+            else:
+                gu, gv, r, var, conf, pstr = peak_fn()
         except Exception:
             gu = gv = r = var = conf = None
             pstr = 0.0

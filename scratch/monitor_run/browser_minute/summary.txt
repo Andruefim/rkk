@@ -1,0 +1,8 @@
+20260719_065314 tick=1934 delta=36 progress=0.25 node=n3 fallen=False
+20260719_065423 tick=2002 delta=104 progress=0.25 node=n3 fallen=False
+20260719_065527 tick=2060 delta=162 progress=0.25 node=n3 fallen=False
+20260719_065632 tick=2116 delta=218 progress=0.25 node=n3 fallen=False
+20260719_065737 tick=2175 delta=277 progress=0.25 node=n3 fallen=False
+20260719_065842 tick=2224 delta=326 progress=0.25 node=n3 fallen=False
+20260719_065947 tick=2285 delta=387 progress=0.25 node=n3 fallen=False
+20260719_070055 tick=2352 delta=454 progress=0.25 node=n3 fallen=False

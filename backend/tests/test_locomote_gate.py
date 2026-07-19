@@ -16,6 +16,17 @@ def test_stable_locomote_ready_variant_com_z() -> None:
     assert stable_locomote_ready(obs)
 
 
+def test_stable_locomote_ready_single_stance_foot() -> None:
+    """Swing phase: one foot airborne should not block locomote."""
+    obs = {
+        "posture_stability": 0.95,
+        "com_z": 0.44,
+        "foot_contact_l": 0.68,
+        "foot_contact_r": 0.02,
+    }
+    assert stable_locomote_ready(obs)
+
+
 def test_stable_locomote_not_ready_low_posture() -> None:
     obs = {"posture_stability": 0.7, "com_z": 0.5, "foot_contact_l": 0.7, "foot_contact_r": 0.7}
     assert not stable_locomote_ready(obs)

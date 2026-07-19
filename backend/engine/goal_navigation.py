@@ -170,6 +170,15 @@ def navigation_intents_from_bearing_range(
         out["intent_stride"] = float(stride)
         out["intent_torso_forward"] = 0.55
 
+    # Large heading error: turn in place, don't walk past the target.
+    abs_h = abs(float(heading_err))
+    if abs_h > 0.95:
+        out["intent_stride"] = float(_TURN_STRIDE * 0.68)
+        out["intent_torso_forward"] = 0.52
+    elif abs_h > 0.62:
+        cur = float(out.get("intent_stride", _STRIDE_MIN))
+        out["intent_stride"] = float(min(cur, _TURN_STRIDE * 0.82))
+
     if posture_stability is not None:
         scaled, active = apply_posture_to_navigation(out, float(posture_stability))
         if not active:
