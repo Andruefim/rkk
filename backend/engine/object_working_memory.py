@@ -144,6 +144,7 @@ class SceneEntity:
     last_update_tick: int = -1
     holding: bool = False
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    uv_track: list[list[float]] = field(default_factory=list)
 
     def is_fresh(self, tick: int) -> bool:
         if self.last_vision_tick < 0:
@@ -204,6 +205,7 @@ class SceneEntity:
         self.last_update_tick = int(tick)
         self.holding = False
         self.diagnostics = {"source": "seed"}
+        self.uv_track = [[float(self.u), float(self.v)]]
 
     def fuse_observation(
         self,
@@ -317,20 +319,34 @@ class LatentSceneMemory:
         if act is None or camera is None:
             return False
         try:
-            from engine.vision_depth import live_uv_range_at_bearing
+            from engine.vision_depth import UvDepthTrack, live_uv_range_at_bearing
             from engine.vision_target import bearing_from_u
         except ImportError:
             return False
 
+        track = UvDepthTrack.from_list(act.uv_track)
+        live_kwargs = {
+            "range_hint": range_hint or act.range_m,
+            "tick": tick,
+            "uv_track": track,
+        }
         live_fn = getattr(camera, "live_at_bearing", None)
         if callable(live_fn):
-            u, v, r, conf = live_fn(act.bearing, range_hint=range_hint or act.range_m)
+            try:
+                u, v, r, conf = live_fn(act.bearing, **live_kwargs)
+            except TypeError:
+                u, v, r, conf = live_fn(
+                    act.bearing, range_hint=range_hint or act.range_m
+                )
+                if u is not None and v is not None:
+                    track.push(float(u), float(v))
         else:
             u, v, r, conf = live_uv_range_at_bearing(
                 camera,
                 act.bearing,
-                range_hint=range_hint or act.range_m,
+                **live_kwargs,
             )
+        act.uv_track = track.to_list()
         if u is None or v is None:
             peak_fn = getattr(camera, "range_from_objectness_peak_near_bearing", None)
             if callable(peak_fn):

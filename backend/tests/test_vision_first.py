@@ -9,13 +9,17 @@ from engine.manipulation_control import manipulation_intents_from_bearing_range
 from engine.vision_depth import (
     ArrayDepthCamera,
     DepthFrame,
+    UvDepthTrack,
+    adaptive_fov_u_half,
     attach_range_to_target,
     attention_guided_range,
     buffer_to_metric_depth,
     depth_at_uv,
+    live_uv_fov_base,
     live_uv_range_at_bearing,
     salient_objectness_peak,
     salient_objectness_peak_near_bearing,
+    track_search_fov_u_half,
 )
 from engine.vision_resolve import resolve_visual_target
 from engine.vision_target import (
@@ -581,6 +585,52 @@ def test_live_uv_rejects_floor_when_hint_closer() -> None:
         ArrayDepthCamera(frame), 0.0, range_hint=1.2
     )
     assert r is not None and r < 1.8
+
+
+def test_adaptive_fov_follows_track_not_range() -> None:
+    """FOV must not shrink from range_hint alone (no object-size / 1/r heuristic)."""
+    base = live_uv_fov_base()
+    assert adaptive_fov_u_half(1.0) == pytest.approx(base)
+    assert adaptive_fov_u_half(4.0) == pytest.approx(base)
+    stable = UvDepthTrack.from_list([[0.50, 0.40], [0.51, 0.40], [0.505, 0.41]])
+    jumpy = UvDepthTrack.from_list([[0.30, 0.35], [0.55, 0.45], [0.80, 0.50]])
+    fov_stable = track_search_fov_u_half(stable)
+    fov_jumpy = track_search_fov_u_half(jumpy)
+    assert fov_stable <= base
+    assert fov_jumpy >= fov_stable
+    assert track_search_fov_u_half(None) == pytest.approx(base)
+
+
+def test_live_uv_relaxes_range_gate_inside_track() -> None:
+    """Tight range_hint with only far depth near track must not return empty."""
+    h, w = 48, 64
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    # Blob near prior track UV, but deeper than a tight oracle-like hint.
+    depth[14:24, 28:38] = 2.4
+    frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
+    cam = ArrayDepthCamera(frame)
+    track = UvDepthTrack.from_list([[0.50, 0.40], [0.51, 0.40]])
+    u, v, r, _ = live_uv_range_at_bearing(
+        cam, 0.0, range_hint=1.5, uv_track=track
+    )
+    assert u is not None and r is not None
+    assert abs(u - 0.5) < 0.15
+    assert r < 3.0
+
+
+def test_live_uv_continuity_prefers_prev_track() -> None:
+    h, w = 48, 64
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    depth[10:22, 12:20] = 1.4  # left blob
+    depth[10:22, 44:52] = 1.35  # right blob, slightly closer
+    frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
+    cam = ArrayDepthCamera(frame)
+    track = UvDepthTrack.from_list([[0.28, 0.35]])
+    u, v, r, _ = live_uv_range_at_bearing(
+        cam, 0.0, range_hint=1.5, uv_track=track
+    )
+    assert u is not None and r is not None
+    assert u < 0.42
 
 
 def test_ontology_objectness_fallback_when_scores_crushed(

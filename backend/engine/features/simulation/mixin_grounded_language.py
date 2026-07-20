@@ -1592,11 +1592,24 @@ class SimulationGroundedLanguageMixin:
         reason: str,
         oracle_dist: float | None = None,
         bearing_hint: float | None = None,
+        allow_full_resolve: bool = False,
     ) -> bool:
         vt = getattr(self, "_manip_resolved_visual", None)
         cam = self._depth_camera_from_sim()
         if vt is None or cam is None:
             return False
+
+        from engine.vision_depth import UvDepthTrack, _uv_dist, live_uv_track_radius
+        from engine.vision_resolve import _cap_spatial_confidence
+
+        scene = getattr(self, "_latent_scene", None)
+        ent = scene.active() if scene is not None and hasattr(scene, "active") else None
+        track = UvDepthTrack.from_list(getattr(ent, "uv_track", None) if ent else None)
+        track_pred = track.extrapolate()
+        prev_uv = track.prev()
+        old_range = float(ent.range_m) if ent is not None else None
+        old_u = float(getattr(ent, "u", vt.u) if ent is not None else vt.u)
+        old_v = float(getattr(ent, "v", vt.v) if ent is not None else vt.v)
 
         self._release_scene_hard_lock()
         diags = dict(vt.diagnostics or {})
@@ -1613,24 +1626,81 @@ class SimulationGroundedLanguageMixin:
             bearing=float(bearing_hint if bearing_hint is not None else vt.bearing),
             diagnostics=diags,
         )
-        from engine.vision_resolve import _cap_spatial_confidence
 
         vt2 = attach_range_to_target(vt2, cam, attn_mask=None)
         vt2 = _cap_spatial_confidence(vt2)
         if not vt2.is_ready(require_range=True):
             return False
+
+        new_u = float(vt2.u)
+        new_v = float(vt2.v)
+        new_r = float(vt2.range_m) if vt2.range_m is not None else None
+        radius = live_uv_track_radius() * 1.6
+        ref = track_pred if track_pred is not None else prev_uv
+        if ref is None:
+            ref = (old_u, old_v)
+        cont_ok = _uv_dist(new_u, new_v, ref[0], ref[1]) <= radius
+
+        improves = True
+        if new_r is not None and oracle_dist is not None and float(oracle_dist) < 900.0:
+            od = float(oracle_dist)
+            # Rebind must shrink the vision/oracle gap — otherwise it is the same failure.
+            if old_range is not None:
+                improves = float(new_r) < float(old_range) * 0.90 and (
+                    float(new_r) < od * 1.35 + 0.20
+                )
+            else:
+                improves = float(new_r) < od * 1.35 + 0.20
+        elif new_r is not None and old_range is not None:
+            improves = float(new_r) < float(old_range) * 0.90
+
+        full_resolve = False
+        if not cont_ok or not improves:
+            strong_fix = (
+                new_r is not None
+                and oracle_dist is not None
+                and float(oracle_dist) < 900.0
+                and float(new_r) < float(oracle_dist) * 1.25 + 0.10
+            )
+            if allow_full_resolve and strong_fix:
+                full_resolve = True
+            else:
+                try:
+                    task_log_event(
+                        "vision_rebind_rejected",
+                        tick=int(tick),
+                        reason=str(reason),
+                        continuity_ok=bool(cont_ok),
+                        improves=bool(improves),
+                        u=round(new_u, 3),
+                        v=round(new_v, 3),
+                        range_m=round(float(new_r), 3) if new_r is not None else None,
+                        oracle_dist_m=(
+                            round(float(oracle_dist), 3)
+                            if oracle_dist is not None
+                            else None
+                        ),
+                        track_ref_u=round(float(ref[0]), 3),
+                        track_ref_v=round(float(ref[1]), 3),
+                    )
+                except Exception:
+                    pass
+                return False
+
         self._manip_resolved_visual = vt2
         self._bind_object_working_memory(vt2, int(tick))
         self._task_log_prev_vision_range = None
         try:
             task_log_event(
-                "vision_rebind",
+                "vision_rebind_full_resolve" if full_resolve else "vision_rebind",
                 tick=int(tick),
                 reason=str(reason),
                 u=round(float(vt2.u), 3),
                 v=round(float(vt2.v), 3),
                 range_m=round(float(vt2.range_m or 0.0), 3),
                 oracle_dist_m=round(float(oracle_dist), 3) if oracle_dist is not None else None,
+                continuity_ok=bool(cont_ok),
+                full_resolve=bool(full_resolve),
             )
         except Exception:
             pass
@@ -1687,6 +1757,7 @@ class SimulationGroundedLanguageMixin:
             reason="oracle_divergence",
             oracle_dist=float(oracle_dist),
             bearing_hint=bearing_hint,
+            allow_full_resolve=True,
         ):
             return
 
@@ -1748,9 +1819,17 @@ class SimulationGroundedLanguageMixin:
         ent = scene.active()
         if ent is not None and float(ent.range_m) > od * 1.25 + 0.20:
             try:
+                from engine.vision_depth import UvDepthTrack, live_uv_range_at_bearing
+
+                track = UvDepthTrack.from_list(ent.uv_track)
                 _u, _v, lr, _conf = live_uv_range_at_bearing(
-                    cam, float(ent.bearing), range_hint=float(od)
+                    cam,
+                    float(ent.bearing),
+                    range_hint=float(od),
+                    tick=int(tick),
+                    uv_track=track,
                 )
+                ent.uv_track = track.to_list()
                 if lr is not None and float(lr) < float(ent.range_m):
                     ent.range_m = float(lr)
                     ent.x_fwd, ent.y_right = ego_from_bearing_range(

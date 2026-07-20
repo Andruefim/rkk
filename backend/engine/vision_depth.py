@@ -1,9 +1,11 @@
 """Depth / stereo range-at-UV API — sim PyBullet today, RGB-D/stereo on robot later."""
 from __future__ import annotations
 
+import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
@@ -29,6 +31,155 @@ def depth_sample_window() -> int:
         return max(1, int(os.environ.get("RKK_DEPTH_UV_WINDOW", "3")))
     except ValueError:
         return 3
+
+
+def live_uv_fov_base() -> float:
+    return _ef("RKK_LIVE_UV_FOV_HALF", 0.22)
+
+
+def live_uv_continuity_k() -> float:
+    return _ef("RKK_LIVE_UV_CONTINUITY_K", 9.0)
+
+
+def live_uv_track_radius() -> float:
+    return _ef("RKK_LIVE_UV_TRACK_RADIUS", 0.14)
+
+
+def live_uv_track_len() -> int:
+    try:
+        return max(2, int(os.environ.get("RKK_LIVE_UV_TRACK_LEN", "5")))
+    except ValueError:
+        return 5
+
+
+@dataclass
+class UvDepthTrack:
+    """Compact UV history for depth-lock identity continuity."""
+
+    history: list[tuple[float, float]] = field(default_factory=list)
+    max_len: int = 5
+
+    @classmethod
+    def from_list(cls, pts: list | tuple | None) -> UvDepthTrack:
+        out = cls(max_len=live_uv_track_len())
+        if not pts:
+            return out
+        for item in pts:
+            try:
+                u, v = float(item[0]), float(item[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            out.push(u, v)
+        return out
+
+    def to_list(self) -> list[list[float]]:
+        return [[float(u), float(v)] for u, v in self.history]
+
+    def prev(self) -> tuple[float, float] | None:
+        return self.history[-1] if self.history else None
+
+    def push(self, u: float, v: float) -> None:
+        self.history.append((float(u), float(v)))
+        if len(self.history) > int(self.max_len):
+            self.history = self.history[-int(self.max_len) :]
+
+    def extrapolate(self) -> tuple[float, float] | None:
+        if not self.history:
+            return None
+        if len(self.history) == 1:
+            return self.history[-1]
+        (u0, v0), (u1, v1) = self.history[-2], self.history[-1]
+        return (
+            float(max(0.02, min(0.98, u1 + (u1 - u0)))),
+            float(max(0.02, min(0.98, v1 + (v1 - v0)))),
+        )
+
+
+def track_motion_uv(uv_track: UvDepthTrack | None) -> float:
+    """Max recent UV step magnitude — proxy for localization uncertainty."""
+    if uv_track is None or len(uv_track.history) < 2:
+        return 0.0
+    motions: list[float] = []
+    hist = uv_track.history
+    for i in range(1, len(hist)):
+        u0, v0 = hist[i - 1]
+        u1, v1 = hist[i]
+        motions.append(_uv_dist(u1, v1, u0, v0))
+    return float(max(motions[-3:])) if motions else 0.0
+
+
+def track_search_fov_u_half(
+    uv_track: UvDepthTrack | None = None,
+    *,
+    base: float | None = None,
+) -> float:
+    """
+    Horizontal search half-width from track uncertainty, not 1/range.
+
+    No object-size / range heuristics: unknown task & geometry.
+    - no track / single point → full base (discovery)
+    - stable track → modest tighten toward track_radius scale
+    - fast UV motion → widen up to base
+    """
+    b = float(base if base is not None else live_uv_fov_base())
+    if uv_track is None or len(uv_track.history) < 2:
+        return b
+    sigma = track_motion_uv(uv_track)
+    radius = live_uv_track_radius()
+    # Cover predicted step + identity radius; never below ~half base when tracked.
+    half = max(0.55 * b, min(b, 2.5 * sigma + 0.65 * radius))
+    return float(max(0.08, half))
+
+
+def adaptive_fov_u_half(
+    range_hint: float | None = None,
+    *,
+    base: float | None = None,
+    uv_track: UvDepthTrack | None = None,
+) -> float:
+    """Back-compat wrapper: range_hint ignored; FOV follows track uncertainty."""
+    _ = range_hint
+    return track_search_fov_u_half(uv_track, base=base)
+
+
+def _uv_dist(u: float, v: float, u_ref: float, v_ref: float) -> float:
+    du = float(u) - float(u_ref)
+    dv = float(v) - float(v_ref)
+    return float(math.hypot(du, 1.15 * dv))
+
+
+def _continuity_factor(
+    u: float,
+    v: float,
+    *,
+    prev_uv: tuple[float, float] | None,
+    track_pred: tuple[float, float] | None,
+) -> float:
+    k = live_uv_continuity_k()
+    factors: list[float] = []
+    if prev_uv is not None:
+        factors.append(math.exp(-k * _uv_dist(u, v, prev_uv[0], prev_uv[1])))
+    if track_pred is not None:
+        factors.append(
+            math.exp(-0.85 * k * _uv_dist(u, v, track_pred[0], track_pred[1]))
+        )
+    if not factors:
+        return 1.0
+    return float(max(factors))
+
+
+def _score_live_uv_candidate(
+    u: float,
+    v: float,
+    r: float,
+    conf: float,
+    *,
+    rel: float,
+    prev_uv: tuple[float, float] | None,
+    track_pred: tuple[float, float] | None,
+) -> float:
+    base = float(conf) * (1.0 / max(float(r), 0.25)) * (1.0 / (1.0 + 2.0 * rel))
+    return base * _continuity_factor(u, v, prev_uv=prev_uv, track_pred=track_pred)
 
 
 def depth_far_reject_frac() -> float:
@@ -477,23 +628,138 @@ def salient_objectness_peak_near_bearing(
     return u, v, float(r), var, conf, peak_strength
 
 
+def _live_uv_cand_log_enabled(tick: int | None) -> bool:
+    """TEMP: dump scored window candidates (default: any tick while enabled)."""
+    raw = os.environ.get("RKK_LIVE_UV_CAND_LOG", "1").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if tick is None:
+        return False
+    # Default: log all ticks. Narrow with RKK_LIVE_UV_CAND_LOG_TICK_LO/HI if needed.
+    try:
+        lo = int(os.environ.get("RKK_LIVE_UV_CAND_LOG_TICK_LO", "0"))
+        hi = int(os.environ.get("RKK_LIVE_UV_CAND_LOG_TICK_HI", "999999999"))
+    except ValueError:
+        lo, hi = 0, 999999999
+    return lo <= int(tick) <= hi
+
+
+_LIVE_UV_CAND_PATH_LOGGED = False
+
+
+def _log_live_uv_candidates(
+    *,
+    tick: int,
+    bearing: float,
+    range_hint: float | None,
+    fov_u_half: float,
+    u_lo: int,
+    u_hi: int,
+    v_lo: int,
+    v_hi: int,
+    candidates: list[dict[str, float]],
+    best: tuple[float, float, float, float] | None,
+    best_score: float,
+    min_hit: tuple[float, float, float, float] | None,
+    chosen: tuple[float, float, float, float] | None,
+    chosen_via: str,
+) -> None:
+    """TEMP diagnostic — write one JSONL record per live_uv call."""
+    global _LIVE_UV_CAND_PATH_LOGGED
+    try:
+        from engine.task_logger import task_log_dir, task_log_event
+
+        path = task_log_dir() / "live_uv_candidates.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not _LIVE_UV_CAND_PATH_LOGGED:
+            _LIVE_UV_CAND_PATH_LOGGED = True
+            try:
+                task_log_event(
+                    "live_uv_cand_log_open",
+                    tick=int(tick),
+                    path=str(path.resolve()),
+                )
+            except Exception:
+                pass
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "tick": int(tick),
+            "event": "live_uv_candidates",
+            "bearing": round(float(bearing), 4),
+            "range_hint": round(float(range_hint), 4) if range_hint is not None else None,
+            "fov_u_half": float(fov_u_half),
+            "window_px": {
+                "u_lo": int(u_lo),
+                "u_hi": int(u_hi),
+                "v_lo": int(v_lo),
+                "v_hi": int(v_hi),
+            },
+            "n_candidates": len(candidates),
+            "candidates": candidates,
+            "best": (
+                {
+                    "u": round(best[0], 4),
+                    "v": round(best[1], 4),
+                    "r": round(best[2], 4),
+                    "conf": round(best[3], 4),
+                    "score": round(float(best_score), 6),
+                }
+                if best is not None
+                else None
+            ),
+            "min_hit": (
+                {
+                    "u": round(min_hit[0], 4),
+                    "v": round(min_hit[1], 4),
+                    "r": round(min_hit[2], 4),
+                    "conf": round(min_hit[3], 4),
+                }
+                if min_hit is not None
+                else None
+            ),
+            "chosen": (
+                {
+                    "u": round(chosen[0], 4),
+                    "v": round(chosen[1], 4),
+                    "r": round(chosen[2], 4),
+                    "conf": round(chosen[3], 4),
+                }
+                if chosen is not None
+                else None
+            ),
+            "chosen_via": chosen_via,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def live_uv_range_at_bearing(
     camera: DepthCamera | ArrayDepthCamera,
     bearing: float,
     *,
     range_hint: float | None = None,
-    fov_u_half: float = 0.22,
+    fov_u_half: float | None = None,
+    tick: int | None = None,
+    uv_track: UvDepthTrack | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None]:
     """
   Scan upper-FOV column near bearing for the closest valid depth (live camera lock).
 
   Returns (u, v, range_m, confidence). Used to keep HUD crosshair on the image
   as the robot turns — not frozen at bind-time UV.
+
+  Spatial window follows track uncertainty (not 1/range). If a tight range_hint
+  yields no hits inside the track gate, retry once with range filter relaxed
+  while keeping identity continuity — empty tight scan must not force rebind.
     """
     frame = getattr(camera, "_frame", None)
     if frame is None:
         u0 = max(0.05, min(0.95, 0.5 + 0.5 * float(bearing)))
         r, _var, conf = camera.range_at_uv(u0, 0.42, window=4)
+        if uv_track is not None and u0 is not None and r is not None:
+            uv_track.push(float(u0), 0.42)
         return u0, 0.42 if r is not None else None, r, conf
 
     z = np.asarray(frame.depth_m, dtype=np.float64)
@@ -502,46 +768,184 @@ def live_uv_range_at_bearing(
     far = float(frame.far_m)
     lo = near * 1.05
     hi = depth_hi_m(far)
-    u0 = max(0.05, min(0.95, 0.5 + 0.5 * float(bearing)))
-    u_lo = max(0, int((u0 - fov_u_half) * (w - 1)))
-    u_hi = min(w - 1, int((u0 + fov_u_half) * (w - 1)))
-    v_lo = max(0, int(0.10 * (h - 1)))
-    v_hi = min(h - 1, int(0.58 * (h - 1)))
-
-    best: tuple[float, float, float, float] | None = None
-    best_score = -1.0
-    min_hit: tuple[float, float, float, float] | None = None
     hint = float(range_hint) if range_hint is not None and float(range_hint) > 0.1 else None
-    for yi in range(v_lo, v_hi + 1):
-        v = float(yi) / max(h - 1, 1)
-        for xi in range(u_lo, u_hi + 1):
-            u = float(xi) / max(w - 1, 1)
-            r, _var, conf = depth_at_uv(frame, u, v, window=1)
-            if r is None or conf is None:
-                continue
-            if float(r) >= hi * 0.98 or float(r) <= lo:
-                continue
-            rel = 0.0
-            if hint is not None:
-                rel = abs(float(r) - hint) / max(hint, 0.3)
-                # Reject floor/background lock when eval hint says target is closer.
-                if float(r) > hint * 1.32 and rel > 0.22:
+    fov = (
+        float(fov_u_half)
+        if fov_u_half is not None
+        else track_search_fov_u_half(uv_track)
+    )
+    track_pred = uv_track.extrapolate() if uv_track is not None else None
+    prev_uv = uv_track.prev() if uv_track is not None else None
+    u_bearing = max(0.05, min(0.95, 0.5 + 0.5 * float(bearing)))
+    if track_pred is not None:
+        u0 = max(0.05, min(0.95, 0.32 * u_bearing + 0.68 * float(track_pred[0])))
+    else:
+        u0 = u_bearing
+    track_radius = live_uv_track_radius()
+    log_cands = _live_uv_cand_log_enabled(tick)
+
+    def _scan(
+        *,
+        track_gate: bool,
+        range_gate: bool,
+    ) -> tuple[
+        list[dict[str, float]],
+        tuple[float, float, float, float] | None,
+        float,
+        tuple[float, float, float, float] | None,
+    ]:
+        u_lo = max(0, int((u0 - fov) * (w - 1)))
+        u_hi = min(w - 1, int((u0 + fov) * (w - 1)))
+        v_lo = max(0, int(0.10 * (h - 1)))
+        v_hi = min(h - 1, int(0.58 * (h - 1)))
+        if track_pred is not None:
+            v_mid = float(track_pred[1])
+            v_half = max(0.10, min(0.22, fov * 0.95))
+            v_lo = max(0, int((v_mid - v_half) * (h - 1)))
+            v_hi = min(h - 1, int((v_mid + v_half) * (h - 1)))
+            v_lo = max(v_lo, int(0.08 * (h - 1)))
+            v_hi = min(v_hi, int(0.62 * (h - 1)))
+
+        best: tuple[float, float, float, float] | None = None
+        best_score = -1.0
+        min_hit: tuple[float, float, float, float] | None = None
+        cands: list[dict[str, float]] = []
+        for yi in range(v_lo, v_hi + 1):
+            v = float(yi) / max(h - 1, 1)
+            for xi in range(u_lo, u_hi + 1):
+                u = float(xi) / max(w - 1, 1)
+                if track_gate and track_pred is not None:
+                    if _uv_dist(u, v, track_pred[0], track_pred[1]) > track_radius:
+                        continue
+                r, _var, conf = depth_at_uv(frame, u, v, window=1)
+                if r is None or conf is None:
                     continue
-                if float(r) >= hint * 0.78 and rel > 0.55:
+                if float(r) >= hi * 0.98 or float(r) <= lo:
                     continue
-            score = float(conf) * (1.0 / max(float(r), 0.25)) * (1.0 / (1.0 + 2.0 * rel))
-            if score > best_score:
-                best_score = score
-                best = (u, v, float(r), float(conf))
-            if min_hit is None or float(r) < min_hit[2]:
-                min_hit = (u, v, float(r), float(conf))
+                rel = 0.0
+                if hint is not None:
+                    rel = abs(float(r) - hint) / max(hint, 0.3)
+                    if range_gate:
+                        if float(r) > hint * 1.32 and rel > 0.22:
+                            continue
+                        if float(r) >= hint * 0.78 and rel > 0.55:
+                            continue
+                score = _score_live_uv_candidate(
+                    u,
+                    v,
+                    float(r),
+                    float(conf),
+                    rel=rel,
+                    prev_uv=prev_uv,
+                    track_pred=track_pred,
+                )
+                if log_cands:
+                    cands.append(
+                        {
+                            "u": round(float(u), 4),
+                            "v": round(float(v), 4),
+                            "r": round(float(r), 4),
+                            "conf": round(float(conf), 4),
+                            "score": round(float(score), 6),
+                            "track_gate": bool(track_gate),
+                            "range_gate": bool(range_gate),
+                        }
+                    )
+                if score > best_score:
+                    best_score = score
+                    best = (u, v, float(r), float(conf))
+                if min_hit is None or float(r) < min_hit[2]:
+                    min_hit = (u, v, float(r), float(conf))
+        return cands, best, best_score, min_hit
+
+    candidates, best, best_score, min_hit = _scan(track_gate=True, range_gate=True)
+    chosen_via = "none"
+    # Tight hint empty inside identity gate → relax range filter, keep track gate.
+    if best is None and hint is not None and track_pred is not None:
+        soft_cands, best, best_score, min_hit = _scan(
+            track_gate=True, range_gate=False
+        )
+        if log_cands:
+            candidates.extend(soft_cands)
+        if best is not None:
+            chosen_via = "best_score_track_relax_range"
+    if best is None:
+        loose_cands, best, best_score, min_hit = _scan(
+            track_gate=False, range_gate=True
+        )
+        if log_cands:
+            candidates.extend(loose_cands)
+        if best is not None:
+            chosen_via = "best_score_loose"
+    if best is None and hint is not None:
+        loose_soft, best, best_score, min_hit = _scan(
+            track_gate=False, range_gate=False
+        )
+        if log_cands:
+            candidates.extend(loose_soft)
+        if best is not None:
+            chosen_via = "best_score_loose_relax_range"
     if best is None and min_hit is not None:
         best = min_hit
+        chosen_via = "min_hit_fallback"
     if best is None:
+        if log_cands and tick is not None:
+            _log_live_uv_candidates(
+                tick=int(tick),
+                bearing=float(bearing),
+                range_hint=hint,
+                fov_u_half=float(fov),
+                u_lo=0,
+                u_hi=w - 1,
+                v_lo=0,
+                v_hi=h - 1,
+                candidates=candidates,
+                best=None,
+                best_score=best_score,
+                min_hit=min_hit,
+                chosen=None,
+                chosen_via="empty",
+            )
         return None, None, None, None
-    if hint is not None and min_hit is not None and min_hit[2] < best[2] * 0.82:
-        best = min_hit
-    return best[0], best[1], best[2], best[3]
+    if chosen_via == "none":
+        chosen_via = "best_score_track"
+    chosen = best
+    if (
+        hint is not None
+        and min_hit is not None
+        and min_hit[2] < best[2] * 0.82
+        and (
+            track_pred is None
+            or _uv_dist(min_hit[0], min_hit[1], track_pred[0], track_pred[1])
+            <= track_radius * 1.25
+        )
+    ):
+        chosen = min_hit
+        chosen_via = "min_hit_override"
+    if uv_track is not None:
+        uv_track.push(chosen[0], chosen[1])
+    if log_cands and tick is not None:
+        u_lo = max(0, int((u0 - fov) * (w - 1)))
+        u_hi = min(w - 1, int((u0 + fov) * (w - 1)))
+        v_lo = max(0, int(0.10 * (h - 1)))
+        v_hi = min(h - 1, int(0.58 * (h - 1)))
+        _log_live_uv_candidates(
+            tick=int(tick),
+            bearing=float(bearing),
+            range_hint=hint,
+            fov_u_half=float(fov),
+            u_lo=u_lo,
+            u_hi=u_hi,
+            v_lo=v_lo,
+            v_hi=v_hi,
+            candidates=candidates,
+            best=best,
+            best_score=best_score,
+            min_hit=min_hit,
+            chosen=chosen,
+            chosen_via=chosen_via,
+        )
+    return chosen[0], chosen[1], chosen[2], chosen[3]
 
 
 class ArrayDepthCamera:
@@ -598,8 +1002,18 @@ class ArrayDepthCamera:
         bearing: float,
         *,
         range_hint: float | None = None,
+        tick: int | None = None,
+        uv_track: UvDepthTrack | None = None,
+        fov_u_half: float | None = None,
     ) -> tuple[float | None, float | None, float | None, float | None]:
-        return live_uv_range_at_bearing(self, bearing, range_hint=range_hint)
+        return live_uv_range_at_bearing(
+            self,
+            bearing,
+            range_hint=range_hint,
+            tick=tick,
+            uv_track=uv_track,
+            fov_u_half=fov_u_half,
+        )
 
 
 class StereoDepthProvider:
