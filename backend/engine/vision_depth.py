@@ -367,9 +367,9 @@ def _objectness_map(z: np.ndarray, foreground: np.ndarray, *, near: float) -> np
     m = float(obj.max())
     if m > 1e-6:
         obj = obj / m
-    # Mild preference for mid/upper FOV (objects) vs extreme bottom (feet/floor)
+    # Mild mid-FOV preference — do not crush short ground objects (v>0.7).
     ys = np.linspace(0.0, 1.0, h, dtype=np.float64)[:, None]
-    v_w = np.clip(1.15 - ys, 0.25, 1.0)
+    v_w = np.clip(1.05 - 0.25 * ys, 0.70, 1.0)
     return obj * v_w
 
 
@@ -460,8 +460,132 @@ def attention_guided_range(
 
 
 def objectness_floor_v_max() -> float:
-    """Exclude bottom band (floor/feet) from salient-object search."""
+    """Soft band where planarity gate is required (legacy name kept for env)."""
     return float(max(0.35, min(0.75, _ef("RKK_OBJECTNESS_FLOOR_V", 0.58))))
+
+
+def floor_protrusion_min() -> float:
+    """Min plane residual weight in lower FOV to accept a candidate (0–1)."""
+    return float(max(0.05, min(0.6, _ef("RKK_FLOOR_PROTRUSION_MIN", 0.18))))
+
+
+def _floor_protrusion_weight(
+    z: np.ndarray,
+    foreground: np.ndarray,
+    *,
+    near: float,
+    hi: float,
+) -> np.ndarray:
+    """
+    Per-pixel weight in [0, 1]: closer than expected floor / surround → high.
+
+    Fits z ≈ a + b·v from robust lower-FOV row medians, plus a wide
+    horizontal local-surround residual (catches cylinders whose top sits
+    near plane height). Flat floor → ~0; grounded props → high even at
+    v > floor_v_max.
+    """
+    h, w = int(z.shape[0]), int(z.shape[1])
+    weight = np.zeros((h, w), dtype=np.float64)
+    if h < 8 or w < 8:
+        return weight
+
+    ys = np.linspace(0.0, 1.0, h, dtype=np.float64)[:, None]
+    row_v: list[float] = []
+    row_z: list[float] = []
+    for yi in range(h):
+        v = float(yi) / max(h - 1, 1)
+        if v < 0.45:
+            continue
+        row = z[yi]
+        fg = foreground[yi] & np.isfinite(row) & (row < hi * 0.90)
+        if int(fg.sum()) < max(4, w // 10):
+            continue
+        med = float(np.median(row[fg]))
+        if not np.isfinite(med) or med <= near * 1.05:
+            continue
+        row_v.append(v)
+        row_z.append(med)
+    if len(row_v) < 4:
+        return np.where(foreground, 0.35, 0.0).astype(np.float64)
+
+    vv = np.asarray(row_v, dtype=np.float64)
+    zz = np.asarray(row_z, dtype=np.float64)
+    A = np.column_stack([np.ones_like(vv), vv])
+    try:
+        coef, *_ = np.linalg.lstsq(A, zz, rcond=None)
+        pred = A @ coef
+        resid = np.abs(zz - pred)
+        keep = resid <= max(0.25, float(np.median(resid)) * 2.5)
+        if int(keep.sum()) >= 3:
+            coef, *_ = np.linalg.lstsq(A[keep], zz[keep], rcond=None)
+    except np.linalg.LinAlgError:
+        return np.where(foreground, 0.35, 0.0).astype(np.float64)
+
+    z_pred = coef[0] + coef[1] * ys
+
+    # Per-row background: robust median of the row, then local residual.
+    # (Wide block medians self-contaminate when the object fills the block.)
+    surround = np.full_like(z, np.nan, dtype=np.float64)
+    for yi in range(h):
+        row = z[yi]
+        fg = foreground[yi]
+        if int(fg.sum()) < max(4, w // 10):
+            continue
+        bg = float(np.median(row[fg]))
+        surround[yi, :] = bg
+        # Also try left/right half medians and take the farther (background).
+        mid = w // 2
+        left = row[:mid][fg[:mid]]
+        right = row[mid:][fg[mid:]]
+        cands = [bg]
+        if left.size >= 3:
+            cands.append(float(np.median(left)))
+        if right.size >= 3:
+            cands.append(float(np.median(right)))
+        bg2 = float(max(cands))
+        surround[yi, :] = bg2
+
+    residual_plane = np.where(foreground, z_pred - z, 0.0)
+    residual_local = np.where(
+        foreground & np.isfinite(surround),
+        surround - z,
+        0.0,
+    )
+    floor_v = objectness_floor_v_max()
+    # Plane residual only in the lower band — never mid/upper FOV.
+    lowerish = ys >= floor_v
+    residual = np.where(
+        lowerish,
+        np.maximum(residual_plane, residual_local),
+        np.maximum(residual_local, 0.0),
+    )
+    scale = np.maximum(
+        0.18 * np.maximum(np.where(np.isfinite(surround), surround, z_pred), near),
+        0.12,
+    )
+    weight = np.clip(residual / scale, 0.0, 1.0)
+    weight = np.where(foreground, weight, 0.0)
+    pmin = floor_protrusion_min()
+    lower = ys >= floor_v
+    weight = np.where(lower & (weight < pmin), 0.0, weight)
+    return weight
+
+
+def _apply_planarity_to_score(
+    score: np.ndarray,
+    z: np.ndarray,
+    foreground: np.ndarray,
+    *,
+    near: float,
+    hi: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Blend objectness score with protrusion weight; return (score, weight)."""
+    wmap = _floor_protrusion_weight(z, foreground, near=near, hi=hi)
+    inv_z = 1.0 / np.maximum(z, near)
+    # In lower FOV protrusions dominate; upper FOV keeps objectness×1/Z.
+    out = score * (0.15 + 0.85 * np.maximum(wmap, 0.05)) + inv_z * wmap * 0.55
+    out = np.where(foreground, out, 0.0)
+    return out, wmap
 
 
 def salient_objectness_peak(
@@ -472,11 +596,15 @@ def salient_objectness_peak(
     floor_v_max: float | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None, float | None, float]:
     """
-    Argmax salient depth protrusion in upper FOV (not full-image centroid).
+    Argmax salient depth protrusion (planarity-gated, full FOV).
 
     Returns (u, v, range_m, variance, confidence, peak_strength).
     peak_strength in [0, 1] — use to gate HUD / bind confidence.
+
+    ``floor_v_max`` kept for API compat; binary cutoff removed — lower FOV
+    accepted only when plane residual indicates a protrusion.
     """
+    del floor_v_max  # planarity replaces hard cutoff; arg retained for callers
     if isinstance(depth, DepthFrame):
         z = np.asarray(depth.depth_m, dtype=np.float64)
         near = float(depth.near_m)
@@ -503,16 +631,15 @@ def salient_objectness_peak(
     obj = _objectness_map(z, foreground, near=near)
     inv_z = 1.0 / np.maximum(z, near)
     score = obj * inv_z * foreground.astype(np.float64)
+    score, _wmap = _apply_planarity_to_score(score, z, foreground, near=near, hi=hi)
 
     ys = np.linspace(0.0, 1.0, h, dtype=np.float64)[:, None]
     xs = np.linspace(0.0, 1.0, w, dtype=np.float64)[None, :]
-    floor_v = float(floor_v_max if floor_v_max is not None else objectness_floor_v_max())
-    score = np.where(ys < floor_v, score, 0.0)
 
-    # Penalize lower-center floor dead-zone (common false lock when slots are diffuse).
-    cx, cy, gw, gh = 0.5, 0.55, 0.10, 0.12
+    # Soft-penalize diffuse lower-center floor strip (not a hard ban).
+    cx, cy, gw, gh = 0.5, 0.72, 0.12, 0.10
     center = np.exp(-(((xs - cx) / gw) ** 2 + ((ys - cy) / gh) ** 2))
-    score = score * (1.0 - 0.92 * center)
+    score = score * (1.0 - 0.75 * center * (1.0 - _wmap))
 
     peak_val = float(score.max())
     if peak_val < 1e-8 or int(np.count_nonzero(score > 0)) < 3:
@@ -522,13 +649,26 @@ def salient_objectness_peak(
     u = float(xs[0, xi])
     v = float(ys[yi, 0])
 
-    upper = ys < floor_v
-    med = float(np.median(score[upper & (score > 0)])) if np.any(upper & (score > 0)) else peak_val
+    # Reject empty-floor locks: lower-FOV peak without protrusion, or
+    # globally flat scene (no protrusion + weak objectness).
+    pmin = floor_protrusion_min()
+    if float(_wmap.max()) < pmin * 0.85 and float(obj.max()) < 0.45:
+        return None, None, None, None, None, 0.0
+    if v >= objectness_floor_v_max() and float(_wmap[yi, xi]) < pmin:
+        return None, None, None, None, None, 0.0
+
+    pos = score > 0
+    med = float(np.median(score[pos])) if np.any(pos) else peak_val
     peak_strength = float(min(1.0, peak_val / max(med * 2.5, 1e-6)))
 
     r, var, conf = depth_at_uv(frame, u, v, window=3)
     if r is None:
-        return None, None, None, None, None, peak_strength
+        # Edge / sparse window — fall back to the peak pixel itself.
+        z_peak = float(z[yi, xi])
+        if np.isfinite(z_peak) and lo < z_peak < hi * 0.98:
+            r, var, conf = z_peak, 0.0, 0.55 * peak_strength
+        else:
+            return None, None, None, None, None, peak_strength
     if conf is not None:
         conf = float(max(0.0, min(1.0, float(conf) * (0.25 + 0.75 * peak_strength))))
     return u, v, float(r), var, conf, peak_strength
@@ -544,6 +684,7 @@ def salient_objectness_peak_near_bearing(
     floor_v_max: float | None = None,
 ) -> tuple[float | None, float | None, float | None, float | None, float | None, float]:
     """Salient peak restricted to a horizontal window around ego bearing."""
+    del floor_v_max
     if isinstance(depth, DepthFrame):
         z = np.asarray(depth.depth_m, dtype=np.float64)
         near = float(depth.near_m)
@@ -570,32 +711,29 @@ def salient_objectness_peak_near_bearing(
     obj = _objectness_map(z, foreground, near=near)
     inv_z = 1.0 / np.maximum(z, near)
     score = obj * inv_z * foreground.astype(np.float64)
+    score, wmap = _apply_planarity_to_score(score, z, foreground, near=near, hi=hi)
 
     ys = np.linspace(0.0, 1.0, h, dtype=np.float64)[:, None]
     xs = np.linspace(0.0, 1.0, w, dtype=np.float64)[None, :]
-    floor_v = float(floor_v_max if floor_v_max is not None else objectness_floor_v_max())
-    score = np.where(ys < floor_v, score, 0.0)
 
     u0 = max(0.05, min(0.95, 0.5 + 0.5 * float(bearing)))
     u_lo = max(0.0, u0 - float(fov_u_half))
     u_hi = min(1.0, u0 + float(fov_u_half))
     score = np.where((xs >= u_lo) & (xs <= u_hi), score, 0.0)
 
-    cx, cy, gw, gh = 0.5, 0.55, 0.10, 0.12
+    cx, cy, gw, gh = 0.5, 0.72, 0.12, 0.10
     center = np.exp(-(((xs - cx) / gw) ** 2 + ((ys - cy) / gh) ** 2))
-    score = score * (1.0 - 0.92 * center)
+    score = score * (1.0 - 0.75 * center * (1.0 - wmap))
 
     peak_val = float(score.max())
     if peak_val < 1e-8 or int(np.count_nonzero(score > 0)) < 3:
-        return salient_objectness_peak(
-            frame, near_m=near, far_m=far, floor_v_max=floor_v_max
-        )
+        return salient_objectness_peak(frame, near_m=near, far_m=far)
 
     yi, xi = np.unravel_index(int(np.argmax(score)), score.shape)
     u = float(xs[0, xi])
     v = float(ys[yi, 0])
-    upper = ys < floor_v
-    med = float(np.median(score[upper & (score > 0)])) if np.any(upper & (score > 0)) else peak_val
+    pos = score > 0
+    med = float(np.median(score[pos])) if np.any(pos) else peak_val
     peak_strength = float(min(1.0, peak_val / max(med * 2.5, 1e-6)))
 
     r, var, conf = depth_at_uv(frame, u, v, window=3)
@@ -604,11 +742,15 @@ def salient_objectness_peak_near_bearing(
     u_col = max(0.05, min(0.95, u0))
     u_lo_i = max(0, int((u_col - float(fov_u_half)) * (w - 1)))
     u_hi_i = min(w - 1, int((u_col + float(fov_u_half)) * (w - 1)))
-    v_hi_i = min(h - 1, int(floor_v * (h - 1)))
+    # Full vertical search; planarity already gates floor pixels.
+    v_hi_i = h - 1
     best_r: float | None = None
     best_u = best_v = 0.5
+    pmin = floor_protrusion_min()
     for yi2 in range(0, v_hi_i + 1):
         for xi2 in range(u_lo_i, u_hi_i + 1):
+            if float(wmap[yi2, xi2]) < pmin and (yi2 / max(h - 1, 1)) >= objectness_floor_v_max():
+                continue
             ru = float(xi2) / max(w - 1, 1)
             rv = float(yi2) / max(h - 1, 1)
             rr, _vr, _rc = depth_at_uv(frame, ru, rv, window=1)
@@ -783,6 +925,10 @@ def live_uv_range_at_bearing(
         u0 = u_bearing
     track_radius = live_uv_track_radius()
     log_cands = _live_uv_cand_log_enabled(tick)
+    fg = np.isfinite(z) & (z > lo) & (z < hi)
+    protrude = _floor_protrusion_weight(z, fg, near=near, hi=hi)
+    pmin = floor_protrusion_min()
+    floor_v = objectness_floor_v_max()
 
     def _scan(
         *,
@@ -796,15 +942,17 @@ def live_uv_range_at_bearing(
     ]:
         u_lo = max(0, int((u0 - fov) * (w - 1)))
         u_hi = min(w - 1, int((u0 + fov) * (w - 1)))
-        v_lo = max(0, int(0.10 * (h - 1)))
-        v_hi = min(h - 1, int(0.58 * (h - 1)))
+        # Full vertical FOV; planarity rejects flat floor in the lower band.
+        v_lo = max(0, int(0.08 * (h - 1)))
+        v_hi = min(h - 1, int(0.96 * (h - 1)))
         if track_pred is not None:
             v_mid = float(track_pred[1])
-            v_half = max(0.10, min(0.22, fov * 0.95))
+            v_half = max(0.12, min(0.30, fov * 1.15))
             v_lo = max(0, int((v_mid - v_half) * (h - 1)))
             v_hi = min(h - 1, int((v_mid + v_half) * (h - 1)))
             v_lo = max(v_lo, int(0.08 * (h - 1)))
-            v_hi = min(v_hi, int(0.62 * (h - 1)))
+            v_hi = min(h - 1, max(v_hi, int(0.08 * (h - 1))))
+            # Never re-impose the old 0.62 ceiling — short objects live below it.
 
         best: tuple[float, float, float, float] | None = None
         best_score = -1.0
@@ -812,8 +960,16 @@ def live_uv_range_at_bearing(
         cands: list[dict[str, float]] = []
         for yi in range(v_lo, v_hi + 1):
             v = float(yi) / max(h - 1, 1)
+            pw = float(protrude[yi].max()) if w > 0 else 0.0
+            # Fast reject empty lower rows with no protrusion anywhere in row.
+            if v >= floor_v and pw < pmin * 0.5:
+                # Still allow sparse checks if any column in window protrudes.
+                pass
             for xi in range(u_lo, u_hi + 1):
                 u = float(xi) / max(w - 1, 1)
+                p_w = float(protrude[yi, xi])
+                if v >= floor_v and p_w < pmin:
+                    continue
                 if track_gate and track_pred is not None:
                     if _uv_dist(u, v, track_pred[0], track_pred[1]) > track_radius:
                         continue
@@ -839,6 +995,8 @@ def live_uv_range_at_bearing(
                     prev_uv=prev_uv,
                     track_pred=track_pred,
                 )
+                # Prefer protrusions over flat floor matches.
+                score = float(score) * (0.25 + 0.75 * max(p_w, 0.15 if v < floor_v else 0.0))
                 if log_cands:
                     cands.append(
                         {
@@ -847,6 +1005,7 @@ def live_uv_range_at_bearing(
                             "r": round(float(r), 4),
                             "conf": round(float(conf), 4),
                             "score": round(float(score), 6),
+                            "protrusion": round(float(p_w), 4),
                             "track_gate": bool(track_gate),
                             "range_gate": bool(range_gate),
                         }
@@ -927,8 +1086,8 @@ def live_uv_range_at_bearing(
     if log_cands and tick is not None:
         u_lo = max(0, int((u0 - fov) * (w - 1)))
         u_hi = min(w - 1, int((u0 + fov) * (w - 1)))
-        v_lo = max(0, int(0.10 * (h - 1)))
-        v_hi = min(h - 1, int(0.58 * (h - 1)))
+        v_lo = max(0, int(0.08 * (h - 1)))
+        v_hi = min(h - 1, int(0.96 * (h - 1)))
         _log_live_uv_candidates(
             tick=int(tick),
             bearing=float(bearing),

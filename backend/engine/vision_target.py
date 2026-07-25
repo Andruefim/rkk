@@ -23,6 +23,30 @@ def vision_resolve_enabled() -> bool:
     return task_resolve_mode() == "vision"
 
 
+def sim_oracle_bind_enabled() -> bool:
+    """
+    Non-production sim crutch: bind from privileged oracle XY when vision is
+    uncertain (no peaked slot). Explicitly NOT real perception — for parallel
+    testing of approach / FSM / escalation after honest 3B kill of ontology
+    fallback. Default off; set RKK_SIM_ORACLE_BIND=1 in sim .env.
+    """
+    raw = os.environ.get("RKK_SIM_ORACLE_BIND", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def vision_active_percept_enabled() -> bool:
+    """Look-around retries before giving up / escalating (5A)."""
+    raw = os.environ.get("RKK_VISION_ACTIVE_PERCEPT", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def vision_active_percept_max_tries() -> int:
+    try:
+        return max(1, min(6, int(os.environ.get("RKK_VISION_ACTIVE_PERCEPT_TRIES", "3"))))
+    except ValueError:
+        return 3
+
+
 @dataclass
 class VisualTarget:
     """Ego-camera target. Must not require body_id / world XY for control."""

@@ -199,8 +199,9 @@ class SceneEntity:
         self.y_right = yr
         self.u = float(u) if u is not None else float(0.5 + 0.5 * b)
         self.v = float(v) if v is not None else 0.55
-        self.confidence = float(max(confidence, 0.5))
-        self.activation = float(activation)
+        # 4A: no artificial confidence floor — pass through calibrated/raw score.
+        self.confidence = float(max(0.0, min(1.0, confidence)))
+        self.activation = float(max(0.0, min(1.0, activation)))
         self.last_vision_tick = int(tick)
         self.last_update_tick = int(tick)
         self.holding = False
@@ -448,13 +449,14 @@ class LatentSceneMemory:
             ent = SceneEntity(entity_id=eid)
             self.entities[eid] = ent
         r = float(vt.range_m) if vt.range_m is not None else 1.0
+        conf = float(max(0.0, min(1.0, float(vt.confidence))))
         ent.seed_from_bearing_range(
             bearing=float(vt.bearing),
             range_m=r,
             tick=int(tick),
             label=str(vt.label or ""),
-            confidence=float(max(vt.confidence, 0.5)),
-            activation=float(max(vt.confidence, 0.5)),
+            confidence=conf,
+            activation=conf,
             slot_id=str(vt.slot_id),
             u=float(vt.u),
             v=float(vt.v),

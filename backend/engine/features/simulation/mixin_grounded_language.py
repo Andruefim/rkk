@@ -1,6 +1,7 @@
 """Simulation mixin: Grounded Language + human task binding (AGI command loop)."""
 from __future__ import annotations
 
+import json
 import math
 import os
 import threading
@@ -38,7 +39,14 @@ from engine.task_observation import (
 from engine.task_tree import TERMINAL_STATUSES, TaskTreeController, task_tree_enabled
 from engine.vision_depth import ArrayDepthCamera, DepthFrame, attach_range_to_target
 from engine.vision_resolve import collect_vision_slots, resolve_visual_target, track_visual_target
-from engine.vision_target import VisualTarget, bearing_from_u, vision_resolve_enabled
+from engine.vision_target import (
+    VisualTarget,
+    bearing_from_u,
+    sim_oracle_bind_enabled,
+    vision_active_percept_enabled,
+    vision_active_percept_max_tries,
+    vision_resolve_enabled,
+)
 
 
 def _grounded_lang_every() -> int:
@@ -183,7 +191,29 @@ class SimulationGroundedLanguageMixin:
                 fields["pos"] = pos
         else:
             fields["reason"] = str(diag.get("reason", "no_target"))
-        for key in ("scene_semantics", "semantics", "candidates"):
+        for key in (
+            "scene_semantics",
+            "semantics",
+            "candidates",
+            "slot_peakiness",
+            "mask_peakiness_min",
+            "geometry",
+            "geometry_fallback",
+            "guided_uv",
+            "peak_strength",
+            "confidence_pre_floor",
+            "ontology_score",
+            "range_m",
+            "range_conf",
+            "u",
+            "v",
+            "slot_id",
+            "label",
+            "reason",
+            "ontology",
+            "best_score",
+            "min_conf",
+        ):
             if key in diag and diag[key] is not None:
                 fields[key] = diag[key]
         task_log_event("target_resolution", tick=int(tick), **fields)
@@ -272,6 +302,58 @@ class SimulationGroundedLanguageMixin:
             last_pe=getattr(node, "last_pe", None),
         )
 
+    def _task_log_stage_retry(self, tick: int, node: Any, reason: str) -> None:
+        from engine.task_tree import task_replan_max
+
+        task_log_event(
+            "stage_retry",
+            tick=int(tick),
+            node_id=str(getattr(node, "id", "")),
+            kind=str(getattr(node, "kind", "")),
+            label=str(getattr(node, "label", "")),
+            attempts=int(getattr(node, "attempts", 0) or 0),
+            max_retries=int(task_replan_max()),
+            failure_reason=str(reason)[:200],
+            new_deadline=getattr(node, "tick_deadline", None),
+        )
+        try:
+            self._add_event(
+                f"↻ retry {getattr(node, 'kind', '?')}: {reason} "
+                f"(attempt {int(getattr(node, 'attempts', 0) or 0)}/"
+                f"{int(task_replan_max())})",
+                "#ffaa44",
+                "value",
+            )
+        except Exception:
+            pass
+        # 6C: time-deduped chat REPORT (not every internal retry).
+        self._maybe_emit_retry_chat(tick, node, reason)
+
+    def _retry_report_cooldown_ticks(self) -> int:
+        try:
+            return max(60, int(os.environ.get("RKK_TASK_RETRY_REPORT_COOLDOWN_TICKS", "800")))
+        except ValueError:
+            return 800
+
+    def _maybe_emit_retry_chat(self, tick: int, node: Any, reason: str) -> None:
+        """One chat REPORT per cooldown window while stage retries silently extend."""
+        t = int(tick)
+        last = int(getattr(self, "_last_retry_chat_tick", -10**9) or -10**9)
+        if t - last < self._retry_report_cooldown_ticks():
+            return
+        self._last_retry_chat_tick = t
+        kind = str(getattr(node, "kind", "") or "?")
+        attempts = int(getattr(node, "attempts", 0) or 0)
+        body = (
+            f"Пока не получается на этапе «{kind}» "
+            f"(попытка {attempts}): {str(reason)[:80]}. Пробую ещё раз."
+        )
+        tt = getattr(self, "_task_tree_ctrl", None)
+        cmd = ""
+        if tt is not None and getattr(tt, "tree", None) is not None:
+            cmd = str(tt.tree.command_text or "")
+        self._emit_task_report(t, cmd or kind, done=False, body=body)
+
     def _tt_complete_active(
         self,
         tt: TaskTreeController,
@@ -300,6 +382,8 @@ class SimulationGroundedLanguageMixin:
         if active is None:
             return result
         if retryable and tt.active_node is active:
+            # Deadline extended in-place — do not pretend the stage failed.
+            self._task_log_stage_retry(tick, active, reason)
             return result
         self._task_log_stage_failed(tick, active, reason)
         return result
@@ -778,41 +862,31 @@ class SimulationGroundedLanguageMixin:
             except Exception:
                 pass
 
-    def _emit_task_report(
+    def _emit_task_speech(
         self,
         tick: int,
-        command_text: str,
+        body: str,
         *,
-        done: bool,
-        body: str | None = None,
+        speech_type: Any,
+        curiosity: float = 0.5,
     ) -> None:
         verbal = getattr(self, "_verbal", None)
-        if verbal is None:
+        if verbal is None or not body or len(str(body).strip()) < 2:
             return
         try:
-            from engine.verbal_action import AgentMessage, SpeechType, ollama_chat_speech_enabled
+            from engine.verbal_action import AgentMessage
 
-            if body is None:
-                if ollama_chat_speech_enabled():
-                    body = self.grounded_lang_generate()
-                    if not body or len(body.strip()) < 3:
-                        return
-                elif done:
-                    body = self.grounded_lang_generate()
-                    if not body or len(body.strip()) < 3:
-                        body = f"Готово: {command_text[:60]}"
-                else:
-                    body = f"Не удалось: {command_text[:60]}"
             msg = AgentMessage(
-                tick=tick,
-                speech_type=SpeechType.REPORT,
+                tick=int(tick),
+                speech_type=speech_type,
                 text=str(body).strip(),
                 concepts=["HUMAN_TASK"],
-                curiosity=0.5,
+                curiosity=float(curiosity),
                 posture=0.5,
             )
             verbal._messages.append(msg)
-            verbal._last_report_tick = tick
+            if str(getattr(speech_type, "name", "")) == "REPORT":
+                verbal._last_report_tick = int(tick)
             verbal.total_messages += 1
             for cb in verbal._on_message:
                 try:
@@ -821,6 +895,41 @@ class SimulationGroundedLanguageMixin:
                     pass
         except Exception:
             pass
+
+    def _emit_task_report(
+        self,
+        tick: int,
+        command_text: str,
+        *,
+        done: bool,
+        body: str | None = None,
+    ) -> None:
+        try:
+            from engine.verbal_action import SpeechType, ollama_chat_speech_enabled
+        except Exception:
+            return
+        if body is None:
+            if ollama_chat_speech_enabled():
+                body = self.grounded_lang_generate()
+                if not body or len(body.strip()) < 3:
+                    return
+            elif done:
+                body = self.grounded_lang_generate()
+                if not body or len(body.strip()) < 3:
+                    body = f"Готово: {command_text[:60]}"
+            else:
+                body = f"Не удалось: {command_text[:60]}"
+        self._emit_task_speech(tick, str(body), speech_type=SpeechType.REPORT)
+
+    def _emit_task_ask(self, tick: int, body: str) -> None:
+        """6C terminal / escalate: ASK human for clarification (not spam-retry REPORT)."""
+        try:
+            from engine.verbal_action import SpeechType
+        except Exception:
+            return
+        self._emit_task_speech(
+            tick, body, speech_type=SpeechType.ASK, curiosity=0.85
+        )
 
     def _apply_task_outcome_affect(self, success: bool) -> None:
         if getattr(self, "_task_tree_affect_done", False):
@@ -878,20 +987,36 @@ class SimulationGroundedLanguageMixin:
                 if node.failure_reason:
                     reason = str(node.failure_reason)
                     break
-            if reason.startswith("no_target") or "static" in reason:
-                body = "Не вижу цель или не могу сдвинуть объект."
-            elif reason in (
+            vision_uncertain = reason in (
+                "uncertain_no_peaked_slot",
                 "low_vision_confidence",
                 "resolve_failed_vision",
                 "no_language_vision_link",
                 "missing_or_invalid_range",
                 "floor_lock_rejected",
                 "no_vision_slots",
-            ):
-                body = "Не вижу цель в камере (зрение не закрепило объект)."
+                "weak_objectness_peak",
+                "active_percept_exhausted",
+            )
+            if reason.startswith("no_target") or "static" in reason:
+                body = "Не вижу цель или не могу сдвинуть объект."
+                self._emit_task_report(tick, cmd, done=False, body=body)
+            elif vision_uncertain:
+                # 6C: terminal ASK — need human clarification, not silent fail.
+                self._emit_task_ask(
+                    tick,
+                    "Не уверен, что правильно вижу цель. "
+                    "Уточните объект или направление?",
+                )
+                self._emit_task_report(
+                    tick,
+                    cmd,
+                    done=False,
+                    body="Не вижу цель в камере (зрение не закрепило объект).",
+                )
             else:
                 body = f"Не удалось: {cmd[:60]}"
-            self._emit_task_report(tick, cmd, done=False, body=body)
+                self._emit_task_report(tick, cmd, done=False, body=body)
         self._apply_task_outcome_affect(success)
         reason = ""
         final_pe = None
@@ -1044,11 +1169,163 @@ class SimulationGroundedLanguageMixin:
             if pk in nodes:
                 nodes[pk] = float(v)
 
+    def _dump_bind_frame(
+        self,
+        tick: int,
+        *,
+        visual: VisualTarget | None = None,
+        diag: dict[str, Any] | None = None,
+    ) -> None:
+        """RGB+depth+slot table at bind for threshold-vs-model diagnosis."""
+        try:
+            from engine.task_logger import task_log_dir
+
+            dump_root = task_log_dir() / "bind_dumps" / f"tick_{int(tick)}"
+            dump_root.mkdir(parents=True, exist_ok=True)
+            meta: dict[str, Any] = {
+                "tick": int(tick),
+                "mask_peakiness_min": float(
+                    (diag or {}).get("mask_peakiness_min")
+                    if diag and diag.get("mask_peakiness_min") is not None
+                    else 1.8
+                ),
+                "slot_peakiness": list((diag or {}).get("slot_peakiness") or []),
+                "candidates": list((diag or {}).get("candidates") or []),
+                "geometry": (diag or {}).get("geometry"),
+                "geometry_fallback": (diag or {}).get("geometry_fallback"),
+                "guided_uv": (diag or {}).get("guided_uv"),
+                "peak_strength": (diag or {}).get("peak_strength"),
+                "confidence_pre_floor": (diag or {}).get("confidence_pre_floor"),
+                "ontology_score": (diag or {}).get("ontology_score"),
+                "range_m": (diag or {}).get("range_m"),
+                "reason": (diag or {}).get("reason"),
+            }
+            if visual is not None:
+                meta["visual"] = visual.to_dict()
+                meta["confidence_pre_bind_floor"] = round(float(visual.confidence), 4)
+            rgbd = None
+            try:
+                rgbd = self._get_ego_rgbd()
+            except Exception:
+                rgbd = None
+            if isinstance(rgbd, dict):
+                rgb = rgbd.get("rgb")
+                depth = rgbd.get("depth_m")
+                if rgb is not None:
+                    try:
+                        from PIL import Image
+                        import numpy as np
+
+                        Image.fromarray(np.asarray(rgb, dtype=np.uint8)).save(
+                            dump_root / "rgb.png"
+                        )
+                        meta["rgb_shape"] = list(np.asarray(rgb).shape)
+                    except Exception as exc:
+                        meta["rgb_error"] = str(exc)[:120]
+                if depth is not None:
+                    try:
+                        import numpy as np
+
+                        d = np.asarray(depth, dtype=np.float32)
+                        np.save(dump_root / "depth_m.npy", d)
+                        # Vis: clip 0–6 m → uint8
+                        d_vis = np.clip(d, 0.0, 6.0) / 6.0
+                        from PIL import Image
+
+                        Image.fromarray((d_vis * 255.0).astype(np.uint8)).save(
+                            dump_root / "depth_vis.png"
+                        )
+                        meta["depth_shape"] = list(d.shape)
+                        meta["depth_min"] = float(np.nanmin(d)) if d.size else None
+                        meta["depth_max"] = float(np.nanmax(d)) if d.size else None
+                        # Depth at guided / visual UV
+                        u = float(
+                            ((diag or {}).get("guided_uv") or {}).get("u")
+                            or (visual.u if visual else 0.5)
+                        )
+                        v = float(
+                            ((diag or {}).get("guided_uv") or {}).get("v")
+                            or (visual.v if visual else 0.5)
+                        )
+                        h, w = int(d.shape[0]), int(d.shape[1])
+                        yi = int(max(0, min(h - 1, round(v * (h - 1)))))
+                        xi = int(max(0, min(w - 1, round(u * (w - 1)))))
+                        meta["depth_at_guided_uv"] = {
+                            "u": u,
+                            "v": v,
+                            "xi": xi,
+                            "yi": yi,
+                            "range_m": float(d[yi, xi]),
+                        }
+                    except Exception as exc:
+                        meta["depth_error"] = str(exc)[:120]
+            (dump_root / "meta.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            task_log_event(
+                "bind_dump",
+                tick=int(tick),
+                path=str(dump_root),
+                confidence_pre_floor=(diag or {}).get("confidence_pre_floor"),
+                geometry=(diag or {}).get("geometry"),
+                peak_strength=(diag or {}).get("peak_strength"),
+                range_m=(diag or {}).get("range_m"),
+                n_slots=len(meta.get("slot_peakiness") or []),
+            )
+        except Exception as exc:
+            try:
+                task_log_event(
+                    "bind_dump",
+                    tick=int(tick),
+                    error=str(exc)[:160],
+                )
+            except Exception:
+                pass
+
+    def _get_ego_rgbd(self) -> dict[str, Any] | None:
+        base = self._humanoid_base_env()
+        fn = getattr(base, "get_ego_rgbd", None) if base is not None else None
+        if not callable(fn):
+            sim = getattr(self, "sim", None)
+            fn = getattr(sim, "get_ego_rgbd", None) if sim is not None else None
+        if not callable(fn):
+            return None
+        try:
+            return fn(view="ego", width=160, height=120)
+        except TypeError:
+            try:
+                return fn(width=160, height=120)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
     def _bind_object_working_memory(self, vt: VisualTarget, tick: int) -> None:
+        conf = float(vt.confidence)
         agent_xy, agent_fwd = self._agent_xy_forward()
         scene = self._latent_scene_memory()
         scene.bind_visual_target(
             vt, tick=int(tick), agent_xy=agent_xy, agent_forward=agent_fwd
+        )
+        # 4A: confidence is stored/logged as-is (no artificial 0.5 floor).
+        task_log_event(
+            "owm_bind",
+            tick=int(tick),
+            slot_id=str(vt.slot_id),
+            label=str(vt.label or ""),
+            u=round(float(vt.u), 4),
+            v=round(float(vt.v), 4),
+            range_m=None if vt.range_m is None else round(float(vt.range_m), 4),
+            confidence=round(conf, 4),
+            confidence_pre_floor=round(conf, 4),
+            confidence_post_floor=round(conf, 4),
+            hard_lock_active=True,
+            non_production=bool((vt.diagnostics or {}).get("non_production")),
+            source=(vt.diagnostics or {}).get("source"),
+            geometry=(vt.diagnostics or {}).get("geometry"),
+            peak_strength=(vt.diagnostics or {}).get("objectness_peak_strength"),
+            guided_uv=(vt.diagnostics or {}).get("guided_uv"),
         )
         self._inject_owm_into_graph(scene)
         self._owm_cached_tick = -1
@@ -1326,6 +1603,168 @@ class SimulationGroundedLanguageMixin:
 
         return _project
 
+    def _bearing_range_from_world_xy(
+        self,
+        target_xy: tuple[float, float],
+        *,
+        agent_xy: tuple[float, float] | None = None,
+        agent_fwd: tuple[float, float] | None = None,
+    ) -> tuple[float, float] | None:
+        if agent_xy is None or agent_fwd is None:
+            agent_xy, agent_fwd = self._agent_xy_forward()
+        ax, ay = float(agent_xy[0]), float(agent_xy[1])
+        tx, ty = float(target_xy[0]), float(target_xy[1])
+        dx, dy = tx - ax, ty - ay
+        dist = float(math.hypot(dx, dy))
+        if dist < 0.05:
+            return None
+        fx, fy = float(agent_fwd[0]), float(agent_fwd[1])
+        n = float(math.hypot(fx, fy)) or 1.0
+        fx, fy = fx / n, fy / n
+        tcx, tcy = dx / dist, dy / dist
+        cross = fx * tcy - fy * tcx
+        dot = max(-1.0, min(1.0, fx * tcx + fy * tcy))
+        bearing_rad = math.atan2(cross, dot)
+        bearing = float(max(-1.0, min(1.0, bearing_rad / (math.pi * 0.5))))
+        return bearing, dist
+
+    def _try_sim_oracle_visual_bind(
+        self,
+        text: str,
+        *,
+        embed_fn: Any | None,
+        require_movable: bool,
+        interaction_kinds: frozenset[str],
+        vision_diag: dict[str, Any],
+    ) -> tuple[ResolvedObject | None, VisualTarget | None, dict[str, Any]]:
+        """
+        Non-production sim crutch: privileged registry XY → VisualTarget.
+
+        Used only when RKK_SIM_ORACLE_BIND=1 and honest vision resolve is
+        uncertain (3B). Logged as source=sim_oracle_bind / non_production=true.
+        """
+        if not sim_oracle_bind_enabled():
+            return None, None, {"reason": "sim_oracle_disabled"}
+        agent_xy, agent_fwd = self._agent_xy_forward()
+        extras = self._sandbox_scene_extras()
+        try:
+            oracle, odiag = resolve_manipulation_target(
+                text,
+                extras,
+                agent_xy=agent_xy,
+                agent_forward=agent_fwd,
+                embed_fn=embed_fn,
+                require_movable=require_movable,
+                interaction_kinds=interaction_kinds,
+            )
+        except Exception as exc:
+            return None, None, {"reason": f"sim_oracle_error:{exc}"}
+        if oracle is None:
+            return None, None, {
+                "reason": "sim_oracle_no_registry_match",
+                "oracle_eval": dict(odiag or {}),
+            }
+        pos = getattr(oracle, "position", None)
+        if pos is None or len(pos) < 2:
+            return oracle, None, {"reason": "sim_oracle_no_position"}
+        br = self._bearing_range_from_world_xy(
+            (float(pos[0]), float(pos[1])),
+            agent_xy=agent_xy,
+            agent_fwd=agent_fwd,
+        )
+        if br is None:
+            return oracle, None, {"reason": "sim_oracle_too_close"}
+        bearing, dist = br
+        u = float(max(0.0, min(1.0, 0.5 + 0.5 * bearing)))
+        label = str(
+            getattr(oracle, "semantic", None)
+            or getattr(oracle, "ref", "")
+            or "sim_oracle"
+        )
+        # Deliberately mid confidence — must not look like peaked vision success.
+        conf = 0.40
+        vt = VisualTarget(
+            slot_id="sim_oracle",
+            u=u,
+            v=0.55,
+            label=label,
+            confidence=conf,
+            bearing=float(bearing),
+            range_m=float(dist),
+            range_conf=1.0,
+            diagnostics={
+                "source": "sim_oracle_bind",
+                "non_production": True,
+                "oracle_ref": str(getattr(oracle, "ref", "")),
+                "vision_fail_reason": str(vision_diag.get("reason") or ""),
+                "geometry": "sim_oracle_xy",
+            },
+        )
+        diag: dict[str, Any] = {
+            "reason": "ok_sim_oracle",
+            "resolve_mode": "vision",
+            "source": "sim_oracle_bind",
+            "non_production": True,
+            "slot_id": vt.slot_id,
+            "label": vt.label,
+            "range_m": vt.range_m,
+            "confidence": conf,
+            "oracle_eval": {
+                "ref": getattr(oracle, "ref", None),
+                "reason": (odiag or {}).get("reason"),
+            },
+            "oracle_dist_m": float(dist),
+            "vision_range_m": float(dist),
+            "vision_reason": vision_diag.get("reason"),
+            "refused_geometry_fallback": vision_diag.get("refused_geometry_fallback"),
+        }
+        try:
+            task_log_event(
+                "sim_oracle_bind",
+                tick=int(getattr(self, "tick", 0) or 0),
+                oracle_ref=str(getattr(oracle, "ref", "")),
+                range_m=round(float(dist), 4),
+                bearing=round(float(bearing), 4),
+                vision_reason=str(vision_diag.get("reason") or ""),
+                non_production=True,
+            )
+        except Exception:
+            pass
+        return oracle, vt, diag
+
+    def _apply_active_percept_motor(self, pending: dict[str, Any]) -> None:
+        """5A: look / slight turn while waiting to re-encode and re-resolve."""
+        arb = getattr(self, "_motor_arbiter", None)
+        if arb is None:
+            return
+        sign = float(pending.get("look_sign") or 1.0)
+        yaw = float(max(0.05, min(0.95, 0.5 + 0.30 * sign)))
+        coupling = float(max(0.05, min(0.95, 0.5 + 0.14 * sign)))
+        try:
+            arb.register_from_dict(
+                "human_task",
+                {
+                    "intent_head_yaw": yaw,
+                    "intent_look_at": 0.72,
+                    "intent_gait_coupling": coupling,
+                },
+                precision=0.70,
+            )
+        except Exception:
+            pass
+
+    def _resolve_uncertain_reason(self, reason: str) -> bool:
+        return str(reason or "") in (
+            "uncertain_no_peaked_slot",
+            "low_vision_confidence",
+            "weak_objectness_peak",
+            "floor_lock_rejected",
+            "missing_or_invalid_range",
+            "no_vision_slots",
+            "no_language_vision_link",
+            "resolve_failed_vision",
+        )
+
     def _resolve_command_target(
         self,
         text: str,
@@ -1335,7 +1774,8 @@ class SimulationGroundedLanguageMixin:
         interaction_kinds: frozenset[str],
     ) -> tuple[ResolvedObject | None, VisualTarget | None, dict[str, Any]]:
         """
-        Bind-time resolve. Vision mode never falls back to registry for control.
+        Bind-time resolve. Vision mode never falls back to registry for control
+        unless RKK_SIM_ORACLE_BIND=1 (explicit non-production crutch).
         Returns (oracle_resolved_or_None, visual_target_or_None, diag).
         """
         if vision_resolve_enabled():
@@ -1380,7 +1820,30 @@ class SimulationGroundedLanguageMixin:
             diag = dict(diag)
             diag["resolve_mode"] = "vision"
             if vt is None:
-                diag["reason"] = str(diag.get("reason") or "resolve_failed_vision")
+                reason = str(diag.get("reason") or "resolve_failed_vision")
+                diag["reason"] = reason
+                uncertain = self._resolve_uncertain_reason(reason)
+                # 5A: signal deferred tick to look-around when sim-oracle crutch is off.
+                if (
+                    uncertain
+                    and not sim_oracle_bind_enabled()
+                    and vision_active_percept_enabled()
+                ):
+                    diag["active_percept_candidate"] = True
+                    return None, None, diag
+                # Explicit sim-only cheat (non-production) after honest 3B refuse.
+                if uncertain and sim_oracle_bind_enabled():
+                    o_res, o_vt, o_diag = self._try_sim_oracle_visual_bind(
+                        text,
+                        embed_fn=embed_fn,
+                        require_movable=require_movable,
+                        interaction_kinds=interaction_kinds,
+                        vision_diag=diag,
+                    )
+                    if o_vt is not None and o_vt.is_ready(require_range=True):
+                        merged = {**diag, **o_diag}
+                        return o_res, o_vt, merged
+                    diag["sim_oracle_attempt"] = o_diag
                 return None, None, diag
             # Eval-only: try to attach oracle ref if label matches registry (metrics)
             oracle = None
@@ -2020,7 +2483,11 @@ class SimulationGroundedLanguageMixin:
         return {str(p.kind) for p in (goal.predicates or [])}
 
     def _tick_deferred_vision_resolve(self, *, tick: int, fallen: bool) -> None:
-        """Finish resolve_target after command (async) / stance recovers."""
+        """Finish resolve_target after command (async) / stance recovers.
+
+        5A: when vision is uncertain and sim-oracle crutch is off, look around
+        and re-resolve up to RKK_VISION_ACTIVE_PERCEPT_TRIES before failing.
+        """
         pending = getattr(self, "_deferred_vision_resolve", None)
         if not isinstance(pending, dict):
             return
@@ -2032,6 +2499,13 @@ class SimulationGroundedLanguageMixin:
         if active is None or str(active.kind) != "resolve_target":
             self._deferred_vision_resolve = None
             return
+
+        live = self._live_tick(tick)
+        wait_until = int(pending.get("wait_until_tick") or 0)
+        if wait_until > 0 and live < wait_until:
+            self._apply_active_percept_motor(pending)
+            return
+
         text = str(pending.get("text") or "")
         gl = getattr(self, "_grounded_lang", None)
         embed_fn = gl.embedder.embed if gl is not None and getattr(gl, "embedder", None) else None
@@ -2048,17 +2522,52 @@ class SimulationGroundedLanguageMixin:
             diag = {"reason": f"resolver_error:{exc}", "resolve_mode": "vision"}
             resolved, visual = None, None
         self._manip_diag = dict(diag)
-        live = self._live_tick(tick)
         self._task_log_target_resolution(live, text, resolved, diag)
-        self._deferred_vision_resolve = None
+        self._dump_bind_frame(live, visual=visual, diag=diag if isinstance(diag, dict) else {})
 
         vision_ok = visual is not None and visual.is_ready(require_range=True)
         if vision_resolve_enabled() and not vision_ok:
+            # 5A active-perception: scan → wait encode → rescan (sim-oracle off only).
+            if bool(diag.get("active_percept_candidate")) and vision_active_percept_enabled():
+                tries = int(pending.get("active_percept_tries") or 0)
+                max_tries = vision_active_percept_max_tries()
+                if tries < max_tries:
+                    sign = 1.0 if (tries % 2 == 0) else -1.0
+                    pending["active_percept_tries"] = tries + 1
+                    pending["look_sign"] = sign
+                    try:
+                        settle = max(
+                            8, int(os.environ.get("RKK_VISION_ACTIVE_PERCEPT_SETTLE", "24"))
+                        )
+                    except ValueError:
+                        settle = 24
+                    pending["wait_until_tick"] = live + settle
+                    self._deferred_vision_resolve = pending
+                    self._apply_active_percept_motor(pending)
+                    try:
+                        task_log_event(
+                            "active_percept_scan",
+                            tick=live,
+                            try_n=tries + 1,
+                            max_tries=max_tries,
+                            look_sign=sign,
+                            reason=str(diag.get("reason") or ""),
+                        )
+                    except Exception:
+                        pass
+                    return
+                diag = dict(diag)
+                diag["reason"] = "active_percept_exhausted"
+                self._manip_diag = dict(diag)
+
+            self._deferred_vision_resolve = None
             self._tt_fail_active(
                 tt, live, str(diag.get("reason", "resolve_failed_vision")), retryable=False
             )
             self._maybe_finalize_task_tree(live)
             return
+
+        self._deferred_vision_resolve = None
         if vision_resolve_enabled() and visual is not None:
             goal = getattr(self, "_task_goal", None)
             if goal is not None:
@@ -2089,7 +2598,13 @@ class SimulationGroundedLanguageMixin:
             self._tt_complete_active(
                 tt,
                 live,
-                diagnostics={"resolved": visual.ref, "vision": visual.to_dict(), "deferred": True},
+                diagnostics={
+                    "resolved": visual.ref,
+                    "vision": visual.to_dict(),
+                    "deferred": True,
+                    "non_production": bool((visual.diagnostics or {}).get("non_production")),
+                    "source": (visual.diagnostics or {}).get("source"),
+                },
             )
             self._task_tree_stage_enter_tick = live
         elif resolved is not None:

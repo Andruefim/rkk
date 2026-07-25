@@ -546,10 +546,31 @@ def resolve_visual_target(
             "v": c.get("v"),
             "match_label": round(float(c.get("match_label") or 0.0), 4),
             "match_concept": round(float(c.get("match_concept") or 0.0), 4),
+            "match_ontology": round(float(c.get("match_ontology") or 0.0), 4),
             "uv_valid": c.get("uv_valid"),
+            "mask_peakiness": round(float(c.get("mask_peakiness") or 0.0), 4),
+            "activation": round(float(c.get("activation") or 0.0), 4),
         }
         for c in scored[:5]
     ]
+    # Full slot table for threshold-vs-model diagnosis (all K slots).
+    diag["slot_peakiness"] = [
+        {
+            "slot_id": c.get("slot_id"),
+            "mask_peakiness": round(float(c.get("mask_peakiness") or 0.0), 4),
+            "uv_valid": bool(c.get("uv_valid")),
+            "u": round(float(c.get("u") or 0.5), 4),
+            "v": round(float(c.get("v") or 0.5), 4),
+            "activation": round(float(c.get("activation") or 0.0), 4),
+            "label": c.get("label"),
+            "match_score": round(float(c.get("match_score") or 0.0), 4),
+            "match_label": round(float(c.get("match_label") or 0.0), 4),
+            "match_concept": round(float(c.get("match_concept") or 0.0), 4),
+            "match_ontology": round(float(c.get("match_ontology") or 0.0), 4),
+        }
+        for c in scored
+    ]
+    diag["mask_peakiness_min"] = float(mask_peakiness_min())
     if score_meta.get("ontology"):
         diag["ontology"] = score_meta.get("ontology")
 
@@ -572,10 +593,9 @@ def resolve_visual_target(
         break
 
     if best_target is None and depth_camera is not None:
-        # SlotAttention still diffuse (uv_valid=false) → ranking scores are
-        # crushed below min_conf, but ontology already named the referent
-        # (e.g. cylinder). Lock spatially via depth objectness peak instead
-        # of failing the whole human command.
+        # 3B: do NOT commit ontology→objectness_peak. Diffuse slots + named
+        # referent is UNCERTAIN — caller may escalate / active-perceive / use
+        # an explicit sim-only oracle gate (non-production).
         ont_diag = score_meta.get("ontology") if isinstance(score_meta.get("ontology"), dict) else {}
         ont_best = float((ont_diag or {}).get("best_score") or 0.0)
         best_ont_slot = max(
@@ -587,22 +607,13 @@ def resolve_visual_target(
         )
         ont_slot = float(best_ont_slot.get("match_ontology") or 0.0)
         if ont_best >= 0.25 or ont_slot >= 0.20:
-            cand = dict(best_ont_slot)
-            cand["uv_valid"] = False  # force objectness-peak geometry
-            label = str(
-                (ont_diag or {}).get("best_key")
-                or cand.get("label")
-                or "object"
-            )
-            if not _is_visual_concept(label):
-                label = str((ont_diag or {}).get("best_key") or "object")
-            cand["label"] = label
-            cand["match_score"] = float(max(ont_best, ont_slot, 0.35))
-            target = _apply_metric_geometry(cand, depth_camera)
-            if (not require_range) or target.is_ready(require_range=True):
-                best_target = target
-                diag["geometry_fallback"] = "objectness_peak"
-                diag["ontology_score"] = round(ont_best, 4)
+            diag["reason"] = "uncertain_no_peaked_slot"
+            diag["ontology_score"] = round(ont_best, 4)
+            diag["ontology"] = ont_diag
+            diag["best_score"] = float(best_ont_slot.get("match_score") or 0.0)
+            diag["min_conf"] = min_c
+            diag["refused_geometry_fallback"] = "objectness_peak"
+            return None, diag
 
     if best_target is None:
         # Fall back: best score without range gate (for diagnostics)
@@ -629,11 +640,9 @@ def resolve_visual_target(
         diag["peak_strength"] = round(pstr, 4)
         diag["target_partial"] = target.to_dict()
         return None, diag
-    # Refuse obvious floor-center locks after geometry (still no peaked mask),
-    # unless objectness fallback already ran (then trust depth peak).
+    # Refuse obvious floor-center locks after geometry (still no peaked mask).
     if (
         depth_camera is not None
-        and not diag.get("geometry_fallback")
         and not bool((target.diagnostics or {}).get("uv_valid"))
         and float(target.v) > 0.72
         and float(target.confidence or 0.0) < 0.55
@@ -650,7 +659,17 @@ def resolve_visual_target(
     diag["u"] = target.u
     diag["v"] = target.v
     diag["resolved"] = target.ref
-    diag["guided_uv"] = {"u": target.u, "v": target.v}
+    diag["guided_uv"] = {"u": float(target.u), "v": float(target.v)}
+    diag["geometry"] = (target.diagnostics or {}).get("geometry")
+    diag["peak_strength"] = round(pstr, 4)
+    # Raw confidence after spatial caps (no bind-time floor — 4A).
+    diag["confidence_pre_floor"] = round(float(target.confidence), 4)
+    diag["confidence"] = round(float(target.confidence), 4)
+    if (target.diagnostics or {}).get("guided_uv"):
+        diag["guided_uv"] = dict((target.diagnostics or {}).get("guided_uv") or {})
+    ont = score_meta.get("ontology") if isinstance(score_meta.get("ontology"), dict) else {}
+    if ont and "ontology_score" not in diag:
+        diag["ontology_score"] = round(float(ont.get("best_score") or 0.0), 4)
 
     if visual_env is not None and hasattr(visual_env, "set_slot_lexicon"):
         try:

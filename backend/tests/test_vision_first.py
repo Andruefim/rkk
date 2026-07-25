@@ -546,6 +546,48 @@ def test_salient_peak_prefers_protrusion_over_floor_centroid() -> None:
     assert pstr > 0.1
 
 
+def test_salient_peak_finds_short_object_in_lower_fov() -> None:
+    """Planarity must keep short ground props (v>0.58) instead of hard floor cut."""
+    h, w = 60, 80
+    # Floor gradient: farther at top, closer near bottom.
+    yy = np.linspace(4.5, 1.8, h, dtype=np.float32)[:, None]
+    depth = np.repeat(yy, w, axis=1)
+    # Short cylinder-like blob entirely in lower FOV (v≈0.85–0.95).
+    depth[50:58, 28:42] = 2.05
+    frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
+    u, v, r, _, _, pstr = salient_objectness_peak(frame)
+    assert u is not None and r is not None
+    assert v is not None and v > 0.70
+    assert 1.7 < r < 2.4
+    assert pstr > 0.05
+
+
+def test_salient_peak_rejects_empty_floor_plane() -> None:
+    """Pure floor plane must not yield a confident lower-FOV lock."""
+    h, w = 60, 80
+    yy = np.linspace(4.5, 1.8, h, dtype=np.float32)[:, None]
+    depth = np.repeat(yy, w, axis=1)
+    frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
+    u, v, r, _, _, pstr = salient_objectness_peak(frame)
+    # Either no peak, or peak stays out of the extreme floor band / weak.
+    if r is not None and v is not None and v > 0.70:
+        assert pstr < 0.35
+
+
+def test_live_uv_finds_lower_fov_protrusion() -> None:
+    h, w = 60, 80
+    yy = np.linspace(4.5, 1.8, h, dtype=np.float32)[:, None]
+    depth = np.repeat(yy, w, axis=1)
+    depth[50:58, 28:42] = 2.05
+    frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
+    u, v, r, conf = live_uv_range_at_bearing(
+        ArrayDepthCamera(frame), 0.0, range_hint=2.1
+    )
+    assert u is not None and r is not None and v is not None
+    assert v > 0.70
+    assert 1.7 < r < 2.4
+
+
 def test_lateral_tilt_not_visual_concept() -> None:
     from engine.vision_resolve import _is_visual_concept
 
@@ -633,10 +675,10 @@ def test_live_uv_continuity_prefers_prev_track() -> None:
     assert u < 0.42
 
 
-def test_ontology_objectness_fallback_when_scores_crushed(
+def test_uncertain_no_peaked_slot_refuses_objectness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: uv penalty must not yield 'Не удалось' when depth can lock."""
+    """3B: crushed diffuse slots + ontology match → UNCERTAIN, not objectness commit."""
     from engine.grounded_language import FallbackEmbeddingClient
     from engine.visual_referent_ontology import clear_visual_referent_cache
 
@@ -645,7 +687,7 @@ def test_ontology_objectness_fallback_when_scores_crushed(
     emb = FallbackEmbeddingClient(embed_dim=64)
     h, w = 40, 48
     depth = np.full((h, w), 4.0, dtype=np.float32)
-    depth[10:24, 8:20] = 1.5  # cylinder-like protrusion
+    depth[10:24, 8:20] = 1.5  # cylinder-like protrusion (unused after 3B refuse)
     cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
     slots = [
         {
@@ -667,11 +709,39 @@ def test_ontology_objectness_fallback_when_scores_crushed(
         embed_fn=emb.embed,
         require_range=True,
     )
-    assert vt is not None, diag
-    assert diag.get("geometry_fallback") == "objectness_peak" or (
-        vt.diagnostics or {}
-    ).get("geometry") == "objectness_peak"
-    assert vt.range_m is not None
+    assert vt is None, diag
+    assert diag.get("reason") == "uncertain_no_peaked_slot"
+    assert diag.get("refused_geometry_fallback") == "objectness_peak"
+
+
+def test_bind_confidence_no_floor() -> None:
+    """4A: OWM stores raw confidence; no max(conf, 0.5) inflation."""
+    from engine.object_working_memory import LatentSceneMemory
+
+    scene = LatentSceneMemory()
+    vt = VisualTarget(
+        slot_id="slot_low",
+        u=0.5,
+        v=0.45,
+        label="object",
+        confidence=0.22,
+        bearing=0.0,
+        range_m=2.0,
+        range_conf=0.9,
+    )
+    ent = scene.bind_visual_target(
+        vt, tick=1, agent_xy=(0.0, 0.0), agent_forward=(1.0, 0.0)
+    )
+    assert float(ent.confidence) == pytest.approx(0.22, abs=1e-6)
+
+
+def test_sim_oracle_bind_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engine.vision_target import sim_oracle_bind_enabled
+
+    monkeypatch.setenv("RKK_SIM_ORACLE_BIND", "1")
+    assert sim_oracle_bind_enabled() is True
+    monkeypatch.setenv("RKK_SIM_ORACLE_BIND", "0")
+    assert sim_oracle_bind_enabled() is False
 
 
 def test_llm_decompose_parse(monkeypatch: pytest.MonkeyPatch) -> None:
