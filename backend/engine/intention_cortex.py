@@ -300,11 +300,9 @@ class IntentionCortex:
         tb = getattr(sim, "_task_binding", None)
         ht = tb.active_task if tb is not None else None
         if ht is not None and ht.expected_state:
+            # expected_state / narrative only — macro_hint is authoritative in
+            # _build_context / _macro_for_subgoal (writing IDLE here was a no-op).
             self._last_context.expected_state = dict(ht.expected_state)
-            if fallen:
-                self._last_context.macro_hint = "RECOVER_POSTURE"
-            else:
-                self._last_context.macro_hint = "IDLE"
             if getattr(ht, "text", ""):
                 self._last_context.narrative = f"human: {str(ht.text)[:96]}"
 
@@ -322,7 +320,7 @@ class IntentionCortex:
             alt = self._pick_locomote_primary(self._stack)
             if alt is not None:
                 primary = alt
-        ctx = self._build_context(primary, obs, fallen, tick)
+        ctx = self._build_context(primary, obs, fallen, tick, sim=sim)
         ctx = self._merge_deliberation(sim, ctx, tick)
         self._project_to_graph(agent, ctx, primary)
         self._project_intent_motor(agent, ctx, primary, fallen=fallen, sim=sim)
@@ -344,8 +342,18 @@ class IntentionCortex:
         latest = delib.latest(max_age_ticks=max_age)
         if latest is None:
             return ctx
+        human_exec = False
+        try:
+            from engine.task_executive import human_task_executive_active
+
+            human_exec = human_task_executive_active(sim)
+        except Exception:
+            human_exec = False
         if latest.macro_hint and latest.macro_hint != "IDLE":
-            ctx.macro_hint = str(latest.macro_hint)
+            hint = str(latest.macro_hint).strip().upper()
+            # Do not resurrect LOCOMOTE/EXPLORE from stale deliberation during human task.
+            if not (human_exec and hint in ("LOCOMOTE_DELIVERY", "EXPLORE")):
+                ctx.macro_hint = str(latest.macro_hint)
         if latest.expected_state:
             merged = dict(ctx.expected_state)
             merged.update(latest.expected_state)
@@ -704,16 +712,37 @@ class IntentionCortex:
         obs: dict[str, float],
         fallen: bool,
         tick: int,
+        *,
+        sim: Any | None = None,
     ) -> IntentionContext:
+        human_exec = False
+        try:
+            from engine.task_executive import human_task_executive_active
+
+            human_exec = sim is not None and human_task_executive_active(sim)
+        except Exception:
+            human_exec = False
+
         if primary is None:
-            if not fallen and stable_locomote_ready(obs):
+            if fallen:
+                return IntentionContext(
+                    macro_hint="RECOVER_POSTURE",
+                    horizon_ticks=_ei("RKK_INTENTION_MACRO_TICKS", 180),
+                )
+            # During human task, task navigation owns locomotion — no stable-gate LOCOMOTE.
+            if human_exec:
+                return IntentionContext(
+                    macro_hint="IDLE",
+                    horizon_ticks=_ei("RKK_INTENTION_MACRO_TICKS", 180),
+                )
+            if stable_locomote_ready(obs):
                 return self._stable_locomote_context(tick)
             return IntentionContext(
-                macro_hint="IDLE" if not fallen else "RECOVER_POSTURE",
+                macro_hint="IDLE",
                 horizon_ticks=_ei("RKK_INTENTION_MACRO_TICKS", 180),
             )
 
-        macro = self._macro_for_subgoal(primary, obs, fallen)
+        macro = self._macro_for_subgoal(primary, obs, fallen, sim=sim)
         patch, residuals, expected = self._patches_for_subgoal(primary, obs)
         horizon = max(
             _ei("RKK_INTENTION_MACRO_TICKS", 180),
@@ -732,7 +761,12 @@ class IntentionCortex:
         )
 
     def _macro_for_subgoal(
-        self, sg: SubGoal, obs: dict[str, float], fallen: bool
+        self,
+        sg: SubGoal,
+        obs: dict[str, float],
+        fallen: bool,
+        *,
+        sim: Any | None = None,
     ) -> str:
         if fallen:
             return "RECOVER_POSTURE"
@@ -743,6 +777,19 @@ class IntentionCortex:
         # Variant / elbo-normalized com_z can sit ~0.44 while upright; trust posture first.
         if ps <= 0.55 and cz < 0.46:
             return "RECOVER_POSTURE"
+
+        # Source-aware suppression: human task / human_command subgoals must not
+        # promote LOCOMOTE or EXPLORE — task navigation owns locomotion.
+        human_exec = False
+        try:
+            from engine.task_executive import human_task_executive_active
+
+            human_exec = sim is not None and human_task_executive_active(sim)
+        except Exception:
+            human_exec = False
+        if human_exec or str(getattr(sg, "source", "") or "") == "human_command":
+            return "IDLE"
+
         intents = sg.intent_targets or {}
         keys = set(intents) | {sg.var_id}
         if sg.var_id == "target_dist" or "target_dist" in keys:
@@ -755,7 +802,8 @@ class IntentionCortex:
             if stable_locomote_ready(obs, fallen=fallen):
                 return "LOCOMOTE_DELIVERY"
             return "IDLE" if ps > 0.55 else "RECOVER_POSTURE"
-        return "LOCOMOTE_DELIVERY"
+        # Unrecognized subgoal: stay still rather than invent locomotion.
+        return "IDLE"
 
     def _stable_locomote_context(self, tick: int) -> IntentionContext:
         stride = _ef("RKK_NS_LOCOMOTE_STRIDE", 0.64)

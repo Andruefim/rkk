@@ -173,3 +173,22 @@ def test_task_from_planning_context_human_recover() -> None:
     assert t.macro == "RECOVER_POSTURE"
     assert t.skill_id == "human_command"
     assert t.expected_state["posture_stability"] == 0.8
+
+
+def test_task_from_planning_context_human_keeps_idle() -> None:
+    """Human task must not invent LOCOMOTE/EXPLORE from NL tags."""
+    for text in ("подойди ближе", "осмотрись", "иди вперёд"):
+        ctx = {
+            "human_task_active": True,
+            "human_task_text": text,
+            "macro": "IDLE",
+            "expected_state": {"target_dist": 0.55},
+            "skill_id": "human_command",
+        }
+        t = task_from_planning_context(ctx, {})
+        assert t.macro == "IDLE", text
+        # Stale LOCOMOTE/EXPLORE in ctx must also clamp.
+        ctx["macro"] = "LOCOMOTE_DELIVERY"
+        assert task_from_planning_context(ctx, {}).macro == "IDLE"
+        ctx["macro"] = "EXPLORE"
+        assert task_from_planning_context(ctx, {}).macro == "IDLE"

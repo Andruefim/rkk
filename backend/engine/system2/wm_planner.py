@@ -184,10 +184,10 @@ def task_from_planning_context(ctx: dict[str, Any] | None, graph_nodes: dict[str
         tag = command_tag_for_text(human_text)
         if tag == "recover":
             macro = "RECOVER_POSTURE"
-        elif tag == "locomote":
-            macro = "LOCOMOTE_DELIVERY"
-        else:
-            macro = "EXPLORE"
+        elif macro in ("LOCOMOTE_DELIVERY", "EXPLORE"):
+            # planning_context forces IDLE during human task; do not re-invent
+            # LOCOMOTE/EXPLORE from NL tags (task nav owns locomotion).
+            macro = "IDLE"
     if ctx.get("fallen_override_active"):
         macro = "RECOVER_POSTURE"
     es_raw = ctx.get("expected_state")

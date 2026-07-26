@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from engine.grounded_language import sensory_node_ids
+from engine.intention_cortex import SubGoal
 from engine.motor_arbiter import MotorArbiter
 from engine.system2.controller import System2Controller
 from engine.system2.wm_planner import task_from_planning_context
@@ -62,6 +63,7 @@ def test_command_ingest_bind_writes_wm(agi_loop_sim: AgiLoopSim) -> None:
     task = out.get("task") or {}
     assert task.get("n_expected_keys", 0) > 0
     assert task.get("expected_state")
+    assert "task_target_dist_m" in (task.get("expected_state") or {})
 
     wm = sim._system2.working_memory
     assert wm.has("human_task_active")
@@ -127,7 +129,8 @@ def test_wm_planner_receives_expected_state_from_command(agi_loop_sim: AgiLoopSi
 
     assert plan_ctx.get("human_task_active") is True
     assert plan_ctx.get("skill_id") == "human_command"
-    assert plan_ctx.get("macro") in ("EXPLORE", "LOCOMOTE_DELIVERY")
+    # Human task owns locomotion via task nav — intention must not promote LOCOMOTE/EXPLORE.
+    assert plan_ctx.get("macro") == "IDLE"
     es = plan_ctx.get("expected_state") or {}
     assert es
     active = sim._task_binding.active_task
@@ -137,36 +140,63 @@ def test_wm_planner_receives_expected_state_from_command(agi_loop_sim: AgiLoopSi
 
     wm_task = task_from_planning_context(plan_ctx, sim.agent.graph.nodes)
     assert wm_task.expected_state
-    assert wm_task.macro in ("EXPLORE", "LOCOMOTE_DELIVERY")
+    assert wm_task.macro == "IDLE"
     assert any(k in wm_task.expected_state for k in active.expected_state)
 
 
 def test_intention_registers_motor_arbiter_intent(agi_loop_env: None) -> None:
-    """Human command with intent delta → motor arbiter receives register_from_dict."""
+    """Without an active human task, intention may register motor intents."""
     obs = _default_humanoid_obs()
     obs["intent_stride"] = 0.2
     sim = AgiLoopSim(obs=obs, tick=200)
     _patch_fallback_embed(sim)
-    sim.handle_human_command("иди вперёд")
+    # No human command — curriculum-style projection path.
+    assert sim._task_binding is None
 
+    sim._motor_arbiter = MotorArbiter()
+    sim._motor_arbiter.begin_tick()
+    ic = sim._intention_cortex
+    primary = SubGoal(
+        subgoal_id="walk",
+        var_id="intent_stride",
+        target_val=0.85,
+        intent_targets={"intent_stride": 0.85},
+        source="curriculum_active",
+        status="active",
+    )
+    from engine.intention_cortex import IntentionContext
+
+    ctx = IntentionContext(
+        macro_hint="LOCOMOTE_DELIVERY",
+        intent_residuals={"intent_stride": 0.2},
+    )
+    ic._project_intent_motor(sim.agent, ctx, primary, fallen=False, sim=sim)
+
+    assert len(sim._motor_arbiter._intents) >= 1
+    srcs = {i.source for i in sim._motor_arbiter._intents}
+    assert "intention_cortex" in srcs
+
+
+def test_intention_motor_suppressed_during_human_task(agi_loop_env: None) -> None:
+    """Active human task → intention motor must not drive locomotion."""
+    obs = _default_humanoid_obs()
+    sim = AgiLoopSim(obs=obs, tick=200)
+    _patch_fallback_embed(sim)
+    sim.handle_human_command("иди вперёд")
     task = sim._task_binding.active_task
     assert task is not None
-    task.expected_state = {"intent_stride": 0.85}
 
     sim._motor_arbiter = MotorArbiter()
     sim._motor_arbiter.begin_tick()
     ic = sim._intention_cortex
     ic.absorb_human_task(task, obs, sim.tick)
     primary = ic._stack[0]
-    ctx = ic._last_context
-    ctx.macro_hint = "EXPLORE"
+    from engine.intention_cortex import IntentionContext
+
+    ctx = IntentionContext(macro_hint="LOCOMOTE_DELIVERY", intent_residuals={"intent_stride": 0.3})
     ic._project_intent_motor(sim.agent, ctx, primary, fallen=False, sim=sim)
-
-    assert len(sim._motor_arbiter._intents) >= 1
-    srcs = {i.source for i in sim._motor_arbiter._intents}
-    assert "intention_cortex" in srcs
-    assert primary.source == "human_command"
-
+    assert len(sim._motor_arbiter._intents) == 0
+    assert ic._macro_for_subgoal(primary, obs, fallen=False, sim=sim) == "IDLE"
 
 def test_task_done_emits_verbal_report(agi_loop_sim: AgiLoopSim) -> None:
     """tick_verify success → _emit_task_report appends SpeechType.REPORT."""

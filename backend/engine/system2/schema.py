@@ -84,6 +84,11 @@ def _dynamic_task_key(sk: str) -> bool:
         return True
     if sk.startswith("intent_speak_"):
         return True
+    # Vision-first metric keys (task_observation.TASK_*).
+    if sk.startswith("task_"):
+        return True
+    if sk in ("contact_signal", "grasp_contact"):
+        return True
     return False
 
 

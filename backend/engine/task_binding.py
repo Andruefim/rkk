@@ -28,6 +28,12 @@ from engine.success_predicates import (
 )
 from engine.system2.schema import EpisodeSuccessSpec, filter_expected_state_raw
 from engine.task_goal import TaskGoal
+from engine.task_observation import (
+    CONTACT_SIGNAL,
+    GRASP_CONTACT,
+    TASK_CONTACT,
+    TASK_TARGET_DIST,
+)
 
 
 def task_binding_enabled() -> bool:
@@ -324,6 +330,25 @@ class TaskBindingController:
                 {k: float(obs[k]) for k in fallback_keys if k in obs},
                 obs_keys=list(obs.keys()),
             )
+        # Metric predicates: seed target values when rollout never saw task_* keys
+        # (mock sims / early bind before OWM injects task_target_dist_m).
+        if not expected and goal is not None and goal.predicates:
+            seeded: dict[str, float] = {}
+            for p in goal.predicates:
+                kind = str(p.kind)
+                if kind == "reduce_distance":
+                    seeded[TASK_TARGET_DIST] = float(p.target_value)
+                elif kind == "contact":
+                    seeded[TASK_CONTACT] = float(p.target_value)
+                    seeded[CONTACT_SIGNAL] = float(p.target_value)
+                    seeded[GRASP_CONTACT] = float(p.target_value)
+                elif kind == "state_key" and p.key:
+                    seeded[str(p.key)] = float(p.target_value)
+            if seeded:
+                expected = filter_expected_state_raw(
+                    seeded,
+                    obs_keys=list(obs.keys()) + list(seeded.keys()),
+                )
 
         n_keys = len(expected) if expected else max(1, len(goal.predicates))
         max_pe = resolve_max_prediction_error(

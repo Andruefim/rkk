@@ -2074,7 +2074,8 @@ class SimulationGroundedLanguageMixin:
         old_u = float(getattr(ent, "u", vt.u) if ent is not None else vt.u)
         old_v = float(getattr(ent, "v", vt.v) if ent is not None else vt.v)
 
-        self._release_scene_hard_lock()
+        # Do NOT release hard_lock before continuity/improves gates — a rejected
+        # rebind must leave the lock intact (premature unlock → is_usable flip).
         diags = dict(vt.diagnostics or {})
         diags["geometry"] = "objectness_peak"
         diags["rebind_reason"] = reason
@@ -2145,11 +2146,14 @@ class SimulationGroundedLanguageMixin:
                         ),
                         track_ref_u=round(float(ref[0]), 3),
                         track_ref_v=round(float(ref[1]), 3),
+                        hard_lock_preserved=True,
                     )
                 except Exception:
                     pass
                 return False
 
+        # Gates passed — only now unlock so bind can reseat the track.
+        self._release_scene_hard_lock()
         self._manip_resolved_visual = vt2
         self._bind_object_working_memory(vt2, int(tick))
         self._task_log_prev_vision_range = None

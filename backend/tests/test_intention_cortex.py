@@ -229,3 +229,114 @@ def test_stable_gate_locomote_when_stack_empty() -> None:
     ctx = ic.tick_pre_control(sim, tick=900, obs=obs, fallen=False)
     assert ctx.macro_hint == "LOCOMOTE_DELIVERY"
     assert "intent_stride" in ctx.intent_residuals
+
+
+def test_human_command_subgoal_macro_is_idle() -> None:
+    """absorb_human_task pushes human_command; _macro_for_subgoal must not LOCOMOTE."""
+    ic = IntentionCortex()
+    sg = SubGoal(
+        subgoal_id="human_1",
+        var_id="target_dist",
+        target_val=0.55,
+        intent_targets={"intent_stride": 0.62},
+        source="human_command",
+        priority=0.92,
+        status="active",
+    )
+    obs = {"posture_stability": 0.95, "com_z": 0.5}
+    assert ic._macro_for_subgoal(sg, obs, fallen=False) == "IDLE"
+
+
+def test_human_executive_suppresses_locomote_and_explore() -> None:
+    """Active human task → curriculum LOCOMOTE/EXPLORE subgoals become IDLE."""
+
+    class _Task:
+        status = "active"
+        expected_state = {"target_dist": 0.55}
+
+    class _Binding:
+        active_task = _Task()
+
+    class _Sim(_FakeSim):
+        def __init__(self) -> None:
+            super().__init__()
+            self._task_binding = _Binding()
+            self._motor_arbiter = None
+
+    ic = IntentionCortex()
+    sim = _Sim()
+    obs = {"posture_stability": 0.95, "com_z": 0.5}
+
+    walk = SubGoal(
+        subgoal_id="walk",
+        var_id="intent_stride",
+        target_val=0.7,
+        intent_targets={"intent_stride": 0.7},
+        source="curriculum_active",
+        status="active",
+    )
+    reach = SubGoal(
+        subgoal_id="reach",
+        var_id="intent_reach_left",
+        target_val=0.6,
+        intent_targets={"intent_reach_left": 0.6},
+        source="curriculum_active",
+        status="active",
+    )
+    assert ic._macro_for_subgoal(walk, obs, fallen=False) == "LOCOMOTE_DELIVERY"
+    assert ic._macro_for_subgoal(reach, obs, fallen=False) == "EXPLORE"
+    assert ic._macro_for_subgoal(walk, obs, fallen=False, sim=sim) == "IDLE"
+    assert ic._macro_for_subgoal(reach, obs, fallen=False, sim=sim) == "IDLE"
+
+    # Empty stack + stable gate must not invent LOCOMOTE during human task.
+    ic._stack = []
+    ctx = ic.tick_pre_control(sim, tick=100, obs=obs, fallen=False)
+    assert ctx.macro_hint == "IDLE"
+
+
+def test_unrecognized_subgoal_fallback_is_idle() -> None:
+    ic = IntentionCortex()
+    sg = SubGoal(
+        subgoal_id="weird",
+        var_id="some_unknown_var",
+        target_val=0.5,
+        intent_targets={},
+        source="curriculum_pending",
+        status="active",
+    )
+    obs = {"posture_stability": 0.95, "com_z": 0.5}
+    assert ic._macro_for_subgoal(sg, obs, fallen=False) == "IDLE"
+
+
+def test_merge_deliberation_does_not_resurrect_locomote_during_human_task() -> None:
+    from engine.intention_cortex import IntentionContext
+
+    class _Latest:
+        macro_hint = "LOCOMOTE_DELIVERY"
+        expected_state = {}
+        graph_patch = {}
+        intent_residuals = {}
+        narrative = ""
+
+    class _Delib:
+        def latest(self, max_age_ticks: int = 120):
+            return _Latest()
+
+    class _Task:
+        status = "active"
+        expected_state = {"target_dist": 0.5}
+
+    class _Binding:
+        active_task = _Task()
+
+    class _Sim(_FakeSim):
+        def __init__(self) -> None:
+            super().__init__()
+            self._task_binding = _Binding()
+            self._deliberation = _Delib()
+            self._motor_arbiter = None
+
+    ic = IntentionCortex()
+    ctx = IntentionContext(macro_hint="IDLE")
+    out = ic._merge_deliberation(_Sim(), ctx, tick=10)
+    assert out.macro_hint == "IDLE"
