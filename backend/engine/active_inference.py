@@ -94,6 +94,8 @@ class HomeostaticController:
         current_state: dict[str, float],
         graph: Any,
         target_priors: dict[str, float],
+        *,
+        return_all: bool | None = None,
     ) -> dict[str, float]:
         if getattr(graph, "_core", None) is None or not target_priors:
             return {}
@@ -195,11 +197,18 @@ class HomeostaticController:
 
         final_free = A_free.detach().cpu().numpy()
         initial_np = initial_free.detach().cpu().numpy()
+        if return_all is None:
+            return_all = os.environ.get("RKK_ACTIVE_INF_RETURN_ALL", "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
         optimized_actions: dict[str, float] = {}
         for k, idx in enumerate(iv):
             nid = node_ids[idx]
             val = float(final_free[k])
-            if abs(val - float(initial_np[k])) > 1e-4:
+            if return_all or abs(val - float(initial_np[k])) > 1e-4:
                 optimized_actions[nid] = val
 
         # Лог после последней итерации

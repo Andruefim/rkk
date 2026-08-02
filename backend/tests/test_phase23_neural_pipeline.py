@@ -246,16 +246,33 @@ def test_wm_ai_nav_returns_intents_and_falls_back(monkeypatch: pytest.MonkeyPatc
                         "vision_bearing": 0.0,
                         "vision_range_m": 2.0,
                         "task_target_dist_m": 2.0,
+                        "vision_bearing_01": 0.5,
+                        "vision_range_01": 0.4,
+                        "intent_stride": 0.5,
+                        "intent_gait_coupling": 0.5,
                     },
+                    _node_ids=[
+                        "vision_bearing_01",
+                        "vision_range_01",
+                        "intent_stride",
+                        "intent_gait_coupling",
+                        "phys_posture_stability",
+                        "phys_com_z",
+                        "phys_com_x_vel",
+                    ],
                     _core=SimpleNamespace(device="cpu"),
                     _wm_train_calls=12,
                     snapshot_vec_dict=lambda: {
                         "vision_bearing": 0.2,
                         "vision_range_m": 2.0,
                         "task_target_dist_m": 2.0,
+                        "vision_bearing_01": 0.55,
+                        "vision_range_01": 0.4,
                         "phys_posture_stability": 0.8,
                         "phys_com_z": 0.8,
                         "phys_com_x_vel": 0.1,
+                        "intent_stride": 0.5,
+                        "intent_gait_coupling": 0.5,
                     },
                 )
             )
@@ -343,16 +360,33 @@ def test_wm_ai_assert_forward_when_aligned(monkeypatch: pytest.MonkeyPatch) -> N
                         "vision_bearing": 0.0,
                         "vision_range_m": 1.9,
                         "task_target_dist_m": 1.9,
+                        "vision_bearing_01": 0.55,
+                        "vision_range_01": 0.38,
+                        "intent_stride": 0.5,
+                        "intent_gait_coupling": 0.5,
                     },
+                    _node_ids=[
+                        "vision_bearing_01",
+                        "vision_range_01",
+                        "intent_stride",
+                        "intent_gait_coupling",
+                        "phys_posture_stability",
+                        "phys_com_z",
+                        "phys_com_x_vel",
+                    ],
                     _core=SimpleNamespace(device="cpu"),
                     _wm_train_calls=0,
                     snapshot_vec_dict=lambda: {
                         "vision_bearing": 0.1,
                         "vision_range_m": 1.9,
                         "task_target_dist_m": 1.9,
+                        "vision_bearing_01": 0.55,
+                        "vision_range_01": 0.38,
                         "phys_posture_stability": 0.9,
                         "phys_com_z": 0.82,
                         "phys_com_x_vel": 0.05,
+                        "intent_stride": 0.5,
+                        "intent_gait_coupling": 0.5,
                     },
                 )
             )
@@ -412,3 +446,152 @@ def test_wm_ai_assert_forward_when_aligned(monkeypatch: pytest.MonkeyPatch) -> N
     )
     assert meta_t.get("nav_fwd_assert") is not True
     assert abs(float(intents_t["intent_stride"]) - 0.50) < 0.02
+
+
+def test_wm_ai_encoded_vision_nodes_produce_mapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AI nav with vision_*_01 in graph should not fall back to ai_empty."""
+    monkeypatch.setenv("RKK_TASK_NAV_MODE", "wm_ai")
+    monkeypatch.setenv("RKK_ACTIVE_INFERENCE", "1")
+    monkeypatch.setenv("RKK_ACTIVE_INF_RETURN_ALL", "1")
+    monkeypatch.setenv("RKK_TASK_NAV_WM_MIN_STEPS", "0")
+
+    from engine.features.simulation.mixin_grounded_language import (
+        SimulationGroundedLanguageMixin,
+        _encode_nav_bearing_01,
+        _encode_nav_range_01,
+    )
+    from engine.object_working_memory import ObjectWorkingMemory
+
+    class _ReturnAllCtrl:
+        def optimize_action(self, obs, graph, priors, **kwargs) -> dict[str, float]:
+            assert "vision_bearing_01" in priors
+            assert "vision_range_01" in priors
+            assert priors["vision_bearing_01"] == pytest.approx(0.5)
+            stop01 = _encode_nav_range_01(0.7)
+            assert priors["vision_range_01"] == pytest.approx(stop01)
+            out: dict[str, float] = {}
+            for nid in graph._node_ids:
+                ev = None
+                if str(nid).startswith("intent_"):
+                    ev = str(nid)
+                elif str(nid).startswith("phys_intent_"):
+                    ev = "intent_" + str(nid)[len("phys_intent_") :]
+                if ev == "intent_stride":
+                    out[nid] = 0.64
+                elif ev == "intent_gait_coupling":
+                    out[nid] = 0.68
+            return out
+
+    class _Harness(SimulationGroundedLanguageMixin):
+        def __init__(self) -> None:
+            self.tick = 30
+            self._homeostatic_ctrl = _ReturnAllCtrl()
+            node_ids = [
+                "vision_bearing_01",
+                "vision_range_01",
+                "phys_posture_stability",
+                "phys_com_z",
+                "phys_com_x_vel",
+                "intent_stride",
+                "intent_gait_coupling",
+            ]
+            self.agent = SimpleNamespace(
+                graph=SimpleNamespace(
+                    nodes={nid: 0.5 for nid in node_ids},
+                    _node_ids=list(node_ids),
+                    _core=SimpleNamespace(device="cpu"),
+                    _wm_train_calls=0,
+                    snapshot_vec_dict=lambda: {nid: 0.5 for nid in node_ids},
+                )
+            )
+
+        def _ensure_homeostatic_ctrl(self):
+            return self._homeostatic_ctrl
+
+        def _ensure_nav_vision_graph_nodes(self, graph: Any) -> None:
+            pass
+
+    h = _Harness()
+    vt = VisualTarget(
+        slot_id="nav_enc",
+        u=0.55,
+        v=0.5,
+        label="chair",
+        confidence=0.85,
+        bearing=0.0,
+        range_m=2.2,
+        range_conf=0.9,
+    )
+    owm = ObjectWorkingMemory()
+    owm.bind_from_visual(
+        vt, tick=30, agent_xy=(0.0, 0.0), agent_forward=(1.0, 0.0)
+    )
+    owm.scene.release_hard_lock()
+
+    priors = h._inject_owm_nav_priors(owm, stop=0.7)
+    assert priors["vision_bearing_01"] == pytest.approx(0.5)
+    assert h.agent.graph.nodes["vision_bearing_01"] == pytest.approx(
+        _encode_nav_bearing_01(0.0)
+    )
+    assert h.agent.graph.nodes["vision_range_01"] == pytest.approx(
+        _encode_nav_range_01(2.2)
+    )
+
+    intents, meta = h._navigation_intents_wm_ai(owm, stop=0.7, posture=0.9, fallen=False)
+    assert intents
+    assert meta["nav_ai_ok"] is True
+    assert meta.get("nav_ai_reason") in ("homeostatic", "wm_beam", None, "")
+    assert "intent_stride" in intents
+    assert "intent_gait_coupling" in intents
+
+
+def test_recede_rebind_triggers_after_sustained_increase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RKK_TASK_RESOLVE", "vision")
+    monkeypatch.setenv("RKK_VISION_RECEDE_STREAK", "2")
+    monkeypatch.setenv("RKK_VISION_RECEDE_DELTA_M", "0.25")
+
+    from engine.features.simulation.mixin_grounded_language import (
+        SimulationGroundedLanguageMixin,
+    )
+    from engine.object_working_memory import LatentSceneMemory, SceneEntity
+
+    class _Harness(SimulationGroundedLanguageMixin):
+        def __init__(self) -> None:
+            self.tick = 40
+            self._owm_bind_range_m = 2.0
+            self._owm_range_ema = 2.0
+            self._vision_recede_streak = 0
+            self._latent_scene = LatentSceneMemory()
+            ent = SceneEntity(entity_id="bound_0")
+            ent.seed_from_bearing_range(
+                bearing=0.0,
+                range_m=2.6,
+                tick=1,
+                label="chair",
+                confidence=0.8,
+                slot_id="slot_0",
+            )
+            self._latent_scene.entities["bound_0"] = ent
+            self._latent_scene.focus("bound_0", exclusive=True)
+            self._latent_scene.hard_lock_active = True
+            self._rebind_calls: list[str] = []
+
+        def _depth_camera_from_sim(self) -> Any:
+            return object()
+
+        def _eval_oracle_dist_m(self) -> float | None:
+            return 2.1
+
+        def _rebind_vision_objectness_peak(self, *_a: Any, **kwargs: Any) -> bool:
+            self._rebind_calls.append(str(kwargs.get("reason") or ""))
+            return True
+
+    h = _Harness()
+    h._maybe_rebind_vision_on_recede(40, h._latent_scene, 2.6)
+    assert h._rebind_calls == []
+    h._maybe_rebind_vision_on_recede(41, h._latent_scene, 2.6)
+    assert h._rebind_calls == ["vision_recede_rebind"]

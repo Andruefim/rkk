@@ -124,6 +124,28 @@ def _graph_nid_to_motor_intent(nid: str) -> str | None:
     return None
 
 
+_NAV_RANGE_SCALE_M = 5.0
+
+
+def _encode_nav_bearing_01(bearing: float) -> float:
+    """Map normalized bearing [-1, 1] to [0, 1] with 0.5 = facing target."""
+    b = float(max(-1.0, min(1.0, bearing)))
+    return float(max(0.0, min(1.0, 0.5 + 0.5 * b)))
+
+
+def _encode_nav_range_01(range_m: float, *, scale_m: float = _NAV_RANGE_SCALE_M) -> float:
+    return float(max(0.0, min(1.0, float(range_m) / max(float(scale_m), 0.05))))
+
+
+def _active_inf_return_all_enabled() -> bool:
+    return os.environ.get("RKK_ACTIVE_INF_RETURN_ALL", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 _KINDS_NEEDING_TARGET = frozenset({"reduce_distance", "contact", "displace"})
 
 
@@ -1392,12 +1414,48 @@ class SimulationGroundedLanguageMixin:
             payload = owm.graph_payload(tick=int(getattr(self, "tick", 0)))
         else:
             payload = owm.graph_payload()
-        nodes = self.agent.graph.nodes
+        graph = self.agent.graph
+        node_ids = set(getattr(graph, "_node_ids", []) or [])
         for k, v in payload.items():
+            if k not in node_ids and hasattr(graph, "set_node"):
+                try:
+                    graph.set_node(k, float(v))
+                    node_ids.add(k)
+                except Exception:
+                    pass
+            nodes = graph.nodes
             nodes[k] = float(v)
             pk = f"phys_{k}"
             if pk in nodes:
                 nodes[pk] = float(v)
+        act = None
+        if isinstance(owm, LatentSceneMemory):
+            act = owm.active()
+        else:
+            act = owm.scene.active() if getattr(owm, "scene", None) is not None else None
+        if act is not None:
+            self._ensure_nav_vision_graph_nodes(graph)
+            b01 = _encode_nav_bearing_01(float(act.bearing))
+            r01 = _encode_nav_range_01(float(act.range_m))
+            graph.nodes["vision_bearing_01"] = b01
+            graph.nodes["vision_range_01"] = r01
+            graph.nodes["vision_bearing"] = float(act.bearing)
+            graph.nodes["vision_range_m"] = float(act.range_m)
+
+    def _ensure_nav_vision_graph_nodes(self, graph: Any) -> None:
+        """Register [0,1] vision observation nodes for Active Inference approach."""
+        if not hasattr(graph, "set_node"):
+            return
+        node_ids = set(getattr(graph, "_node_ids", []) or [])
+        for nid, default in (
+            ("vision_bearing_01", 0.5),
+            ("vision_range_01", 0.5),
+        ):
+            if nid not in node_ids:
+                try:
+                    graph.set_node(nid, float(default))
+                except Exception:
+                    pass
 
     def _dump_bind_frame(
         self,
@@ -1558,6 +1616,10 @@ class SimulationGroundedLanguageMixin:
             guided_uv=(vt.diagnostics or {}).get("guided_uv"),
         )
         self._inject_owm_into_graph(scene)
+        if vt.range_m is not None:
+            self._owm_bind_range_m = float(vt.range_m)
+            self._owm_range_ema = float(vt.range_m)
+        self._vision_recede_streak = 0
         self._owm_cached_tick = -1
         self._owm_cached = None
 
@@ -1796,6 +1858,8 @@ class SimulationGroundedLanguageMixin:
                     pass
         self._inject_owm_into_graph(scene)
         owm = self._object_working_memory()
+        if owm is not None and owm.is_usable(tick_i):
+            self._maybe_rebind_vision_on_recede(int(tick), scene, float(owm.range_m))
         if owm.is_usable(tick_i):
             self._owm_cached_tick = tick_i
             self._owm_cached = owm
@@ -2881,11 +2945,95 @@ class SimulationGroundedLanguageMixin:
         except Exception:
             pass
 
+    def _maybe_rebind_vision_on_recede(
+        self,
+        tick: int,
+        scene: LatentSceneMemory,
+        range_m: float,
+    ) -> None:
+        """
+        Under hard_lock, if live range recedes vs bind/EMA for several ticks,
+        refresh live camera and attempt objectness rebind.
+        """
+        if not vision_resolve_enabled():
+            return
+        if not bool(getattr(scene, "hard_lock_active", False)):
+            self._vision_recede_streak = 0
+            return
+        try:
+            threshold = float(os.environ.get("RKK_VISION_RECEDE_DELTA_M", "0.25"))
+        except ValueError:
+            threshold = 0.25
+        try:
+            need_streak = max(1, int(os.environ.get("RKK_VISION_RECEDE_STREAK", "3")))
+        except ValueError:
+            need_streak = 3
+
+        ema = float(getattr(self, "_owm_range_ema", range_m) or range_m)
+        alpha = 0.18
+        self._owm_range_ema = (1.0 - alpha) * ema + alpha * float(range_m)
+        bind_r = getattr(self, "_owm_bind_range_m", None)
+        ref = float(bind_r) if bind_r is not None else ema
+        if float(range_m) <= ref + threshold:
+            self._vision_recede_streak = 0
+            return
+
+        streak = int(getattr(self, "_vision_recede_streak", 0)) + 1
+        self._vision_recede_streak = streak
+        if streak < need_streak:
+            return
+        self._vision_recede_streak = 0
+
+        cam = self._depth_camera_from_sim()
+        if cam is not None:
+            try:
+                oracle = self._eval_oracle_dist_m()
+                scene.refresh_active_from_live_camera(
+                    cam,
+                    tick=int(tick),
+                    range_hint=oracle,
+                    blend=1.0,
+                )
+            except Exception:
+                pass
+
+        owm = getattr(self, "_obj_working_memory", None)
+        bearing_hint = float(owm.bearing) if owm is not None else None
+        oracle_dist = self._eval_oracle_dist_m()
+        rebind_ok = bool(
+            self._rebind_vision_objectness_peak(
+                int(tick),
+                reason="vision_recede_rebind",
+                oracle_dist=float(oracle_dist) if oracle_dist is not None else None,
+                bearing_hint=bearing_hint,
+                allow_full_resolve=True,
+            )
+        )
+        self._owm_cached_tick = -1
+        self._task_log_prev_vision_range = None
+        try:
+            task_log_event(
+                "vision_recede_rebind",
+                tick=int(tick),
+                range_m=round(float(range_m), 4),
+                bind_range_m=round(float(bind_r), 4) if bind_r is not None else None,
+                range_ema_m=round(float(self._owm_range_ema), 4),
+                delta_m=round(float(range_m) - ref, 4),
+                rebind_ok=bool(rebind_ok),
+                hard_lock_after=bool(getattr(scene, "hard_lock_active", False)),
+            )
+        except Exception:
+            pass
+
     def _wm_train_steps(self) -> int:
-        g = getattr(getattr(self, "agent", None), "graph", None)
+        agent = getattr(self, "agent", None)
+        g = getattr(agent, "graph", None) if agent is not None else None
         if g is None:
             return 0
-        return int(getattr(g, "_wm_train_calls", 0) or 0)
+        train_calls = int(getattr(g, "_wm_train_calls", 0) or 0)
+        if train_calls > 0:
+            return train_calls
+        return int(getattr(agent, "_notears_steps", 0) or 0)
 
     def _inject_owm_nav_priors(
         self,
@@ -2894,9 +3042,16 @@ class SimulationGroundedLanguageMixin:
         stop: float,
     ) -> dict[str, float]:
         """Write OWM into graph nodes and return approach target priors for AI."""
+        graph = self.agent.graph
+        self._ensure_nav_vision_graph_nodes(graph)
         b = float(owm.bearing)
         r = float(owm.range_m)
-        nodes = self.agent.graph.nodes
+        b01 = _encode_nav_bearing_01(b)
+        r01 = _encode_nav_range_01(r)
+        stop01 = _encode_nav_range_01(float(max(0.05, stop)))
+        nodes = graph.nodes
+        nodes["vision_bearing_01"] = b01
+        nodes["vision_range_01"] = r01
         nodes["vision_bearing"] = b
         nodes["vision_range_m"] = r
         if "task_target_dist_m" in nodes:
@@ -2904,9 +3059,8 @@ class SimulationGroundedLanguageMixin:
         priors: dict[str, float] = {
             "phys_posture_stability": 1.0,
             "phys_com_z": 0.82,
-            "vision_bearing": 0.0,
-            "vision_range_m": float(max(0.05, stop)),
-            "task_target_dist_m": float(max(0.05, stop)),
+            "vision_bearing_01": 0.5,
+            "vision_range_01": stop01,
         }
         # Aligned → ask for forward COM velocity; large bearing → stay cautious.
         if abs(b) < 0.35 and r > float(stop) + 0.05:
@@ -3046,14 +3200,35 @@ class SimulationGroundedLanguageMixin:
             else:
                 ctrl = ensure()
 
-            obs = self.agent.graph.snapshot_vec_dict()
-            # Keep OWM live values in the state vector used for optimize.
+            graph = self.agent.graph
+            obs = graph.snapshot_vec_dict()
+            b01 = _encode_nav_bearing_01(float(owm.bearing))
+            r01 = _encode_nav_range_01(float(owm.range_m))
+            obs["vision_bearing_01"] = b01
+            obs["vision_range_01"] = r01
             obs["vision_bearing"] = float(owm.bearing)
             obs["vision_range_m"] = float(owm.range_m)
             if "task_target_dist_m" in obs:
                 obs["task_target_dist_m"] = float(owm.range_m)
 
-            actions = ctrl.optimize_action(obs, self.agent.graph, priors) or {}
+            # Warm-start intent slots from heuristic nav so AI refines a real seed.
+            node_ids = list(getattr(graph, "_node_ids", []) or [])
+            for key, val in heur.items():
+                if not str(key).startswith("intent_"):
+                    continue
+                fv = float(max(0.0, min(1.0, val)))
+                for nid in (str(key), f"phys_{key}"):
+                    if nid in node_ids:
+                        obs[nid] = fv
+                        graph.nodes[nid] = fv
+
+            return_all = _active_inf_return_all_enabled()
+            actions = (
+                ctrl.optimize_action(
+                    obs, graph, priors, return_all=return_all
+                )
+                or {}
+            )
             mapped: dict[str, float] = {}
             for gid, val in actions.items():
                 ev = _graph_nid_to_motor_intent(str(gid))
@@ -3072,7 +3247,7 @@ class SimulationGroundedLanguageMixin:
                         ("intent_stride", 0.55),
                         ("intent_stride", 0.72),
                     ]
-                    stop_f = float(stop)
+                    stop01 = _encode_nav_range_01(float(stop))
 
                     def _score(
                         _s0: dict[str, float],
@@ -3080,12 +3255,21 @@ class SimulationGroundedLanguageMixin:
                         val: float,
                         s_after: dict[str, float],
                     ) -> float:
-                        br = float(s_after.get("vision_bearing", owm.bearing))
-                        rg = float(s_after.get("vision_range_m", owm.range_m))
-                        # Prefer smaller |bearing| and range approaching stop.
-                        return -abs(br) - 0.15 * abs(rg - stop_f)
+                        br = float(
+                            s_after.get(
+                                "vision_bearing_01",
+                                _encode_nav_bearing_01(owm.bearing),
+                            )
+                        )
+                        rg = float(
+                            s_after.get(
+                                "vision_range_01",
+                                _encode_nav_range_01(owm.range_m),
+                            )
+                        )
+                        return -abs(br - 0.5) - 0.15 * abs(rg - stop01)
 
-                    best, _sc = beam_search_first_action(
+                    best, sc = beam_search_first_action(
                         self.agent,
                         state0=state0,
                         actions=cand_actions,
@@ -3103,10 +3287,17 @@ class SimulationGroundedLanguageMixin:
                         if ev:
                             mapped[ev] = float(val)
                             meta["nav_ai_reason"] = "wm_beam"
+                        else:
+                            meta["wm_beam_unmap"] = str(var)
+                    else:
+                        meta["wm_beam_empty"] = True
+                        meta["wm_beam_score"] = float(sc)
                 except Exception as exc:
                     meta["wm_beam_error"] = str(exc)
             elif not mapped and not wm_warm:
                 meta["wm_beam_skipped"] = "wm_cold"
+            elif not mapped:
+                meta["wm_beam_skipped"] = "mapped_nonempty" if actions else "ai_empty"
 
             if mapped and (
                 "intent_gait_coupling" in mapped or "intent_stride" in mapped
