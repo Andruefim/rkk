@@ -66,6 +66,26 @@ _VISUAL_REFERENT_CATALOG: tuple[VisualReferentEntry, ...] = (
     VisualReferentEntry("ball", "круглый обьект перед тобой"),
     VisualReferentEntry("cylinder", "цилиндрический большой объект перед тобой"),
     VisualReferentEntry("cylinder", "большой цилиндр перед тобой"),
+    VisualReferentEntry(
+        "cylinder",
+        "cylindrical object in front of you",
+        weight=1.25,
+    ),
+    VisualReferentEntry(
+        "cylinder",
+        "approach the cylindrical object",
+        weight=1.25,
+    ),
+    VisualReferentEntry(
+        "cylinder",
+        "cylinder in front of you",
+        weight=1.25,
+    ),
+    VisualReferentEntry(
+        "cylinder",
+        "cylindrical object before you",
+        weight=1.25,
+    ),
 )
 
 

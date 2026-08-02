@@ -159,6 +159,40 @@ def objectness_bind_min_peak() -> float:
     return _env_float("RKK_VISION_OBJECTNESS_BIND_MIN_PEAK", 0.18)
 
 
+# Ontology keys that name a concrete scene object (not generic "object").
+_CONCRETE_ONTOLOGY_KEYS = frozenset({"cylinder", "chair", "ball", "prop"})
+
+
+def _is_floorish_objectness(
+    target: VisualTarget,
+    *,
+    ont_key: str = "",
+    peak_strength: float = 0.0,
+    min_peak: float | None = None,
+) -> bool:
+    """Reject objectness UV when it likely locks onto ground plane, not a protrusion."""
+    v = float(target.v)
+    conf = float(target.confidence or 0.0)
+    range_m = target.range_m
+    key = str(ont_key or "").strip().lower()
+    pstr = float(peak_strength)
+    mp = float(min_peak if min_peak is not None else objectness_bind_min_peak())
+
+    # Strong depth protrusion + concrete referent: lower FOV is a near object, not floor.
+    if key in _CONCRETE_ONTOLOGY_KEYS and pstr >= mp:
+        return False
+
+    # Geometry: distant ground plane in lower image band.
+    if range_m is not None and float(range_m) > 3.5 and v > 0.78:
+        return True
+
+    # Weak protrusion with low semantic confidence in lower band.
+    if v > 0.72 and conf < 0.55 and pstr < mp:
+        return True
+
+    return False
+
+
 def _normalize(v: np.ndarray | None) -> np.ndarray | None:
     if v is None:
         return None
@@ -671,9 +705,10 @@ def resolve_visual_target(
                 pstr = float(
                     (target.diagnostics or {}).get("objectness_peak_strength") or 0.0
                 )
-                floorish = (
-                    float(target.v) > 0.72
-                    and float(target.confidence or 0.0) < 0.55
+                floorish = _is_floorish_objectness(
+                    target,
+                    ont_key=ont_key,
+                    peak_strength=pstr,
                 )
                 try:
                     from engine.vision_depth import objectness_edge_u_margin
@@ -742,11 +777,16 @@ def resolve_visual_target(
         diag["target_partial"] = target.to_dict()
         return None, diag
     # Refuse obvious floor-center locks after geometry (still no peaked mask).
+    ont_diag_final = score_meta.get("ontology") if isinstance(score_meta.get("ontology"), dict) else {}
+    ont_key_final = str((ont_diag_final or {}).get("best_key") or "").strip()
     if (
         depth_camera is not None
         and not bool((target.diagnostics or {}).get("uv_valid"))
-        and float(target.v) > 0.72
-        and float(target.confidence or 0.0) < 0.55
+        and _is_floorish_objectness(
+            target,
+            ont_key=ont_key_final,
+            peak_strength=pstr,
+        )
     ):
         diag["reason"] = "floor_lock_rejected"
         diag["target_partial"] = target.to_dict()

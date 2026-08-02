@@ -942,3 +942,95 @@ def test_llm_decompose_parse(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "resolve_target" in kinds
     assert "approach" in kinds
     assert "reach_contact" in kinds
+
+
+def test_get_raw_frame_prefers_ego_rgbd() -> None:
+    """RGB numpy from get_ego_rgbd must work without Pillow / base64."""
+    from unittest.mock import MagicMock
+
+    import torch
+
+    from engine.environment_visual import EnvironmentVisual, VISION_PIPELINE_CAM_H, VISION_PIPELINE_CAM_W
+
+    h, w = VISION_PIPELINE_CAM_H, VISION_PIPELINE_CAM_W
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb[20, 30] = [200, 10, 5]
+
+    base = MagicMock()
+    base.preset = "humanoid"
+    base.observe.return_value = {"com_z": 0.9}
+    base.variable_ids = []
+    base.get_ego_rgbd.return_value = {
+        "rgb": rgb,
+        "depth_m": np.ones((h, w), dtype=np.float32),
+    }
+    base.get_frame_base64.return_value = None
+
+    vis = EnvironmentVisual(base, torch.device("cpu"), n_slots=4, mode="visual")
+    frame = vis._get_raw_frame()
+    assert frame is not None
+    assert frame.shape == (h, w, 3)
+    assert int(frame[20, 30, 0]) == 200
+    base.get_ego_rgbd.assert_called()
+    base.get_frame_base64.assert_not_called()
+
+
+def test_cylinder_ontology_english_paraphrases() -> None:
+    from engine.grounded_language import FallbackEmbeddingClient
+    from engine.visual_referent_ontology import clear_visual_referent_cache, match_visual_referent
+
+    clear_visual_referent_cache()
+    emb = FallbackEmbeddingClient(embed_dim=64)
+    for cmd in (
+        "cylindrical object in front of you",
+        "approach the cylindrical object",
+        "cylinder in front of you",
+    ):
+        entry, score, diag = match_visual_referent(cmd, emb.embed)
+        assert entry is not None, diag
+        assert entry.key == "cylinder", (cmd, diag)
+        assert score >= 0.25, (cmd, score, diag)
+
+
+def test_objectness_floorish_allows_lower_fov_concrete_cylinder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lower-FOV protrusion + cylinder ontology must not be refused as floorish."""
+    from engine.grounded_language import FallbackEmbeddingClient
+    from engine.visual_referent_ontology import clear_visual_referent_cache
+
+    clear_visual_referent_cache()
+    monkeypatch.setenv("RKK_VISION_RESOLVE_MIN_CONF", "0.20")
+    monkeypatch.setenv("RKK_VISION_OBJECTNESS_BIND", "1")
+    monkeypatch.setenv("RKK_VISION_OBJECTNESS_BIND_MIN_PEAK", "0.12")
+    emb = FallbackEmbeddingClient(embed_dim=64)
+    h, w = 60, 80
+    yy = np.linspace(4.5, 1.8, h, dtype=np.float32)[:, None]
+    depth = np.repeat(yy, w, axis=1)
+    depth[50:58, 28:42] = 2.05  # short cylinder in lower FOV
+    cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
+    slots = [
+        {
+            "slot_id": "slot_0",
+            "u": 0.5,
+            "v": 0.5,
+            "label": "",
+            "activation": 0.9,
+            "vector": None,
+            "uv_valid": False,
+            "mask_peakiness": 1.0,
+            "attn_mask": np.ones((8, 8), dtype=np.float32),
+        }
+    ]
+    vt, diag = resolve_visual_target(
+        "cylindrical object in front of you",
+        slots=slots,
+        depth_camera=cam,
+        embed_fn=emb.embed,
+        require_range=True,
+    )
+    assert vt is not None, diag
+    assert diag.get("reason") == "ok"
+    assert float(vt.v) > 0.70
+    assert diag.get("objectness_bind") is True
+    assert (vt.diagnostics or {}).get("geometry") == "objectness_peak"

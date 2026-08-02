@@ -181,7 +181,38 @@ class EnvironmentVisual:
     # ── Frame acquisition ─────────────────────────────────────────────────────
     def _get_raw_frame(self) -> np.ndarray | None:
         """Получаем numpy RGB frame из base_env."""
-        # PyBullet env: get_frame_base64 → декодируем
+        # Prefer ego RGB-D numpy path (same source as depth camera; no Pillow).
+        for source in (self.base_env, getattr(self.base_env, "_sim", None)):
+            if source is None:
+                continue
+            fn = getattr(source, "get_ego_rgbd", None)
+            if not callable(fn):
+                continue
+            rgbd = None
+            try:
+                rgbd = fn(
+                    view="ego",
+                    width=VISION_PIPELINE_CAM_W,
+                    height=VISION_PIPELINE_CAM_H,
+                )
+            except TypeError:
+                try:
+                    rgbd = fn(
+                        width=VISION_PIPELINE_CAM_W,
+                        height=VISION_PIPELINE_CAM_H,
+                    )
+                except Exception:
+                    rgbd = None
+            except Exception:
+                rgbd = None
+            if isinstance(rgbd, dict):
+                rgb = rgbd.get("rgb")
+                if rgb is not None:
+                    arr = np.asarray(rgb, dtype=np.uint8)
+                    if arr.ndim == 3 and arr.shape[2] >= 3:
+                        return arr[:, :, :3].copy()
+
+        # Fallback: PyBullet env get_frame_base64 → JPEG decode (needs Pillow).
         fn = getattr(self.base_env, "get_frame_base64", None)
         if callable(fn):
             b64 = None
@@ -246,8 +277,8 @@ class EnvironmentVisual:
                         _, self._cached_masks_b64 = self._encode_frame_and_masks_for_ui(
                             frame, attn
                         )
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[VisualEnv] encode_worker failed: {exc!r}")
 
     def _refresh(self, run_encode: bool = True, force_sync: bool = False) -> None:
         """
