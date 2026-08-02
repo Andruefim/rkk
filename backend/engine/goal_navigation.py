@@ -187,8 +187,6 @@ def navigation_intents_from_bearing_range(
     Ego-frame navigation from vision bearing + metric range_m.
     bearing in [-1, 1] (left…right); range_m in meters.
     """
-    if fallen:
-        return {}
     dist = float(range_m)
     if not math.isfinite(dist) or dist <= 0.05:
         return {}
@@ -215,10 +213,37 @@ def navigation_intents_from_bearing_range(
         )
     )
 
+    if fallen:
+        # Crawl-mode while recovering: keep closing on the bound target instead
+        # of freezing locomotion (empty intents let S2 recovery drift away).
+        crawl = {
+            "intent_gait_coupling": 0.64,
+            "intent_stride": 0.55,
+            "intent_torso_forward": 0.56,
+            "intent_stop_recover": 0.60,
+            "intent_lean_forward": 0.54,
+            "task_nav_active": 1.0,
+            "task_heading_err": out["task_heading_err"],
+            "task_closing_vel": 0.0,
+            "vision_bearing": b,
+            "vision_range_m": float(dist),
+        }
+        for k, v in out.items():
+            if str(k).startswith("intent_") and k not in crawl:
+                crawl[k] = float(v)
+        # Soften upright-only intents.
+        if "intent_stride" in crawl:
+            crawl["intent_stride"] = float(min(0.58, max(0.54, crawl["intent_stride"])))
+        return crawl
+
     if posture_stability is not None:
         scaled, active = apply_posture_to_navigation(out, float(posture_stability))
         if not active:
-            return {}
+            # Low posture during approach: keep a crawl floor so we do not stall.
+            crawl_ps = max(float(posture_stability), task_nav_pause_posture() + 0.02)
+            scaled, active = apply_posture_to_navigation(out, crawl_ps)
+            if not active:
+                return {}
         out = scaled
         out["task_nav_active"] = 1.0
     else:
