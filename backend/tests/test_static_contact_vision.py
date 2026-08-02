@@ -229,3 +229,60 @@ def test_manip_has_contact_via_static_body_without_resolved() -> None:
 def test_manip_has_contact_false_when_no_pybullet_contact() -> None:
     h = _StaticContactHarness(contact_body_id=None)
     assert h._manip_has_contact(None) is False
+
+
+def test_physics_range_to_locked_body_cylinder_surface() -> None:
+    """COM near planter rim → surface distance, not inflated OWM range."""
+
+    class _Harness(_StaticContactHarness):
+        def _agent_xy_forward(self) -> tuple[tuple[float, float], tuple[float, float]]:
+            return (1.95, 0.0), (1.0, 0.0)
+
+    h = _Harness()
+    h._task_locked_body_id = 201
+    r = h._physics_range_to_locked_body()
+    assert r is not None
+    assert r == pytest.approx(0.0, abs=0.02)
+
+
+def test_physics_range_to_locked_body_from_registry_xy() -> None:
+    h = _StaticContactHarness()
+    h._task_locked_body_id = 201
+    r = h._physics_range_to_locked_body()
+    assert r is not None
+    # agent at origin, planter center (2,0) r=0.3 → surface ~1.7m
+    assert r == pytest.approx(1.7, abs=0.05)
+
+
+def test_blend_dist_uses_min_physics_when_owm_inflated() -> None:
+    """Approach gate: min(vision/OWM, physics) completes when physically near."""
+
+    h = _StaticContactHarness()
+    h._task_locked_body_id = 201
+    h.tick = 100
+    blended = h._blend_dist_with_physics_range(3.8, 3.8, 100)
+    assert blended == pytest.approx(1.7, abs=0.05)
+
+
+def test_lock_task_contact_body_on_bind_from_cylinder_label() -> None:
+    from engine.vision_target import VisualTarget
+
+    h = _StaticContactHarness()
+    vt = VisualTarget(
+        slot_id="slot_0",
+        u=0.5,
+        v=0.5,
+        label="planter",
+        confidence=0.8,
+        bearing=0.0,
+        range_m=3.5,
+    )
+    h._lock_task_contact_body_on_bind(vt)
+    assert h._task_locked_body_id == 201
+
+
+def test_clear_object_working_memory_clears_locked_body() -> None:
+    h = _StaticContactHarness()
+    h._task_locked_body_id = 201
+    h._clear_object_working_memory()
+    assert h._task_locked_body_id is None

@@ -1414,6 +1414,172 @@ class SimulationGroundedLanguageMixin:
                     out.append(int(bid))
         return out
 
+    def _static_registry_row_for_body(self, body_id: int) -> dict | None:
+        base = self._humanoid_base_env()
+        if base is None:
+            return None
+        for row in getattr(base, "_static_body_registry", []) or []:
+            bid = row.get("body_id")
+            if bid is not None and int(bid) == int(body_id):
+                return row
+        return None
+
+    def _lock_task_contact_body_on_bind(self, vt: VisualTarget | None = None) -> None:
+        """Pin static body_id at vision bind for physics range (not oracle XY control)."""
+        resolved = getattr(self, "_manip_resolved", None)
+        body_id = self._contact_body_id_for_task(resolved)
+        if body_id is None:
+            from engine.vision_resolve import _is_visual_concept
+
+            ont_key = str(self._task_ontology_best_key() or "").strip().lower()
+            label_src = ""
+            if vt is not None:
+                label_src = str(vt.label or "")
+            else:
+                owm = getattr(self, "_obj_working_memory", None)
+                if owm is not None:
+                    label_src = str(getattr(owm, "label", "") or "")
+            visual_label = label_src.lower() if _is_visual_concept(label_src) else ""
+            prefer_cyl = (
+                ont_key == "cylinder"
+                or "cylinder" in ont_key
+                or any(k in visual_label for k in ("cylinder", "planter", "column"))
+            )
+            if prefer_cyl:
+                base = self._humanoid_base_env()
+                fn = getattr(base, "find_static_contact_body", None) if base is not None else None
+                if callable(fn):
+                    agent_xy, _ = self._agent_xy_forward()
+                    probe = (float(agent_xy[0]), float(agent_xy[1]))
+                    body_id = fn(probe, kind="cylinder", style="planter", max_dist_m=2.5)
+                    if body_id is None:
+                        body_id = fn(probe, kind="cylinder", max_dist_m=2.5)
+                    if body_id is None:
+                        body_id = fn(probe, max_dist_m=2.5)
+        self._task_locked_body_id = int(body_id) if body_id is not None else None
+
+    def _physics_range_to_locked_body(self) -> float | None:
+        """COM XY distance to bound static body (surface distance for cylinders)."""
+        bid = getattr(self, "_task_locked_body_id", None)
+        if bid is None:
+            return None
+        base = self._humanoid_base_env()
+        if base is None:
+            return None
+        agent_xy, _ = self._agent_xy_forward()
+        ax, ay = float(agent_xy[0]), float(agent_xy[1])
+        row = self._static_registry_row_for_body(int(bid))
+        kind = str(row.get("kind", "")) if row is not None else ""
+        radius = float(row.get("radius", 0.0)) if row is not None else 0.0
+        bx: float | None = None
+        by: float | None = None
+        if row is not None:
+            bx = float(row.get("x", 0.0))
+            by = float(row.get("y", 0.0))
+        try:
+            import pybullet as pb
+
+            client = getattr(base, "client", None)
+            lock = getattr(base, "_physics_lock", None)
+            if lock is not None:
+                lock.acquire()
+            try:
+                p, _ = pb.getBasePositionAndOrientation(int(bid), physicsClientId=client)
+                bx, by = float(p[0]), float(p[1])
+            finally:
+                if lock is not None:
+                    lock.release()
+        except Exception:
+            pass
+        if bx is None or by is None:
+            return None
+        d = float(math.hypot(ax - bx, ay - by))
+        if kind in ("cylinder", "sphere"):
+            d = max(0.0, d - radius)
+        return float(d)
+
+    def _blend_dist_with_physics_range(
+        self,
+        dist: float,
+        owm_range: float | None,
+        tick: int,
+    ) -> float:
+        phys = self._physics_range_to_locked_body()
+        if phys is None:
+            return float(dist)
+        blended = min(float(dist), float(phys))
+        prev_log = int(getattr(self, "_task_physics_range_log_tick", -9999))
+        if int(tick) - prev_log >= 30:
+            self._task_physics_range_log_tick = int(tick)
+            try:
+                task_log_event(
+                    "task_physics_range",
+                    tick=int(tick),
+                    phys_m=round(float(phys), 4),
+                    owm_range_m=(
+                        round(float(owm_range), 4) if owm_range is not None else None
+                    ),
+                    vision_dist_m=round(float(dist), 4),
+                    blended_m=round(float(blended), 4),
+                    locked_body_id=int(getattr(self, "_task_locked_body_id", 0) or 0),
+                )
+            except Exception:
+                pass
+        return blended
+
+    def _maybe_rebind_on_physics_range_desync(
+        self,
+        tick: int,
+        *,
+        phys: float,
+        owm_range: float | None,
+        kind: str,
+        stop: float,
+    ) -> None:
+        """Soft-unlock + objectness rebind when COM is near locked body but OWM range drifts high."""
+        if not vision_resolve_enabled():
+            return
+        if kind not in ("approach", "approach_target"):
+            return
+        if float(phys) >= float(stop):
+            return
+        if owm_range is None or float(owm_range) - float(phys) < 0.6:
+            return
+
+        until = int(getattr(self, "_physics_range_rebind_until_tick", -1) or -1)
+        if int(tick) < until:
+            return
+
+        streak = int(getattr(self, "_physics_range_desync_streak", 0)) + 1
+        self._physics_range_desync_streak = streak
+        if streak < 3:
+            return
+        self._physics_range_desync_streak = 0
+        self._physics_range_rebind_until_tick = int(tick) + 40
+
+        scene = getattr(self, "_latent_scene", None)
+        cam = self._depth_camera_from_sim()
+        if scene is not None and cam is not None:
+            try:
+                scene.refresh_active_from_live_camera(
+                    cam,
+                    tick=int(tick),
+                    range_hint=float(phys),
+                    blend=1.0,
+                )
+            except Exception:
+                pass
+
+        owm = getattr(self, "_obj_working_memory", None)
+        bearing_hint = float(owm.bearing) if owm is not None else None
+        self._rebind_vision_objectness_peak(
+            int(tick),
+            reason="physics_range_desync",
+            oracle_dist=float(phys),
+            bearing_hint=bearing_hint,
+            allow_full_resolve=True,
+        )
+
     def _manip_has_contact(self, resolved: ResolvedObject | None) -> bool:
         env = getattr(getattr(self, "agent", None), "env", None)
         if env is not None and bool(getattr(env, "_contact_flag", False)):
@@ -1533,6 +1699,7 @@ class SimulationGroundedLanguageMixin:
         self._task_log_prev_vision_range = None
         self._owm_cached_tick = -1
         self._owm_cached = None
+        self._task_locked_body_id = None
 
     def _inject_owm_into_graph(self, owm: ObjectWorkingMemory | LatentSceneMemory) -> None:
         if isinstance(owm, LatentSceneMemory):
@@ -1747,6 +1914,7 @@ class SimulationGroundedLanguageMixin:
         self._vision_recede_streak = 0
         self._owm_cached_tick = -1
         self._owm_cached = None
+        self._lock_task_contact_body_on_bind(vt)
 
     def _collect_scene_percepts(self) -> list[dict[str, Any]]:
         """
@@ -3999,6 +4167,28 @@ class SimulationGroundedLanguageMixin:
         else:
             dist = float(oracle_dist)
             owm = None
+
+        owm_range = (
+            float(owm.range_m)
+            if owm is not None and owm.is_usable(int(tick))
+            else None
+        )
+        dist = self._blend_dist_with_physics_range(float(dist), owm_range, int(tick))
+
+        stop_for_rebind = float(
+            active.expected_state.get("stop_distance", nav_stop_m())
+            if kind in ("approach", "approach_target")
+            else nav_stop_m()
+        )
+        phys_for_rebind = self._physics_range_to_locked_body()
+        if phys_for_rebind is not None:
+            self._maybe_rebind_on_physics_range_desync(
+                int(tick),
+                phys=float(phys_for_rebind),
+                owm_range=owm_range,
+                kind=str(kind),
+                stop=float(stop_for_rebind),
+            )
 
         self._maybe_rebind_vision_on_divergence(
             int(tick),
