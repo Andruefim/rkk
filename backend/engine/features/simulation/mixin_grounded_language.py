@@ -4086,13 +4086,76 @@ class SimulationGroundedLanguageMixin:
             tick = int(getattr(self, "tick", 0))
             if owm is None:
                 owm = self._update_object_working_memory(tick)
-            if owm is None or not owm.is_usable(tick):
-                # Stale / no memory → pause (no oracle fallback)
-                self._set_task_nav_graph_flags(nav_active=False)
+            phys = self._physics_range_to_locked_body()
+            owm_ok = owm is not None and owm.is_usable(tick)
+            if not owm_ok:
+                # Fallen / teleport can make OWM briefly unusable — still crawl
+                # toward the locked planter using physics ego bearing/range.
+                if phys is None or float(phys) <= float(stop):
+                    self._set_task_nav_graph_flags(nav_active=False)
+                    return
+                row = self._static_registry_row_for_body(
+                    int(getattr(self, "_task_locked_body_id", 0) or 0)
+                )
+                if row is None:
+                    self._set_task_nav_graph_flags(nav_active=False)
+                    return
+                br = self._bearing_range_from_world_xy(
+                    (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                )
+                if br is None:
+                    self._set_task_nav_graph_flags(nav_active=False)
+                    return
+                nav_bearing, _ = br
+                intents = navigation_intents_from_bearing_range(
+                    float(nav_bearing),
+                    float(phys),
+                    stop,
+                    fallen=True,
+                    posture_stability=None,
+                )
+                nav_meta = {
+                    "task_nav_mode": "physics_crawl",
+                    "nav_ai_ok": False,
+                    "nav_ai_reason": "owm_unusable_physics_crawl",
+                }
+                self._last_nav_meta = dict(nav_meta)
+                if intents:
+                    self._last_nav_intents = {
+                        k: float(v)
+                        for k, v in intents.items()
+                        if str(k).startswith("intent_")
+                    }
+                    heading_err = intents.pop("task_heading_err", None)
+                    intents.pop("task_closing_vel", None)
+                    intents.pop("task_nav_active", None)
+                    intents.pop("vision_bearing", None)
+                    intents.pop("vision_range_m", None)
+                    self._set_task_nav_graph_flags(
+                        nav_active=True,
+                        heading_err=(
+                            float(heading_err) if heading_err is not None else None
+                        ),
+                    )
+                    try:
+                        task_log_event(
+                            "task_nav",
+                            tick=int(tick),
+                            task_nav_mode="physics_crawl",
+                            nav_ai_ok=False,
+                            nav_ai_reason="owm_unusable_physics_crawl",
+                            bearing=round(float(nav_bearing), 4),
+                            range_m=round(float(phys), 4),
+                        )
+                    except Exception:
+                        pass
+                    if arb is not None and intents:
+                        arb.register_from_dict("navigation", intents, precision=0.9)
+                else:
+                    self._set_task_nav_graph_flags(nav_active=False)
                 return
             range_m = float(owm.range_m)
             # Prefer physics surface range for stop decisions when locked.
-            phys = self._physics_range_to_locked_body()
             if phys is not None:
                 if float(phys) - float(owm.range_m) > 0.25:
                     range_m = float(phys)
