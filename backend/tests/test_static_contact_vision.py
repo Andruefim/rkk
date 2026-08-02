@@ -340,6 +340,44 @@ def test_humanoid_physics_sim_unwraps_nested_sim() -> None:
     assert h._manip_has_contact(None) is True
 
 
+def test_forward_cylinder_prefers_near_planter_over_far() -> None:
+    class _Harness(_StaticContactHarness):
+        def _agent_xy_forward(self):
+            return (0.0, 0.0), (1.0, 0.0)
+
+        def _task_ontology_best_key(self) -> str:
+            return "cylinder"
+
+    h = _Harness()
+    h._base._static_body_registry = [
+        {
+            "body_id": 201,
+            "kind": "cylinder",
+            "style": "planter",
+            "x": 2.0,
+            "y": 0.0,
+            "radius": 0.3,
+            "height": 1.0,
+        },
+        {
+            "body_id": 299,
+            "kind": "cylinder",
+            "style": "planter",
+            "x": 7.0,
+            "y": 0.0,
+            "radius": 0.5,
+            "height": 1.0,
+        },
+    ]
+    bid = h._forward_cylinder_contact_body(vision_range=1.7, prefer_planter=True)
+    assert bid == 201
+    h._lock_task_contact_body_on_bind()
+    assert h._task_locked_body_id == 201
+    # Optimistic vision must not beat physics for approach gates.
+    blended = h._blend_dist_with_physics_range(0.3, 0.3, 50)
+    assert blended == pytest.approx(1.7, abs=0.05)
+
+
 def test_fall_assist_near_goal_blocks_teleport() -> None:
     h = _StaticContactHarness()
     h._task_locked_body_id = 201

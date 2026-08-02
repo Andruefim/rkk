@@ -1351,6 +1351,55 @@ class SimulationGroundedLanguageMixin:
         except Exception:
             return None
 
+    def _forward_cylinder_contact_body(
+        self,
+        *,
+        vision_range: float | None = None,
+        prefer_planter: bool = True,
+        max_dist_m: float = 8.0,
+    ) -> int | None:
+        """Pick a static cylinder ahead of the agent (physics registry, not oracle control).
+
+        Scores by surface distance, optional vision-range agreement, and planter style.
+        """
+        base = self._humanoid_physics_sim()
+        if base is None:
+            return None
+        agent_xy, fwd = self._agent_xy_forward()
+        ax, ay = float(agent_xy[0]), float(agent_xy[1])
+        fx, fy = float(fwd[0]), float(fwd[1])
+        fn = float(math.hypot(fx, fy))
+        if fn > 1e-6:
+            fx, fy = fx / fn, fy / fn
+        best_id: int | None = None
+        best_score = float("inf")
+        for row in getattr(base, "_static_body_registry", []) or []:
+            if str(row.get("kind", "")) != "cylinder":
+                continue
+            bx = float(row.get("x", 0.0))
+            by = float(row.get("y", 0.0))
+            dx, dy = bx - ax, by - ay
+            ahead = dx * fx + dy * fy
+            horiz = float(math.hypot(dx, dy))
+            if horiz > 1e-6 and ahead < -0.05 * horiz:
+                continue
+            d = max(0.0, horiz - float(row.get("radius", 0.0)))
+            if d > float(max_dist_m):
+                continue
+            score = float(d)
+            if vision_range is not None and float(vision_range) > 0.05:
+                score += 0.55 * abs(float(d) - float(vision_range))
+            style = str(row.get("style", "") or "")
+            if prefer_planter and style == "planter":
+                score *= 0.82
+            elif prefer_planter and style in ("wood", "chrome", "glass"):
+                score *= 1.15
+            bid = row.get("body_id")
+            if bid is not None and score < best_score:
+                best_score = score
+                best_id = int(bid)
+        return best_id
+
     def _contact_body_id_for_task(self, resolved: ResolvedObject | None) -> int | None:
         body_id = getattr(resolved, "body_id", None) if resolved is not None else None
         if body_id is not None:
@@ -1363,13 +1412,6 @@ class SimulationGroundedLanguageMixin:
         fn = getattr(base, "find_static_contact_body", None)
         if not callable(fn):
             return None
-        # Prefer OWM world XY when usable; else agent COM for cylinder ontology.
-        probe_xy = None
-        if owm is not None and owm.is_usable(tick):
-            probe_xy = self._world_xy_from_owm(owm)
-        if probe_xy is None:
-            agent_xy, _ = self._agent_xy_forward()
-            probe_xy = (float(agent_xy[0]), float(agent_xy[1]))
         from engine.vision_resolve import _is_visual_concept
         from engine.task_observation import contact_reach_m
 
@@ -1382,8 +1424,28 @@ class SimulationGroundedLanguageMixin:
             or "cylinder" in ont_key
             or any(k in visual_label for k in ("cylinder", "planter", "column"))
         )
+        vision_range = None
+        if owm is not None and owm.is_usable(tick):
+            vision_range = float(owm.range_m)
+        elif vt is not None and vt.range_m is not None:
+            vision_range = float(vt.range_m)
+
+        if prefer_cyl:
+            bid = self._forward_cylinder_contact_body(
+                vision_range=vision_range,
+                prefer_planter=True,
+                max_dist_m=max(8.0, float(vision_range or 0.0) + 3.0),
+            )
+            if bid is not None:
+                return int(bid)
+
+        probe_xy = None
+        if owm is not None and owm.is_usable(tick):
+            probe_xy = self._world_xy_from_owm(owm)
+        if probe_xy is None:
+            agent_xy, _ = self._agent_xy_forward()
+            probe_xy = (float(agent_xy[0]), float(agent_xy[1]))
         max_d = float(contact_reach_m())
-        # Near-range cylinder: widen probe so large planter COM can match.
         if prefer_cyl:
             max_d = max(max_d, 2.5)
             bid = fn(probe_xy, kind="cylinder", style="planter", max_dist_m=max_d)
@@ -1451,15 +1513,24 @@ class SimulationGroundedLanguageMixin:
             )
             if prefer_cyl:
                 base = self._humanoid_physics_sim()
-                fn = getattr(base, "find_static_contact_body", None) if base is not None else None
-                if callable(fn):
-                    agent_xy, _ = self._agent_xy_forward()
-                    probe = (float(agent_xy[0]), float(agent_xy[1]))
-                    body_id = fn(probe, kind="cylinder", style="planter", max_dist_m=2.5)
-                    if body_id is None:
-                        body_id = fn(probe, kind="cylinder", max_dist_m=2.5)
-                    if body_id is None:
-                        body_id = fn(probe, max_dist_m=2.5)
+                vision_range = None
+                if vt is not None and vt.range_m is not None:
+                    vision_range = float(vt.range_m)
+                body_id = self._forward_cylinder_contact_body(
+                    vision_range=vision_range,
+                    prefer_planter=True,
+                    max_dist_m=8.0,
+                )
+                if body_id is None:
+                    fn = getattr(base, "find_static_contact_body", None) if base is not None else None
+                    if callable(fn):
+                        agent_xy, _ = self._agent_xy_forward()
+                        probe = (float(agent_xy[0]), float(agent_xy[1]))
+                        body_id = fn(probe, kind="cylinder", style="planter", max_dist_m=2.5)
+                        if body_id is None:
+                            body_id = fn(probe, kind="cylinder", max_dist_m=2.5)
+                        if body_id is None:
+                            body_id = fn(probe, max_dist_m=2.5)
         self._task_locked_body_id = int(body_id) if body_id is not None else None
         try:
             task_log_event(
@@ -1520,7 +1591,17 @@ class SimulationGroundedLanguageMixin:
         phys = self._physics_range_to_locked_body()
         if phys is None:
             return float(dist)
-        blended = min(float(dist), float(phys))
+        # Physics is ground truth for stage gates once a body is locked.
+        # Optimistic vision (much closer than phys) must not complete approach early.
+        if float(dist) + 0.45 < float(phys):
+            blended = float(phys)
+            self._maybe_relock_body_on_optimistic_vision(
+                int(tick),
+                phys=float(phys),
+                vision=float(dist),
+            )
+        else:
+            blended = min(float(dist), float(phys))
         prev_log = int(getattr(self, "_task_physics_range_log_tick", -9999))
         if int(tick) - prev_log >= 30:
             self._task_physics_range_log_tick = int(tick)
@@ -1539,6 +1620,58 @@ class SimulationGroundedLanguageMixin:
             except Exception:
                 pass
         return blended
+
+    def _maybe_relock_body_on_optimistic_vision(
+        self,
+        tick: int,
+        *,
+        phys: float,
+        vision: float,
+    ) -> None:
+        """When vision << physics, locked body is likely wrong — reselect forward cylinder."""
+        until = int(getattr(self, "_body_relock_until_tick", -1) or -1)
+        if int(tick) < until:
+            return
+        if float(phys) - float(vision) < 0.8:
+            return
+        streak = int(getattr(self, "_optimistic_vision_relock_streak", 0)) + 1
+        self._optimistic_vision_relock_streak = streak
+        if streak < 2:
+            return
+        self._optimistic_vision_relock_streak = 0
+        self._body_relock_until_tick = int(tick) + 25
+        bid = self._forward_cylinder_contact_body(
+            vision_range=float(vision),
+            prefer_planter=True,
+            max_dist_m=8.0,
+        )
+        if bid is None:
+            return
+        prev = getattr(self, "_task_locked_body_id", None)
+        if prev is not None and int(prev) == int(bid):
+            # Try nearest planter by COM surface distance ignoring vision match.
+            bid2 = self._forward_cylinder_contact_body(
+                vision_range=None,
+                prefer_planter=True,
+                max_dist_m=8.0,
+            )
+            if bid2 is not None:
+                bid = bid2
+        if prev is not None and int(prev) == int(bid):
+            return
+        self._task_locked_body_id = int(bid)
+        try:
+            task_log_event(
+                "task_body_relock",
+                tick=int(tick),
+                prev_body_id=int(prev) if prev is not None else None,
+                locked_body_id=int(bid),
+                phys_m=round(float(phys), 4),
+                vision_m=round(float(vision), 4),
+                reason="optimistic_vision",
+            )
+        except Exception:
+            pass
 
     def _maybe_rebind_on_physics_range_desync(
         self,
@@ -4336,9 +4469,18 @@ class SimulationGroundedLanguageMixin:
             except ValueError:
                 fail_after_assist_ticks = 200
             fail_after_assist_ticks = max(1, min(fail_after_assist_ticks, 5000))
+            # Near locked body: keep recovering in place — do not abort the touch stage.
+            near_goal = False
+            try:
+                near_goal = bool(self._task_fall_assist_near_goal())
+            except Exception:
+                near_goal = False
+            if near_goal and kind in _reach_verify_fall_kinds + _approach_fall_kinds:
+                fail_after_assist_ticks = max(fail_after_assist_ticks, 800)
             fail_after_assist = (
                 bool(getattr(self, "_task_fall_assist_used", False))
                 and after_assist_ticks >= fail_after_assist_ticks
+                and not near_goal
             )
             fail_reason = (
                 "fallen_during_approach"
