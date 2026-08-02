@@ -774,6 +774,24 @@ class SimulationGroundedLanguageMixin:
             return None
         return getattr(env, "base_env", env)
 
+    def _humanoid_physics_sim(self) -> Any | None:
+        """Unwrap to the object that owns PyBullet static body registry / contacts."""
+        base = self._humanoid_base_env()
+        if base is None:
+            return None
+        sim = getattr(base, "_sim", None)
+        if sim is not None and (
+            hasattr(sim, "_static_body_registry")
+            or callable(getattr(sim, "find_static_contact_body", None))
+            or callable(getattr(sim, "_manip_has_contact", None))
+        ):
+            return sim
+        if hasattr(base, "_static_body_registry") or callable(
+            getattr(base, "find_static_contact_body", None)
+        ):
+            return base
+        return base
+
     def _sandbox_scene_extras(self) -> dict:
         """Scene objects from embodiment (sim or real robot driver), not resolver heuristics."""
         base = self._humanoid_base_env()
@@ -1334,68 +1352,54 @@ class SimulationGroundedLanguageMixin:
             return None
 
     def _contact_body_id_for_task(self, resolved: ResolvedObject | None) -> int | None:
-        if resolved is not None:
-            body_id = getattr(resolved, "body_id", None)
-            if body_id is not None:
-                return int(body_id)
-        base = self._humanoid_base_env()
+        body_id = getattr(resolved, "body_id", None) if resolved is not None else None
+        if body_id is not None:
+            return int(body_id)
+        base = self._humanoid_physics_sim()
         if base is None:
             return None
         owm = getattr(self, "_obj_working_memory", None)
-        if owm is None:
-            owm = getattr(self, "_owm_cached", None)
-        if owm is None:
-            return None
+        tick = int(getattr(self, "tick", 0))
         fn = getattr(base, "find_static_contact_body", None)
         if not callable(fn):
             return None
-
+        # Prefer OWM world XY when usable; else agent COM for cylinder ontology.
+        probe_xy = None
+        if owm is not None and owm.is_usable(tick):
+            probe_xy = self._world_xy_from_owm(owm)
+        if probe_xy is None:
+            agent_xy, _ = self._agent_xy_forward()
+            probe_xy = (float(agent_xy[0]), float(agent_xy[1]))
         from engine.vision_resolve import _is_visual_concept
+        from engine.task_observation import contact_reach_m
 
         ont_key = str(self._task_ontology_best_key() or "").strip().lower()
-        raw_label = str(getattr(owm, "label", "") or "")
-        visual_label = raw_label.lower() if _is_visual_concept(raw_label) else ""
-        range_m = float(getattr(owm, "range_m", 0.0) or 0.0)
-
+        vt = getattr(self, "_manip_resolved_visual", None)
+        label_src = str(getattr(vt, "label", "") or getattr(owm, "label", "") or "")
+        visual_label = label_src.lower() if _is_visual_concept(label_src) else ""
         prefer_cyl = (
             ont_key == "cylinder"
             or "cylinder" in ont_key
             or any(k in visual_label for k in ("cylinder", "planter", "column"))
         )
-
-        world_xy = self._world_xy_from_owm(owm)
-        agent_xy, _ = self._agent_xy_forward()
-        max_dist = 2.5
-
-        if prefer_cyl and range_m < contact_reach_m():
-            probe_xy = (float(agent_xy[0]), float(agent_xy[1]))
-            bid = fn(probe_xy, kind="cylinder", style="planter", max_dist_m=max_dist)
-            if bid is not None:
-                return int(bid)
-            bid = fn(probe_xy, kind="cylinder", max_dist_m=max_dist)
-            if bid is not None:
-                return int(bid)
-
+        max_d = float(contact_reach_m())
+        # Near-range cylinder: widen probe so large planter COM can match.
         if prefer_cyl:
-            probe_xy = world_xy
-            if probe_xy is None and range_m < contact_reach_m():
-                probe_xy = (float(agent_xy[0]), float(agent_xy[1]))
-            if probe_xy is not None:
-                bid = fn(probe_xy, kind="cylinder", style="planter", max_dist_m=max_dist)
-                if bid is not None:
-                    return int(bid)
-                bid = fn(probe_xy, kind="cylinder", max_dist_m=max_dist)
-                if bid is not None:
-                    return int(bid)
-
-        if world_xy is None:
-            return None
-        bid = fn(world_xy, max_dist_m=max_dist)
+            max_d = max(max_d, 2.5)
+            bid = fn(probe_xy, kind="cylinder", style="planter", max_dist_m=max_d)
+            if bid is None:
+                bid = fn(probe_xy, kind="cylinder", max_dist_m=max_d)
+            return int(bid) if bid is not None else None
+        style = None
+        kind = None
+        if "chair" in visual_label or ont_key == "chair":
+            kind = "box"
+        bid = fn(probe_xy, kind=kind, style=style, max_dist_m=max_d)
         return int(bid) if bid is not None else None
 
     def _cylinder_contact_body_ids_near_agent(self, max_dist_m: float = 2.5) -> list[int]:
         """All cylinder static bodies within reach of agent COM (physics contact probe)."""
-        base = self._humanoid_base_env()
+        base = self._humanoid_physics_sim()
         if base is None:
             return []
         agent_xy, _ = self._agent_xy_forward()
@@ -1415,7 +1419,7 @@ class SimulationGroundedLanguageMixin:
         return out
 
     def _static_registry_row_for_body(self, body_id: int) -> dict | None:
-        base = self._humanoid_base_env()
+        base = self._humanoid_physics_sim()
         if base is None:
             return None
         for row in getattr(base, "_static_body_registry", []) or []:
@@ -1446,7 +1450,7 @@ class SimulationGroundedLanguageMixin:
                 or any(k in visual_label for k in ("cylinder", "planter", "column"))
             )
             if prefer_cyl:
-                base = self._humanoid_base_env()
+                base = self._humanoid_physics_sim()
                 fn = getattr(base, "find_static_contact_body", None) if base is not None else None
                 if callable(fn):
                     agent_xy, _ = self._agent_xy_forward()
@@ -1457,13 +1461,22 @@ class SimulationGroundedLanguageMixin:
                     if body_id is None:
                         body_id = fn(probe, max_dist_m=2.5)
         self._task_locked_body_id = int(body_id) if body_id is not None else None
+        try:
+            task_log_event(
+                "task_body_lock",
+                tick=int(getattr(self, "tick", 0)),
+                locked_body_id=self._task_locked_body_id,
+                label=str(getattr(vt, "label", "") or ""),
+            )
+        except Exception:
+            pass
 
     def _physics_range_to_locked_body(self) -> float | None:
         """COM XY distance to bound static body (surface distance for cylinders)."""
         bid = getattr(self, "_task_locked_body_id", None)
         if bid is None:
             return None
-        base = self._humanoid_base_env()
+        base = self._humanoid_physics_sim()
         if base is None:
             return None
         agent_xy, _ = self._agent_xy_forward()
@@ -1584,7 +1597,7 @@ class SimulationGroundedLanguageMixin:
         env = getattr(getattr(self, "agent", None), "env", None)
         if env is not None and bool(getattr(env, "_contact_flag", False)):
             return True
-        base = self._humanoid_base_env()
+        base = self._humanoid_physics_sim()
         if base is None:
             return False
         fn = getattr(base, "_manip_has_contact", None)
@@ -1592,6 +1605,10 @@ class SimulationGroundedLanguageMixin:
             return False
 
         body_id = self._contact_body_id_for_task(resolved)
+        locked = getattr(self, "_task_locked_body_id", None)
+        if locked is not None and bool(fn(int(locked))):
+            self._log_task_contact_detected(int(locked))
+            return True
         if body_id is not None and bool(fn(int(body_id))):
             self._log_task_contact_detected(int(body_id))
             return True
@@ -1600,6 +1617,11 @@ class SimulationGroundedLanguageMixin:
             self, "_owm_cached", None
         )
         range_m = float(getattr(owm, "range_m", 0.0) or 0.0) if owm is not None else 999.0
+        phys = self._physics_range_to_locked_body()
+        near = min(
+            range_m,
+            float(phys) if phys is not None else range_m,
+        )
         ont_key = str(self._task_ontology_best_key() or "").strip().lower()
         raw_label = str(getattr(owm, "label", "") or "") if owm is not None else ""
         from engine.vision_resolve import _is_visual_concept
@@ -1610,9 +1632,14 @@ class SimulationGroundedLanguageMixin:
             or "cylinder" in ont_key
             or any(k in visual_label for k in ("cylinder", "planter", "column"))
         )
-        if prefer_cyl and range_m < contact_reach_m():
+        # Scan nearby cylinders when physics/vision say we are in reach (not OWM-only).
+        if prefer_cyl and near < max(float(contact_reach_m()), 1.2):
             for bid in self._cylinder_contact_body_ids_near_agent():
-                if bid != body_id and bool(fn(int(bid))):
+                if locked is not None and int(bid) == int(locked):
+                    continue
+                if body_id is not None and int(bid) == int(body_id):
+                    continue
+                if bool(fn(int(bid))):
                     self._log_task_contact_detected(int(bid))
                     return True
         return False
@@ -2254,18 +2281,63 @@ class SimulationGroundedLanguageMixin:
         return None
 
     def _capture_task_fall_approach_baseline(self, dist: float) -> None:
-        """Record range/COM at fall edge during approach (assist progress baseline)."""
-        self._task_fall_start_range = float(dist)
+        """Record range/COM at fall edge during approach (assist progress baseline).
+
+        Never worsen an existing baseline — a re-fall near the goal must not
+        erase earlier approach progress or fall-assist will teleport away.
+        """
+        prev_r = getattr(self, "_task_fall_start_range", None)
+        new_r = float(dist)
+        if prev_r is None:
+            self._task_fall_start_range = new_r
+        else:
+            # Keep the farther baseline so re-falls near the goal still count
+            # prior approach progress.
+            self._task_fall_start_range = max(float(prev_r), new_r)
+        # Prefer the farther (worse) bind/start as the progress reference.
+        bind_range = getattr(self, "_owm_bind_range_m", None)
+        if bind_range is not None:
+            self._task_fall_start_range = max(
+                float(self._task_fall_start_range), float(bind_range)
+            )
         com_d = self._task_fall_approach_com_dist_m()
-        self._task_fall_start_com = float(com_d) if com_d is not None else None
+        if com_d is not None:
+            prev_c = getattr(self, "_task_fall_start_com", None)
+            if prev_c is None:
+                self._task_fall_start_com = float(com_d)
+            else:
+                # Keep the farther COM baseline so closing still counts as progress.
+                self._task_fall_start_com = max(float(prev_c), float(com_d))
+
+    def _task_fall_assist_near_goal(self) -> bool:
+        """True when physically / visually near approach stop — never teleport."""
+        stop = float(nav_stop_m()) + 0.35
+        phys = self._physics_range_to_locked_body()
+        if phys is not None and float(phys) <= stop:
+            return True
+        cur = self._task_fall_approach_range_m()
+        if cur is not None and float(cur) <= stop:
+            return True
+        return False
 
     def _task_fall_assist_progress_blocks_reset(self) -> bool:
         """True when fallen approach made enough progress — skip assist teleport."""
+        if self._task_fall_assist_near_goal():
+            return True
         min_gain = self._task_fall_assist_progress_min_m()
         start_range = getattr(self, "_task_fall_start_range", None)
         bind_range = getattr(self, "_owm_bind_range_m", None)
         baseline_range = start_range if start_range is not None else bind_range
+        if baseline_range is None and bind_range is not None:
+            baseline_range = bind_range
         current_range = self._task_fall_approach_range_m()
+        phys = self._physics_range_to_locked_body()
+        if phys is not None:
+            current_range = (
+                float(phys)
+                if current_range is None
+                else min(float(current_range), float(phys))
+            )
         if baseline_range is not None and current_range is not None:
             if float(baseline_range) - float(current_range) >= min_gain:
                 return True
@@ -2807,7 +2879,18 @@ class SimulationGroundedLanguageMixin:
         owm: ObjectWorkingMemory | None = None,
     ) -> None:
         if fallen or active is None:
-            return
+            # Near locked body: still drive reach/manip so contact can register.
+            if fallen and active is not None:
+                kind = str(active.kind)
+                if kind in ("reach_contact", "reach_target", "verify_goal"):
+                    phys = self._physics_range_to_locked_body()
+                    near = phys is not None and float(phys) <= float(contact_reach_m())
+                    if not near:
+                        return
+                else:
+                    return
+            else:
+                return
         kind = str(active.kind)
         manip_kinds = ("reach_contact", "reach_target")
         if kind not in manip_kinds:
@@ -3763,9 +3846,11 @@ class SimulationGroundedLanguageMixin:
         owm: ObjectWorkingMemory | None = None,
     ) -> None:
         tick = int(getattr(self, "tick", 0))
-        if fallen or active is None or self._nav_hold_active(tick):
+        if active is None or self._nav_hold_active(tick):
             self._set_task_nav_graph_flags(nav_active=False)
             return
+        # Fallen still allows WM/AI nav (intents already downscale for fallen).
+        # Blocking nav on fallen was freezing crawl-to-target once upright failed.
         kind = str(active.kind)
         if kind not in ("approach", "reach_contact", "approach_target", "reach_target"):
             return
@@ -3794,8 +3879,19 @@ class SimulationGroundedLanguageMixin:
                 self._set_task_nav_graph_flags(nav_active=False)
                 return
             range_m = float(owm.range_m)
+            # Prefer physics surface range for stop decisions when locked.
+            phys = self._physics_range_to_locked_body()
+            if phys is not None:
+                range_m = min(range_m, float(phys))
+            has_contact = False
+            if kind == "reach_contact":
+                has_contact = bool(
+                    self._manip_has_contact(getattr(self, "_manip_resolved", None))
+                )
             need_nav = kind in ("approach", "approach_target") or (
-                kind == "reach_contact" and range_m > reach_start_m()
+                kind == "reach_contact"
+                and (not has_contact)
+                and range_m > 0.12
             ) or (kind == "reach_target" and range_m > approach_m)
             mode = _task_nav_mode()
             if need_nav:
@@ -3900,8 +3996,13 @@ class SimulationGroundedLanguageMixin:
 
         agent_xy, agent_fwd = self._agent_xy_forward()
         prev_xy = getattr(self, "_task_nav_prev_xy", None)
+        has_contact = False
+        if kind == "reach_contact":
+            has_contact = bool(
+                self._manip_has_contact(getattr(self, "_manip_resolved", None))
+            )
         if kind in ("approach", "approach_target") or (
-            kind == "reach_contact" and float(dist) > reach_start_m()
+            kind == "reach_contact" and (not has_contact) and float(dist) > 0.12
         ) or (kind == "reach_target" and float(dist) > approach_m):
             intents = navigation_intents(
                 agent_xy,
@@ -4305,10 +4406,11 @@ class SimulationGroundedLanguageMixin:
                 self._tt_fail_active(tt, tick, "approach_timeout", retryable=True)
 
         elif kind == "reach_contact":
-            reach_m = reach_start_m()
             min_elapsed = int(tick) - stage_enter >= reach_min
+            # Touch / contact stages require physics contact — proximity alone
+            # must not skip the neural/physics verify path.
             has_contact = self._manip_has_contact(resolved)
-            if min_elapsed and (has_contact or dist <= reach_m):
+            if min_elapsed and has_contact:
                 self._tt_complete_active(tt, tick)
                 self._task_tree_stage_enter_tick = tick
             elif active.tick_deadline and tick > int(active.tick_deadline):

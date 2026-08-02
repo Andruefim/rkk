@@ -142,6 +142,15 @@ class SimulationFallMixin:
         ):
             self._task_fall_assist_used = True
             self._task_fallen_after_assist_ticks = 0
+            try:
+                from engine.task_logger import task_log_event
+
+                task_log_event(
+                    "task_fall_assist_reset",
+                    tick=int(getattr(self, "tick", 0)),
+                )
+            except Exception:
+                pass
             unlock_fn = getattr(self, "_owm_unlock_after_teleport", None)
             if callable(unlock_fn):
                 try:
@@ -331,6 +340,17 @@ class SimulationFallMixin:
                         self._add_event(
                             "task_fall_assist_skipped_progress", "#66ccff", "value"
                         )
+                        try:
+                            from engine.task_logger import task_log_event
+
+                            task_log_event(
+                                "task_fall_assist_skipped_progress",
+                                tick=int(getattr(self, "tick", 0)),
+                                fallen_ticks=int(fallen_ticks),
+                                stall_count=int(stall_count),
+                            )
+                        except Exception:
+                            pass
                         return False
                     self._clear_fall_recovery()
                     return self._try_task_fall_assist_reset()

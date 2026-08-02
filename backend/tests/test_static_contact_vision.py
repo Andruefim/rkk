@@ -286,3 +286,79 @@ def test_clear_object_working_memory_clears_locked_body() -> None:
     h._task_locked_body_id = 201
     h._clear_object_working_memory()
     assert h._task_locked_body_id is None
+
+
+def test_humanoid_physics_sim_unwraps_nested_sim() -> None:
+    """Contact registry lives on PyBullet _sim, not HumanoidEnv wrapper."""
+
+    class _Sim:
+        def __init__(self) -> None:
+            self._static_body_registry = [
+                {
+                    "body_id": 301,
+                    "kind": "cylinder",
+                    "style": "planter",
+                    "x": 1.0,
+                    "y": 0.0,
+                    "radius": 0.3,
+                    "height": 1.0,
+                }
+            ]
+
+        def find_static_contact_body(self, world_xy, *, kind=None, style=None, max_dist_m=1.2):
+            return 301
+
+        def _manip_has_contact(self, body_id: int) -> bool:
+            return int(body_id) == 301
+
+    class _Env:
+        def __init__(self) -> None:
+            self._sim = _Sim()
+
+        def get_task_agent_pose(self) -> dict:
+            return {"xy": (0.7, 0.0), "forward": (1.0, 0.0), "yaw": 0.0}
+
+    class _Harness(SimulationGroundedLanguageMixin):
+        def __init__(self) -> None:
+            self.agent = SimpleNamespace(env=SimpleNamespace(base_env=_Env(), _contact_flag=False))
+            self._obj_working_memory = None
+            self._owm_cached = None
+
+        def _task_ontology_best_key(self) -> str:
+            return "cylinder"
+
+        def _agent_xy_forward(self):
+            return (0.7, 0.0), (1.0, 0.0)
+
+    h = _Harness()
+    phys = h._humanoid_physics_sim()
+    assert phys is not None
+    assert getattr(phys, "_static_body_registry", None) is not None
+    assert h._contact_body_id_for_task(None) == 301
+    h._task_locked_body_id = 301
+    assert h._physics_range_to_locked_body() == pytest.approx(0.0, abs=0.02)
+    assert h._manip_has_contact(None) is True
+
+
+def test_fall_assist_near_goal_blocks_teleport() -> None:
+    h = _StaticContactHarness()
+    h._task_locked_body_id = 201
+    h._task_fall_start_range = 3.5
+    h._owm_bind_range_m = 3.5
+
+    class _Near(_StaticContactHarness):
+        def _agent_xy_forward(self):
+            return (1.95, 0.0), (1.0, 0.0)
+
+        def _task_fall_approach_range_m(self):
+            return 0.4
+
+    n = _Near()
+    n._task_locked_body_id = 201
+    n._task_fall_start_range = 0.45  # re-fall near goal must not erase progress
+    n._owm_bind_range_m = 3.5
+    assert n._task_fall_assist_near_goal() is True
+    assert n._task_fall_assist_progress_blocks_reset() is True
+    n._capture_task_fall_approach_baseline(0.4)
+    # Baseline stays at bind/far reference, not the near re-fall distance.
+    assert float(n._task_fall_start_range) >= 3.0
