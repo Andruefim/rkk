@@ -368,6 +368,15 @@ def test_forward_cylinder_prefers_near_planter_over_far() -> None:
             "radius": 0.5,
             "height": 1.0,
         },
+        {
+            "body_id": 25,
+            "kind": "cylinder",
+            "style": "chrome",
+            "x": 0.5,
+            "y": 0.0,
+            "radius": 0.015,
+            "height": 0.4,
+        },
     ]
     bid = h._forward_cylinder_contact_body(vision_range=1.7, prefer_planter=True)
     assert bid == 201
@@ -376,6 +385,9 @@ def test_forward_cylinder_prefers_near_planter_over_far() -> None:
     # Optimistic vision must not beat physics for approach gates.
     blended = h._blend_dist_with_physics_range(0.3, 0.3, 50)
     assert blended == pytest.approx(1.7, abs=0.05)
+    # Sticky planter lock across rebinds.
+    h._lock_task_contact_body_on_bind()
+    assert h._task_locked_body_id == 201
 
 
 def test_fall_assist_near_goal_blocks_teleport() -> None:

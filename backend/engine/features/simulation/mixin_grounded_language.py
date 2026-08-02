@@ -1360,7 +1360,8 @@ class SimulationGroundedLanguageMixin:
     ) -> int | None:
         """Pick a static cylinder ahead of the agent (physics registry, not oracle control).
 
-        Scores by surface distance, optional vision-range agreement, and planter style.
+        For cylinder ontology (`prefer_planter`), only planter-style bodies compete —
+        cafe chrome/glass legs must not win on raw proximity.
         """
         base = self._humanoid_physics_sim()
         if base is None:
@@ -1371,29 +1372,36 @@ class SimulationGroundedLanguageMixin:
         fn = float(math.hypot(fx, fy))
         if fn > 1e-6:
             fx, fy = fx / fn, fy / fn
+        rows = [
+            row
+            for row in (getattr(base, "_static_body_registry", []) or [])
+            if str(row.get("kind", "")) == "cylinder"
+        ]
+        if prefer_planter:
+            planters = [row for row in rows if str(row.get("style", "")) == "planter"]
+            if planters:
+                rows = planters
         best_id: int | None = None
         best_score = float("inf")
-        for row in getattr(base, "_static_body_registry", []) or []:
-            if str(row.get("kind", "")) != "cylinder":
-                continue
+        for row in rows:
             bx = float(row.get("x", 0.0))
             by = float(row.get("y", 0.0))
             dx, dy = bx - ax, by - ay
             ahead = dx * fx + dy * fy
             horiz = float(math.hypot(dx, dy))
-            if horiz > 1e-6 and ahead < -0.05 * horiz:
+            # Soft behind-gate: allow near-lateral targets; only drop clear rear ones.
+            if horiz > 1e-6 and ahead < -0.45 * horiz:
                 continue
-            d = max(0.0, horiz - float(row.get("radius", 0.0)))
+            radius = float(row.get("radius", 0.0))
+            d = max(0.0, horiz - radius)
             if d > float(max_dist_m):
                 continue
             score = float(d)
             if vision_range is not None and float(vision_range) > 0.05:
-                score += 0.55 * abs(float(d) - float(vision_range))
-            style = str(row.get("style", "") or "")
-            if prefer_planter and style == "planter":
-                score *= 0.82
-            elif prefer_planter and style in ("wood", "chrome", "glass"):
-                score *= 1.15
+                score += 0.35 * abs(float(d) - float(vision_range))
+            # Larger planters are the scene landmark for "cylindrical object".
+            if str(row.get("style", "")) == "planter":
+                score -= 0.25 * min(radius, 2.0)
             bid = row.get("body_id")
             if bid is not None and score < best_score:
                 best_score = score
@@ -1492,6 +1500,24 @@ class SimulationGroundedLanguageMixin:
 
     def _lock_task_contact_body_on_bind(self, vt: VisualTarget | None = None) -> None:
         """Pin static body_id at vision bind for physics range (not oracle XY control)."""
+        prev = getattr(self, "_task_locked_body_id", None)
+        if prev is not None:
+            prev_row = self._static_registry_row_for_body(int(prev))
+            # Keep an existing planter lock across vision rebinds unless it is gone.
+            if prev_row is not None and str(prev_row.get("style", "")) == "planter":
+                try:
+                    task_log_event(
+                        "task_body_lock",
+                        tick=int(getattr(self, "tick", 0)),
+                        locked_body_id=int(prev),
+                        label=str(getattr(vt, "label", "") or ""),
+                        style="planter",
+                        kept=True,
+                        radius_m=round(float(prev_row.get("radius", 0.0)), 4),
+                    )
+                except Exception:
+                    pass
+                return
         resolved = getattr(self, "_manip_resolved", None)
         body_id = self._contact_body_id_for_task(resolved)
         if body_id is None:
@@ -1532,12 +1558,22 @@ class SimulationGroundedLanguageMixin:
                         if body_id is None:
                             body_id = fn(probe, max_dist_m=2.5)
         self._task_locked_body_id = int(body_id) if body_id is not None else None
+        row = (
+            self._static_registry_row_for_body(int(body_id))
+            if body_id is not None
+            else None
+        )
         try:
             task_log_event(
                 "task_body_lock",
                 tick=int(getattr(self, "tick", 0)),
                 locked_body_id=self._task_locked_body_id,
                 label=str(getattr(vt, "label", "") or ""),
+                style=str((row or {}).get("style", "") or ""),
+                kind=str((row or {}).get("kind", "") or ""),
+                x_m=round(float((row or {}).get("x", 0.0)), 4) if row else None,
+                y_m=round(float((row or {}).get("y", 0.0)), 4) if row else None,
+                radius_m=round(float((row or {}).get("radius", 0.0)), 4) if row else None,
             )
         except Exception:
             pass
@@ -1648,18 +1684,26 @@ class SimulationGroundedLanguageMixin:
         if bid is None:
             return
         prev = getattr(self, "_task_locked_body_id", None)
-        if prev is not None and int(prev) == int(bid):
-            # Try nearest planter by COM surface distance ignoring vision match.
-            bid2 = self._forward_cylinder_contact_body(
-                vision_range=None,
-                prefer_planter=True,
-                max_dist_m=8.0,
-            )
-            if bid2 is not None:
-                bid = bid2
+        # Only switch if the candidate is meaningfully closer than the current lock.
+        if prev is not None:
+            row_new = self._static_registry_row_for_body(int(bid))
+            agent_xy, _ = self._agent_xy_forward()
+            ax, ay = float(agent_xy[0]), float(agent_xy[1])
+            new_phys = float(phys)
+            if row_new is not None:
+                nx = float(row_new.get("x", 0.0))
+                ny = float(row_new.get("y", 0.0))
+                new_phys = max(
+                    0.0,
+                    float(math.hypot(ax - nx, ay - ny))
+                    - float(row_new.get("radius", 0.0)),
+                )
+            if new_phys >= float(phys) - 0.2:
+                return
         if prev is not None and int(prev) == int(bid):
             return
         self._task_locked_body_id = int(bid)
+        row = self._static_registry_row_for_body(int(bid))
         try:
             task_log_event(
                 "task_body_relock",
@@ -1669,6 +1713,8 @@ class SimulationGroundedLanguageMixin:
                 phys_m=round(float(phys), 4),
                 vision_m=round(float(vision), 4),
                 reason="optimistic_vision",
+                style=str((row or {}).get("style", "") or ""),
+                radius_m=round(float((row or {}).get("radius", 0.0)), 4) if row else None,
             )
         except Exception:
             pass
@@ -3768,18 +3814,22 @@ class SimulationGroundedLanguageMixin:
         stop: float,
         posture: float,
         fallen: bool,
+        *,
+        bearing_override: float | None = None,
+        range_override: float | None = None,
     ) -> tuple[dict[str, float], dict[str, Any]]:
         """
         WM + Active Inference approach intents (arbiter source ``navigation``).
 
-        Falls back to heuristic bearing/range nav when fallen, posture pause,
-        AI returns empty, or WM is cold.
+        Falls back to heuristic bearing/range nav when posture pause,
+        AI returns empty, or WM is cold. Fallen still gets heuristic nav
+        (downscaled) so crawl-to-target can continue.
         """
         tick = int(getattr(self, "tick", 0))
         every = _task_nav_ai_every()
         cached_tick = int(getattr(self, "_nav_ai_cached_tick", -1))
         cached = getattr(self, "_nav_ai_cached", None)
-        if cached is not None and tick - cached_tick < every:
+        if cached is not None and tick - cached_tick < every and not fallen:
             intents_c, meta_c = cached
             return dict(intents_c), dict(meta_c)
 
@@ -3790,23 +3840,35 @@ class SimulationGroundedLanguageMixin:
             self._nav_ai_cached = (dict(out_intents), dict(out_meta))
             return out_intents, out_meta
 
+        bearing = (
+            float(bearing_override)
+            if bearing_override is not None
+            else float(owm.bearing)
+        )
+        range_m = (
+            float(range_override)
+            if range_override is not None
+            else float(owm.range_m)
+        )
         meta: dict[str, Any] = {
             "task_nav_mode": "wm_ai",
             "nav_ai_ok": False,
             "nav_ai_reason": "",
             "wm_steps": self._wm_train_steps(),
             "wm_min_steps": _task_nav_wm_min_steps(),
+            "nav_bearing": round(float(bearing), 4),
+            "nav_range_m": round(float(range_m), 4),
         }
         heur = navigation_intents_from_bearing_range(
-            float(owm.bearing),
-            float(owm.range_m),
+            float(bearing),
+            float(range_m),
             float(stop),
             fallen=fallen,
             posture_stability=float(posture),
         )
         if fallen:
-            meta["nav_ai_reason"] = "fallen"
-            return {}, meta
+            meta["nav_ai_reason"] = "fallen_heuristic"
+            return _store_cache(heur if heur else {}, meta)
         if not heur:
             meta["nav_ai_reason"] = "heuristic_empty_or_posture"
             return _store_cache({}, meta)
@@ -3844,14 +3906,14 @@ class SimulationGroundedLanguageMixin:
 
             graph = self.agent.graph
             obs = graph.snapshot_vec_dict()
-            b01 = _encode_nav_bearing_01(float(owm.bearing))
-            r01 = _encode_nav_range_01(float(owm.range_m))
+            b01 = _encode_nav_bearing_01(float(bearing))
+            r01 = _encode_nav_range_01(float(range_m))
             obs["vision_bearing_01"] = b01
             obs["vision_range_01"] = r01
-            obs["vision_bearing"] = float(owm.bearing)
-            obs["vision_range_m"] = float(owm.range_m)
+            obs["vision_bearing"] = float(bearing)
+            obs["vision_range_m"] = float(range_m)
             if "task_target_dist_m" in obs:
-                obs["task_target_dist_m"] = float(owm.range_m)
+                obs["task_target_dist_m"] = float(range_m)
 
             # Warm-start intent slots from heuristic nav so AI refines a real seed.
             node_ids = list(getattr(graph, "_node_ids", []) or [])
@@ -3900,13 +3962,13 @@ class SimulationGroundedLanguageMixin:
                         br = float(
                             s_after.get(
                                 "vision_bearing_01",
-                                _encode_nav_bearing_01(owm.bearing),
+                                _encode_nav_bearing_01(bearing),
                             )
                         )
                         rg = float(
                             s_after.get(
                                 "vision_range_01",
-                                _encode_nav_range_01(owm.range_m),
+                                _encode_nav_range_01(range_m),
                             )
                         )
                         return -abs(br - 0.5) - 0.15 * abs(rg - stop01)
@@ -3951,8 +4013,8 @@ class SimulationGroundedLanguageMixin:
                 out = self._assert_forward_when_aligned(
                     out,
                     heur,
-                    bearing=float(owm.bearing),
-                    range_m=float(owm.range_m),
+                    bearing=float(bearing),
+                    range_m=float(range_m),
                     stop=float(stop),
                     meta=meta,
                 )
@@ -4015,7 +4077,21 @@ class SimulationGroundedLanguageMixin:
             # Prefer physics surface range for stop decisions when locked.
             phys = self._physics_range_to_locked_body()
             if phys is not None:
-                range_m = min(range_m, float(phys))
+                if float(range_m) + 0.45 < float(phys):
+                    range_m = float(phys)
+                else:
+                    range_m = min(float(range_m), float(phys))
+            nav_bearing = float(owm.bearing)
+            if phys is not None and abs(float(owm.range_m) - float(phys)) > 0.55:
+                row = self._static_registry_row_for_body(
+                    int(getattr(self, "_task_locked_body_id", 0) or 0)
+                )
+                if row is not None:
+                    br = self._bearing_range_from_world_xy(
+                        (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                    )
+                    if br is not None:
+                        nav_bearing = float(br[0])
             has_contact = False
             if kind == "reach_contact":
                 has_contact = bool(
@@ -4030,11 +4106,16 @@ class SimulationGroundedLanguageMixin:
             if need_nav:
                 if mode == "wm_ai":
                     intents, nav_meta = self._navigation_intents_wm_ai(
-                        owm, stop, posture, fallen
+                        owm,
+                        stop,
+                        posture,
+                        fallen,
+                        bearing_override=nav_bearing,
+                        range_override=range_m,
                     )
                 else:
                     intents = navigation_intents_from_bearing_range(
-                        float(owm.bearing),
+                        float(nav_bearing),
                         range_m,
                         stop,
                         fallen=fallen,
