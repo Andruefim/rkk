@@ -104,7 +104,11 @@ class SimulationVisualGroundingMixin:
                 continue
             lab = entry.get("label")
             if lab:
-                vlm_str[str(sid)] = str(lab)
+                from engine.vision_resolve import _is_visual_concept
+
+                lab_s = str(lab)
+                if _is_visual_concept(lab_s):
+                    vlm_str[str(sid)] = lab_s
             slot_confidences[str(sid)] = float(entry.get("confidence", 0.6))
 
         slot_positions = self._phase_m_slot_positions_from_visual(vis)

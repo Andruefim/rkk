@@ -151,6 +151,40 @@ def test_contact_body_id_from_owm_without_resolved() -> None:
     assert bid == 201
 
 
+def test_contact_body_id_uses_cylinder_when_label_is_backward_lean() -> None:
+    """Ontology/command cylinder must win over BACKWARD_LEAN OWM label."""
+
+    class _Harness(_StaticContactHarness):
+        def _task_ontology_best_key(self) -> str | None:
+            return "cylinder"
+
+    h = _Harness()
+    ent = h._obj_working_memory.scene.entities["bound_0"]
+    ent.label = "BACKWARD_LEAN"
+    ent.range_m = 2.0
+    bid = h._contact_body_id_for_task(None)
+    assert bid == 201
+
+
+def test_contact_body_id_near_planter_from_agent_com_when_ontology_cylinder() -> None:
+    """Very close range + cylinder ontology: probe from agent COM near planter rim."""
+
+    class _Harness(_StaticContactHarness):
+        def _task_ontology_best_key(self) -> str | None:
+            return "cylinder"
+
+        def _agent_xy_forward(self) -> tuple[tuple[float, float], tuple[float, float]]:
+            return (1.95, 0.0), (1.0, 0.0)
+
+    h = _Harness()
+    ent = h._obj_working_memory.scene.entities["bound_0"]
+    ent.label = "BACKWARD_LEAN"
+    ent.range_m = 0.28
+    ent.bearing = 0.0
+    bid = h._contact_body_id_for_task(None)
+    assert bid == 201
+
+
 def test_manip_has_contact_via_static_body_without_resolved() -> None:
     h = _StaticContactHarness(contact_body_id=201)
     assert h._manip_has_contact(None) is True

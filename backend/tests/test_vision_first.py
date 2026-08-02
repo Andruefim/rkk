@@ -695,6 +695,81 @@ def test_lateral_tilt_not_visual_concept() -> None:
     assert not _is_visual_concept("TILT_LEFT")
 
 
+def test_backward_lean_not_visual_concept() -> None:
+    from engine.vision_resolve import _is_visual_concept
+
+    assert not _is_visual_concept("BACKWARD_LEAN")
+    assert not _is_visual_concept("FORWARD_LEAN")
+    assert not _is_visual_concept("LEFT_LEAN")
+
+
+def test_ontology_overrides_backward_lean_on_objectness_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-visual slot label must not win over ontology on objectness bind."""
+    from engine.grounded_language import FallbackEmbeddingClient
+    from engine.visual_referent_ontology import clear_visual_referent_cache
+
+    clear_visual_referent_cache()
+    monkeypatch.setenv("RKK_VISION_RESOLVE_MIN_CONF", "0.35")
+    monkeypatch.setenv("RKK_VISION_OBJECTNESS_BIND", "1")
+    monkeypatch.setenv("RKK_VISION_OBJECTNESS_BIND_MIN_PEAK", "0.12")
+    emb = FallbackEmbeddingClient(embed_dim=64)
+    h, w = 40, 48
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    depth[10:24, 8:20] = 1.5
+    cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
+    slots = [
+        {
+            "slot_id": "slot_0",
+            "u": 0.5,
+            "v": 0.5,
+            "label": "BACKWARD_LEAN",
+            "activation": 0.9,
+            "vector": None,
+            "uv_valid": False,
+            "mask_peakiness": 1.0,
+            "attn_mask": np.ones((8, 8), dtype=np.float32),
+        }
+    ]
+    vt, diag = resolve_visual_target(
+        "подойди к цилиндру",
+        slots=slots,
+        depth_camera=cam,
+        embed_fn=emb.embed,
+        require_range=True,
+    )
+    assert vt is not None, diag
+    assert str(vt.label).lower() == "cylinder"
+    assert diag.get("objectness_bind") is True
+
+
+def test_score_slots_ontology_replaces_non_visual_label() -> None:
+    from engine.grounded_language import FallbackEmbeddingClient
+    from engine.vision_resolve import score_slots_for_command
+    from engine.visual_referent_ontology import clear_visual_referent_cache
+
+    clear_visual_referent_cache()
+    emb = FallbackEmbeddingClient(embed_dim=64)
+
+    slots = [
+        {
+            "slot_id": "slot_0",
+            "u": 0.4,
+            "v": 0.45,
+            "label": "BACKWARD_LEAN",
+            "activation": 0.8,
+            "vector": None,
+            "uv_valid": True,
+            "mask_peakiness": 3.0,
+        }
+    ]
+    scored, meta = score_slots_for_command(slots, "цилиндр", embed_fn=emb.embed)
+    assert scored
+    assert str(scored[0].get("label") or "").lower() == "cylinder"
+    assert meta.get("ontology")
+
+
 def test_live_uv_at_bearing_tracks_protrusion() -> None:
     h, w = 48, 64
     depth = np.full((h, w), 4.0, dtype=np.float32)

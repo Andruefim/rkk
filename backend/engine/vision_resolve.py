@@ -86,6 +86,17 @@ _NON_VISUAL_CONCEPTS = frozenset(
         "ROLL",
         "PITCH",
         "YAW",
+        # Posture / balance leakage from NeuralConceptProjector
+        "LEAN",
+        "FORWARD_LEAN",
+        "BACKWARD_LEAN",
+        "LEFT_LEAN",
+        "RIGHT_LEAN",
+        "POSTURE",
+        "LEANING",
+        "SLOUCH",
+        "CROUCH",
+        "STUMBLE",
     }
 )
 
@@ -100,6 +111,8 @@ _NON_VISUAL_PREFIXES = (
     "LEARNING_",
     "LATERAL_",
     "TILT_",
+    "LEAN_",
+    "POSTURE_",
 )
 
 
@@ -159,8 +172,28 @@ def objectness_bind_min_peak() -> float:
     return _env_float("RKK_VISION_OBJECTNESS_BIND_MIN_PEAK", 0.18)
 
 
+def objectness_self_floor_range_m() -> float:
+    """After fall, reject objectness peaks closer than this (self/floor)."""
+    return _env_float("RKK_VISION_OBJECTNESS_SELF_FLOOR_M", 0.25)
+
+
+def objectness_range_jump_m() -> float:
+    """Reject objectness when range jumps wildly vs previous bind."""
+    return _env_float("RKK_VISION_OBJECTNESS_RANGE_JUMP_M", 0.75)
+
+
 # Ontology keys that name a concrete scene object (not generic "object").
 _CONCRETE_ONTOLOGY_KEYS = frozenset({"cylinder", "chair", "ball", "prop"})
+
+
+def _apply_ontology_label_override(cand: dict[str, Any], ont_key: str) -> None:
+    """Prefer ontology referent over non-visual / generic slot labels."""
+    key = str(ont_key or "").strip()
+    if not key:
+        return
+    cur = str(cand.get("label") or "").strip()
+    if not cur or not _is_visual_concept(cur) or cur.lower() in ("object", "com_high"):
+        cand["label"] = key
 
 
 def _is_floorish_objectness(
@@ -169,6 +202,8 @@ def _is_floorish_objectness(
     ont_key: str = "",
     peak_strength: float = 0.0,
     min_peak: float | None = None,
+    fallen: bool = False,
+    prev_range_m: float | None = None,
 ) -> bool:
     """Reject objectness UV when it likely locks onto ground plane, not a protrusion."""
     v = float(target.v)
@@ -178,8 +213,20 @@ def _is_floorish_objectness(
     pstr = float(peak_strength)
     mp = float(min_peak if min_peak is not None else objectness_bind_min_peak())
 
+    if key in _CONCRETE_ONTOLOGY_KEYS:
+        if fallen and range_m is not None and float(range_m) < objectness_self_floor_range_m():
+            return True
+        if (
+            prev_range_m is not None
+            and range_m is not None
+            and abs(float(range_m) - float(prev_range_m)) > objectness_range_jump_m()
+        ):
+            return True
+
     # Strong depth protrusion + concrete referent: lower FOV is a near object, not floor.
     if key in _CONCRETE_ONTOLOGY_KEYS and pstr >= mp:
+        if fallen and range_m is not None and float(range_m) < objectness_self_floor_range_m():
+            return True
         return False
 
     # Geometry: distant ground plane in lower image band.
@@ -460,6 +507,10 @@ def score_slots_for_command(
                 s2["label"] = concept_hit
             elif ont_entry is not None and ont_slot_sc >= max(label_sc, concept_sc):
                 s2["label"] = str(ont_entry.key)
+        elif ont_entry is not None and ont_sc >= 0.25:
+            cur = str(s2.get("label") or "").strip()
+            if cur and not _is_visual_concept(cur):
+                s2["label"] = str(ont_entry.key)
         out.append(s2)
 
     if not any_language_link:
@@ -573,6 +624,8 @@ def resolve_visual_target(
     embed_fn: EmbedFn | None = None,
     concept_project_fn: ConceptProjectFn | None = None,
     require_range: bool = True,
+    fallen: bool = False,
+    prev_range_m: float | None = None,
 ) -> tuple[VisualTarget | None, dict[str, Any]]:
     """
     Resolve a VisualTarget from ego vision via embedding grounding only.
@@ -684,14 +737,7 @@ def resolve_visual_target(
                 cand = dict(best_ont_slot)
                 cand["uv_valid"] = False  # force objectness geometry path
                 ont_key = str((ont_diag or {}).get("best_key") or "").strip()
-                if ont_key and not str(cand.get("label") or "").strip():
-                    cand["label"] = ont_key
-                elif ont_key and str(cand.get("label") or "").lower() in (
-                    "object",
-                    "com_high",
-                    "",
-                ):
-                    cand["label"] = ont_key
+                _apply_ontology_label_override(cand, ont_key)
                 # Boost match_score so spatial confidence isn't crushed to ~0
                 # when ontology is the only language link (flat SA scores ~0.07).
                 cand["match_score"] = float(
@@ -709,6 +755,8 @@ def resolve_visual_target(
                     target,
                     ont_key=ont_key,
                     peak_strength=pstr,
+                    fallen=bool(fallen),
+                    prev_range_m=prev_range_m,
                 )
                 try:
                     from engine.vision_depth import objectness_edge_u_margin
@@ -786,6 +834,8 @@ def resolve_visual_target(
             target,
             ont_key=ont_key_final,
             peak_strength=pstr,
+            fallen=bool(fallen),
+            prev_range_m=prev_range_m,
         )
     ):
         diag["reason"] = "floor_lock_rejected"
@@ -817,9 +867,16 @@ def resolve_visual_target(
             lex = dict(getattr(visual_env, "_slot_lexicon", None) or {})
             sid = str(target.slot_id)
             prev = dict(lex.get(sid) or {})
+            label_out = str(target.label or prev.get("label") or "visual_referent")
+            if not _is_visual_concept(label_out):
+                ont_key_lex = str((ont or {}).get("best_key") or "").strip()
+                if ont_key_lex:
+                    label_out = ont_key_lex
+                else:
+                    label_out = "visual_referent"
             lex[sid] = {
                 **prev,
-                "label": str(target.label or prev.get("label") or "visual_referent"),
+                "label": label_out,
                 "confidence": float(target.confidence),
             }
             tick = int(getattr(visual_env, "_slot_lexicon_tick", -1) or -1)

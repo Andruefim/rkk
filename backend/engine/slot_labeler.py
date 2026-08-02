@@ -247,6 +247,11 @@ class SlotLabeler:
         # Update slot states
         slot_list: list[SlotState] = []
         for slot_id, label in vlm_labels.items():
+            from engine.vision_resolve import _is_visual_concept
+
+            label_s = str(label or "").strip()
+            if label_s and not _is_visual_concept(label_s):
+                label_s = ""
             prev = self._slot_states.get(slot_id)
             pos = slot_positions.get(slot_id, (0.5, 0.5))
             vec = slot_vectors.get(slot_id, [])
@@ -254,7 +259,7 @@ class SlotLabeler:
 
             state = SlotState(
                 slot_idx=int(slot_id.split("_")[-1]) if "_" in slot_id else 0,
-                label=label,
+                label=label_s,
                 position_2d=pos,
                 vector=vec,
                 confidence=conf,

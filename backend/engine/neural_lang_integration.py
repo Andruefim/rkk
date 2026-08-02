@@ -181,6 +181,10 @@ def _patch_slot_labeler(sim, nlg) -> None:
             for concept_idx, score in projected:
                 concept_name = concept_store.idx_to_name.get(concept_idx)
                 if concept_name and not concept_name.startswith("LATENT_"):
+                    from engine.vision_resolve import _is_visual_concept
+
+                    if not _is_visual_concept(str(concept_name)):
+                        continue
                     neural_additions[concept_name] = max(
                         neural_additions.get(concept_name, 0.0), score
                     )

@@ -1305,6 +1305,33 @@ class SimulationGroundedLanguageMixin:
         ax, ay = float(agent_xy[0]), float(agent_xy[1])
         return (ax + x_fwd * fx + y_right * rx, ay + x_fwd * fy + y_right * ry)
 
+    def _task_ontology_best_key(self) -> str | None:
+        """Visual-referent ontology key from active task command / goal text."""
+        cmd = ""
+        tt = getattr(self, "_task_tree_ctrl", None)
+        if tt is not None and tt.tree is not None:
+            cmd = str(tt.tree.command_text or "")
+        if not cmd:
+            goal = getattr(self, "_task_goal", None)
+            if goal is not None:
+                cmd = str(getattr(goal, "text", "") or "")
+        if not cmd.strip():
+            return None
+        gl = getattr(self, "_grounded_lang", None)
+        embed_fn = gl.embedder.embed if gl is not None and getattr(gl, "embedder", None) else None
+        if embed_fn is None:
+            return None
+        try:
+            from engine.visual_referent_ontology import match_visual_referent
+
+            _, score, diag = match_visual_referent(cmd, embed_fn)
+            if float(score) < 0.25:
+                return None
+            key = (diag or {}).get("best_key")
+            return str(key) if key else None
+        except Exception:
+            return None
+
     def _contact_body_id_for_task(self, resolved: ResolvedObject | None) -> int | None:
         if resolved is not None:
             body_id = getattr(resolved, "body_id", None)
@@ -1318,18 +1345,40 @@ class SimulationGroundedLanguageMixin:
             owm = getattr(self, "_owm_cached", None)
         if owm is None:
             return None
-        world_xy = self._world_xy_from_owm(owm)
-        if world_xy is None:
-            return None
         fn = getattr(base, "find_static_contact_body", None)
         if not callable(fn):
             return None
-        label = str(getattr(owm, "label", "") or "").lower()
-        prefer_cyl = any(k in label for k in ("cylinder", "planter", "column"))
+
+        from engine.vision_resolve import _is_visual_concept
+
+        ont_key = str(self._task_ontology_best_key() or "").strip().lower()
+        raw_label = str(getattr(owm, "label", "") or "")
+        visual_label = raw_label.lower() if _is_visual_concept(raw_label) else ""
+        range_m = float(getattr(owm, "range_m", 0.0) or 0.0)
+
+        prefer_cyl = (
+            ont_key == "cylinder"
+            or "cylinder" in ont_key
+            or any(k in visual_label for k in ("cylinder", "planter", "column"))
+        )
+
+        world_xy = self._world_xy_from_owm(owm)
+        agent_xy, _ = self._agent_xy_forward()
+
         if prefer_cyl:
-            bid = fn(world_xy, kind="cylinder")
-            if bid is not None:
-                return int(bid)
+            probe_xy = world_xy
+            if probe_xy is None and range_m < 0.35:
+                probe_xy = (float(agent_xy[0]), float(agent_xy[1]))
+            if probe_xy is not None:
+                bid = fn(probe_xy, kind="cylinder", style="planter")
+                if bid is not None:
+                    return int(bid)
+                bid = fn(probe_xy, kind="cylinder")
+                if bid is not None:
+                    return int(bid)
+
+        if world_xy is None:
+            return None
         bid = fn(world_xy)
         return int(bid) if bid is not None else None
 
@@ -2288,6 +2337,14 @@ class SimulationGroundedLanguageMixin:
                     "reason": "no_embed_fn",
                     "resolve_mode": "vision",
                 }
+            prev_range = None
+            owm_prev = getattr(self, "_obj_working_memory", None)
+            if owm_prev is not None and float(getattr(owm_prev, "range_m", 0.0) or 0.0) > 0.05:
+                prev_range = float(owm_prev.range_m)
+            fallen_flag = False
+            base = self._humanoid_base_env()
+            if base is not None and callable(getattr(base, "is_fallen", None)):
+                fallen_flag = bool(base.is_fallen())
             vt, diag = resolve_visual_target(
                 text,
                 visual_env=ven,
@@ -2295,6 +2352,8 @@ class SimulationGroundedLanguageMixin:
                 embed_fn=embed_fn,
                 concept_project_fn=self._slot_concept_project_fn(),
                 require_range=True,
+                fallen=fallen_flag,
+                prev_range_m=prev_range,
             )
             diag = dict(diag)
             diag["resolve_mode"] = "vision"
@@ -2961,6 +3020,13 @@ class SimulationGroundedLanguageMixin:
             self._vision_recede_streak = 0
             return
         try:
+            cooldown = max(0, int(os.environ.get("RKK_VISION_RECEDE_COOLDOWN", "15")))
+        except ValueError:
+            cooldown = 15
+        last_tick = int(getattr(self, "_vision_recede_last_tick", -999999) or -999999)
+        if cooldown > 0 and int(tick) - last_tick < cooldown:
+            return
+        try:
             threshold = float(os.environ.get("RKK_VISION_RECEDE_DELTA_M", "0.25"))
         except ValueError:
             threshold = 0.25
@@ -2983,6 +3049,7 @@ class SimulationGroundedLanguageMixin:
         if streak < need_streak:
             return
         self._vision_recede_streak = 0
+        self._vision_recede_last_tick = int(tick)
 
         cam = self._depth_camera_from_sim()
         if cam is not None:
