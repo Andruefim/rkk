@@ -389,6 +389,14 @@ class SimulationGroundedLanguageMixin:
         return result
 
     def _task_log_human_motor_targets(self) -> dict[str, float]:
+        """
+        Dump steering-relevant intents actually requested this tick.
+
+        Prefer live arbiter ``navigation`` / ``human_task`` registrations.
+        Also surface ``motor_final_*`` from motor_state (what CPG saw last
+        finalize) so gait_coupling is observable even when tree fallback
+        only has static approach stride/torso.
+        """
         out: dict[str, float] = {}
         arb = getattr(self, "_motor_arbiter", None)
         if arb is not None:
@@ -405,19 +413,52 @@ class SimulationGroundedLanguageMixin:
                                 out[sk] = round(float(v), 4)
                             except (TypeError, ValueError):
                                 pass
-        if not out:
+        cached = getattr(self, "_last_nav_intents", None)
+        if isinstance(cached, dict):
+            for k, v in cached.items():
+                sk = str(k)
+                if sk.startswith("intent_") and sk not in out:
+                    try:
+                        out[sk] = round(float(v), 4)
+                    except (TypeError, ValueError):
+                        pass
+        # Applied / previous-tick finals — proves whether coupling reached CPG.
+        try:
+            agent = getattr(self, "agent", None)
+            base = getattr(getattr(agent, "env", None), "base_env", None) or getattr(
+                agent, "env", None
+            )
+            ms = getattr(base, "_motor_state", None) if base is not None else None
+            if isinstance(ms, dict):
+                for k in (
+                    "intent_gait_coupling",
+                    "intent_stride",
+                    "intent_torso_forward",
+                    "intent_support_left",
+                    "intent_support_right",
+                ):
+                    if k in ms:
+                        out[f"motor_final_{k[len('intent_'):]}"] = round(
+                            float(ms[k]), 4
+                        )
+        except Exception:
+            pass
+        if not any(k.startswith("intent_") for k in out):
             try:
-                out = {
-                    k: round(float(v), 4)
-                    for k, v in self.task_tree_motor_targets().items()
-                    if str(k).startswith("intent_")
-                }
+                for k, v in self.task_tree_motor_targets().items():
+                    sk = str(k)
+                    if sk.startswith("intent_"):
+                        out[sk] = round(float(v), 4)
             except Exception:
                 pass
         return out
 
     def _task_log_progress(self, tick: int, *, obs: dict[str, float], fallen: bool) -> None:
-        if int(tick) % 50 != 0:
+        try:
+            progress_every = max(1, int(os.environ.get("RKK_TASK_LOG_PROGRESS_EVERY", "25")))
+        except ValueError:
+            progress_every = 25
+        if int(tick) % progress_every != 0:
             return
         if getattr(self, "_task_log_session_start_tick", None) is None:
             return
@@ -438,10 +479,12 @@ class SimulationGroundedLanguageMixin:
 
         last_pe = None
         max_pe = None
+        task_text = ""
         task = tb.active_task if tb is not None else None
         if task is None and tb is not None:
             task = getattr(tb, "_active", None)
         if task is not None:
+            task_text = str(getattr(task, "text", "") or "")[:120]
             try:
                 last_pe = float(getattr(task, "last_pe", 0.0))
             except (TypeError, ValueError):
@@ -461,8 +504,21 @@ class SimulationGroundedLanguageMixin:
                     4,
                 )
 
+        macro_hint = ""
+        try:
+            ic = getattr(self, "_intention_state", None) or getattr(
+                self, "_intention_cortex", None
+            )
+            if ic is not None:
+                ctx = getattr(ic, "_last_context", ic)
+                macro_hint = str(getattr(ctx, "macro_hint", "") or "")
+        except Exception:
+            pass
+
         fields: dict[str, Any] = {
             "node_kind": node_kind or None,
+            "task_text": task_text or None,
+            "macro_hint": macro_hint or None,
             "last_pe": last_pe,
             "max_pe": max_pe,
             "com_x": obs.get("com_x"),
@@ -502,6 +558,21 @@ class SimulationGroundedLanguageMixin:
                 fields["hard_lock"] = bool(
                     getattr(getattr(owm, "scene", None), "hard_lock_active", False)
                 )
+                # Drift probe: live scan bearing vs odometry-owned lock bearing.
+                try:
+                    scene = getattr(owm, "scene", None)
+                    act = scene.active() if scene is not None else None
+                    diags = dict(getattr(act, "diagnostics", None) or {}) if act else {}
+                    if "live_bearing" in diags:
+                        fields["live_bearing"] = round(float(diags["live_bearing"]), 4)
+                    if "bearing_live_delta" in diags:
+                        fields["bearing_live_delta"] = round(
+                            float(diags["bearing_live_delta"]), 4
+                        )
+                    if "bearing_nudge" in diags:
+                        fields["bearing_nudge"] = round(float(diags["bearing_nudge"]), 4)
+                except Exception:
+                    pass
                 scene = getattr(owm, "scene", None)
                 if scene is not None and bool(
                     getattr(scene, "last_odom_discontinuity", False)
@@ -2235,7 +2306,26 @@ class SimulationGroundedLanguageMixin:
         oracle_dist: float,
         kind: str,
     ) -> None:
-        """Soft-correct inflated floor-lock range via live camera (no rebind storm)."""
+        """
+        Soft-correct inflated floor-lock range via live camera.
+
+        Gated hard_lock release (not blind unlock):
+          1) Soft live-camera refresh keeps hard_lock (HUD / range nudge only).
+          2) If still mismatched, try objectness rebind — lock releases only if
+             continuity/improves gates pass (see ``_rebind_vision_objectness_peak``).
+          3) After several consecutive gated rejects, escalate to
+             ``allow_full_resolve`` (strong oracle-aligned peak may unlock).
+          4) After further failures, force-unlock once so a truly lost target can
+             be re-resolved (avoids eternal sticky lock).
+
+        Success criteria for a fresh approach episode (before track_radius work):
+          - fewer ``vision_rebind_rejected`` while ``hard_lock`` stays true between
+            successful rebinds;
+          - ``hard_lock=false`` only right after successful rebind / force-unlock
+            fallback — not on every range_correct;
+          - ``oracle_dist`` can fall below the ~1.3 m barrier seen in stuck runs;
+          - force-unlock path still allows redefinition when the object is gone.
+        """
         if not vision_resolve_enabled():
             return
         if kind not in ("approach", "approach_target"):
@@ -2254,6 +2344,7 @@ class SimulationGroundedLanguageMixin:
         ratio = vr / max(od, 0.25)
         if vr <= od * 1.32 + 0.30:
             self._vision_range_mismatch_streak = 0
+            self._vision_floor_lock_reject_streak = 0
             return
 
         streak = int(getattr(self, "_vision_range_mismatch_streak", 0)) + 1
@@ -2269,10 +2360,16 @@ class SimulationGroundedLanguageMixin:
         if scene is None or cam is None:
             return
 
-        self._release_scene_hard_lock()
+        hard_before = bool(getattr(scene, "hard_lock_active", False))
+        unlocked = False
+        rebind_ok = False
+        force_unlock = False
+        allow_full = False
+
+        # Soft correction under lock — do NOT release here.
         try:
             from engine.object_working_memory import ego_from_bearing_range
-            from engine.vision_depth import live_uv_range_at_bearing
+            from engine.vision_depth import UvDepthTrack, live_uv_range_at_bearing
 
             scene.refresh_active_from_live_camera(
                 cam,
@@ -2286,8 +2383,6 @@ class SimulationGroundedLanguageMixin:
         ent = scene.active()
         if ent is not None and float(ent.range_m) > od * 1.25 + 0.20:
             try:
-                from engine.vision_depth import UvDepthTrack, live_uv_range_at_bearing
-
                 track = UvDepthTrack.from_list(ent.uv_track)
                 _u, _v, lr, _conf = live_uv_range_at_bearing(
                     cam,
@@ -2305,26 +2400,83 @@ class SimulationGroundedLanguageMixin:
             except Exception:
                 pass
 
-        ent = scene.active()
-        if ent is not None and float(ent.range_m) > od * 1.40 + 0.15:
-            self._rebind_vision_objectness_peak(
-                int(tick),
-                reason="floor_lock",
-                oracle_dist=float(od),
-                bearing_hint=float(ent.bearing),
+        try:
+            escalate_after = max(
+                1, int(os.environ.get("RKK_VISION_FLOOR_LOCK_ESCALATE_AFTER", "3"))
             )
-            ent = scene.active()
+        except ValueError:
+            escalate_after = 3
+        try:
+            force_after = max(
+                escalate_after + 1,
+                int(os.environ.get("RKK_VISION_FLOOR_LOCK_FORCE_UNLOCK_AFTER", "5")),
+            )
+        except ValueError:
+            force_after = 5
+
+        reject_streak = int(getattr(self, "_vision_floor_lock_reject_streak", 0) or 0)
+        ent = scene.active()
+        still_bad = ent is not None and float(ent.range_m) > od * 1.40 + 0.15
+        if still_bad:
+            allow_full = reject_streak >= escalate_after
+            rebind_ok = bool(
+                self._rebind_vision_objectness_peak(
+                    int(tick),
+                    reason="floor_lock",
+                    oracle_dist=float(od),
+                    bearing_hint=float(ent.bearing),
+                    allow_full_resolve=bool(allow_full),
+                )
+            )
+            if rebind_ok:
+                self._vision_floor_lock_reject_streak = 0
+                unlocked = True  # successful rebind releases lock inside gate
+            else:
+                reject_streak += 1
+                self._vision_floor_lock_reject_streak = reject_streak
+                # Target may be truly gone / unrecoverable under continuity —
+                # force unlock so later percept fuse / re-resolve can retarget.
+                if reject_streak >= force_after and hard_before:
+                    self._release_scene_hard_lock()
+                    unlocked = True
+                    force_unlock = True
+                    self._vision_floor_lock_reject_streak = 0
+                    try:
+                        task_log_event(
+                            "vision_range_correct_force_unlock",
+                            tick=int(tick),
+                            reason="floor_lock_reject_streak",
+                            reject_streak=int(reject_streak),
+                            force_after=int(force_after),
+                            oracle_dist_m=round(od, 3),
+                            vision_range_m=round(vr, 3),
+                        )
+                    except Exception:
+                        pass
+        else:
+            # Soft path fixed the mismatch without rebind — keep lock.
+            self._vision_floor_lock_reject_streak = 0
 
         self._owm_cached_tick = -1
         self._task_log_prev_vision_range = None
         try:
             ent = scene.active()
+            hard_after = bool(getattr(scene, "hard_lock_active", False))
             task_log_event(
                 "vision_range_correct",
                 tick=int(tick),
                 vision_range_m=round(vr, 3),
                 oracle_dist_m=round(od, 3),
                 corrected_range_m=round(float(ent.range_m), 3) if ent else None,
+                hard_lock_before=bool(hard_before),
+                hard_lock_after=bool(hard_after),
+                unlocked=bool(unlocked),
+                rebind_ok=bool(rebind_ok),
+                force_unlock=bool(force_unlock),
+                allow_full_resolve=bool(allow_full),
+                floor_lock_reject_streak=int(
+                    getattr(self, "_vision_floor_lock_reject_streak", 0) or 0
+                ),
             )
         except Exception:
             pass
@@ -2382,6 +2534,12 @@ class SimulationGroundedLanguageMixin:
                     posture_stability=posture,
                 )
             if intents:
+                # Cache raw nav intents (incl. gait_coupling) for task_progress dump.
+                self._last_nav_intents = {
+                    k: float(v)
+                    for k, v in intents.items()
+                    if str(k).startswith("intent_")
+                }
                 heading_err = intents.pop("task_heading_err", None)
                 intents.pop("task_closing_vel", None)
                 intents.pop("task_nav_active", None)
@@ -2431,6 +2589,11 @@ class SimulationGroundedLanguageMixin:
         self._task_nav_prev_xy = (float(agent_xy[0]), float(agent_xy[1]))
 
         if intents:
+            self._last_nav_intents = {
+                k: float(v)
+                for k, v in intents.items()
+                if str(k).startswith("intent_")
+            }
             heading_err = intents.pop("task_heading_err", None)
             closing_vel = intents.pop("task_closing_vel", None)
             intents.pop("task_nav_active", None)
@@ -2947,8 +3110,14 @@ class SimulationGroundedLanguageMixin:
                 if fallen and not prev_fallen:
                     self._task_log_fall_during_task(tick)
                 self._task_log_prev_fallen = bool(fallen)
-                self._task_log_progress(tick, obs=obs, fallen=fallen)
+                # Register navigation BEFORE progress dump so human_task_motor
+                # shows gait_coupling / supports — not static tree approach stubs.
                 self._tick_task_tree(fallen=fallen, obs=obs, tick=tick)
+                try:
+                    obs = self._inject_task_obs(obs)
+                except Exception:
+                    pass
+                self._task_log_progress(tick, obs=obs, fallen=fallen)
                 return
 
         tb = self._ensure_task_binding()

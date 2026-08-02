@@ -313,8 +313,9 @@ class LatentSceneMemory:
         """
         Project active target onto the current ego RGB-D frame (HUD + soft track).
 
-        Hard-lock still blocks slot re-fuse, but u/v must move with the camera
-        or the preview crosshair looks glued to the window.
+        Hard-lock: control bearing is odometry-owned with a *bounded* live nudge
+        when the live hit stays near the lock (EMA + max step). Outliers are
+        rejected — no full rebind yank. Unlocked: live UV may rewrite bearing.
         """
         act = self.active()
         if act is None or camera is None:
@@ -324,6 +325,14 @@ class LatentSceneMemory:
             from engine.vision_target import bearing_from_u
         except ImportError:
             return False
+
+        locked = bool(self.hard_lock_active)
+        prev_b = float(act.bearing)
+        locked_u = float(max(0.05, min(0.95, 0.5 + 0.5 * prev_b)))
+        # Accept live hits only inside this slack for nudge / range soft-correct.
+        lock_bearing_slack = _ef("RKK_HARD_LOCK_BEARING_SLACK", 0.18)
+        nudge_ema = _ef("RKK_HARD_LOCK_BEARING_NUDGE_EMA", 0.18)
+        nudge_max = _ef("RKK_HARD_LOCK_BEARING_NUDGE_MAX", 0.035)
 
         track = UvDepthTrack.from_list(act.uv_track)
         live_kwargs = {
@@ -356,11 +365,24 @@ class LatentSceneMemory:
                 except Exception:
                     pu = pv = pr = pconf = None
                 if pu is not None and pr is not None:
-                    from engine.vision_target import bearing_from_u
-
                     if abs(bearing_from_u(float(pu)) - float(act.bearing)) < 0.4:
                         u, v, r, conf = float(pu), float(pv), float(pr), pconf
+            # Global peak fallback only when unlocked — under hard_lock it yanks
+            # navigation toward unrelated protrusions.
             if u is None or v is None:
+                if locked:
+                    act.u = locked_u
+                    act.diagnostics = {
+                        **dict(act.diagnostics or {}),
+                        "source": "hard_lock_hud",
+                        "live_conf": 0.0,
+                        "live_bearing": None,
+                        "bearing_live_delta": None,
+                        "bearing_nudge": 0.0,
+                    }
+                    if tick is not None:
+                        act.last_update_tick = int(tick)
+                    return True
                 peak_fn = getattr(camera, "range_from_objectness_peak", None)
                 if callable(peak_fn):
                     try:
@@ -368,15 +390,61 @@ class LatentSceneMemory:
                     except Exception:
                         pu = pv = pr = pconf = None
                     if pu is not None and pr is not None:
-                        from engine.vision_target import bearing_from_u
-
                         if abs(bearing_from_u(float(pu)) - float(act.bearing)) < 0.4:
                             u, v, r, conf = float(pu), float(pv), float(pr), pconf
         if u is None or v is None:
             return False
 
         a = float(max(0.15, min(0.95, blend)))
-        prev_b = float(act.bearing)
+        live_b = float(bearing_from_u(float(u)))
+        live_delta = float(live_b - prev_b)
+        near_locked = abs(live_delta) <= lock_bearing_slack
+
+        if locked:
+            nudge = 0.0
+            if near_locked:
+                act.u = (1.0 - a) * float(act.u) + a * float(u)
+                act.v = (1.0 - a) * float(act.v) + a * float(v)
+                # Bounded EMA correction — kills odom drift without full rebind.
+                raw = float(nudge_ema) * live_delta
+                nudge = float(max(-nudge_max, min(nudge_max, raw)))
+                act.bearing = float(prev_b + nudge)
+                locked_u = float(max(0.05, min(0.95, 0.5 + 0.5 * float(act.bearing))))
+                act.u = (1.0 - 0.35) * float(act.u) + 0.35 * locked_u
+            else:
+                act.u = (1.0 - a) * float(act.u) + a * locked_u
+                act.bearing = prev_b
+            if near_locked and r is not None and float(r) > 0.05:
+                prev_r = float(act.range_m)
+                new_r = float(r)
+                hint = (
+                    float(range_hint)
+                    if range_hint is not None and float(range_hint) > 0.1
+                    else None
+                )
+                accept = (
+                    new_r < prev_r * 0.82
+                    or abs(new_r - prev_r) / max(prev_r, 0.3) < 0.35
+                    or new_r < prev_r * 0.92
+                )
+                if hint is not None and prev_r > hint * 1.25 and new_r < prev_r * 0.90:
+                    accept = True
+                if accept:
+                    act.range_m = (1.0 - a) * prev_r + a * new_r
+            act.x_fwd, act.y_right = ego_from_bearing_range(act.bearing, act.range_m)
+            act.diagnostics = {
+                **dict(act.diagnostics or {}),
+                "source": "hard_lock_live_nudge" if near_locked and nudge else "hard_lock_live_hud",
+                "live_conf": float(conf or 0.0),
+                "near_locked": bool(near_locked),
+                "live_bearing": float(live_b),
+                "bearing_live_delta": float(live_delta),
+                "bearing_nudge": float(nudge),
+            }
+            if tick is not None:
+                act.last_update_tick = int(tick)
+            return True
+
         act.u = (1.0 - a) * float(act.u) + a * float(u)
         act.v = (1.0 - a) * float(act.v) + a * float(v)
         new_b = bearing_from_u(act.u)
@@ -407,6 +475,8 @@ class LatentSceneMemory:
             **dict(act.diagnostics or {}),
             "source": "live_camera_uv",
             "live_conf": float(conf or 0.0),
+            "live_bearing": float(live_b),
+            "bearing_live_delta": float(live_delta),
         }
         if tick is not None:
             act.last_update_tick = int(tick)

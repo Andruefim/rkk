@@ -288,6 +288,8 @@ def test_refresh_active_from_live_camera_updates_uv() -> None:
         range_conf=0.8,
     )
     scene.bind_visual_target(vt, tick=1, agent_xy=(0.0, 0.0), agent_forward=(1.0, 0.0))
+    # Unlocked soft-track may rewrite bearing from live UV.
+    scene.release_hard_lock()
     h, w = 40, 48
     depth = np.full((h, w), 4.0, dtype=np.float32)
     depth[8:22, 22:30] = 1.5
@@ -298,6 +300,73 @@ def test_refresh_active_from_live_camera_updates_uv() -> None:
     assert act is not None
     assert 0.42 < act.u < 0.68
     assert act.range_m < 3.0
+
+
+def test_hard_lock_refresh_does_not_yank_bearing() -> None:
+    """Far live peak under hard_lock must not rewrite navigation bearing."""
+
+    class _FarCam:
+        def live_at_bearing(self, bearing, **_kwargs):
+            # Far-left UV → live bearing ≈ -0.9, well outside slack.
+            return 0.05, 0.55, 1.2, 0.9
+
+    scene = LatentSceneMemory()
+    vt = VisualTarget(
+        slot_id="slot_0",
+        u=0.5,
+        v=0.55,
+        label="cylinder",
+        confidence=0.8,
+        bearing=0.1,
+        range_m=2.3,
+        range_conf=0.8,
+    )
+    scene.bind_visual_target(vt, tick=1, agent_xy=(0.0, 0.0), agent_forward=(1.0, 0.0))
+    assert scene.hard_lock_active is True
+    locked_bearing = float(scene.active().bearing)
+
+    ok = scene.refresh_active_from_live_camera(_FarCam(), tick=2, blend=0.78)
+    assert ok
+    act = scene.active()
+    assert act is not None
+    assert act.bearing == pytest.approx(locked_bearing, abs=1e-6)
+    assert float(act.diagnostics.get("bearing_nudge") or 0.0) == pytest.approx(0.0)
+    assert act.diagnostics.get("near_locked") is False
+
+
+def test_hard_lock_near_live_applies_bounded_nudge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Near live hit under hard_lock may EMA-nudge bearing, never jump."""
+    monkeypatch.setenv("RKK_HARD_LOCK_BEARING_NUDGE_MAX", "0.04")
+    monkeypatch.setenv("RKK_HARD_LOCK_BEARING_NUDGE_EMA", "1.0")
+    monkeypatch.setenv("RKK_HARD_LOCK_BEARING_SLACK", "0.25")
+    from engine.vision_depth import ArrayDepthCamera, DepthFrame
+
+    scene = LatentSceneMemory()
+    vt = VisualTarget(
+        slot_id="slot_0",
+        u=0.5,
+        v=0.55,
+        label="cylinder",
+        confidence=0.8,
+        bearing=0.0,
+        range_m=2.5,
+        range_conf=0.8,
+    )
+    scene.bind_visual_target(vt, tick=1, agent_xy=(0.0, 0.0), agent_forward=(1.0, 0.0))
+    before = float(scene.active().bearing)
+
+    h, w = 40, 48
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    # Peak slightly right of center → small positive bearing.
+    depth[8:22, 26:34] = 1.4
+    cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
+    ok = scene.refresh_active_from_live_camera(cam, tick=2, blend=1.0)
+    assert ok
+    act = scene.active()
+    assert act is not None
+    assert abs(float(act.bearing) - before) <= 0.04 + 1e-6
+    assert act.diagnostics.get("live_bearing") is not None
+    assert act.diagnostics.get("bearing_live_delta") is not None
 
 
 def test_odom_discontinuity_skips_warp_and_reseeds(monkeypatch: pytest.MonkeyPatch) -> None:

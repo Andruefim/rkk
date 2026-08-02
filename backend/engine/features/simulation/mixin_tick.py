@@ -1019,6 +1019,12 @@ class SimulationTickMixin:
                     _ht_ex,
                     exc_info=True,
                 )
+            try:
+                from engine.task_log_analyzer import maybe_analyze_task_logs
+
+                maybe_analyze_task_logs(int(self.tick))
+            except Exception:
+                pass
             if arb_ht is not None and arb_ht.human_task_active():
                 try:
                     arb_ht.early_finalize(

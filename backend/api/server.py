@@ -153,6 +153,16 @@ async def _startup_post_boot_pipeline() -> None:
 
 @asynccontextmanager
 async def _app_lifespan(_: FastAPI):
+    try:
+        from engine.task_logger import clear_session_logs
+
+        cleared = clear_session_logs()
+        if cleared:
+            print(f"[RKK] Cleared session logs: {', '.join(cleared)}")
+        else:
+            print("[RKK] Session logs clean (nothing to clear)")
+    except Exception as e:
+        print(f"[RKK] Session log clear failed: {e}")
     get_sim()._uvicorn_loop = asyncio.get_running_loop()
     asyncio.create_task(_startup_post_boot_pipeline())
     yield

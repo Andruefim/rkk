@@ -14,6 +14,18 @@ _LOCK = threading.Lock()
 _MAX_BYTES = 5 * 1024 * 1024
 _JSONL_NAME = "task_log.jsonl"
 _TXT_NAME = "task_log.txt"
+_AI_ANALYSIS_NAME = "ai_task_analysis.txt"
+
+# Runtime session logs wiped on backend start (not archival external_review/).
+_SESSION_LOG_NAMES: tuple[str, ...] = (
+    _JSONL_NAME,
+    _TXT_NAME,
+    f"{_JSONL_NAME}.1",
+    f"{_TXT_NAME}.1",
+    _AI_ANALYSIS_NAME,
+    "live_uv_candidates.jsonl",
+    "system2_distill.jsonl",
+)
 
 
 def task_log_enabled() -> bool:
@@ -34,6 +46,109 @@ def _jsonl_path() -> Path:
 
 def _txt_path() -> Path:
     return task_log_dir() / _TXT_NAME
+
+
+def ai_analysis_path() -> Path:
+    return task_log_dir() / _AI_ANALYSIS_NAME
+
+
+def clear_session_logs() -> list[str]:
+    """Delete runtime log files so each project start begins with a clean slate."""
+    cleared: list[str] = []
+    log_dir = task_log_dir()
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return cleared
+    with _LOCK:
+        for name in _SESSION_LOG_NAMES:
+            path = log_dir / name
+            try:
+                if path.is_file():
+                    path.unlink()
+                    cleared.append(name)
+            except Exception:
+                pass
+        # Extra rotated / stray session dumps in the log root.
+        try:
+            for path in log_dir.glob("live_uv_candidates.jsonl*"):
+                if path.is_file():
+                    path.unlink()
+                    cleared.append(path.name)
+        except Exception:
+            pass
+    return cleared
+
+
+def read_task_log_events(
+    *,
+    tick_lo: int,
+    tick_hi: int,
+    max_events: int = 400,
+) -> list[dict[str, Any]]:
+    """Load JSONL events with tick in [tick_lo, tick_hi] (inclusive)."""
+    path = _jsonl_path()
+    if not path.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        # Read without holding the write lock for the whole scan (append stays atomic).
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                tick = row.get("tick")
+                if tick is None:
+                    continue
+                try:
+                    t = int(tick)
+                except (TypeError, ValueError):
+                    continue
+                if t < int(tick_lo) or t > int(tick_hi):
+                    continue
+                out.append(row)
+    except Exception:
+        return out
+    if len(out) > max_events:
+        # Prefer latest samples in the window for the AI prompt.
+        out = out[-max_events:]
+    return out
+
+
+def read_ai_analysis_text(*, max_chars: int = 12000) -> str:
+    path = ai_analysis_path()
+    if not path.is_file():
+        return ""
+    try:
+        with _LOCK:
+            text = path.read_text(encoding="utf-8")
+        if len(text) <= max_chars:
+            return text
+        return text[-max_chars:]
+    except Exception:
+        return ""
+
+
+def append_ai_analysis(tick_lo: int, tick_hi: int, analysis: str) -> None:
+    """Append one window analysis block to ai_task_analysis.txt."""
+    body = str(analysis or "").strip()
+    if not body:
+        body = "(empty analysis)"
+    block = f"[{int(tick_lo)}-{int(tick_hi)}]: {body}\n\n"
+    try:
+        with _LOCK:
+            log_dir = task_log_dir()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = ai_analysis_path()
+            with path.open("a", encoding="utf-8") as f:
+                f.write(block)
+    except Exception:
+        pass
 
 
 def _round_float(v: float, ndigits: int = 4) -> float:

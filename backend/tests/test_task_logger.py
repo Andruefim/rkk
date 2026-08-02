@@ -107,3 +107,15 @@ def test_task_log_creates_log_directory(
     monkeypatch.setenv("RKK_TASK_LOG_DIR", str(nested))
     task_log_event("command_received", tick=0, text="init")
     assert (nested / "task_log.jsonl").is_file()
+
+
+def test_clear_session_logs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from engine.task_logger import clear_session_logs
+
+    monkeypatch.setenv("RKK_TASK_LOG", "1")
+    monkeypatch.setenv("RKK_TASK_LOG_DIR", str(tmp_path))
+    task_log_event("command_received", tick=1, text="x")
+    assert (tmp_path / "task_log.jsonl").is_file()
+    cleared = clear_session_logs()
+    assert "task_log.jsonl" in cleared
+    assert not (tmp_path / "task_log.jsonl").exists()
