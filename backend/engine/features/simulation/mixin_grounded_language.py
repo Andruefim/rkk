@@ -27,6 +27,7 @@ from engine.object_resolver import ResolvedObject, resolve_manipulation_target
 from engine.object_working_memory import (
     LatentSceneMemory,
     ObjectWorkingMemory,
+    ego_from_bearing_range,
     match_latent_slot,
 )
 from engine.success_predicates import evaluate_goal
@@ -87,6 +88,20 @@ def _task_nav_mode() -> str:
     if raw in ("heuristic", "heur", "bearing", "goal_navigation"):
         return "heuristic"
     return "wm_ai"
+
+
+def _task_nav_ai_every() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_TASK_NAV_AI_EVERY", "2")))
+    except ValueError:
+        return 2
+
+
+def _owm_live_refresh_every() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_OWM_LIVE_REFRESH_EVERY", "2")))
+    except ValueError:
+        return 2
 
 
 def _task_nav_wm_min_steps() -> int:
@@ -1255,14 +1270,55 @@ class SimulationGroundedLanguageMixin:
             pass
         return None
 
+    def _world_xy_from_owm(self, owm: ObjectWorkingMemory) -> tuple[float, float] | None:
+        """Egocentric OWM bearing/range → world XY via agent pose."""
+        if float(getattr(owm, "range_m", 0.0) or 0.0) < 0.05:
+            return None
+        agent_xy, agent_fwd = self._agent_xy_forward()
+        x_fwd, y_right = ego_from_bearing_range(float(owm.bearing), float(owm.range_m))
+        fx, fy = float(agent_fwd[0]), float(agent_fwd[1])
+        n = float(math.hypot(fx, fy)) or 1.0
+        fx, fy = fx / n, fy / n
+        rx, ry = fy, -fx
+        ax, ay = float(agent_xy[0]), float(agent_xy[1])
+        return (ax + x_fwd * fx + y_right * rx, ay + x_fwd * fy + y_right * ry)
+
+    def _contact_body_id_for_task(self, resolved: ResolvedObject | None) -> int | None:
+        if resolved is not None:
+            body_id = getattr(resolved, "body_id", None)
+            if body_id is not None:
+                return int(body_id)
+        base = self._humanoid_base_env()
+        if base is None:
+            return None
+        owm = getattr(self, "_obj_working_memory", None)
+        if owm is None:
+            owm = getattr(self, "_owm_cached", None)
+        if owm is None:
+            return None
+        world_xy = self._world_xy_from_owm(owm)
+        if world_xy is None:
+            return None
+        fn = getattr(base, "find_static_contact_body", None)
+        if not callable(fn):
+            return None
+        label = str(getattr(owm, "label", "") or "").lower()
+        prefer_cyl = any(k in label for k in ("cylinder", "planter", "column"))
+        if prefer_cyl:
+            bid = fn(world_xy, kind="cylinder")
+            if bid is not None:
+                return int(bid)
+        bid = fn(world_xy)
+        return int(bid) if bid is not None else None
+
     def _manip_has_contact(self, resolved: ResolvedObject | None) -> bool:
         env = getattr(getattr(self, "agent", None), "env", None)
         if env is not None and bool(getattr(env, "_contact_flag", False)):
             return True
         base = self._humanoid_base_env()
-        if base is None or resolved is None:
+        if base is None:
             return False
-        body_id = getattr(resolved, "body_id", None)
+        body_id = self._contact_body_id_for_task(resolved)
         if body_id is None:
             return False
         fn = getattr(base, "_manip_has_contact", None)
@@ -1700,18 +1756,20 @@ class SimulationGroundedLanguageMixin:
             agent_forward=agent_fwd,
         )
         if bool(getattr(scene, "hard_lock_active", False)) and scene.active_ids:
-            try:
-                cam = self._depth_camera_from_sim()
-                if cam is not None:
-                    range_hint = self._eval_oracle_dist_m()
-                    scene.refresh_active_from_live_camera(
-                        cam,
-                        tick=int(tick),
-                        range_hint=range_hint,
-                        blend=0.78,
-                    )
-            except Exception:
-                pass
+            live_every = _owm_live_refresh_every()
+            if int(tick) % live_every == 0:
+                try:
+                    cam = self._depth_camera_from_sim()
+                    if cam is not None:
+                        range_hint = self._eval_oracle_dist_m()
+                        scene.refresh_active_from_live_camera(
+                            cam,
+                            tick=int(tick),
+                            range_hint=range_hint,
+                            blend=0.78,
+                        )
+                except Exception:
+                    pass
         if bool(getattr(scene, "last_odom_discontinuity", False)):
             jump = float(getattr(scene, "last_odom_jump_m", 0.0) or 0.0)
             prev_logged = int(getattr(self, "_last_odom_disc_log_tick", -9999))
@@ -2921,6 +2979,21 @@ class SimulationGroundedLanguageMixin:
         Falls back to heuristic bearing/range nav when fallen, posture pause,
         AI returns empty, or WM is cold.
         """
+        tick = int(getattr(self, "tick", 0))
+        every = _task_nav_ai_every()
+        cached_tick = int(getattr(self, "_nav_ai_cached_tick", -1))
+        cached = getattr(self, "_nav_ai_cached", None)
+        if cached is not None and tick - cached_tick < every:
+            intents_c, meta_c = cached
+            return dict(intents_c), dict(meta_c)
+
+        def _store_cache(
+            out_intents: dict[str, float], out_meta: dict[str, Any]
+        ) -> tuple[dict[str, float], dict[str, Any]]:
+            self._nav_ai_cached_tick = tick
+            self._nav_ai_cached = (dict(out_intents), dict(out_meta))
+            return out_intents, out_meta
+
         meta: dict[str, Any] = {
             "task_nav_mode": "wm_ai",
             "nav_ai_ok": False,
@@ -2940,7 +3013,7 @@ class SimulationGroundedLanguageMixin:
             return {}, meta
         if not heur:
             meta["nav_ai_reason"] = "heuristic_empty_or_posture"
-            return {}, meta
+            return _store_cache({}, meta)
 
         wm_steps = self._wm_train_steps()
         wm_warm = wm_steps >= _task_nav_wm_min_steps()
@@ -2954,20 +3027,20 @@ class SimulationGroundedLanguageMixin:
         )
         if not ai_on:
             meta["nav_ai_reason"] = "active_inference_off_fallback_heur"
-            return heur, meta
+            return _store_cache(heur, meta)
 
         try:
             priors = self._inject_owm_nav_priors(owm, stop=float(stop))
             ensure = getattr(self, "_ensure_homeostatic_ctrl", None)
             if not callable(ensure):
-                from engine.active_inference import HomeostaticController
+                from engine.active_inference import HomeostaticController, _eff_iters
                 import torch
 
                 device = getattr(
                     self.agent.graph._core, "device", torch.device("cpu")
                 )
                 self._homeostatic_ctrl = HomeostaticController(
-                    device=device, learning_rate=0.1, max_iters=8
+                    device=device, learning_rate=0.1, max_iters=min(8, _eff_iters())
                 )
                 ctrl = self._homeostatic_ctrl
             else:
@@ -3054,13 +3127,13 @@ class SimulationGroundedLanguageMixin:
                 if not meta.get("nav_ai_reason"):
                     meta["nav_ai_reason"] = "homeostatic"
                 meta["nav_ai_intents"] = sorted(mapped.keys())
-                return out, meta
+                return _store_cache(out, meta)
 
             meta["nav_ai_reason"] = "ai_empty_fallback_heur"
-            return heur, meta
+            return _store_cache(heur, meta)
         except Exception as exc:
             meta["nav_ai_reason"] = f"ai_error_fallback_heur:{exc}"
-            return heur, meta
+            return _store_cache(heur, meta)
 
     def _register_task_navigation(
         self,
@@ -3179,7 +3252,6 @@ class SimulationGroundedLanguageMixin:
                         "nav",
                         "intents",
                         tick=int(tick),
-                        force=True,
                         task_nav_mode=str(nav_meta.get("task_nav_mode") or mode),
                         nav_ai_ok=bool(nav_meta.get("nav_ai_ok")),
                         nav_ai_reason=str(nav_meta.get("nav_ai_reason") or ""),

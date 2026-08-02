@@ -296,6 +296,7 @@ def test_wm_ai_nav_returns_intents_and_falls_back(monkeypatch: pytest.MonkeyPatc
             return {}
 
     h._homeostatic_ctrl = _EmptyCtrl()
+    h.tick = 22
     intents2, meta2 = h._navigation_intents_wm_ai(owm, stop=0.7, posture=0.9, fallen=False)
     assert intents2
     assert "intent_gait_coupling" in intents2
@@ -303,6 +304,7 @@ def test_wm_ai_nav_returns_intents_and_falls_back(monkeypatch: pytest.MonkeyPatc
     assert "fallback" in str(meta2.get("nav_ai_reason") or "")
 
     # Fallen → empty
+    h.tick = 24
     intents3, meta3 = h._navigation_intents_wm_ai(owm, stop=0.7, posture=0.9, fallen=True)
     assert intents3 == {}
     assert meta3["nav_ai_ok"] is False
@@ -390,6 +392,7 @@ def test_wm_ai_assert_forward_when_aligned(monkeypatch: pytest.MonkeyPatch) -> N
             return {"intent_gait_coupling": 0.72, "intent_stride": 0.50}
 
     h._homeostatic_ctrl = _TurnCtrl()
+    h.tick = 22
     vt2 = VisualTarget(
         slot_id="nav_turn",
         u=0.85,

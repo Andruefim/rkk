@@ -326,6 +326,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         self.lever_trigger_r = 0.26
         self._ball_start = [1.8, 1.4, 0.1375]
         self._object_registry: list[dict] = []
+        self._static_body_registry: list[dict] = []
         br = 0.1125
         col_ball = pb.createCollisionShape(pb.GEOM_SPHERE, radius=br, physicsClientId=self.client)
         vis_ball = pb.createVisualShape(
@@ -517,7 +518,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         rz: float = 0.0,
         *,
         style: str = "default",
-    ) -> None:
+    ) -> int:
         """Статика: центр в координатах Three.js (tx,ty,tz), полуразмеры (hx,hy,hz), y-up."""
         half = [hx, hz, hy]
         pos_pb = [tx, tz, ty]
@@ -530,7 +531,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             rgbaColor=[rgb[0], rgb[1], rgb[2], 1.0],
             physicsClientId=cid,
         )
-        pb.createMultiBody(
+        bid = pb.createMultiBody(
             baseMass=0,
             baseCollisionShapeIndex=col,
             baseVisualShapeIndex=vis,
@@ -540,6 +541,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         )
         self._static_scene_export.append({
             "kind": "box",
+            "body_id": int(bid),
             "tx": float(tx),
             "ty": float(ty),
             "tz": float(tz),
@@ -554,6 +556,17 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             "rz": float(rz),
             "style": style,
         })
+        self._static_body_registry.append({
+            "body_id": int(bid),
+            "kind": "box",
+            "style": style,
+            "x": float(pos_pb[0]),
+            "y": float(pos_pb[1]),
+            "hx": float(hx),
+            "hy": float(hy),
+            "hz": float(hz),
+        })
+        return int(bid)
 
     def _static_cylinder_pb(
         self,
@@ -563,7 +576,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         rgb: tuple[float, float, float],
         *,
         style: str = "default",
-    ) -> None:
+    ) -> int:
         """Статический цилиндр (ось Z в PyBullet = высота в Three)."""
         cid = self.client
         col = pb.createCollisionShape(
@@ -576,7 +589,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             rgbaColor=[rgb[0], rgb[1], rgb[2], 1.0],
             physicsClientId=cid,
         )
-        pb.createMultiBody(
+        bid = pb.createMultiBody(
             baseMass=0,
             baseCollisionShapeIndex=col,
             baseVisualShapeIndex=vis,
@@ -585,6 +598,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         )
         self._static_scene_export.append({
             "kind": "cylinder",
+            "body_id": int(bid),
             "tx": float(pos_pb[0]),
             "ty": float(pos_pb[2]),
             "tz": float(pos_pb[1]),
@@ -598,6 +612,16 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             "rz": 0.0,
             "style": style,
         })
+        self._static_body_registry.append({
+            "body_id": int(bid),
+            "kind": "cylinder",
+            "style": style,
+            "x": float(pos_pb[0]),
+            "y": float(pos_pb[1]),
+            "radius": float(radius),
+            "height": float(height),
+        })
+        return int(bid)
 
     def _static_sphere_pb(
         self,
@@ -606,7 +630,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         rgb: tuple[float, float, float],
         *,
         style: str = "default",
-    ) -> None:
+    ) -> int:
         cid = self.client
         col = pb.createCollisionShape(pb.GEOM_SPHERE, radius=radius, physicsClientId=cid)
         vis = pb.createVisualShape(
@@ -615,7 +639,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             rgbaColor=[rgb[0], rgb[1], rgb[2], 1.0],
             physicsClientId=cid,
         )
-        pb.createMultiBody(
+        bid = pb.createMultiBody(
             baseMass=0,
             baseCollisionShapeIndex=col,
             baseVisualShapeIndex=vis,
@@ -624,6 +648,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         )
         self._static_scene_export.append({
             "kind": "sphere",
+            "body_id": int(bid),
             "tx": float(pos_pb[0]),
             "ty": float(pos_pb[2]),
             "tz": float(pos_pb[1]),
@@ -633,6 +658,15 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             "b": rgb[2],
             "style": style,
         })
+        self._static_body_registry.append({
+            "body_id": int(bid),
+            "kind": "sphere",
+            "style": style,
+            "x": float(pos_pb[0]),
+            "y": float(pos_pb[1]),
+            "radius": float(radius),
+        })
+        return int(bid)
 
     def _export_torus_visual(
         self,
@@ -1012,6 +1046,38 @@ class _PyBulletHumanoid(InstrumentalSandbox):
             if pts:
                 return True
         return False
+
+    def find_static_contact_body(
+        self,
+        world_xy: tuple[float, float],
+        *,
+        kind: str | None = None,
+        style: str | None = None,
+        max_dist_m: float = 1.2,
+    ) -> int | None:
+        """Nearest static body to world XY (surface distance for cylinders/spheres)."""
+        import math
+
+        wx, wy = float(world_xy[0]), float(world_xy[1])
+        best_id: int | None = None
+        best_dist = float(max_dist_m)
+        for row in getattr(self, "_static_body_registry", []) or []:
+            if kind is not None and str(row.get("kind")) != str(kind):
+                continue
+            if style is not None and str(row.get("style")) != str(style):
+                continue
+            bx = float(row.get("x", 0.0))
+            by = float(row.get("y", 0.0))
+            d = float(math.hypot(wx - bx, wy - by))
+            rk = str(row.get("kind", ""))
+            if rk in ("cylinder", "sphere"):
+                d -= float(row.get("radius", 0.0))
+            if d < best_dist:
+                bid = row.get("body_id")
+                if bid is not None:
+                    best_dist = d
+                    best_id = int(bid)
+        return best_id
 
     def get_task_agent_pose(self) -> dict[str, Any]:
         """COM XY + body forward for task navigation (root yaw — not chest−root noise)."""
