@@ -340,6 +340,43 @@ def test_humanoid_physics_sim_unwraps_nested_sim() -> None:
     assert h._manip_has_contact(None) is True
 
 
+def test_forward_cylinder_matches_vision_range_to_central_planter() -> None:
+    """Spawn facing +X must still lock the nearby large planter when depth agrees."""
+
+    class _Harness(_StaticContactHarness):
+        def _agent_xy_forward(self):
+            # Facing +X; central planter is toward -X (behind).
+            return (2.55, -1.5), (1.0, 0.0)
+
+        def _task_ontology_best_key(self) -> str:
+            return "cylinder"
+
+    h = _Harness()
+    h._base._static_body_registry = [
+        {
+            "body_id": 7,
+            "kind": "cylinder",
+            "style": "planter",
+            "x": 0.0,
+            "y": 0.0,
+            "radius": 1.42,
+            "height": 0.22,
+        },
+        {
+            "body_id": 98,
+            "kind": "cylinder",
+            "style": "planter",
+            "x": 7.2,
+            "y": -2.5,
+            "radius": 0.55,
+            "height": 0.9,
+        },
+    ]
+    # Depth ~1.85 matches central surface (hypot(2.55,1.5)-1.42 ≈ 1.86)
+    bid = h._forward_cylinder_contact_body(vision_range=1.85, prefer_planter=True)
+    assert bid == 7
+
+
 def test_forward_cylinder_prefers_near_planter_over_far() -> None:
     class _Harness(_StaticContactHarness):
         def _agent_xy_forward(self):

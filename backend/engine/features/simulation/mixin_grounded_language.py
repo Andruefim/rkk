@@ -1389,19 +1389,23 @@ class SimulationGroundedLanguageMixin:
             dx, dy = bx - ax, by - ay
             ahead = dx * fx + dy * fy
             horiz = float(math.hypot(dx, dy))
-            # Soft behind-gate: allow near-lateral targets; only drop clear rear ones.
-            if horiz > 1e-6 and ahead < -0.45 * horiz:
-                continue
             radius = float(row.get("radius", 0.0))
             d = max(0.0, horiz - radius)
             if d > float(max_dist_m):
                 continue
+            # Planter landmark search: spawn yaw often faces +X while the large
+            # central planter sits toward scene origin — do not drop it as "behind".
+            if not prefer_planter or str(row.get("style", "")) != "planter":
+                if horiz > 1e-6 and ahead < -0.45 * horiz:
+                    continue
             score = float(d)
             if vision_range is not None and float(vision_range) > 0.05:
-                score += 0.35 * abs(float(d) - float(vision_range))
-            # Larger planters are the scene landmark for "cylindrical object".
+                # Strongly prefer bodies whose surface distance matches depth.
+                score += 1.1 * abs(float(d) - float(vision_range))
             if str(row.get("style", "")) == "planter":
-                score -= 0.25 * min(radius, 2.0)
+                score -= 0.35 * min(radius, 2.0)
+                if horiz > 1e-6 and ahead > 0.0:
+                    score -= 0.15
             bid = row.get("body_id")
             if bid is not None and score < best_score:
                 best_score = score
