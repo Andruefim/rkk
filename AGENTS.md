@@ -56,7 +56,10 @@ Depth: sim uses PyBullet ego depth buffer (`get_ego_rgbd` → `DepthCamera.range
 
 ### Key gotchas
 
-- `pybullet` requires `build-essential`, `cmake`, and `python3-dev` system packages to compile from source. These must be installed before `pip install -r backend/requirements.txt`.
+- `pybullet` requires `build-essential`, `cmake`, and `python3-dev` system packages to compile from source. These must be installed before `pip install -r backend/requirements.txt`. `python3-dev` is baked into the cloud snapshot; without it the pybullet wheel build fails with `fatal error: Python.h: No such file or directory`.
+- Python packages install into the user site (`~/.local`). The base image ships a PEP 668 `EXTERNALLY-MANAGED` marker, so manual pip installs need `pip install --user --break-system-packages ...` (the startup update script already uses this). `torch` (CPU build, `2.13.0+cpu`) is pre-installed in the snapshot and is NOT in `requirements.txt` — do not `pip install torch` from the default index or it pulls the large CUDA build.
+- `pytest` is not in `requirements.txt`; it is baked into the snapshot. Backend tests are skipped unless `RKK_RUN_TESTS=1` (see `backend/tests/conftest.py`). Run: `cd backend && RKK_RUN_TESTS=1 RKK_DEVICE=cpu python3 -m pytest tests/ -q`.
+- Known pre-existing failure (unrelated to env setup): `tests/test_manipulation_pybullet_smoke.py::test_fallback_manip_chair_push` — `_FallbackHumanoid.__init__` in `engine/features/humanoid/fallback.py` uses `self._object_registry` before it is assigned. The rest of the suite passes.
 - PyTorch CPU variant must be installed with `--index-url https://download.pytorch.org/whl/cpu` to avoid downloading the large CUDA build.
 - The `.env` file is tracked in git. To override settings without modifying it, pass environment variables directly when starting the backend.
 - The backend initializes the PyBullet humanoid simulation on first request (lazy `get_sim()` call), so the first API call or WebSocket connection takes a few seconds.
