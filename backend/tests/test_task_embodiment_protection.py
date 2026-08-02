@@ -45,9 +45,18 @@ class _FallSimStub(SimulationFallMixin):
         self._task_fall_protected_stall_ticks = 0
         self._task_fall_start_range = None
         self._current_approach_range = None
+        self._task_locked_body_id = 7
+        self._task_face_lift_tick = -10_000
         self.reset_calls: list[int] = []
+        self.face_lift_calls: list[tuple[float, float]] = []
         self.agent = SimpleNamespace(
-            env=SimpleNamespace(reset_stance=lambda: self.reset_calls.append(1)),
+            env=SimpleNamespace(
+                reset_stance=lambda: self.reset_calls.append(1),
+                face_target_and_lift=lambda xy, stand_z=None: (
+                    self.face_lift_calls.append((float(xy[0]), float(xy[1])))
+                    or {"ok": True, "x": 2.0, "y": 0.0, "yaw": 3.14}
+                ),
+            ),
             graph=SimpleNamespace(_obs_buffer=[], _int_buffer=[]),
         )
 
@@ -60,13 +69,17 @@ class _FallSimStub(SimulationFallMixin):
     def _unwrap_base_env(self, env: object) -> object:
         return env
 
-
     def _task_fall_assist_progress_blocks_reset(self) -> bool:
         start = getattr(self, "_task_fall_start_range", None)
         current = getattr(self, "_current_approach_range", None)
         if start is not None and current is not None:
             return float(start) - float(current) >= 0.15
         return False
+
+    def _locked_contact_target_xy(self) -> tuple[float, float] | None:
+        if self._task_locked_body_id is None:
+            return None
+        return (0.0, 0.0)
 
 
 def test_maybe_recover_skips_hard_reset_during_task(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -119,6 +132,7 @@ def test_protected_stall_eventually_assist_reset_once(monkeypatch: pytest.Monkey
     sim._task_fallen_ticks = 120
     monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
     monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
+    monkeypatch.setenv("RKK_TASK_FACE_LIFT_EVERY", "16")
     monkeypatch.setattr(
         "engine.task_binding.human_task_embodiment_protected",
         lambda _sim: True,
@@ -138,17 +152,23 @@ def test_protected_stall_eventually_assist_reset_once(monkeypatch: pytest.Monkey
     assert sim.reset_calls == [1]
     assert sim._task_fall_assist_used is True
     assert sim._fall_recovery_active is False
+    assert sim.face_lift_calls == []
 
+    # After the one-shot spawn assist, further stalls use in-place face+lift
+    # (does not consume another spawn teleport).
     sim._fall_recovery_active = True
     sim._fall_recovery_last_progress_tick = 0
     sim.tick = 400
-    assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is False
+    assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is True
     assert sim.reset_calls == [1]
+    assert sim.face_lift_calls == [(0.0, 0.0)]
+    assert sim._task_fall_assist_used is True
 
 
-def test_protected_stall_skips_assist_when_range_improving(
+def test_protected_stall_face_lifts_when_range_improving(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Progress blocks spawn teleport — in-place face+lift toward locked body."""
     sim = _FallSimStub()
     sim.tick = 200
     sim._fall_recovery_last_progress_tick = 0
@@ -157,6 +177,7 @@ def test_protected_stall_skips_assist_when_range_improving(
     sim._current_approach_range = 0.96
     monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
     monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
+    monkeypatch.setenv("RKK_TASK_FACE_LIFT_EVERY", "16")
     monkeypatch.setattr(
         "engine.task_binding.human_task_embodiment_protected",
         lambda _sim: True,
@@ -172,9 +193,11 @@ def test_protected_stall_skips_assist_when_range_improving(
         "foot_contact_l": 0.0,
         "foot_contact_r": 0.0,
     }
-    assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is False
+    assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is True
     assert sim.reset_calls == []
     assert sim._task_fall_assist_used is False
+    assert sim.face_lift_calls == [(0.0, 0.0)]
+    assert sim._fall_recovery_active is False
 
 
 def test_assist_reset_refused_during_verify_goal(monkeypatch: pytest.MonkeyPatch) -> None:

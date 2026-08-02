@@ -1089,20 +1089,23 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         # Prefer root/base orientation. Chest−root XY is near-vertical and noisy,
         # which previously made heading_err random and approach orbit the target.
         fwd = (math.cos(yaw), math.sin(yaw))
-        try:
-            links = self._named_link_world_positions()
-            # Optional: pelvis→chest projected only if horizontal span is meaningful.
-            if "chest" in links and "root" in links:
-                chest = links["chest"]
-                root = links["root"]
-                dx = float(chest[0]) - float(root[0])
-                dy = float(chest[1]) - float(root[1])
-                n = math.hypot(dx, dy)
-                if n > 0.08:
-                    fwd = (dx / n, dy / n)
-                    yaw = math.atan2(fwd[1], fwd[0])
-        except Exception:
-            pass
+        com_z = float(com[2]) if len(com) > 2 else 1.0
+        # While fallen / low COM the chest−root vector is garbage — keep root yaw.
+        if com_z >= 0.45:
+            try:
+                links = self._named_link_world_positions()
+                # Optional: pelvis→chest projected only if horizontal span is meaningful.
+                if "chest" in links and "root" in links:
+                    chest = links["chest"]
+                    root = links["root"]
+                    dx = float(chest[0]) - float(root[0])
+                    dy = float(chest[1]) - float(root[1])
+                    n = math.hypot(dx, dy)
+                    if n > 0.08:
+                        fwd = (dx / n, dy / n)
+                        yaw = math.atan2(fwd[1], fwd[0])
+            except Exception:
+                pass
         return {"xy": xy, "forward": fwd, "yaw": yaw}
 
     def get_ego_camera_forward_xy(self) -> tuple[float, float] | None:
@@ -1453,7 +1456,64 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         with self._physics_lock:
             self._reset_stance_locked()
 
-    def _reset_stance_locked(self) -> None:
+    def face_target_and_lift(
+        self,
+        target_xy: tuple[float, float],
+        *,
+        stand_z: float | None = None,
+    ) -> dict:
+        """
+        In-place upright recover facing ``target_xy`` (keep COM XY).
+
+        Used during fallen approach when spawn teleport would erase progress:
+        body yaw is unreliable while fallen, so crawl orbits; re-orient facing
+        the locked contact body, then resume neural / WM crawl.
+        Does not move scene objects and does not teleport to spawn.
+        """
+        import math
+
+        tx, ty = float(target_xy[0]), float(target_xy[1])
+        z = float(stand_z) if stand_z is not None else float(HUMANOID_URDF_SPAWN_Z)
+        with self._physics_lock:
+            rid, cid = self.robot_id, self.client
+            pos, _ = pb.getBasePositionAndOrientation(rid, physicsClientId=cid)
+            ax, ay = float(pos[0]), float(pos[1])
+            dx, dy = tx - ax, ty - ay
+            if math.hypot(dx, dy) < 0.05:
+                yaw = 0.0
+            else:
+                yaw = float(math.atan2(dy, dx))
+            stand = HUMANOID_URDF_STAND_EULER
+            orn = pb.getQuaternionFromEuler(
+                [float(stand[0]), float(stand[1]), yaw]
+            )
+            self._repose_locked(
+                base_pos=[ax, ay, z],
+                base_orn=list(orn),
+                reset_scene_objects=False,
+            )
+        print(
+            f"[HumanoidEnv] face_target_and_lift "
+            f"xy=({ax:.2f},{ay:.2f}) yaw={yaw:.2f} → ({tx:.2f},{ty:.2f})"
+        )
+        return {
+            "ok": True,
+            "x": ax,
+            "y": ay,
+            "z": z,
+            "yaw": yaw,
+            "target_x": tx,
+            "target_y": ty,
+        }
+
+    def _repose_locked(
+        self,
+        *,
+        base_pos: list[float],
+        base_orn: list[float],
+        reset_scene_objects: bool = True,
+    ) -> None:
+        """Neutral-joint repose at an explicit base pose (caller holds physics lock)."""
         had_fixed = self._root_constraint is not None
         if had_fixed:
             if self._root_constraint is not None:
@@ -1469,7 +1529,7 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         rid = self.robot_id
         cid = self.client
         pb.resetBasePositionAndOrientation(
-            rid, self._reset_base_pos, self._reset_base_orn,
+            rid, list(base_pos), list(base_orn),
             physicsClientId=cid,
         )
         pb.resetBaseVelocity(rid, [0, 0, 0], [0, 0, 0], physicsClientId=cid)
@@ -1524,40 +1584,51 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 physicsClientId=cid,
             )
 
-        if getattr(self, "ball_id", None) is not None:
-            pb.resetBasePositionAndOrientation(
-                self.ball_id,
-                self._ball_start,
-                [0, 0, 0, 1],
-                physicsClientId=cid,
-            )
-            pb.resetBaseVelocity(
-                self.ball_id, [0, 0, 0], [0, 0, 0], physicsClientId=cid,
-            )
+        if reset_scene_objects:
+            if getattr(self, "ball_id", None) is not None:
+                pb.resetBasePositionAndOrientation(
+                    self.ball_id,
+                    self._ball_start,
+                    [0, 0, 0, 1],
+                    physicsClientId=cid,
+                )
+                pb.resetBaseVelocity(
+                    self.ball_id, [0, 0, 0], [0, 0, 0], physicsClientId=cid,
+                )
 
-        for pid, p0 in zip(getattr(self, "prop_ids", []) or [], getattr(self, "_prop_starts", []) or []):
-            pb.resetBasePositionAndOrientation(
-                pid, p0, [0, 0, 0, 1], physicsClientId=cid,
-            )
-            pb.resetBaseVelocity(pid, [0, 0, 0], [0, 0, 0], physicsClientId=cid)
+            for pid, p0 in zip(
+                getattr(self, "prop_ids", []) or [],
+                getattr(self, "_prop_starts", []) or [],
+            ):
+                pb.resetBasePositionAndOrientation(
+                    pid, p0, [0, 0, 0, 1], physicsClientId=cid,
+                )
+                pb.resetBaseVelocity(pid, [0, 0, 0], [0, 0, 0], physicsClientId=cid)
 
-        if getattr(self, "_manip_chair_id", None) is not None and self._manip_chair_start:
-            pb.resetBasePositionAndOrientation(
-                self._manip_chair_id,
-                self._manip_chair_start,
-                [0, 0, 0, 1],
-                physicsClientId=cid,
-            )
-            pb.resetBaseVelocity(
-                self._manip_chair_id, [0, 0, 0], [0, 0, 0], physicsClientId=cid,
-            )
-            for row in getattr(self, "_object_registry", []) or []:
-                if row.get("body_id") == self._manip_chair_id:
-                    row["x"] = float(self._manip_chair_start[0])
-                    row["y"] = float(self._manip_chair_start[1])
-                    row["z"] = float(self._manip_chair_start[2])
+            if getattr(self, "_manip_chair_id", None) is not None and self._manip_chair_start:
+                pb.resetBasePositionAndOrientation(
+                    self._manip_chair_id,
+                    self._manip_chair_start,
+                    [0, 0, 0, 1],
+                    physicsClientId=cid,
+                )
+                pb.resetBaseVelocity(
+                    self._manip_chair_id, [0, 0, 0], [0, 0, 0], physicsClientId=cid,
+                )
+                for row in getattr(self, "_object_registry", []) or []:
+                    if row.get("body_id") == self._manip_chair_id:
+                        row["x"] = float(self._manip_chair_start[0])
+                        row["y"] = float(self._manip_chair_start[1])
+                        row["z"] = float(self._manip_chair_start[2])
 
-        self._reset_instrumental_hidden()
+            self._reset_instrumental_hidden()
+
+    def _reset_stance_locked(self) -> None:
+        self._repose_locked(
+            base_pos=list(self._reset_base_pos),
+            base_orn=list(self._reset_base_orn),
+            reset_scene_objects=True,
+        )
 
     def set_joint(self, var_name: str, target_pos: float):
         with self._physics_lock:

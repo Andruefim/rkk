@@ -4087,6 +4087,15 @@ class SimulationGroundedLanguageMixin:
             if owm is None:
                 owm = self._update_object_working_memory(tick)
             phys = self._physics_range_to_locked_body()
+            # Fallen + locked body: body yaw is unreliable → face+lift in place
+            # (rate-limited) so crawl closes instead of orbiting.
+            if fallen and getattr(self, "_task_locked_body_id", None) is not None:
+                face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
+                if callable(face_fn):
+                    try:
+                        face_fn()
+                    except Exception:
+                        pass
             owm_ok = owm is not None and owm.is_usable(tick)
             if not owm_ok:
                 # Fallen / teleport can make OWM briefly unusable — still crawl
@@ -4162,7 +4171,19 @@ class SimulationGroundedLanguageMixin:
                 else:
                     range_m = min(float(owm.range_m), float(phys))
             nav_bearing = float(owm.bearing)
-            if phys is not None and abs(float(owm.range_m) - float(phys)) > 0.35:
+            # Fallen: always recompute bearing from locked body world XY —
+            # OWM/vision bearing inherits garbage yaw while prone.
+            if fallen and phys is not None:
+                row = self._static_registry_row_for_body(
+                    int(getattr(self, "_task_locked_body_id", 0) or 0)
+                )
+                if row is not None:
+                    br = self._bearing_range_from_world_xy(
+                        (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                    )
+                    if br is not None:
+                        nav_bearing = float(br[0])
+            elif phys is not None and abs(float(owm.range_m) - float(phys)) > 0.35:
                 row = self._static_registry_row_for_body(
                     int(getattr(self, "_task_locked_body_id", 0) or 0)
                 )

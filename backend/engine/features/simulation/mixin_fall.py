@@ -160,6 +160,143 @@ class SimulationFallMixin:
             return True
         return False
 
+    def _locked_contact_target_xy(self) -> tuple[float, float] | None:
+        """World XY of the locked contact body (registry / live PyBullet)."""
+        bid = getattr(self, "_task_locked_body_id", None)
+        if bid is None:
+            return None
+        row_fn = getattr(self, "_static_registry_row_for_body", None)
+        row = row_fn(int(bid)) if callable(row_fn) else None
+        if isinstance(row, dict):
+            try:
+                return float(row.get("x", 0.0)), float(row.get("y", 0.0))
+            except (TypeError, ValueError):
+                pass
+        base = None
+        phys_fn = getattr(self, "_humanoid_physics_sim", None)
+        if callable(phys_fn):
+            base = phys_fn()
+        if base is None:
+            unwrap = getattr(self, "_unwrap_base_env", None)
+            env = getattr(getattr(self, "agent", None), "env", None)
+            if callable(unwrap) and env is not None:
+                base = unwrap(env)
+                base = getattr(base, "_sim", base)
+        if base is None:
+            return None
+        try:
+            import pybullet as pb
+
+            client = getattr(base, "client", None)
+            lock = getattr(base, "_physics_lock", None)
+            if lock is not None:
+                lock.acquire()
+            try:
+                p, _ = pb.getBasePositionAndOrientation(int(bid), physicsClientId=client)
+                return float(p[0]), float(p[1])
+            finally:
+                if lock is not None:
+                    lock.release()
+        except Exception:
+            return None
+
+    def _try_task_face_lift_toward_locked(self) -> bool:
+        """
+        In-place face+lift toward locked body — preserves approach XY progress.
+
+        Spawn teleport would erase closing distance; fallen body yaw is garbage
+        so crawl orbits. Re-orient upright facing the locked cylinder, then
+        resume WM/AI / crawl navigation.
+        """
+        if not self._fall_assist_allowed_for_stage():
+            return False
+        target = self._locked_contact_target_xy()
+        if target is None:
+            return False
+        tick = int(getattr(self, "tick", 0))
+        try:
+            every = int(os.environ.get("RKK_TASK_FACE_LIFT_EVERY", "90"))
+        except ValueError:
+            every = 90
+        every = max(16, min(every, 600))
+        last = int(getattr(self, "_task_face_lift_tick", -10_000))
+        if tick - last < every:
+            return False
+        if tick - int(getattr(self, "_last_fall_reset_tick", -999)) < 4:
+            return False
+
+        env = getattr(getattr(self, "agent", None), "env", None)
+        fn = getattr(env, "face_target_and_lift", None) if env is not None else None
+        if not callable(fn):
+            # Fallback through physics sim if HumanoidEnv wrapper missing.
+            base = None
+            phys_fn = getattr(self, "_humanoid_physics_sim", None)
+            if callable(phys_fn):
+                base = phys_fn()
+            fn = getattr(base, "face_target_and_lift", None) if base is not None else None
+        if not callable(fn):
+            return False
+        try:
+            out = fn(target)
+        except Exception:
+            return False
+        if not bool((out or {}).get("ok", True)):
+            return False
+
+        self._task_face_lift_tick = tick
+        self._last_fall_reset_tick = tick
+        self._task_fallen_after_assist_ticks = 0
+        # Do NOT consume the one-shot spawn assist — face-lift may repeat.
+        lc = getattr(self, "_locomotion_controller", None)
+        if lc is not None:
+            reset_fn = getattr(lc, "reset_cpg_phases", None)
+            if callable(reset_fn):
+                try:
+                    reset_fn()
+                except Exception:
+                    pass
+        graph = getattr(getattr(self, "agent", None), "graph", None)
+        if graph is not None:
+            try:
+                graph._obs_buffer.clear()
+                graph._int_buffer.clear()
+            except Exception:
+                pass
+        sync_fn = getattr(self, "_sync_graph_intents_to_defaults", None)
+        if callable(sync_fn):
+            try:
+                sync_fn()
+            except Exception:
+                pass
+        hold_fn = getattr(self, "_arm_post_reset_motor_hold", None)
+        if callable(hold_fn):
+            try:
+                hold_fn()
+            except Exception:
+                pass
+        unlock_fn = getattr(self, "_owm_unlock_after_teleport", None)
+        if callable(unlock_fn):
+            try:
+                unlock_fn(tick, reason="task_face_lift")
+            except Exception:
+                pass
+        self._add_event("task_face_lift", "#88e0a8", "value")
+        try:
+            from engine.task_logger import task_log_event
+
+            task_log_event(
+                "task_face_lift",
+                tick=tick,
+                target_x=round(float(target[0]), 4),
+                target_y=round(float(target[1]), 4),
+                x=round(float((out or {}).get("x", 0.0)), 4),
+                y=round(float((out or {}).get("y", 0.0)), 4),
+                yaw=round(float((out or {}).get("yaw", 0.0)), 4),
+            )
+        except Exception:
+            pass
+        return True
+
     @staticmethod
     def _fall_recovery_score(obs: dict) -> float:
         cz = float(obs.get("com_z", obs.get("phys_com_z", 0.0)))
@@ -337,6 +474,12 @@ class SimulationFallMixin:
                         self, "_task_fall_assist_progress_blocks_reset", None
                     )
                     if callable(progress_fn) and progress_fn():
+                        # Spawn teleport would erase closing distance — face+lift
+                        # in place so crawl yaw matches the locked body.
+                        face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
+                        if callable(face_fn) and face_fn():
+                            self._clear_fall_recovery()
+                            return True
                         self._add_event(
                             "task_fall_assist_skipped_progress", "#66ccff", "value"
                         )
@@ -354,6 +497,16 @@ class SimulationFallMixin:
                         return False
                     self._clear_fall_recovery()
                     return self._try_task_fall_assist_reset()
+                # Even after the one-shot spawn assist was used/skipped, keep
+                # re-orienting in place so fallen crawl does not orbit forever.
+                if (
+                    at_threshold
+                    and self._fall_assist_allowed_for_stage()
+                ):
+                    face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
+                    if callable(face_fn) and face_fn():
+                        self._clear_fall_recovery()
+                        return True
                 # Genome recovery continues; no hard reset until assist threshold.
                 return False
             self._clear_fall_recovery()

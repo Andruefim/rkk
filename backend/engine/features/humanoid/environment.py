@@ -990,6 +990,32 @@ class EnvironmentHumanoid:
         self._intero_control_lost = False
         self._prev_raw_obs = None
 
+    def face_target_and_lift(
+        self,
+        target_xy: tuple[float, float],
+        *,
+        stand_z: float | None = None,
+    ) -> dict:
+        """In-place upright recover facing target — keeps task progress XY."""
+        self._fallen_low_z_streak = 0
+        fn = getattr(self._sim, "face_target_and_lift", None)
+        out: dict = {"ok": False}
+        if callable(fn):
+            try:
+                out = dict(fn(target_xy, stand_z=stand_z) or {})
+            except Exception as exc:
+                out = {"ok": False, "error": str(exc)}
+        for k in SELF_VARS:
+            self._self_state[k] = 0.5
+        self._self_state["self_com_z_target"] = 0.62
+        self._self_state["self_posture_target"] = 0.58
+        for k in MOTOR_INTENT_VARS:
+            self._motor_state[k] = float(MOTOR_INTENT_DEFAULTS.get(k, 0.5))
+        self._intero_state = {"intero_energy": 1.0, "intero_stress": 0.0}
+        self._intero_control_lost = False
+        self._prev_raw_obs = None
+        return out
+
     # ── Camera / Skeleton ─────────────────────────────────────────────────────
     def get_frame_base64(self, view: str | None = None, **kwargs) -> str | None:
         return self._sim.get_frame_base64(view, **kwargs)
