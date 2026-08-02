@@ -120,14 +120,34 @@ class SimulationFallMixin:
             event_color="#44aaff",
         )
 
+    def _fall_assist_allowed_for_stage(self) -> bool:
+        """Assist teleport only during early locomotion stages — not reach/verify."""
+        try:
+            from engine.task_executive import active_tree_stage_kind
+
+            stage = str(active_tree_stage_kind(self) or "").strip()
+        except Exception:
+            return False
+        if not stage:
+            return False
+        return stage in ("resolve_target", "approach", "approach_target")
+
     def _try_task_fall_assist_reset(self) -> bool:
         """One assist reset during protected human task (preserves task/OWM)."""
+        if not self._fall_assist_allowed_for_stage():
+            return False
         if self._apply_pose_reset_after_fall(
             event_label="task_fall_assist_reset",
             event_color="#66ccff",
         ):
             self._task_fall_assist_used = True
             self._task_fallen_after_assist_ticks = 0
+            unlock_fn = getattr(self, "_owm_unlock_after_teleport", None)
+            if callable(unlock_fn):
+                try:
+                    unlock_fn(int(getattr(self, "tick", 0)), reason="task_fall_assist_reset")
+                except Exception:
+                    pass
             return True
         return False
 
@@ -302,6 +322,7 @@ class SimulationFallMixin:
                 if (
                     at_threshold
                     and not bool(getattr(self, "_task_fall_assist_used", False))
+                    and self._fall_assist_allowed_for_stage()
                 ):
                     self._clear_fall_recovery()
                     return self._try_task_fall_assist_reset()

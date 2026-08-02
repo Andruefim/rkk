@@ -36,6 +36,7 @@ from engine.task_goal import TaskGoal
 from engine.task_logger import summarize_expected_state, task_log_event
 from engine.task_observation import (
     build_task_observations,
+    contact_reach_m,
     inject_task_observations,
     nav_stop_m,
     reach_start_m,
@@ -1364,23 +1365,54 @@ class SimulationGroundedLanguageMixin:
 
         world_xy = self._world_xy_from_owm(owm)
         agent_xy, _ = self._agent_xy_forward()
+        max_dist = 2.5
+
+        if prefer_cyl and range_m < contact_reach_m():
+            probe_xy = (float(agent_xy[0]), float(agent_xy[1]))
+            bid = fn(probe_xy, kind="cylinder", style="planter", max_dist_m=max_dist)
+            if bid is not None:
+                return int(bid)
+            bid = fn(probe_xy, kind="cylinder", max_dist_m=max_dist)
+            if bid is not None:
+                return int(bid)
 
         if prefer_cyl:
             probe_xy = world_xy
-            if probe_xy is None and range_m < 0.35:
+            if probe_xy is None and range_m < contact_reach_m():
                 probe_xy = (float(agent_xy[0]), float(agent_xy[1]))
             if probe_xy is not None:
-                bid = fn(probe_xy, kind="cylinder", style="planter")
+                bid = fn(probe_xy, kind="cylinder", style="planter", max_dist_m=max_dist)
                 if bid is not None:
                     return int(bid)
-                bid = fn(probe_xy, kind="cylinder")
+                bid = fn(probe_xy, kind="cylinder", max_dist_m=max_dist)
                 if bid is not None:
                     return int(bid)
 
         if world_xy is None:
             return None
-        bid = fn(world_xy)
+        bid = fn(world_xy, max_dist_m=max_dist)
         return int(bid) if bid is not None else None
+
+    def _cylinder_contact_body_ids_near_agent(self, max_dist_m: float = 2.5) -> list[int]:
+        """All cylinder static bodies within reach of agent COM (physics contact probe)."""
+        base = self._humanoid_base_env()
+        if base is None:
+            return []
+        agent_xy, _ = self._agent_xy_forward()
+        ax, ay = float(agent_xy[0]), float(agent_xy[1])
+        out: list[int] = []
+        for row in getattr(base, "_static_body_registry", []) or []:
+            if str(row.get("kind", "")) != "cylinder":
+                continue
+            bx = float(row.get("x", 0.0))
+            by = float(row.get("y", 0.0))
+            d = float(math.hypot(ax - bx, ay - by))
+            d -= float(row.get("radius", 0.0))
+            if d <= float(max_dist_m):
+                bid = row.get("body_id")
+                if bid is not None:
+                    out.append(int(bid))
+        return out
 
     def _manip_has_contact(self, resolved: ResolvedObject | None) -> bool:
         env = getattr(getattr(self, "agent", None), "env", None)
@@ -1389,13 +1421,57 @@ class SimulationGroundedLanguageMixin:
         base = self._humanoid_base_env()
         if base is None:
             return False
-        body_id = self._contact_body_id_for_task(resolved)
-        if body_id is None:
-            return False
         fn = getattr(base, "_manip_has_contact", None)
-        if callable(fn):
-            return bool(fn(int(body_id)))
+        if not callable(fn):
+            return False
+
+        body_id = self._contact_body_id_for_task(resolved)
+        if body_id is not None and bool(fn(int(body_id))):
+            self._log_task_contact_detected(int(body_id))
+            return True
+
+        owm = getattr(self, "_obj_working_memory", None) or getattr(
+            self, "_owm_cached", None
+        )
+        range_m = float(getattr(owm, "range_m", 0.0) or 0.0) if owm is not None else 999.0
+        ont_key = str(self._task_ontology_best_key() or "").strip().lower()
+        raw_label = str(getattr(owm, "label", "") or "") if owm is not None else ""
+        from engine.vision_resolve import _is_visual_concept
+
+        visual_label = raw_label.lower() if _is_visual_concept(raw_label) else ""
+        prefer_cyl = (
+            ont_key == "cylinder"
+            or "cylinder" in ont_key
+            or any(k in visual_label for k in ("cylinder", "planter", "column"))
+        )
+        if prefer_cyl and range_m < contact_reach_m():
+            for bid in self._cylinder_contact_body_ids_near_agent():
+                if bid != body_id and bool(fn(int(bid))):
+                    self._log_task_contact_detected(int(bid))
+                    return True
         return False
+
+    def _log_task_contact_detected(self, body_id: int) -> None:
+        prev = int(getattr(self, "_task_contact_logged_body_id", -1) or -1)
+        if prev == int(body_id):
+            return
+        self._task_contact_logged_body_id = int(body_id)
+        owm = getattr(self, "_obj_working_memory", None) or getattr(
+            self, "_owm_cached", None
+        )
+        range_m = float(getattr(owm, "range_m", 0.0) or 0.0) if owm is not None else None
+        agent_xy, _ = self._agent_xy_forward()
+        try:
+            task_log_event(
+                "task_contact_detected",
+                tick=int(getattr(self, "tick", 0)),
+                body_id=int(body_id),
+                range_m=round(float(range_m), 4) if range_m is not None else None,
+                com_x_m=round(float(agent_xy[0]), 4),
+                com_y_m=round(float(agent_xy[1]), 4),
+            )
+        except Exception:
+            pass
 
     def _visual_env_ref(self) -> Any | None:
         return getattr(self, "_visual_env", None)
@@ -1905,10 +1981,18 @@ class SimulationGroundedLanguageMixin:
                     )
                 except Exception:
                     pass
+                try:
+                    from engine.task_binding import human_task_execution_active
+
+                    if human_task_execution_active(self):
+                        self._owm_unlock_after_teleport(int(tick), reason="com_teleport")
+                except Exception:
+                    pass
         self._inject_owm_into_graph(scene)
         owm = self._object_working_memory()
         if owm is not None and owm.is_usable(tick_i):
             self._maybe_rebind_vision_on_recede(int(tick), scene, float(owm.range_m))
+        self._maybe_rebind_after_teleport(int(tick))
         if owm.is_usable(tick_i):
             self._owm_cached_tick = tick_i
             self._owm_cached = owm
@@ -2489,8 +2573,11 @@ class SimulationGroundedLanguageMixin:
     ) -> None:
         if fallen or active is None:
             return
-        if str(active.kind) not in ("reach_contact", "reach_target"):
-            return
+        kind = str(active.kind)
+        manip_kinds = ("reach_contact", "reach_target")
+        if kind not in manip_kinds:
+            if kind != "verify_goal" or float(dist) >= 0.9:
+                return
 
         arb = getattr(self, "_motor_arbiter", None)
         if vision_resolve_enabled():
@@ -2771,6 +2858,43 @@ class SimulationGroundedLanguageMixin:
         scene = getattr(self, "_latent_scene", None)
         if scene is not None and hasattr(scene, "release_hard_lock"):
             scene.release_hard_lock()
+
+    def _owm_unlock_after_teleport(self, tick: int, *, reason: str = "com_teleport") -> None:
+        """Soft-unlock OWM after COM teleport / assist reset so range rebinds from vision."""
+        self._release_scene_hard_lock()
+        self._owm_bind_range_m = None
+        self._owm_range_ema = None
+        self._vision_recede_streak = 0
+        self._owm_cached_tick = -1
+        self._owm_cached = None
+        self._owm_pending_rebind_after_teleport = True
+        try:
+            task_log_event(
+                "owm_unlock_after_teleport",
+                tick=int(tick),
+                reason=str(reason),
+            )
+        except Exception:
+            pass
+
+    def _maybe_rebind_after_teleport(self, tick: int) -> None:
+        if not bool(getattr(self, "_owm_pending_rebind_after_teleport", False)):
+            return
+        self._owm_pending_rebind_after_teleport = False
+        if not vision_resolve_enabled():
+            return
+        oracle_dist = self._eval_oracle_dist_m()
+        owm = getattr(self, "_obj_working_memory", None)
+        bearing_hint = float(owm.bearing) if owm is not None else None
+        self._rebind_vision_objectness_peak(
+            int(tick),
+            reason="teleport_rebind",
+            oracle_dist=float(oracle_dist) if oracle_dist is not None else None,
+            bearing_hint=bearing_hint,
+            allow_full_resolve=True,
+        )
+        self._owm_cached_tick = -1
+        self._owm_cached = None
 
     def _maybe_rebind_vision_on_divergence(
         self,
@@ -3823,11 +3947,13 @@ class SimulationGroundedLanguageMixin:
         kind = active.kind
         stage_enter = int(getattr(self, "_task_tree_stage_enter_tick", tick))
 
-        if fallen and kind in ("approach", "approach_target", "reach_contact", "reach_target"):
+        _approach_fall_kinds = ("approach", "approach_target")
+        _reach_verify_fall_kinds = ("reach_contact", "reach_target", "verify_goal", "verify_target")
+        if fallen and kind in _approach_fall_kinds + _reach_verify_fall_kinds:
             streak = int(getattr(self, "_task_fall_streak", 0)) + 1
             self._task_fall_streak = streak
             self._task_fallen_ticks = int(getattr(self, "_task_fallen_ticks", 0)) + 1
-            if streak == 1:
+            if kind in _approach_fall_kinds and streak == 1:
                 self._arm_nav_hold(int(tick), reason="fallen_during_approach")
             # Do not fail/clear the task on brief falls — hard reset is already
             # deferred by embodiment protection; keep approach alive.
@@ -3855,13 +3981,23 @@ class SimulationGroundedLanguageMixin:
                 bool(getattr(self, "_task_fall_assist_used", False))
                 and after_assist_ticks >= fail_after_assist_ticks
             )
-            if fail_after_assist or (
+            fail_reason = (
+                "fallen_during_approach"
+                if kind in _approach_fall_kinds
+                else f"fallen_during_{kind}"
+            )
+            if kind in _reach_verify_fall_kinds and protected and not fail_after_assist:
+                if streak >= fail_after_assist_ticks:
+                    self._tt_fail_active(tt, tick, fail_reason, retryable=True)
+                    self._maybe_finalize_task_tree(tick)
+                    return
+            elif fail_after_assist or (
                 not protected
                 and streak >= 3
                 and active.tick_deadline
                 and tick > stage_enter + 30
             ):
-                self._tt_fail_active(tt, tick, "fallen_during_approach", retryable=True)
+                self._tt_fail_active(tt, tick, fail_reason, retryable=True)
                 self._maybe_finalize_task_tree(tick)
                 return
         else:

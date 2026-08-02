@@ -113,6 +113,10 @@ def test_protected_stall_eventually_assist_reset_once(monkeypatch: pytest.Monkey
         "engine.task_binding.human_task_embodiment_protected",
         lambda _sim: True,
     )
+    monkeypatch.setattr(
+        "engine.task_executive.active_tree_stage_kind",
+        lambda _sim: "approach",
+    )
 
     obs = {
         "com_z": 0.2,
@@ -130,6 +134,33 @@ def test_protected_stall_eventually_assist_reset_once(monkeypatch: pytest.Monkey
     sim.tick = 400
     assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is False
     assert sim.reset_calls == [1]
+
+
+def test_assist_reset_refused_during_verify_goal(monkeypatch: pytest.MonkeyPatch) -> None:
+    sim = _FallSimStub()
+    sim.tick = 200
+    sim._fall_recovery_last_progress_tick = 0
+    sim._task_fallen_ticks = 200
+    monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
+    monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
+    monkeypatch.setattr(
+        "engine.task_binding.human_task_embodiment_protected",
+        lambda _sim: True,
+    )
+    monkeypatch.setattr(
+        "engine.task_executive.active_tree_stage_kind",
+        lambda _sim: "verify_goal",
+    )
+
+    obs = {
+        "com_z": 0.2,
+        "posture_stability": 0.2,
+        "foot_contact_l": 0.0,
+        "foot_contact_r": 0.0,
+    }
+    assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is False
+    assert sim.reset_calls == []
+    assert sim._task_fall_assist_used is False
 
 
 def test_prolonged_fall_after_assist_fails_approach_retryably(

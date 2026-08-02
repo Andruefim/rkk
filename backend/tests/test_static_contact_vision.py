@@ -167,7 +167,7 @@ def test_contact_body_id_uses_cylinder_when_label_is_backward_lean() -> None:
 
 
 def test_contact_body_id_near_planter_from_agent_com_when_ontology_cylinder() -> None:
-    """Very close range + cylinder ontology: probe from agent COM near planter rim."""
+    """Close range + cylinder ontology: probe from agent COM near planter rim."""
 
     class _Harness(_StaticContactHarness):
         def _task_ontology_best_key(self) -> str | None:
@@ -183,6 +183,42 @@ def test_contact_body_id_near_planter_from_agent_com_when_ontology_cylinder() ->
     ent.bearing = 0.0
     bid = h._contact_body_id_for_task(None)
     assert bid == 201
+
+
+def test_contact_body_id_from_agent_com_when_range_within_contact_reach() -> None:
+    """Within contact_reach_m, agent COM wins over stale OWM world XY."""
+
+    class _Harness(_StaticContactHarness):
+        def _task_ontology_best_key(self) -> str | None:
+            return "cylinder"
+
+        def _agent_xy_forward(self) -> tuple[tuple[float, float], tuple[float, float]]:
+            return (1.95, 0.0), (1.0, 0.0)
+
+    h = _Harness()
+    ent = h._obj_working_memory.scene.entities["bound_0"]
+    ent.label = "cylinder"
+    ent.range_m = 0.85
+    ent.bearing = 0.0
+    bid = h._contact_body_id_for_task(None)
+    assert bid == 201
+
+
+def test_manip_has_contact_scans_all_cylinders_near_com() -> None:
+    """When primary body misses, scan all cylinder registry entries near COM."""
+
+    class _Harness(_StaticContactHarness):
+        def _task_ontology_best_key(self) -> str | None:
+            return "cylinder"
+
+        def _agent_xy_forward(self) -> tuple[tuple[float, float], tuple[float, float]]:
+            return (1.95, 0.0), (1.0, 0.0)
+
+    h = _Harness(contact_body_id=201)
+    ent = h._obj_working_memory.scene.entities["bound_0"]
+    ent.label = "cylinder"
+    ent.range_m = 0.45
+    assert h._manip_has_contact(None) is True
 
 
 def test_manip_has_contact_via_static_body_without_resolved() -> None:
