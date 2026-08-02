@@ -74,12 +74,8 @@ class SimulationFallMixin:
         self._bt_snap_payload = snap
         return snap
 
-    def _try_reset_pose_after_fall(self) -> bool:
-        """Сброс позы гуманоида (база PyBullet), чтобы выйти из ловушки fallen + VL block."""
-        from engine.task_binding import human_task_embodiment_protected
-
-        if human_task_embodiment_protected(self):
-            return False
+    def _apply_pose_reset_after_fall(self, *, event_label: str, event_color: str) -> bool:
+        """Shared reset_stance path (task/OWM state preserved on env side)."""
         env = self.agent.env
         fn = getattr(env, "reset_stance", None)
         if not callable(fn):
@@ -110,8 +106,30 @@ class SimulationFallMixin:
                 hold_fn()
             except Exception:
                 pass
-        self._add_event("🔄 Сброс позы после падения", "#44aaff", "value")
+        self._add_event(event_label, event_color, "value")
         return True
+
+    def _try_reset_pose_after_fall(self) -> bool:
+        """Сброс позы гуманоида (база PyBullet), чтобы выйти из ловушки fallen + VL block."""
+        from engine.task_binding import human_task_embodiment_protected
+
+        if human_task_embodiment_protected(self):
+            return False
+        return self._apply_pose_reset_after_fall(
+            event_label="🔄 Сброс позы после падения",
+            event_color="#44aaff",
+        )
+
+    def _try_task_fall_assist_reset(self) -> bool:
+        """One assist reset during protected human task (preserves task/OWM)."""
+        if self._apply_pose_reset_after_fall(
+            event_label="task_fall_assist_reset",
+            event_color="#66ccff",
+        ):
+            self._task_fall_assist_used = True
+            self._task_fallen_after_assist_ticks = 0
+            return True
+        return False
 
     @staticmethod
     def _fall_recovery_score(obs: dict) -> float:
@@ -267,8 +285,27 @@ class SimulationFallMixin:
             from engine.task_binding import human_task_embodiment_protected
 
             if human_task_embodiment_protected(self):
-                # Genome recovery continues; no teleport reset mid-task.
-                self._fall_recovery_last_progress_tick = self.tick
+                try:
+                    assist_threshold = int(
+                        os.environ.get("RKK_TASK_FALL_ASSIST_TICKS", "150")
+                    )
+                except ValueError:
+                    assist_threshold = 150
+                assist_threshold = max(8, min(assist_threshold, 2000))
+                fallen_ticks = int(getattr(self, "_task_fallen_ticks", 0))
+                stall_count = int(getattr(self, "_task_fall_protected_stall_ticks", 0)) + 1
+                self._task_fall_protected_stall_ticks = stall_count
+                at_threshold = (
+                    fallen_ticks >= assist_threshold
+                    or stall_count >= assist_threshold
+                )
+                if (
+                    at_threshold
+                    and not bool(getattr(self, "_task_fall_assist_used", False))
+                ):
+                    self._clear_fall_recovery()
+                    return self._try_task_fall_assist_reset()
+                # Genome recovery continues; no hard reset until assist threshold.
                 return False
             self._clear_fall_recovery()
             return self._try_reset_pose_after_fall()

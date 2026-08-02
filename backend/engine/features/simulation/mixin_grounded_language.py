@@ -3826,6 +3826,7 @@ class SimulationGroundedLanguageMixin:
         if fallen and kind in ("approach", "approach_target", "reach_contact", "reach_target"):
             streak = int(getattr(self, "_task_fall_streak", 0)) + 1
             self._task_fall_streak = streak
+            self._task_fallen_ticks = int(getattr(self, "_task_fallen_ticks", 0)) + 1
             if streak == 1:
                 self._arm_nav_hold(int(tick), reason="fallen_during_approach")
             # Do not fail/clear the task on brief falls — hard reset is already
@@ -3837,7 +3838,24 @@ class SimulationGroundedLanguageMixin:
                 protected = bool(human_task_embodiment_protected(self))
             except Exception:
                 protected = False
-            if (
+            after_assist_ticks = 0
+            if bool(getattr(self, "_task_fall_assist_used", False)):
+                after_assist_ticks = (
+                    int(getattr(self, "_task_fallen_after_assist_ticks", 0)) + 1
+                )
+                self._task_fallen_after_assist_ticks = after_assist_ticks
+            try:
+                fail_after_assist_ticks = int(
+                    os.environ.get("RKK_TASK_FALL_FAIL_TICKS", "200")
+                )
+            except ValueError:
+                fail_after_assist_ticks = 200
+            fail_after_assist_ticks = max(1, min(fail_after_assist_ticks, 5000))
+            fail_after_assist = (
+                bool(getattr(self, "_task_fall_assist_used", False))
+                and after_assist_ticks >= fail_after_assist_ticks
+            )
+            if fail_after_assist or (
                 not protected
                 and streak >= 3
                 and active.tick_deadline
@@ -4188,6 +4206,10 @@ class SimulationGroundedLanguageMixin:
         self._nav_arrival_streak = 0
         self._task_goal = None
         self._task_goal_verified = False
+        self._task_fall_assist_used = False
+        self._task_fallen_ticks = 0
+        self._task_fallen_after_assist_ticks = 0
+        self._task_fall_protected_stall_ticks = 0
 
         use_tb = task_binding_enabled()
         use_tree = task_tree_enabled() and use_tb
