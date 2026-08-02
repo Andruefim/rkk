@@ -307,10 +307,10 @@ class SimulationFallMixin:
             if human_task_embodiment_protected(self):
                 try:
                     assist_threshold = int(
-                        os.environ.get("RKK_TASK_FALL_ASSIST_TICKS", "150")
+                        os.environ.get("RKK_TASK_FALL_ASSIST_TICKS", "180")
                     )
                 except ValueError:
-                    assist_threshold = 150
+                    assist_threshold = 180
                 assist_threshold = max(8, min(assist_threshold, 2000))
                 fallen_ticks = int(getattr(self, "_task_fallen_ticks", 0))
                 stall_count = int(getattr(self, "_task_fall_protected_stall_ticks", 0)) + 1
@@ -324,6 +324,14 @@ class SimulationFallMixin:
                     and not bool(getattr(self, "_task_fall_assist_used", False))
                     and self._fall_assist_allowed_for_stage()
                 ):
+                    progress_fn = getattr(
+                        self, "_task_fall_assist_progress_blocks_reset", None
+                    )
+                    if callable(progress_fn) and progress_fn():
+                        self._add_event(
+                            "task_fall_assist_skipped_progress", "#66ccff", "value"
+                        )
+                        return False
                     self._clear_fall_recovery()
                     return self._try_task_fall_assist_reset()
                 # Genome recovery continues; no hard reset until assist threshold.

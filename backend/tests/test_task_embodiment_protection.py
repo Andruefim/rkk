@@ -43,6 +43,8 @@ class _FallSimStub(SimulationFallMixin):
         self._task_fallen_ticks = 0
         self._task_fall_assist_used = False
         self._task_fall_protected_stall_ticks = 0
+        self._task_fall_start_range = None
+        self._current_approach_range = None
         self.reset_calls: list[int] = []
         self.agent = SimpleNamespace(
             env=SimpleNamespace(reset_stance=lambda: self.reset_calls.append(1)),
@@ -57,6 +59,14 @@ class _FallSimStub(SimulationFallMixin):
 
     def _unwrap_base_env(self, env: object) -> object:
         return env
+
+
+    def _task_fall_assist_progress_blocks_reset(self) -> bool:
+        start = getattr(self, "_task_fall_start_range", None)
+        current = getattr(self, "_current_approach_range", None)
+        if start is not None and current is not None:
+            return float(start) - float(current) >= 0.15
+        return False
 
 
 def test_maybe_recover_skips_hard_reset_during_task(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -134,6 +144,37 @@ def test_protected_stall_eventually_assist_reset_once(monkeypatch: pytest.Monkey
     sim.tick = 400
     assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is False
     assert sim.reset_calls == [1]
+
+
+def test_protected_stall_skips_assist_when_range_improving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sim = _FallSimStub()
+    sim.tick = 200
+    sim._fall_recovery_last_progress_tick = 0
+    sim._task_fallen_ticks = 120
+    sim._task_fall_start_range = 4.8
+    sim._current_approach_range = 0.96
+    monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
+    monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
+    monkeypatch.setattr(
+        "engine.task_binding.human_task_embodiment_protected",
+        lambda _sim: True,
+    )
+    monkeypatch.setattr(
+        "engine.task_executive.active_tree_stage_kind",
+        lambda _sim: "approach",
+    )
+
+    obs = {
+        "com_z": 0.2,
+        "posture_stability": 0.2,
+        "foot_contact_l": 0.0,
+        "foot_contact_r": 0.0,
+    }
+    assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is False
+    assert sim.reset_calls == []
+    assert sim._task_fall_assist_used is False
 
 
 def test_assist_reset_refused_during_verify_goal(monkeypatch: pytest.MonkeyPatch) -> None:

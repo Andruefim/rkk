@@ -2041,6 +2041,73 @@ class SimulationGroundedLanguageMixin:
                 return float(vt.range_m)
         return float(oracle_dist)
 
+    @staticmethod
+    def _task_fall_assist_progress_min_m() -> float:
+        try:
+            return float(os.environ.get("RKK_TASK_FALL_ASSIST_PROGRESS_M", "0.15"))
+        except ValueError:
+            return 0.15
+
+    def _task_fall_approach_range_m(self) -> float | None:
+        """Current OWM/vision range for fall-assist progress checks."""
+        if vision_resolve_enabled():
+            owm = getattr(self, "_obj_working_memory", None)
+            tick = int(getattr(self, "tick", 0))
+            if owm is not None and owm.is_usable(tick):
+                r = float(owm.range_m)
+                if r > 0.05:
+                    return r
+            vt = getattr(self, "_manip_resolved_visual", None)
+            if vt is not None and vt.range_m is not None and float(vt.range_m) > 0.05:
+                return float(vt.range_m)
+        bind_r = getattr(self, "_owm_bind_range_m", None)
+        if bind_r is not None and float(bind_r) > 0.05:
+            return float(bind_r)
+        return None
+
+    def _task_fall_approach_com_dist_m(self) -> float | None:
+        """Agent COM distance to approach goal (origin for cylinder, else OWM/target XY)."""
+        agent_xy, _ = self._agent_xy_forward()
+        ax, ay = float(agent_xy[0]), float(agent_xy[1])
+        ont_key = str(self._task_ontology_best_key() or "").lower()
+        if ont_key == "cylinder" or "cylinder" in ont_key:
+            return float(math.hypot(ax, ay))
+        owm = getattr(self, "_obj_working_memory", None)
+        tick = int(getattr(self, "tick", 0))
+        if owm is not None and owm.is_usable(tick):
+            wxy = self._world_xy_from_owm(owm)
+            if wxy is not None:
+                return float(math.hypot(ax - wxy[0], ay - wxy[1]))
+        resolved = getattr(self, "_manip_resolved", None)
+        ref = str(getattr(resolved, "ref", "") or "")
+        target_xy = self._target_xy(ref) if ref and not ref.startswith("vision:") else None
+        if target_xy is not None:
+            return float(math.hypot(ax - target_xy[0], ay - target_xy[1]))
+        return None
+
+    def _capture_task_fall_approach_baseline(self, dist: float) -> None:
+        """Record range/COM at fall edge during approach (assist progress baseline)."""
+        self._task_fall_start_range = float(dist)
+        com_d = self._task_fall_approach_com_dist_m()
+        self._task_fall_start_com = float(com_d) if com_d is not None else None
+
+    def _task_fall_assist_progress_blocks_reset(self) -> bool:
+        """True when fallen approach made enough progress — skip assist teleport."""
+        min_gain = self._task_fall_assist_progress_min_m()
+        start_range = getattr(self, "_task_fall_start_range", None)
+        bind_range = getattr(self, "_owm_bind_range_m", None)
+        baseline_range = start_range if start_range is not None else bind_range
+        current_range = self._task_fall_approach_range_m()
+        if baseline_range is not None and current_range is not None:
+            if float(baseline_range) - float(current_range) >= min_gain:
+                return True
+        start_com = getattr(self, "_task_fall_start_com", None)
+        current_com = self._task_fall_approach_com_dist_m()
+        if start_com is not None and current_com is not None:
+            if float(start_com) - float(current_com) >= min_gain:
+                return True
+        return False
+
     def _slot_concept_project_fn(self) -> Any | None:
         """NeuralConceptProjector: slot_vec → concept names (language space)."""
         nlg = getattr(self, "_neural_lang", None)
@@ -3955,6 +4022,7 @@ class SimulationGroundedLanguageMixin:
             self._task_fallen_ticks = int(getattr(self, "_task_fallen_ticks", 0)) + 1
             if kind in _approach_fall_kinds and streak == 1:
                 self._arm_nav_hold(int(tick), reason="fallen_during_approach")
+                self._capture_task_fall_approach_baseline(float(dist))
             # Do not fail/clear the task on brief falls — hard reset is already
             # deferred by embodiment protection; keep approach alive.
             protected = False
@@ -4002,6 +4070,8 @@ class SimulationGroundedLanguageMixin:
                 return
         else:
             self._task_fall_streak = 0
+            self._task_fall_start_range = None
+            self._task_fall_start_com = None
 
         self._register_task_navigation(
             active=active,
@@ -4346,6 +4416,8 @@ class SimulationGroundedLanguageMixin:
         self._task_fallen_ticks = 0
         self._task_fallen_after_assist_ticks = 0
         self._task_fall_protected_stall_ticks = 0
+        self._task_fall_start_range = None
+        self._task_fall_start_com = None
 
         use_tb = task_binding_enabled()
         use_tree = task_tree_enabled() and use_tb
