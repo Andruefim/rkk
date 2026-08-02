@@ -1507,21 +1507,34 @@ class SimulationGroundedLanguageMixin:
         prev = getattr(self, "_task_locked_body_id", None)
         if prev is not None:
             prev_row = self._static_registry_row_for_body(int(prev))
-            # Keep an existing planter lock across vision rebinds unless it is gone.
+            # Keep an existing planter lock across vision rebinds unless depth
+            # strongly disagrees (wrong planter / chrome mis-lock leftover).
             if prev_row is not None and str(prev_row.get("style", "")) == "planter":
+                keep = True
                 try:
-                    task_log_event(
-                        "task_body_lock",
-                        tick=int(getattr(self, "tick", 0)),
-                        locked_body_id=int(prev),
-                        label=str(getattr(vt, "label", "") or ""),
-                        style="planter",
-                        kept=True,
-                        radius_m=round(float(prev_row.get("radius", 0.0)), 4),
-                    )
+                    phys = self._physics_range_to_locked_body()
+                    vision = None
+                    if vt is not None and vt.range_m is not None:
+                        vision = float(vt.range_m)
+                    if phys is not None and vision is not None and float(phys) - float(vision) > 1.2:
+                        keep = False
                 except Exception:
-                    pass
-                return
+                    keep = True
+                if keep:
+                    try:
+                        task_log_event(
+                            "task_body_lock",
+                            tick=int(getattr(self, "tick", 0)),
+                            locked_body_id=int(prev),
+                            label=str(getattr(vt, "label", "") or ""),
+                            style="planter",
+                            kept=True,
+                            radius_m=round(float(prev_row.get("radius", 0.0)), 4),
+                        )
+                    except Exception:
+                        pass
+                    return
+                self._task_locked_body_id = None
         resolved = getattr(self, "_manip_resolved", None)
         body_id = self._contact_body_id_for_task(resolved)
         if body_id is None:
@@ -1633,7 +1646,7 @@ class SimulationGroundedLanguageMixin:
             return float(dist)
         # Physics is ground truth for stage gates once a body is locked.
         # Optimistic vision (much closer than phys) must not complete approach early.
-        if float(dist) + 0.45 < float(phys):
+        if float(phys) - float(dist) > 0.25:
             blended = float(phys)
             self._maybe_relock_body_on_optimistic_vision(
                 int(tick),
@@ -4081,12 +4094,12 @@ class SimulationGroundedLanguageMixin:
             # Prefer physics surface range for stop decisions when locked.
             phys = self._physics_range_to_locked_body()
             if phys is not None:
-                if float(range_m) + 0.45 < float(phys):
+                if float(phys) - float(owm.range_m) > 0.25:
                     range_m = float(phys)
                 else:
-                    range_m = min(float(range_m), float(phys))
+                    range_m = min(float(owm.range_m), float(phys))
             nav_bearing = float(owm.bearing)
-            if phys is not None and abs(float(owm.range_m) - float(phys)) > 0.55:
+            if phys is not None and abs(float(owm.range_m) - float(phys)) > 0.35:
                 row = self._static_registry_row_for_body(
                     int(getattr(self, "_task_locked_body_id", 0) or 0)
                 )

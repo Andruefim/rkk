@@ -422,6 +422,9 @@ def test_forward_cylinder_prefers_near_planter_over_far() -> None:
     # Optimistic vision must not beat physics for approach gates.
     blended = h._blend_dist_with_physics_range(0.3, 0.3, 50)
     assert blended == pytest.approx(1.7, abs=0.05)
+    # Mild optimism still defers to physics when gap > 0.25m.
+    blended2 = h._blend_dist_with_physics_range(1.4, 1.4, 80)
+    assert blended2 == pytest.approx(1.7, abs=0.05)
     # Sticky planter lock across rebinds.
     h._lock_task_contact_body_on_bind()
     assert h._task_locked_body_id == 201
