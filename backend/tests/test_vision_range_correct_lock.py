@@ -197,6 +197,7 @@ def test_soft_fix_without_rebind_keeps_lock(
 
     assert rebind_calls["n"] == 0
     assert sim._latent_scene.hard_lock_active is True
+    assert float(sim._obj_working_memory.range_m) == pytest.approx(1.8)
 
 
 def test_escalate_passes_allow_full_resolve_after_rejects(

@@ -643,15 +643,24 @@ class SimulationSkillsMixin:
             "1", "true", "yes", "on",
         )
         if ai_on and not s2_strict:
-            try:
-                every = max(1, int(os.environ.get("RKK_ACTIVE_INFERENCE_EVERY", "4")))
-            except ValueError:
-                every = 4
-            if engine_tick % every == 0:
+            skip_global_ai = self._human_task_suppresses_autonomous_locomotion()
+            if not skip_global_ai:
                 try:
-                    return self._run_active_inference_step(engine_tick)
+                    from engine.task_executive import human_task_executive_active
+
+                    skip_global_ai = human_task_executive_active(self)
                 except Exception:
                     pass
+            if not skip_global_ai:
+                try:
+                    every = max(1, int(os.environ.get("RKK_ACTIVE_INFERENCE_EVERY", "4")))
+                except ValueError:
+                    every = 4
+                if engine_tick % every == 0:
+                    try:
+                        return self._run_active_inference_step(engine_tick)
+                    except Exception:
+                        pass
         if self._start_skill_if_due(engine_tick):
             return self._execute_skill_frame()
         fallen = False

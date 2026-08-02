@@ -409,3 +409,106 @@ def test_wm_ai_assert_forward_when_aligned(monkeypatch: pytest.MonkeyPatch) -> N
     )
     assert meta_t.get("nav_fwd_assert") is not True
     assert abs(float(intents_t["intent_stride"]) - 0.50) < 0.02
+
+
+def test_enrich_visual_target_latent_from_nearest_slot() -> None:
+    from engine.features.simulation.mixin_grounded_language import (
+        SimulationGroundedLanguageMixin,
+    )
+
+    class _Harness(SimulationGroundedLanguageMixin):
+        def _visual_env_ref(self):
+            return object()
+
+    h = _Harness()
+    vt = VisualTarget(
+        slot_id="obj_peak",
+        u=0.52,
+        v=0.48,
+        label="prop",
+        confidence=0.6,
+        bearing=0.04,
+        range_m=2.1,
+        diagnostics={"geometry": "objectness_peak"},
+    )
+
+    def _fake_slots(_env):
+        return [
+            {"slot_id": "slot_0", "u": 0.2, "v": 0.5, "vector": [0.0, 1.0, 0.0]},
+            {"slot_id": "slot_1", "u": 0.51, "v": 0.47, "vector": [0.9, 0.1, 0.2]},
+        ]
+
+    import engine.features.simulation.mixin_grounded_language as mgl
+
+    orig = mgl.collect_vision_slots
+    mgl.collect_vision_slots = _fake_slots
+    try:
+        out = h._enrich_visual_target_latent(vt)
+    finally:
+        mgl.collect_vision_slots = orig
+
+    assert out.latent == pytest.approx([0.9, 0.1, 0.2])
+    assert out.diagnostics.get("latent_source") == "nearest_slot_uv"
+
+
+def test_rebind_task_binding_after_vision_sets_target_dist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engine.features.simulation.mixin_grounded_language import (
+        SimulationGroundedLanguageMixin,
+    )
+    from engine.task_binding import TaskBindingController
+
+    monkeypatch.setenv("RKK_TASK_BINDING", "1")
+    monkeypatch.setenv("RKK_GROUNDED_LANG", "1")
+    monkeypatch.setenv("RKK_TASK_RESOLVE", "vision")
+
+    class _Harness(SimulationGroundedLanguageMixin):
+        def __init__(self) -> None:
+            self.tick = 50
+            self._task_binding = TaskBindingController()
+            self._task_goal = None
+            self.agent = SimpleNamespace(
+                graph=SimpleNamespace(
+                    nodes={"task_target_dist_m": 5.0},
+                    _core=SimpleNamespace(device="cpu"),
+                    snapshot_vec_dict=lambda: {"task_target_dist_m": 5.0},
+                ),
+                env=SimpleNamespace(observe=lambda: {"task_target_dist_m": 5.0}),
+            )
+
+        def _graph_vec_cached(self):
+            return {"task_target_dist_m": 5.0}
+
+        def _agent_xy_forward(self):
+            return (0.0, 0.0), (1.0, 0.0)
+
+        def _ensure_task_tree(self):
+            return SimpleNamespace(active_node=None)
+
+    h = _Harness()
+    visual = VisualTarget(
+        slot_id="slot_3",
+        u=0.5,
+        v=0.5,
+        label="chair",
+        confidence=0.7,
+        bearing=0.0,
+        range_m=1.6,
+        range_conf=0.8,
+        latent=[1.0, 0.0, 0.0],
+    )
+    seen: dict[str, Any] = {}
+    orig = h._task_binding.bind_command
+
+    def _spy_bind(*args, **kwargs):
+        seen["target_xy"] = kwargs.get("target_xy")
+        return orig(*args, **kwargs)
+
+    h._task_binding.bind_command = _spy_bind  # type: ignore[method-assign]
+    h._rebind_task_binding_after_vision(
+        tick=50, text="approach the chair", visual=visual
+    )
+    assert seen.get("target_xy") == pytest.approx((1.6, 0.0))
+    assert h._task_binding.active_task is not None
+    assert h._task_binding.active_task.text == "approach the chair"

@@ -48,7 +48,11 @@ _VISUAL_REFERENT_CATALOG: tuple[VisualReferentEntry, ...] = (
     VisualReferentEntry("object", "the object in front of you"),
     VisualReferentEntry("object", "something to approach and touch"),
     VisualReferentEntry("object", "a physical object in the camera view"),
-    VisualReferentEntry("object", "подойди к объекту перед тобой и дотронься"),
+    VisualReferentEntry(
+        "cylinder",
+        "подойди к цилиндрическому объекту перед тобой и дотронься",
+        weight=1.3,
+    ),
     VisualReferentEntry("chair", "стул в сцене"),
     VisualReferentEntry("chair", "a chair"),
     VisualReferentEntry("chair", "chair in front of you"),

@@ -16,6 +16,15 @@ from engine.features.humanoid.constants import MOTOR_INTENT_VARS
 from engine.graph_constants import is_read_only_macro_var
 
 
+def _active_inference_debug() -> bool:
+    return os.environ.get("RKK_ACTIVE_INFERENCE_DEBUG", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _resolve_target_pairs(
     node_ids: list[str], target_priors: dict[str, float]
 ) -> list[tuple[int, float]]:
@@ -183,9 +192,10 @@ class HomeostaticController:
                     if A_free.grad is not None
                     else 0.0
                 )
-                print(
-                    f"[ACTIVE INF] Iter 0: Loss {total_loss.item():.4f}, Max Grad {gn:.6f}"
-                )
+                if _active_inference_debug():
+                    print(
+                        f"[ACTIVE INF] Iter 0: Loss {total_loss.item():.4f}, Max Grad {gn:.6f}"
+                    )
             optimizer.step()
             with torch.no_grad():
                 A_free.clamp_(0.0, 1.0)
@@ -215,17 +225,18 @@ class HomeostaticController:
                 torch.clamp(target_vals.squeeze(0), 0.0, 1.0),
             )
             active_targets = [node_ids[i] for i in target_ix]
-            print(
-                f"[ACTIVE INF] Targets: {active_targets} | Curr: {curr_vals.tolist()} | "
-                f"Pred: {pred_raw.tolist()} (clipped {pred_vals.tolist()}) | Loss: {tl.item():.6f}"
-            )
-            if optimized_actions:
-                top_acts = sorted(
-                    optimized_actions.items(),
-                    key=lambda x: abs(x[1] - 0.5),
-                    reverse=True,
-                )[:3]
-                print(f"[ACTIVE INF] Top Actions: {top_acts}")
+            if _active_inference_debug():
+                print(
+                    f"[ACTIVE INF] Targets: {active_targets} | Curr: {curr_vals.tolist()} | "
+                    f"Pred: {pred_raw.tolist()} (clipped {pred_vals.tolist()}) | Loss: {tl.item():.6f}"
+                )
+                if optimized_actions:
+                    top_acts = sorted(
+                        optimized_actions.items(),
+                        key=lambda x: abs(x[1] - 0.5),
+                        reverse=True,
+                    )[:3]
+                    print(f"[ACTIVE INF] Top Actions: {top_acts}")
             try:
                 from engine.neural_logger import neural_log_event, summarize_prediction_gaps
 

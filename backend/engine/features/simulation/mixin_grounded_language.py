@@ -1475,7 +1475,117 @@ class SimulationGroundedLanguageMixin:
         except Exception:
             return None
 
+    def _enrich_visual_target_latent(self, vt: VisualTarget) -> VisualTarget:
+        """Attach nearest SlotAttention latent when objectness bind lacks one."""
+        if vt.latent:
+            return vt
+        diags = dict(vt.diagnostics or {})
+        raw_lat = diags.get("latent")
+        if raw_lat:
+            try:
+                vt.latent = [float(x) for x in raw_lat]
+            except (TypeError, ValueError):
+                pass
+            if vt.latent:
+                return vt
+        slots = collect_vision_slots(self._visual_env_ref())
+        if not slots:
+            return vt
+        u, v = float(vt.u), float(vt.v)
+        best: dict[str, Any] | None = None
+        best_d2 = 1e9
+        for s in slots:
+            vec = s.get("vector") or s.get("latent")
+            if vec is None:
+                continue
+            su = float(s.get("u", 0.5))
+            sv = float(s.get("v", 0.55))
+            d2 = (su - u) ** 2 + (sv - v) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best = s
+        if best is None:
+            return vt
+        from engine.vision_resolve import _slot_latent_list
+
+        lat = _slot_latent_list(best)
+        if not lat:
+            return vt
+        vt.latent = lat
+        diags["latent"] = lat
+        diags["latent_dim"] = len(lat)
+        diags["latent_source"] = "nearest_slot_uv"
+        vt.diagnostics = diags
+        return vt
+
+    def _rebind_task_binding_after_vision(
+        self,
+        *,
+        tick: int,
+        text: str,
+        visual: VisualTarget,
+        goal: Any | None = None,
+    ) -> None:
+        """Re-imagine WM expected_state once deferred vision resolve has a target."""
+        if not task_binding_enabled():
+            return
+        tb = self._ensure_task_binding()
+        gl = getattr(self, "_grounded_lang", None)
+        embed_fn = (
+            gl.embedder.embed
+            if gl is not None and getattr(gl, "embedder", None)
+            else None
+        )
+        if goal is None:
+            goal = getattr(self, "_task_goal", None)
+        try:
+            obs = dict(self._graph_vec_cached())
+        except Exception:
+            try:
+                obs = dict(self.agent.env.observe())
+            except Exception:
+                obs = {}
+        bind_agent_xy, bind_agent_fwd = self._agent_xy_forward()
+        bind_target_xy = None
+        if vision_resolve_enabled() and visual is not None:
+            ax, ay = bind_agent_xy
+            fx, fy = bind_agent_fwd
+            r = float(visual.range_m or 1.0)
+            bind_target_xy = (ax + fx * r, ay + fy * r)
+        task = tb.bind_command(
+            self.agent.graph,
+            obs,
+            text,
+            int(tick),
+            embed_fn=embed_fn,
+            goal=goal,
+            agent_xy=bind_agent_xy,
+            target_xy=bind_target_xy,
+            agent_forward=bind_agent_fwd,
+        )
+        if goal is not None:
+            exp: dict[str, float] = {}
+            for p in goal.predicates:
+                if p.kind == "state_key" and p.key:
+                    exp[str(p.key)] = float(p.target_value)
+            if exp:
+                task.expected_state.update(exp)
+        self._task_log_imagine_done(int(tick), task)
+        ic = getattr(self, "_intention_cortex", None)
+        if ic is None and hasattr(self, "_ensure_intention_cortex"):
+            try:
+                ic = self._ensure_intention_cortex()
+            except Exception:
+                ic = None
+        if ic is not None and hasattr(ic, "absorb_human_task"):
+            tt = self._ensure_task_tree()
+            stage_kind = ""
+            if tt.active_node is not None:
+                stage_kind = str(tt.active_node.kind)
+            ic.absorb_human_task(task, obs, int(tick), stage_kind=stage_kind)
+
     def _bind_object_working_memory(self, vt: VisualTarget, tick: int) -> None:
+        vt = self._enrich_visual_target_latent(vt)
         conf = float(vt.confidence)
         agent_xy, agent_fwd = self._agent_xy_forward()
         scene = self._latent_scene_memory()
@@ -2691,11 +2801,17 @@ class SimulationGroundedLanguageMixin:
 
         streak = int(getattr(self, "_vision_range_mismatch_streak", 0)) + 1
         self._vision_range_mismatch_streak = streak
-        need_streak = 3 if ratio > 1.75 else 5
+        need_streak = 2 if ratio > 1.5 else 3
         if streak < need_streak:
             return
         self._vision_range_mismatch_streak = 0
-        self._vision_range_correct_until_tick = int(tick) + 40
+        try:
+            cooldown = max(
+                8, int(os.environ.get("RKK_VISION_RANGE_CORRECT_COOLDOWN", "14"))
+            )
+        except ValueError:
+            cooldown = 14
+        self._vision_range_correct_until_tick = int(tick) + cooldown
 
         scene = getattr(self, "_latent_scene", None)
         cam = self._depth_camera_from_sim()
@@ -2744,17 +2860,17 @@ class SimulationGroundedLanguageMixin:
 
         try:
             escalate_after = max(
-                1, int(os.environ.get("RKK_VISION_FLOOR_LOCK_ESCALATE_AFTER", "3"))
+                1, int(os.environ.get("RKK_VISION_FLOOR_LOCK_ESCALATE_AFTER", "2"))
             )
         except ValueError:
-            escalate_after = 3
+            escalate_after = 2
         try:
             force_after = max(
                 escalate_after + 1,
-                int(os.environ.get("RKK_VISION_FLOOR_LOCK_FORCE_UNLOCK_AFTER", "5")),
+                int(os.environ.get("RKK_VISION_FLOOR_LOCK_FORCE_UNLOCK_AFTER", "3")),
             )
         except ValueError:
-            force_after = 5
+            force_after = 3
 
         reject_streak = int(getattr(self, "_vision_floor_lock_reject_streak", 0) or 0)
         ent = scene.active()
@@ -2798,8 +2914,21 @@ class SimulationGroundedLanguageMixin:
         else:
             # Soft path fixed the mismatch without rebind — keep lock.
             self._vision_floor_lock_reject_streak = 0
+            ent = scene.active()
+            if ent is not None and float(ent.range_m) <= od * 1.25 + 0.20:
+                self._obj_working_memory = ObjectWorkingMemory(scene)
+                if getattr(self, "agent", None) is not None:
+                    try:
+                        self._inject_owm_into_graph(scene)
+                    except Exception:
+                        pass
+                mrv = getattr(self, "_manip_resolved_visual", None)
+                if mrv is not None:
+                    mrv.range_m = float(ent.range_m)
+                    mrv.bearing = float(ent.bearing)
 
         self._owm_cached_tick = -1
+        self._owm_cached = None
         self._task_log_prev_vision_range = None
         try:
             ent = scene.active()
@@ -3409,6 +3538,12 @@ class SimulationGroundedLanguageMixin:
                     "non_production": bool((visual.diagnostics or {}).get("non_production")),
                     "source": (visual.diagnostics or {}).get("source"),
                 },
+            )
+            self._rebind_task_binding_after_vision(
+                tick=live,
+                text=text,
+                visual=visual,
+                goal=goal,
             )
             self._task_tree_stage_enter_tick = live
         elif resolved is not None:
