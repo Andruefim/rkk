@@ -1699,7 +1699,18 @@ class SimulationGroundedLanguageMixin:
             agent_xy=agent_xy,
             agent_forward=agent_fwd,
         )
-        if bool(getattr(scene, "hard_lock_active", False)) and scene.active_ids:
+        # Live-camera depth refresh is the dominant per-tick cost during approach
+        # (~100-200ms). Throttle to a cadence; odometry warp in scene.update keeps the
+        # lock between full depth refreshes.
+        try:
+            _live_every = max(1, int(os.environ.get("RKK_OWM_LIVE_REFRESH_EVERY", "3")))
+        except ValueError:
+            _live_every = 3
+        if (
+            bool(getattr(scene, "hard_lock_active", False))
+            and scene.active_ids
+            and (int(tick) % _live_every == 0)
+        ):
             try:
                 cam = self._depth_camera_from_sim()
                 if cam is not None:
@@ -2956,111 +2967,162 @@ class SimulationGroundedLanguageMixin:
             meta["nav_ai_reason"] = "active_inference_off_fallback_heur"
             return heur, meta
 
+        # Turning regime: when the target is off-axis the forward homeostatic/WM plan
+        # must NOT clobber the perceptual turn intents, otherwise the agent strafes
+        # past off-axis targets (regression observed after b78266c: range plateaus
+        # while |bearing| stays large). Alignment threshold reused from assert-forward.
         try:
-            priors = self._inject_owm_nav_priors(owm, stop=float(stop))
-            ensure = getattr(self, "_ensure_homeostatic_ctrl", None)
-            if not callable(ensure):
-                from engine.active_inference import HomeostaticController
-                import torch
+            align_thr = float(os.environ.get("RKK_NAV_ALIGN_BEARING", "0.40"))
+        except ValueError:
+            align_thr = 0.40
+        turning = abs(float(owm.bearing)) > align_thr
+        meta["nav_turning"] = bool(turning)
 
-                device = getattr(
-                    self.agent.graph._core, "device", torch.device("cpu")
-                )
-                self._homeostatic_ctrl = HomeostaticController(
-                    device=device, learning_rate=0.1, max_iters=8
-                )
-                ctrl = self._homeostatic_ctrl
-            else:
-                ctrl = ensure()
+        # Performance: the homeostatic optimize + WM beam is the dominant per-tick cost
+        # during approach (~110ms). Replan on a neural MPC cadence and hold the last
+        # plan between replans; the cheap perceptual heuristic still recomputes each
+        # tick so turning stays responsive.
+        tick = int(getattr(self, "tick", 0))
+        try:
+            replan_every = max(1, int(os.environ.get("RKK_TASK_NAV_REPLAN_EVERY", "4")))
+        except ValueError:
+            replan_every = 4
+        cache_mapped = getattr(self, "_nav_ai_cache_mapped", None)
+        cache_tick = int(getattr(self, "_nav_ai_cache_tick", -(10 ** 9)))
+        cache_reason = str(getattr(self, "_nav_ai_cache_reason", ""))
+        # Only reuse a plan computed on an EARLIER tick (strictly older); repeated
+        # calls within the same tick recompute (never memoize a mid-tick plan).
+        fresh = (
+            cache_mapped is not None
+            and cache_tick < tick
+            and (tick - cache_tick) < replan_every
+        )
 
-            obs = self.agent.graph.snapshot_vec_dict()
-            # Keep OWM live values in the state vector used for optimize.
-            obs["vision_bearing"] = float(owm.bearing)
-            obs["vision_range_m"] = float(owm.range_m)
-            if "task_target_dist_m" in obs:
-                obs["task_target_dist_m"] = float(owm.range_m)
+        if fresh:
+            mapped = dict(cache_mapped)
+            meta["nav_ai_cached"] = True
+            if cache_reason:
+                meta["nav_ai_reason"] = cache_reason
+        else:
+            mapped = {}
+            try:
+                priors = self._inject_owm_nav_priors(owm, stop=float(stop))
+                ensure = getattr(self, "_ensure_homeostatic_ctrl", None)
+                if not callable(ensure):
+                    from engine.active_inference import HomeostaticController
+                    import torch
 
-            actions = ctrl.optimize_action(obs, self.agent.graph, priors) or {}
-            mapped: dict[str, float] = {}
-            for gid, val in actions.items():
-                ev = _graph_nid_to_motor_intent(str(gid))
-                if ev is not None:
-                    mapped[ev] = float(val)
-
-            # Optional short WM beam nudge only when WM has trained enough.
-            if not mapped and wm_warm:
-                try:
-                    from engine.goal_planning import beam_search_first_action
-
-                    state0 = dict(obs)
-                    cand_actions: list[tuple[str, float]] = [
-                        ("intent_gait_coupling", 0.35),
-                        ("intent_gait_coupling", 0.65),
-                        ("intent_stride", 0.55),
-                        ("intent_stride", 0.72),
-                    ]
-                    stop_f = float(stop)
-
-                    def _score(
-                        _s0: dict[str, float],
-                        var: str,
-                        val: float,
-                        s_after: dict[str, float],
-                    ) -> float:
-                        br = float(s_after.get("vision_bearing", owm.bearing))
-                        rg = float(s_after.get("vision_range_m", owm.range_m))
-                        # Prefer smaller |bearing| and range approaching stop.
-                        return -abs(br) - 0.15 * abs(rg - stop_f)
-
-                    best, _sc = beam_search_first_action(
-                        self.agent,
-                        state0=state0,
-                        actions=cand_actions,
-                        depth=1,
-                        beam_k=4,
-                        rollout_horizon=1,
-                        score_fn=_score,
-                        maximize=True,
+                    device = getattr(
+                        self.agent.graph._core, "device", torch.device("cpu")
                     )
-                    if best is not None:
-                        var, val = best
-                        ev = _graph_nid_to_motor_intent(str(var)) or (
-                            str(var) if str(var).startswith("intent_") else None
+                    self._homeostatic_ctrl = HomeostaticController(
+                        device=device, learning_rate=0.1, max_iters=8
+                    )
+                    ctrl = self._homeostatic_ctrl
+                else:
+                    ctrl = ensure()
+
+                obs = self.agent.graph.snapshot_vec_dict()
+                # Keep OWM live values in the state vector used for optimize.
+                obs["vision_bearing"] = float(owm.bearing)
+                obs["vision_range_m"] = float(owm.range_m)
+                if "task_target_dist_m" in obs:
+                    obs["task_target_dist_m"] = float(owm.range_m)
+
+                actions = ctrl.optimize_action(obs, self.agent.graph, priors) or {}
+                for gid, val in actions.items():
+                    ev = _graph_nid_to_motor_intent(str(gid))
+                    if ev is not None:
+                        mapped[ev] = float(val)
+
+                # Optional short WM beam nudge only when WM has trained enough.
+                if not mapped and wm_warm:
+                    try:
+                        from engine.goal_planning import beam_search_first_action
+
+                        state0 = dict(obs)
+                        cand_actions: list[tuple[str, float]] = [
+                            ("intent_gait_coupling", 0.35),
+                            ("intent_gait_coupling", 0.65),
+                            ("intent_stride", 0.55),
+                            ("intent_stride", 0.72),
+                        ]
+                        stop_f = float(stop)
+
+                        def _score(
+                            _s0: dict[str, float],
+                            var: str,
+                            val: float,
+                            s_after: dict[str, float],
+                        ) -> float:
+                            br = float(s_after.get("vision_bearing", owm.bearing))
+                            rg = float(s_after.get("vision_range_m", owm.range_m))
+                            # Prefer smaller |bearing| and range approaching stop.
+                            return -abs(br) - 0.15 * abs(rg - stop_f)
+
+                        best, _sc = beam_search_first_action(
+                            self.agent,
+                            state0=state0,
+                            actions=cand_actions,
+                            depth=1,
+                            beam_k=4,
+                            rollout_horizon=1,
+                            score_fn=_score,
+                            maximize=True,
                         )
-                        if ev:
-                            mapped[ev] = float(val)
-                            meta["nav_ai_reason"] = "wm_beam"
-                except Exception as exc:
-                    meta["wm_beam_error"] = str(exc)
-            elif not mapped and not wm_warm:
-                meta["wm_beam_skipped"] = "wm_cold"
+                        if best is not None:
+                            var, val = best
+                            ev = _graph_nid_to_motor_intent(str(var)) or (
+                                str(var) if str(var).startswith("intent_") else None
+                            )
+                            if ev:
+                                mapped[ev] = float(val)
+                                meta["nav_ai_reason"] = "wm_beam"
+                    except Exception as exc:
+                        meta["wm_beam_error"] = str(exc)
+                elif not mapped and not wm_warm:
+                    meta["wm_beam_skipped"] = "wm_cold"
+            except Exception as exc:
+                meta["nav_ai_reason"] = f"ai_error_fallback_heur:{exc}"
+                self._nav_ai_cache_mapped = None
+                return heur, meta
 
-            if mapped and (
-                "intent_gait_coupling" in mapped or "intent_stride" in mapped
-            ):
-                out = dict(heur)
-                for k, v in mapped.items():
-                    if str(k).startswith("intent_"):
-                        out[str(k)] = float(v)
-                out = self._assert_forward_when_aligned(
-                    out,
-                    heur,
-                    bearing=float(owm.bearing),
-                    range_m=float(owm.range_m),
-                    stop=float(stop),
-                    meta=meta,
-                )
-                meta["nav_ai_ok"] = True
-                if not meta.get("nav_ai_reason"):
-                    meta["nav_ai_reason"] = "homeostatic"
-                meta["nav_ai_intents"] = sorted(mapped.keys())
-                return out, meta
+            self._nav_ai_cache_mapped = dict(mapped)
+            self._nav_ai_cache_tick = tick
+            self._nav_ai_cache_reason = str(meta.get("nav_ai_reason", ""))
 
-            meta["nav_ai_reason"] = "ai_empty_fallback_heur"
-            return heur, meta
-        except Exception as exc:
-            meta["nav_ai_reason"] = f"ai_error_fallback_heur:{exc}"
-            return heur, meta
+        if mapped and (
+            "intent_gait_coupling" in mapped or "intent_stride" in mapped
+        ):
+            out = dict(heur)
+            heur_stride = float(heur.get("intent_stride", 0.5))
+            for k, v in mapped.items():
+                ks = str(k)
+                if not ks.startswith("intent_"):
+                    continue
+                # Off-axis regime: the forward plan must not push stride ABOVE the
+                # perceptual turn-stride, otherwise the agent charges forward and
+                # strafes past off-axis targets instead of turning (plateau observed
+                # after b78266c). Lower/equal forward stride still applies.
+                if turning and ks == "intent_stride" and float(v) > heur_stride:
+                    continue
+                out[ks] = float(v)
+            out = self._assert_forward_when_aligned(
+                out,
+                heur,
+                bearing=float(owm.bearing),
+                range_m=float(owm.range_m),
+                stop=float(stop),
+                meta=meta,
+            )
+            meta["nav_ai_ok"] = True
+            if not meta.get("nav_ai_reason"):
+                meta["nav_ai_reason"] = "homeostatic"
+            meta["nav_ai_intents"] = sorted(mapped.keys())
+            return out, meta
+
+        meta["nav_ai_reason"] = "ai_empty_fallback_heur"
+        return heur, meta
 
     def _register_task_navigation(
         self,
