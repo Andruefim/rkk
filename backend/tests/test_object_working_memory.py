@@ -303,7 +303,7 @@ def test_refresh_active_from_live_camera_updates_uv() -> None:
 
 
 def test_hard_lock_refresh_does_not_yank_bearing() -> None:
-    """Far live peak under hard_lock must not rewrite navigation bearing."""
+    """Far live peak under hard_lock must get near-zero Kalman gain (no yank)."""
 
     class _FarCam:
         def live_at_bearing(self, bearing, **_kwargs):
@@ -329,16 +329,24 @@ def test_hard_lock_refresh_does_not_yank_bearing() -> None:
     assert ok
     act = scene.active()
     assert act is not None
-    assert act.bearing == pytest.approx(locked_bearing, abs=1e-6)
-    assert float(act.diagnostics.get("bearing_nudge") or 0.0) == pytest.approx(0.0)
-    assert act.diagnostics.get("near_locked") is False
+    # Continuous fusion may apply a tiny residual nudge — never a yank.
+    assert abs(float(act.bearing) - locked_bearing) < 0.03
+    assert float(act.diagnostics.get("kalman_gain") or 1.0) < 0.08
+    assert abs(float(act.diagnostics.get("bearing_nudge") or 1.0)) < 0.03
+    assert act.diagnostics.get("source") == "hard_lock_bayesian_kalman"
 
 
 def test_hard_lock_near_live_applies_bounded_nudge(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Near live hit under hard_lock may EMA-nudge bearing, never jump."""
-    monkeypatch.setenv("RKK_HARD_LOCK_BEARING_NUDGE_MAX", "0.04")
-    monkeypatch.setenv("RKK_HARD_LOCK_BEARING_NUDGE_EMA", "1.0")
+    """Near live hit under hard_lock gets higher Kalman gain than a far outlier."""
     monkeypatch.setenv("RKK_HARD_LOCK_BEARING_SLACK", "0.25")
+    from engine.object_working_memory import _bayesian_vision_kalman_gain
+
+    k_near, _ = _bayesian_vision_kalman_gain(0.05, 0.9, outlier_scale=0.25)
+    k_far, _ = _bayesian_vision_kalman_gain(0.90, 0.9, outlier_scale=0.25)
+    assert k_near > k_far
+    assert k_far < 0.08
+    assert k_near > 0.20
+
     from engine.vision_depth import ArrayDepthCamera, DepthFrame
 
     scene = LatentSceneMemory()
@@ -364,9 +372,9 @@ def test_hard_lock_near_live_applies_bounded_nudge(monkeypatch: pytest.MonkeyPat
     assert ok
     act = scene.active()
     assert act is not None
-    assert abs(float(act.bearing) - before) <= 0.04 + 1e-6
+    assert abs(float(act.bearing) - before) < 0.20
     assert act.diagnostics.get("live_bearing") is not None
-    assert act.diagnostics.get("bearing_live_delta") is not None
+    assert act.diagnostics.get("kalman_gain") is not None
 
 
 def test_odom_discontinuity_skips_warp_and_reseeds(monkeypatch: pytest.MonkeyPatch) -> None:

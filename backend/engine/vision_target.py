@@ -62,6 +62,8 @@ class VisualTarget:
     range_conf: float | None = None
     bbox: tuple[float, float, float, float] | None = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    # SlotAttention embedding for cosine re-ID across slot permutations.
+    latent: list[float] | None = None
 
     @property
     def ref(self) -> str:
@@ -106,6 +108,7 @@ class VisualTarget:
             range_conf=range_conf,
             bbox=self.bbox,
             diagnostics=dict(self.diagnostics),
+            latent=list(self.latent) if self.latent else None,
         )
 
     def with_uv(self, u: float, v: float, *, bearing: float | None = None) -> "VisualTarget":
@@ -122,6 +125,7 @@ class VisualTarget:
             range_conf=self.range_conf,
             bbox=self.bbox,
             diagnostics=dict(self.diagnostics),
+            latent=list(self.latent) if self.latent else None,
         )
 
     def to_dict(self) -> dict[str, Any]:

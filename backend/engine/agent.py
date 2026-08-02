@@ -2408,6 +2408,38 @@ class RKKAgent:
             if notears_result:
                 self._notears_steps += 1
                 self._last_notears_loss = notears_result
+                try:
+                    from engine.neural_logger import neural_log_event
+
+                    neural_log_event(
+                        "wm",
+                        "train_step",
+                        tick=int(engine_tick),
+                        **{
+                            k: v
+                            for k, v in dict(notears_result).items()
+                            if k
+                            in (
+                                "loss",
+                                "l_rec",
+                                "l_jepa",
+                                "l_sig",
+                                "l_dag",
+                                "l_l1",
+                                "l_int",
+                                "l_traj",
+                                "l_sz",
+                                "l_bridge",
+                                "mode",
+                                "batch_B",
+                                "seq_T",
+                                "h_W",
+                            )
+                        },
+                        wm_train_calls=int(getattr(self.graph, "_wm_train_calls", 0) or 0),
+                    )
+                except Exception:
+                    pass
 
         if _fallen_fast:
             mdl_after = mdl_before
@@ -2422,6 +2454,39 @@ class RKKAgent:
                 for k in self.graph._node_ids[:32]
             ]) if self.graph._node_ids else 0.0
         )
+        try:
+            from engine.neural_logger import neural_log_event, summarize_prediction_gaps
+
+            # Sample a few locomotion / vision / task keys for interpretability.
+            watch = [
+                k
+                for k in (
+                    "phys_com_x_vel",
+                    "phys_com_z",
+                    "phys_posture_stability",
+                    "vision_bearing",
+                    "vision_range_m",
+                    "task_target_dist_m",
+                    "intent_gait_coupling",
+                    "intent_stride",
+                )
+                if k in self.graph._node_ids
+            ]
+            if not watch:
+                watch = list(self.graph._node_ids[:8])
+            pred_s = {k: float(predicted.get(k, 0.5)) for k in watch}
+            obs_s = {k: float(observed_full.get(k, 0.5)) for k in watch}
+            neural_log_event(
+                "wm",
+                "predict_vs_obs",
+                tick=int(engine_tick),
+                pe_mean=round(float(pe_mean), 5),
+                gaps=summarize_prediction_gaps(obs_s, pred_s, obs_s),
+                predicted=pred_s,
+                observed=obs_s,
+            )
+        except Exception:
+            pass
         if not _perf_fast:
             self._push_causal_replay(
                 var, value, obs_before_full, observed_full,

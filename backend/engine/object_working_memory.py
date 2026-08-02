@@ -32,6 +32,60 @@ def _ei(key: str, default: int) -> int:
         return int(default)
 
 
+def _bayesian_vision_kalman_gain(
+    live_delta: float,
+    conf: float | None,
+    *,
+    sigma_odom2: float | None = None,
+    outlier_scale: float | None = None,
+) -> tuple[float, float]:
+    """
+    Continuous vision↔odom Kalman gain (no binary lock-out).
+
+    Returns ``(k_gain, sigma_vis2)``. Large bearing residuals inflate σ_vision² so
+    gain → 0 smoothly (robust / Cauchy-like), avoiding the old yank↔freeze binary.
+    """
+    c_val = float(max(0.05, min(1.0, float(conf if conf is not None else 0.5))))
+    d = float(live_delta)
+    s = float(
+        outlier_scale
+        if outlier_scale is not None
+        else _ef("RKK_HARD_LOCK_BEARING_SLACK", 0.18)
+    )
+    s = max(0.05, s)
+    resid = (abs(d) / s) ** 2
+    sigma_vis2 = (1.0 / c_val) * (1.0 + 2.0 * resid + 2.5 * (resid**2))
+    so2 = float(
+        sigma_odom2 if sigma_odom2 is not None else _ef("RKK_HARD_LOCK_ODOM_VAR", 0.35)
+    )
+    so2 = max(1e-4, so2)
+    pi_vis = 1.0 / max(1e-6, sigma_vis2)
+    pi_odom = 1.0 / so2
+    k_gain = float(pi_vis / (pi_vis + pi_odom))
+    return k_gain, float(sigma_vis2)
+
+
+def _inject_vision_precision(
+    k_gain: float, conf: float | None, live_delta: float
+) -> None:
+    """Soft-update global π_vision from track quality (precision_groups hook)."""
+    try:
+        from engine.precision_groups import get_precision_state, precision_groups_enabled
+
+        if not precision_groups_enabled():
+            return
+        c_val = float(max(0.05, min(1.0, float(conf if conf is not None else 0.5))))
+        quality = float(max(0.0, min(1.0, float(k_gain) * c_val)))
+        quality *= float(1.0 / (1.0 + 4.0 * (float(live_delta) ** 2)))
+        target_pi = 0.25 + 1.75 * quality
+        st = get_precision_state()
+        st.vision = float(
+            max(0.05, min(4.0, 0.82 * float(st.vision) + 0.18 * target_pi))
+        )
+    except Exception:
+        pass
+
+
 def scene_ema_alpha() -> float:
     return float(max(0.05, min(0.95, _ef("RKK_SCENE_EMA_ALPHA", _ef("RKK_OWM_EMA_ALPHA", 0.35)))))
 
@@ -101,6 +155,81 @@ def scene_odom_max_step_m() -> float:
     return float(max(0.15, min(3.0, _ef("RKK_SCENE_ODOM_MAX_STEP_M", 0.75))))
 
 
+def latent_reid_min_cos() -> float:
+    return float(max(0.15, min(0.95, _ef("RKK_LATENT_REID_MIN_COS", 0.55))))
+
+
+def _as_latent_list(vec: Any) -> list[float]:
+    if vec is None:
+        return []
+    try:
+        if hasattr(vec, "detach"):
+            arr = vec.detach().float().cpu().numpy().reshape(-1)
+        else:
+            import numpy as np
+
+            arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+        out = [float(x) for x in arr.tolist() if math.isfinite(float(x))]
+        return out
+    except Exception:
+        return []
+
+
+def latent_cosine(a: list[float] | None, b: list[float] | None) -> float:
+    """Cosine similarity in [-1, 1]; 0 if either latent is empty/mismatched."""
+    aa = list(a or [])
+    bb = list(b or [])
+    if not aa or not bb or len(aa) != len(bb):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(aa, bb):
+        xf, yf = float(x), float(y)
+        dot += xf * yf
+        na += xf * xf
+        nb += yf * yf
+    denom = math.sqrt(na) * math.sqrt(nb)
+    if denom < 1e-12:
+        return 0.0
+    return float(max(-1.0, min(1.0, dot / denom)))
+
+
+def match_latent_slot(
+    candidates: list[dict[str, Any]],
+    query_latent: list[float] | None,
+    *,
+    min_cos: float | None = None,
+) -> dict[str, Any] | None:
+    """
+    Pick the candidate whose ``vector``/``latent`` best matches ``query_latent``.
+
+    Returns the winning candidate dict (mutated with ``latent_cos``) or None.
+    """
+    q = list(query_latent or [])
+    if not q or not candidates:
+        return None
+    thr = float(latent_reid_min_cos() if min_cos is None else min_cos)
+    best: dict[str, Any] | None = None
+    best_cos = -2.0
+    for cand in candidates:
+        vec = cand.get("latent")
+        if vec is None:
+            vec = cand.get("vector")
+        lat = _as_latent_list(vec)
+        if not lat:
+            continue
+        cos = latent_cosine(q, lat)
+        if cos > best_cos:
+            best_cos = cos
+            best = dict(cand)
+            best["latent"] = lat
+            best["latent_cos"] = float(cos)
+    if best is None or float(best.get("latent_cos", -1.0)) < thr:
+        return None
+    return best
+
+
 def _apply_odometry_to_ego(
     x_fwd: float,
     y_right: float,
@@ -145,6 +274,8 @@ class SceneEntity:
     holding: bool = False
     diagnostics: dict[str, Any] = field(default_factory=dict)
     uv_track: list[list[float]] = field(default_factory=list)
+    # SlotAttention embedding for re-ID across slot_id permutations.
+    latent: list[float] = field(default_factory=list)
 
     def is_fresh(self, tick: int) -> bool:
         if self.last_vision_tick < 0:
@@ -173,7 +304,13 @@ class SceneEntity:
             "activation": float(self.activation),
             "last_vision_tick": int(self.last_vision_tick),
             "holding": bool(self.holding),
+            "latent_dim": len(self.latent),
         }
+
+    def set_latent(self, vec: Any) -> None:
+        lat = _as_latent_list(vec)
+        if lat:
+            self.latent = lat
 
     def seed_from_bearing_range(
         self,
@@ -187,6 +324,7 @@ class SceneEntity:
         slot_id: str = "",
         u: float | None = None,
         v: float | None = None,
+        latent: Any = None,
     ) -> None:
         b = float(bearing)
         r = float(max(0.05, range_m))
@@ -207,6 +345,8 @@ class SceneEntity:
         self.holding = False
         self.diagnostics = {"source": "seed"}
         self.uv_track = [[float(self.u), float(self.v)]]
+        if latent is not None:
+            self.set_latent(latent)
 
     def fuse_observation(
         self,
@@ -221,6 +361,7 @@ class SceneEntity:
         u: float | None = None,
         v: float | None = None,
         gate: bool = False,
+        latent: Any = None,
     ) -> bool:
         """
         EMA-fuse a vision observation. If gate=True, reject outliers that would
@@ -266,6 +407,8 @@ class SceneEntity:
         self.last_update_tick = int(tick)
         self.holding = False
         self.diagnostics = {"source": "vision_ema", "alpha": alpha}
+        if latent is not None:
+            self.set_latent(latent)
         return True
 
 
@@ -287,6 +430,7 @@ class LatentSceneMemory:
     hard_lock_active: bool = False
     last_odom_discontinuity: bool = False
     last_odom_jump_m: float = 0.0
+    _live_diverge_streak: int = field(default=0, repr=False)
     _prev_xy: tuple[float, float] | None = field(default=None, repr=False)
     _prev_fwd: tuple[float, float] | None = field(default=None, repr=False)
 
@@ -296,11 +440,13 @@ class LatentSceneMemory:
         self.hard_lock_active = False
         self.last_odom_discontinuity = False
         self.last_odom_jump_m = 0.0
+        self._live_diverge_streak = 0
         self._prev_xy = None
         self._prev_fwd = None
 
     def release_hard_lock(self) -> None:
         self.hard_lock_active = False
+        self._live_diverge_streak = 0
 
     def refresh_active_from_live_camera(
         self,
@@ -313,9 +459,9 @@ class LatentSceneMemory:
         """
         Project active target onto the current ego RGB-D frame (HUD + soft track).
 
-        Hard-lock: control bearing is odometry-owned with a *bounded* live nudge
-        when the live hit stays near the lock (EMA + max step). Outliers are
-        rejected — no full rebind yank. Unlocked: live UV may rewrite bearing.
+        Hard-lock: continuous Bayesian vision↔odom fusion (Kalman gain from
+        confidence + residual size). Outliers get near-zero gain — no binary
+        freeze and no full rebind yank. Unlocked: live UV may rewrite bearing.
         """
         act = self.active()
         if act is None or camera is None:
@@ -329,10 +475,7 @@ class LatentSceneMemory:
         locked = bool(self.hard_lock_active)
         prev_b = float(act.bearing)
         locked_u = float(max(0.05, min(0.95, 0.5 + 0.5 * prev_b)))
-        # Accept live hits only inside this slack for nudge / range soft-correct.
         lock_bearing_slack = _ef("RKK_HARD_LOCK_BEARING_SLACK", 0.18)
-        nudge_ema = _ef("RKK_HARD_LOCK_BEARING_NUDGE_EMA", 0.18)
-        nudge_max = _ef("RKK_HARD_LOCK_BEARING_NUDGE_MAX", 0.035)
 
         track = UvDepthTrack.from_list(act.uv_track)
         live_kwargs = {
@@ -398,23 +541,97 @@ class LatentSceneMemory:
         a = float(max(0.15, min(0.95, blend)))
         live_b = float(bearing_from_u(float(u)))
         live_delta = float(live_b - prev_b)
-        near_locked = abs(live_delta) <= lock_bearing_slack
 
         if locked:
-            nudge = 0.0
-            if near_locked:
-                act.u = (1.0 - a) * float(act.u) + a * float(u)
-                act.v = (1.0 - a) * float(act.v) + a * float(v)
-                # Bounded EMA correction — kills odom drift without full rebind.
-                raw = float(nudge_ema) * live_delta
-                nudge = float(max(-nudge_max, min(nudge_max, raw)))
-                act.bearing = float(prev_b + nudge)
-                locked_u = float(max(0.05, min(0.95, 0.5 + 0.5 * float(act.bearing))))
-                act.u = (1.0 - 0.35) * float(act.u) + 0.35 * locked_u
-            else:
-                act.u = (1.0 - a) * float(act.u) + a * locked_u
-                act.bearing = prev_b
-            if near_locked and r is not None and float(r) > 0.05:
+            k_gain, sigma_vis2 = _bayesian_vision_kalman_gain(
+                live_delta, conf, outlier_scale=lock_bearing_slack
+            )
+            # Soft floor-depth downweight: lower FOV hits inflate σ further.
+            try:
+                from engine.vision_depth import objectness_floor_v_max
+
+                floor_v = float(objectness_floor_v_max())
+                if float(v) >= floor_v:
+                    sigma_vis2 *= 4.0
+                    pi_vis = 1.0 / max(1e-6, sigma_vis2)
+                    pi_odom = 1.0 / max(1e-4, _ef("RKK_HARD_LOCK_ODOM_VAR", 0.35))
+                    k_gain = float(pi_vis / (pi_vis + pi_odom))
+            except Exception:
+                pass
+
+            nudge = float(k_gain * live_delta)
+            # Persistent wrong-edge lock: lock extreme (+/−) while live camera
+            # says near-center → force trust live (Kalman alone goes to ~0).
+            # Also: sustained |live−lock| disagreement over several ticks.
+            force_live = False
+            soft_unlock = False
+            try:
+                live_ok = float(conf or 0.0) >= _ef(
+                    "RKK_HARD_LOCK_FORCE_MIN_CONF", 0.15
+                )
+                diverge_thr = _ef("RKK_HARD_LOCK_DIVERGE_B", 0.40)
+                if live_ok and abs(float(live_delta)) >= diverge_thr:
+                    self._live_diverge_streak = int(self._live_diverge_streak) + 1
+                else:
+                    self._live_diverge_streak = 0
+
+                extreme_lock = abs(float(prev_b)) >= _ef(
+                    "RKK_HARD_LOCK_EXTREME_B", 0.55
+                )
+                live_centered = abs(float(live_b)) <= _ef(
+                    "RKK_HARD_LOCK_LIVE_CENTER", 0.35
+                )
+                big_delta = abs(float(live_delta)) >= _ef(
+                    "RKK_HARD_LOCK_FORCE_DELTA", 0.45
+                )
+                sustained_n = _ei("RKK_HARD_LOCK_DIVERGE_TICKS", 3)
+                soft_n = _ei("RKK_HARD_LOCK_SOFT_UNLOCK_TICKS", 6)
+                sustained = int(self._live_diverge_streak) >= sustained_n
+                if live_ok and (
+                    (extreme_lock and live_centered and big_delta) or sustained
+                ):
+                    force_live = True
+                    k_force = _ef("RKK_HARD_LOCK_FORCE_LIVE_GAIN", 0.45)
+                    max_step = _ef("RKK_HARD_LOCK_FORCE_MAX_STEP", 0.28)
+                    if int(self._live_diverge_streak) >= soft_n:
+                        soft_unlock = True
+                        k_force = max(
+                            float(k_force),
+                            _ef("RKK_HARD_LOCK_SOFT_UNLOCK_GAIN", 0.75),
+                        )
+                        max_step = max(
+                            float(max_step),
+                            _ef("RKK_HARD_LOCK_SOFT_UNLOCK_MAX_STEP", 0.55),
+                        )
+                    k_gain = max(float(k_gain), float(k_force))
+                    nudge = float(k_gain * live_delta)
+                    # Cap single-tick snap so we don't oscillate, but escape edge.
+                    nudge = float(max(-max_step, min(max_step, nudge)))
+            except Exception:
+                force_live = False
+                soft_unlock = False
+
+            act.bearing = float(prev_b + nudge)
+            if soft_unlock:
+                # Aggressive snap toward live while keeping hard-lock identity;
+                # cool diverge streak so we do not yank every subsequent tick.
+                snap = _ef("RKK_HARD_LOCK_SOFT_UNLOCK_SNAP", 0.70)
+                act.bearing = (1.0 - snap) * float(act.bearing) + snap * float(
+                    live_b
+                )
+                act.bearing = float(max(-1.0, min(1.0, act.bearing)))
+                self._live_diverge_streak = max(
+                    0, int(self._live_diverge_streak) // 2
+                )
+            # HUD follows live only in proportion to trust — outliers stay glued
+            # to the locked column instead of yanking the crosshair.
+            uv_w = float(a * max(k_gain, 0.35 if force_live else 0.0))
+            act.u = (1.0 - uv_w) * float(act.u) + uv_w * float(u)
+            act.v = (1.0 - uv_w) * float(act.v) + uv_w * float(v)
+            locked_u = float(max(0.05, min(0.95, 0.5 + 0.5 * float(act.bearing))))
+            act.u = (1.0 - 0.35) * float(act.u) + 0.35 * locked_u
+
+            if r is not None and float(r) > 0.05 and (k_gain > 0.05 or force_live):
                 prev_r = float(act.range_m)
                 new_r = float(r)
                 hint = (
@@ -424,22 +641,40 @@ class LatentSceneMemory:
                 )
                 accept = (
                     new_r < prev_r * 0.82
-                    or abs(new_r - prev_r) / max(prev_r, 0.3) < 0.35
-                    or new_r < prev_r * 0.92
+                    or abs(new_r - prev_r) / max(prev_r, 0.3) < 0.45
+                    or new_r < prev_r * 0.95
+                    or force_live
                 )
                 if hint is not None and prev_r > hint * 1.25 and new_r < prev_r * 0.90:
                     accept = True
                 if accept:
-                    act.range_m = (1.0 - a) * prev_r + a * new_r
+                    r_gain = min(0.55, k_gain * a + 0.08)
+                    if force_live:
+                        r_gain = max(r_gain, 0.25)
+                    act.range_m = (1.0 - r_gain) * prev_r + r_gain * new_r
             act.x_fwd, act.y_right = ego_from_bearing_range(act.bearing, act.range_m)
+            _inject_vision_precision(k_gain, conf, live_delta)
             act.diagnostics = {
                 **dict(act.diagnostics or {}),
-                "source": "hard_lock_live_nudge" if near_locked and nudge else "hard_lock_live_hud",
+                "source": (
+                    "hard_lock_soft_unlock"
+                    if soft_unlock
+                    else (
+                        "hard_lock_force_live"
+                        if force_live
+                        else "hard_lock_bayesian_kalman"
+                    )
+                ),
                 "live_conf": float(conf or 0.0),
-                "near_locked": bool(near_locked),
+                "kalman_gain": float(k_gain),
+                "sigma_vis2": round(float(sigma_vis2), 4),
+                "near_locked": bool(abs(live_delta) <= lock_bearing_slack),
                 "live_bearing": float(live_b),
                 "bearing_live_delta": float(live_delta),
                 "bearing_nudge": float(nudge),
+                "force_live": bool(force_live),
+                "soft_unlock": bool(soft_unlock),
+                "live_diverge_streak": int(self._live_diverge_streak),
             }
             if tick is not None:
                 act.last_update_tick = int(tick)
@@ -530,8 +765,13 @@ class LatentSceneMemory:
             slot_id=str(vt.slot_id),
             u=float(vt.u),
             v=float(vt.v),
+            latent=getattr(vt, "latent", None)
+            or (vt.diagnostics or {}).get("latent")
+            or (vt.diagnostics or {}).get("vector"),
         )
         ent.diagnostics = {"source": "bind", **dict(vt.diagnostics or {})}
+        if ent.latent:
+            ent.diagnostics["latent_dim"] = len(ent.latent)
         self.focus(eid, exclusive=True)
         self.hard_lock_active = True
         if agent_xy is not None:
@@ -564,6 +804,8 @@ class LatentSceneMemory:
             jump = float(math.hypot(ax - px, ay - py))
             self.last_odom_jump_m = jump
             # Position-only gate: yaw spins are normal; reset_stance teleports XY.
+            # Skip odom warp on discontinuity so hard-lock range is not inflated;
+            # locked active reseeds from vision below (adaptive recovery).
             if jump > scene_odom_max_step_m():
                 self.last_odom_discontinuity = True
             else:
@@ -599,11 +841,36 @@ class LatentSceneMemory:
                 ent.diagnostics = {"source": "hard_lock_odom"}
 
         seen: set[str] = set() if reseed_locked else set(locked_ids)
-        for p in percepts or []:
+        # Latent re-ID: remap permuted slot_ids onto the active entity when
+        # SlotAttention reorders slots but the embedding still matches.
+        remapped: list[dict[str, Any]] = list(percepts or [])
+        act_ent = self.active()
+        if act_ent is not None and act_ent.latent:
+            hit = match_latent_slot(remapped, act_ent.latent)
+            if hit is not None:
+                orig_sid = str(hit.get("slot_id") or "")
+                hit = dict(hit)
+                hit["slot_id"] = str(act_ent.entity_id)
+                hit["_latent_reid"] = True
+                drop = {
+                    str(act_ent.entity_id),
+                    str(act_ent.slot_id or ""),
+                    orig_sid,
+                }
+                remapped = [hit] + [
+                    p
+                    for p in remapped
+                    if str(p.get("slot_id") or "") not in drop
+                ]
+
+        for p in remapped:
             sid = str(p.get("slot_id") or "")
             if not sid:
                 continue
-            if sid in locked_ids and not reseed_locked:
+            # Soft-lock: allow latent-matched re-fuse onto active even under hard_lock
+            # when cosine re-ID succeeded (keeps track without full unlock).
+            latent_ok = bool(p.get("_latent_reid"))
+            if sid in locked_ids and not reseed_locked and not latent_ok:
                 continue  # never re-fuse active while hard-locked
             r = p.get("range_m")
             if r is None or float(r) <= 0.05:
@@ -618,8 +885,12 @@ class LatentSceneMemory:
             v = p.get("v")
             u_f = float(u) if u is not None else None
             v_f = float(v) if v is not None else None
+            lat = p.get("latent", p.get("vector"))
             eid = sid
             ent = self.entities.get(eid)
+            if ent is None and latent_ok and act_ent is not None:
+                ent = act_ent
+                eid = act_ent.entity_id
             if ent is None:
                 if len(self.entities) >= scene_max_entities():
                     self._evict_weakest(keep=seen | set(self.active_ids))
@@ -637,8 +908,9 @@ class LatentSceneMemory:
                     slot_id=sid,
                     u=u_f,
                     v=v_f,
+                    latent=lat,
                 )
-            elif sid in locked_ids and reseed_locked:
+            elif (sid in locked_ids or latent_ok) and reseed_locked:
                 # After teleport: replace corrupted ego with a fresh depth sample
                 ent.seed_from_bearing_range(
                     bearing=bearing,
@@ -647,13 +919,29 @@ class LatentSceneMemory:
                     label=label or ent.label,
                     confidence=max(conf, float(ent.confidence)),
                     activation=max(act, float(ent.activation)),
-                    slot_id=sid,
+                    slot_id=str(ent.slot_id or sid),
                     u=u_f if u_f is not None else ent.u,
                     v=v_f if v_f is not None else ent.v,
+                    latent=lat,
                 )
                 ent.diagnostics = {
                     "source": "hard_lock_reseed",
                     "odom_jump_m": round(float(self.last_odom_jump_m), 3),
+                    "latent_reid": bool(latent_ok),
+                    "latent_cos": p.get("latent_cos"),
+                }
+            elif latent_ok and sid in locked_ids and not reseed_locked:
+                # Soft identity refresh under lock — update latent/UV lightly, keep ego.
+                if lat is not None:
+                    ent.set_latent(lat)
+                if u_f is not None:
+                    ent.u = 0.7 * float(ent.u) + 0.3 * float(u_f)
+                if v_f is not None:
+                    ent.v = 0.7 * float(ent.v) + 0.3 * float(v_f)
+                ent.last_vision_tick = int(tick)
+                ent.diagnostics = {
+                    "source": "hard_lock_latent_reid",
+                    "latent_cos": p.get("latent_cos"),
                 }
             else:
                 ent.fuse_observation(
@@ -667,6 +955,7 @@ class LatentSceneMemory:
                     u=u_f,
                     v=v_f,
                     gate=bool(eid in self.active_ids),
+                    latent=lat,
                 )
             seen.add(eid)
 

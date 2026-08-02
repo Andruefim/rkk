@@ -464,6 +464,11 @@ def objectness_floor_v_max() -> float:
     return float(max(0.35, min(0.75, _ef("RKK_OBJECTNESS_FLOOR_V", 0.58))))
 
 
+def objectness_edge_u_margin() -> float:
+    """Reject / suppress peaks within this margin of left/right frame edge."""
+    return float(max(0.02, min(0.25, _ef("RKK_OBJECTNESS_EDGE_U", 0.08))))
+
+
 def floor_protrusion_min() -> float:
     """Min plane residual weight in lower FOV to accept a candidate (0–1)."""
     return float(max(0.05, min(0.6, _ef("RKK_FLOOR_PROTRUSION_MIN", 0.18))))
@@ -641,6 +646,13 @@ def salient_objectness_peak(
     center = np.exp(-(((xs - cx) / gw) ** 2 + ((ys - cy) / gh) ** 2))
     score = score * (1.0 - 0.75 * center * (1.0 - _wmap))
 
+    # Suppress left/right frame edges — depth FOV borders produce false
+    # protrusions (u→0/1) that lock approach into infinite turn-in-place.
+    edge_m = objectness_edge_u_margin()
+    if edge_m > 1e-6:
+        edge_kill = (xs < edge_m) | (xs > (1.0 - edge_m))
+        score = np.where(edge_kill, 0.0, score)
+
     peak_val = float(score.max())
     if peak_val < 1e-8 or int(np.count_nonzero(score > 0)) < 3:
         return None, None, None, None, None, 0.0
@@ -648,6 +660,10 @@ def salient_objectness_peak(
     yi, xi = np.unravel_index(int(np.argmax(score)), score.shape)
     u = float(xs[0, xi])
     v = float(ys[yi, 0])
+
+    # Hard reject residual edge peaks (numerical / thin FOV).
+    if u < edge_m or u > (1.0 - edge_m):
+        return None, None, None, None, None, 0.0
 
     # Reject empty-floor locks: lower-FOV peak without protrusion, or
     # globally flat scene (no protrusion + weak objectness).
@@ -662,13 +678,23 @@ def salient_objectness_peak(
     peak_strength = float(min(1.0, peak_val / max(med * 2.5, 1e-6)))
 
     r, var, conf = depth_at_uv(frame, u, v, window=3)
+    z_peak = float(z[yi, xi])
+    # Edge of a protrusion: 3×3 window often mixes background and reports far
+    # plane — prefer the peak pixel when it is a clear closer foreground sample.
+    if (
+        np.isfinite(z_peak)
+        and lo < z_peak < hi * 0.98
+        and (
+            r is None
+            or (
+                float(r) > z_peak * 1.25 + 0.15
+                and (var is None or float(var) > 0.25)
+            )
+        )
+    ):
+        r, var, conf = z_peak, 0.0, 0.55 * peak_strength
     if r is None:
-        # Edge / sparse window — fall back to the peak pixel itself.
-        z_peak = float(z[yi, xi])
-        if np.isfinite(z_peak) and lo < z_peak < hi * 0.98:
-            r, var, conf = z_peak, 0.0, 0.55 * peak_strength
-        else:
-            return None, None, None, None, None, peak_strength
+        return None, None, None, None, None, peak_strength
     if conf is not None:
         conf = float(max(0.0, min(1.0, float(conf) * (0.25 + 0.75 * peak_strength))))
     return u, v, float(r), var, conf, peak_strength
@@ -737,6 +763,19 @@ def salient_objectness_peak_near_bearing(
     peak_strength = float(min(1.0, peak_val / max(med * 2.5, 1e-6)))
 
     r, var, conf = depth_at_uv(frame, u, v, window=3)
+    z_peak = float(z[yi, xi])
+    if (
+        np.isfinite(z_peak)
+        and lo < z_peak < hi * 0.98
+        and (
+            r is None
+            or (
+                float(r) > z_peak * 1.25 + 0.15
+                and (var is None or float(var) > 0.25)
+            )
+        )
+    ):
+        r, var, conf = z_peak, 0.0, 0.55 * peak_strength
     if r is None:
         return None, None, None, None, None, peak_strength
     u_col = max(0.05, min(0.95, u0))

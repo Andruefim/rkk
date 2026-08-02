@@ -25,6 +25,10 @@ _SESSION_LOG_NAMES: tuple[str, ...] = (
     _AI_ANALYSIS_NAME,
     "live_uv_candidates.jsonl",
     "system2_distill.jsonl",
+    "neural_log.jsonl",
+    "neural_log.txt",
+    "neural_log.jsonl.1",
+    "neural_log.txt.1",
 )
 
 

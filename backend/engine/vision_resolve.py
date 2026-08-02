@@ -145,6 +145,20 @@ def mask_peakiness_min() -> float:
     return _env_float("RKK_SLOT_MASK_PEAKINESS_MIN", 1.8)
 
 
+def objectness_bind_enabled() -> bool:
+    """
+    When SlotAttention UV is diffuse, allow depth objectness-peak bind if
+    language↔ontology matched. Camera-only (not sim_oracle). Default on —
+    required for neural-primary resolve with RKK_SIM_ORACLE_BIND=0.
+    """
+    raw = os.environ.get("RKK_VISION_OBJECTNESS_BIND", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def objectness_bind_min_peak() -> float:
+    return _env_float("RKK_VISION_OBJECTNESS_BIND_MIN_PEAK", 0.18)
+
+
 def _normalize(v: np.ndarray | None) -> np.ndarray | None:
     if v is None:
         return None
@@ -440,7 +454,25 @@ def _cap_spatial_confidence(target: VisualTarget) -> VisualTarget:
         range_conf=target.range_conf,
         bbox=target.bbox,
         diagnostics=diags,
+        latent=list(target.latent) if target.latent else None,
     )
+
+
+def _slot_latent_list(cand: dict[str, Any]) -> list[float] | None:
+    raw = cand.get("latent")
+    if raw is None:
+        raw = cand.get("vector")
+    if raw is None:
+        return None
+    try:
+        if hasattr(raw, "detach"):
+            arr = raw.detach().float().cpu().numpy().reshape(-1)
+        else:
+            arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+        out = [float(x) for x in arr.tolist()]
+        return out if out else None
+    except Exception:
+        return None
 
 
 def _apply_metric_geometry(
@@ -450,6 +482,17 @@ def _apply_metric_geometry(
     """Build VisualTarget and attach attention-guided (or UV) metric range."""
     u = float(cand.get("u", 0.5))
     v = float(cand.get("v", 0.55))
+    lat = _slot_latent_list(cand)
+    diags: dict[str, Any] = {
+        "match_label": cand.get("match_label"),
+        "match_concept": cand.get("match_concept"),
+        "match_ontology": cand.get("match_ontology"),
+        "uv_valid": cand.get("uv_valid"),
+        "mask_peakiness": cand.get("mask_peakiness"),
+    }
+    if lat:
+        diags["latent"] = lat
+        diags["latent_dim"] = len(lat)
     target = VisualTarget(
         slot_id=str(cand["slot_id"]),
         u=u,
@@ -457,13 +500,8 @@ def _apply_metric_geometry(
         label=str(cand.get("label") or "visual_referent"),
         confidence=float(cand.get("match_score") or 0.0),
         bearing=bearing_from_u(u),
-        diagnostics={
-            "match_label": cand.get("match_label"),
-            "match_concept": cand.get("match_concept"),
-            "match_ontology": cand.get("match_ontology"),
-            "uv_valid": cand.get("uv_valid"),
-            "mask_peakiness": cand.get("mask_peakiness"),
-        },
+        diagnostics=diags,
+        latent=lat,
     )
     if depth_camera is None:
         return target
@@ -486,6 +524,7 @@ def _apply_metric_geometry(
             range_conf=target.range_conf,
             bbox=target.bbox,
             diagnostics=diags,
+            latent=list(target.latent) if target.latent else None,
         )
     out = attach_range_to_target(target, depth_camera, attn_mask=mask)
     return _cap_spatial_confidence(out)
@@ -593,9 +632,9 @@ def resolve_visual_target(
         break
 
     if best_target is None and depth_camera is not None:
-        # 3B: do NOT commit ontology→objectness_peak. Diffuse slots + named
-        # referent is UNCERTAIN — caller may escalate / active-perceive / use
-        # an explicit sim-only oracle gate (non-production).
+        # Diffuse SlotAttention: try gated depth objectness bind when language
+        # ontology matched. This is camera-only (not sim_oracle). Refuse only
+        # when peak is weak / floor / objectness bind disabled.
         ont_diag = score_meta.get("ontology") if isinstance(score_meta.get("ontology"), dict) else {}
         ont_best = float((ont_diag or {}).get("best_score") or 0.0)
         best_ont_slot = max(
@@ -607,13 +646,75 @@ def resolve_visual_target(
         )
         ont_slot = float(best_ont_slot.get("match_ontology") or 0.0)
         if ont_best >= 0.25 or ont_slot >= 0.20:
-            diag["reason"] = "uncertain_no_peaked_slot"
-            diag["ontology_score"] = round(ont_best, 4)
-            diag["ontology"] = ont_diag
-            diag["best_score"] = float(best_ont_slot.get("match_score") or 0.0)
-            diag["min_conf"] = min_c
-            diag["refused_geometry_fallback"] = "objectness_peak"
-            return None, diag
+            if objectness_bind_enabled():
+                cand = dict(best_ont_slot)
+                cand["uv_valid"] = False  # force objectness geometry path
+                ont_key = str((ont_diag or {}).get("best_key") or "").strip()
+                if ont_key and not str(cand.get("label") or "").strip():
+                    cand["label"] = ont_key
+                elif ont_key and str(cand.get("label") or "").lower() in (
+                    "object",
+                    "com_high",
+                    "",
+                ):
+                    cand["label"] = ont_key
+                # Boost match_score so spatial confidence isn't crushed to ~0
+                # when ontology is the only language link (flat SA scores ~0.07).
+                cand["match_score"] = float(
+                    max(
+                        float(cand.get("match_score") or 0.0),
+                        max(ont_best, ont_slot) * 0.85,
+                        0.40,
+                    )
+                )
+                target = _apply_metric_geometry(cand, depth_camera)
+                pstr = float(
+                    (target.diagnostics or {}).get("objectness_peak_strength") or 0.0
+                )
+                floorish = (
+                    float(target.v) > 0.72
+                    and float(target.confidence or 0.0) < 0.55
+                )
+                try:
+                    from engine.vision_depth import objectness_edge_u_margin
+
+                    edge_m = float(objectness_edge_u_margin())
+                except Exception:
+                    edge_m = 0.08
+                edgeish = float(target.u) < edge_m or float(target.u) > (1.0 - edge_m)
+                if (
+                    target.is_ready(require_range=True)
+                    and pstr >= objectness_bind_min_peak()
+                    and not floorish
+                    and not edgeish
+                ):
+                    diags = dict(target.diagnostics or {})
+                    diags["geometry"] = "objectness_peak"
+                    diags["source"] = "vision_objectness_bind"
+                    diags["ontology_score"] = round(max(ont_best, ont_slot), 4)
+                    target.diagnostics = diags
+                    best_target = target
+                    diag["geometry_fallback"] = "objectness_peak"
+                    diag["objectness_bind"] = True
+                    diag["ontology_score"] = round(max(ont_best, ont_slot), 4)
+                else:
+                    diag["objectness_bind_attempt"] = {
+                        "peak_strength": round(pstr, 4),
+                        "ready": bool(target.is_ready(require_range=True)),
+                        "floorish": bool(floorish),
+                        "edgeish": bool(edgeish),
+                        "u": round(float(target.u), 4),
+                        "range_m": target.range_m,
+                        "v": round(float(target.v), 4),
+                    }
+            if best_target is None:
+                diag["reason"] = "uncertain_no_peaked_slot"
+                diag["ontology_score"] = round(ont_best, 4)
+                diag["ontology"] = ont_diag
+                diag["best_score"] = float(best_ont_slot.get("match_score") or 0.0)
+                diag["min_conf"] = min_c
+                diag["refused_geometry_fallback"] = "objectness_peak"
+                return None, diag
 
     if best_target is None:
         # Fall back: best score without range gate (for diagnostics)

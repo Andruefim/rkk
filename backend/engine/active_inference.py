@@ -143,6 +143,25 @@ class HomeostaticController:
         except ValueError:
             pen_w = 0.015
 
+        from engine.precision_channels import default_precision_vector, modality_of_node
+        from engine.precision_groups import get_precision_state, precision_groups_enabled
+
+        prec_vec = default_precision_vector()
+        if precision_groups_enabled():
+            st = get_precision_state()
+            # Live π overrides static defaults when groups are on.
+            for g in ("vision", "proprio", "motor_intent", "sandbox", "vestibular", "other"):
+                try:
+                    prec_vec[g] = float(st.weight_for_group(g))
+                except Exception:
+                    pass
+        target_nodes = [node_ids[i] for i in target_ix]
+        prec_weights = torch.tensor(
+            [[prec_vec.get(modality_of_node(nid), 1.0) for nid in target_nodes]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
         initial_free = A_free.detach().clone()
 
         for it in range(iters):
@@ -153,7 +172,8 @@ class HomeostaticController:
             pred_t = predicted_X[0, ix_t].unsqueeze(0)
             pred_c = torch.clamp(pred_t, 0.0, 1.0)
             targ_c = torch.clamp(target_vals, 0.0, 1.0)
-            loss = F.mse_loss(pred_c, targ_c)
+            sq_err = (pred_c - targ_c) ** 2
+            loss = (sq_err * prec_weights).mean()
             action_penalty = pen_w * ((A_free - 0.5) ** 2).mean()
             total_loss = loss + action_penalty
             total_loss.backward()
@@ -206,5 +226,40 @@ class HomeostaticController:
                     reverse=True,
                 )[:3]
                 print(f"[ACTIVE INF] Top Actions: {top_acts}")
+            try:
+                from engine.neural_logger import neural_log_event, summarize_prediction_gaps
+
+                pred_map = {
+                    active_targets[i]: float(pred_raw[i]) for i in range(len(active_targets))
+                }
+                curr_map = {
+                    active_targets[i]: float(curr_vals[i]) for i in range(len(active_targets))
+                }
+                targ_map = {nid: float(target_priors.get(nid, 0.5)) for nid in active_targets}
+                top_acts_log = sorted(
+                    optimized_actions.items(),
+                    key=lambda x: abs(x[1] - 0.5),
+                    reverse=True,
+                )[:8]
+                neural_log_event(
+                    "active_inf",
+                    "optimize",
+                    tick=int(getattr(graph, "_tick", 0) or 0) or None,
+                    loss=_round_safe(float(tl.item())),
+                    n_intents=len(iv),
+                    n_targets=len(active_targets),
+                    targets=targ_map,
+                    top_actions={k: float(v) for k, v in top_acts_log},
+                    gaps=summarize_prediction_gaps(curr_map, pred_map, targ_map),
+                )
+            except Exception:
+                pass
 
         return optimized_actions
+
+
+def _round_safe(v: float) -> float:
+    try:
+        return round(float(v), 6)
+    except Exception:
+        return 0.0

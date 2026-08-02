@@ -24,7 +24,11 @@ from engine.manipulation_control import (
 )
 from engine.manipulation_verify import ManipulationEpisode, verify_manipulation
 from engine.object_resolver import ResolvedObject, resolve_manipulation_target
-from engine.object_working_memory import LatentSceneMemory, ObjectWorkingMemory
+from engine.object_working_memory import (
+    LatentSceneMemory,
+    ObjectWorkingMemory,
+    match_latent_slot,
+)
 from engine.success_predicates import evaluate_goal
 from engine.task_binding import TaskBindingController, task_binding_enabled
 from engine.task_goal import TaskGoal
@@ -75,6 +79,34 @@ def _nav_arrival_streak_needed() -> int:
         return max(1, int(os.environ.get("RKK_NAV_ARRIVAL_STREAK", "3")))
     except ValueError:
         return 3
+
+
+def _task_nav_mode() -> str:
+    """Production default: wm_ai. Use heuristic for ablation / cold WM fallback tests."""
+    raw = os.environ.get("RKK_TASK_NAV_MODE", "wm_ai").strip().lower()
+    if raw in ("heuristic", "heur", "bearing", "goal_navigation"):
+        return "heuristic"
+    return "wm_ai"
+
+
+def _task_nav_wm_min_steps() -> int:
+    try:
+        return max(0, int(os.environ.get("RKK_TASK_NAV_WM_MIN_STEPS", "0")))
+    except ValueError:
+        return 0
+
+
+def _graph_nid_to_motor_intent(nid: str) -> str | None:
+    from engine.features.humanoid.constants import MOTOR_INTENT_VARS
+
+    s = str(nid)
+    if s in MOTOR_INTENT_VARS:
+        return s
+    if s.startswith("phys_intent_"):
+        suf = s[len("phys_intent_") :]
+        if suf in MOTOR_INTENT_VARS:
+            return suf
+    return None
 
 
 _KINDS_NEEDING_TARGET = frozenset({"reduce_distance", "contact", "displace"})
@@ -213,10 +245,40 @@ class SimulationGroundedLanguageMixin:
             "ontology",
             "best_score",
             "min_conf",
+            "objectness_bind",
+            "objectness_bind_attempt",
+            "refused_geometry_fallback",
+            "latent_reid_attempt",
+            "source",
         ):
             if key in diag and diag[key] is not None:
                 fields[key] = diag[key]
         task_log_event("target_resolution", tick=int(tick), **fields)
+        try:
+            from engine.neural_logger import neural_log_event, summarize_slot_table
+
+            neural_log_event(
+                "vision",
+                "resolve",
+                tick=int(tick),
+                force=True,
+                reason=fields.get("reason"),
+                slot_id=fields.get("slot_id"),
+                label=fields.get("label"),
+                geometry=fields.get("geometry") or fields.get("geometry_fallback"),
+                objectness_bind=fields.get("objectness_bind"),
+                ontology_score=fields.get("ontology_score"),
+                best_score=fields.get("best_score"),
+                range_m=fields.get("range_m"),
+                peak_strength=fields.get("peak_strength"),
+                source=fields.get("source"),
+                candidates=summarize_slot_table(diag.get("candidates") or fields.get("candidates")),
+                slot_peakiness=summarize_slot_table(diag.get("slot_peakiness")),
+                objectness_bind_attempt=diag.get("objectness_bind_attempt"),
+                latent_reid_attempt=diag.get("latent_reid_attempt"),
+            )
+        except Exception:
+            pass
 
     def _task_log_tree_bound(self, tick: int, tt: TaskTreeController) -> None:
         tree = tt.tree
@@ -531,6 +593,15 @@ class SimulationGroundedLanguageMixin:
             "human_task_motor": self._task_log_human_motor_targets(),
         }
         try:
+            nav_meta = getattr(self, "_last_nav_meta", None) or {}
+            if isinstance(nav_meta, dict) and nav_meta:
+                fields["task_nav_mode"] = str(nav_meta.get("task_nav_mode") or "")
+                fields["nav_ai_ok"] = bool(nav_meta.get("nav_ai_ok"))
+                if nav_meta.get("nav_ai_reason"):
+                    fields["nav_ai_reason"] = str(nav_meta.get("nav_ai_reason"))
+        except Exception:
+            pass
+        try:
             nodes = getattr(getattr(self, "agent", None), "graph", None)
             nodes = getattr(nodes, "nodes", {}) if nodes is not None else {}
             for k in ("task_heading_err", "task_closing_vel", "task_nav_active"):
@@ -571,6 +642,8 @@ class SimulationGroundedLanguageMixin:
                         )
                     if "bearing_nudge" in diags:
                         fields["bearing_nudge"] = round(float(diags["bearing_nudge"]), 4)
+                    if "kalman_gain" in diags:
+                        fields["kalman_gain"] = round(float(diags["kalman_gain"]), 4)
                 except Exception:
                     pass
                 scene = getattr(owm, "scene", None)
@@ -608,6 +681,36 @@ class SimulationGroundedLanguageMixin:
             if isinstance(snap, dict) and snap.get("sources"):
                 fields["motor_sources"] = list(snap.get("sources") or [])
         task_log_event("task_progress", tick=int(tick), **fields)
+        try:
+            from engine.neural_logger import neural_log_event, summarize_latent
+
+            owm = getattr(self, "_obj_working_memory", None)
+            scene = getattr(owm, "scene", None) if owm is not None else None
+            act = scene.active() if scene is not None and hasattr(scene, "active") else None
+            diags = dict(getattr(act, "diagnostics", None) or {}) if act else {}
+            neural_log_event(
+                "owm",
+                "track",
+                tick=int(tick),
+                bearing=fields.get("vision_bearing"),
+                range_m=fields.get("vision_range_m"),
+                hard_lock=fields.get("hard_lock"),
+                kalman_gain=fields.get("kalman_gain"),
+                live_bearing=fields.get("live_bearing"),
+                bearing_nudge=fields.get("bearing_nudge"),
+                bearing_live_delta=fields.get("bearing_live_delta"),
+                fusion_source=diags.get("source"),
+                latent_cos=diags.get("latent_cos"),
+                latent=summarize_latent(getattr(act, "latent", None)) if act else None,
+                entity_id=getattr(act, "entity_id", None) if act else None,
+                slot_id=getattr(act, "slot_id", None) if act else None,
+                task_nav_mode=fields.get("task_nav_mode"),
+                nav_ai_ok=fields.get("nav_ai_ok"),
+                nav_ai_reason=fields.get("nav_ai_reason"),
+                node_kind=fields.get("node_kind"),
+            )
+        except Exception:
+            pass
 
     def _task_log_fall_during_task(self, tick: int) -> None:
         if getattr(self, "_task_log_session_start_tick", None) is None:
@@ -1452,20 +1555,25 @@ class SimulationGroundedLanguageMixin:
                 if range_m is None or float(range_m) <= 0.05:
                     continue
                 label = str((s or {}).get("label") or ent.label or "")
-                out.append(
-                    {
-                        "slot_id": str(ent.slot_id or eid),
-                        "u": u,
-                        "v": v,
-                        "bearing": bearing_from_u(u),
-                        "range_m": float(range_m),
-                        "label": label,
-                        "activation": float(
-                            (s or {}).get("activation") or ent.activation or 0.5
-                        ),
-                        "confidence": conf,
-                    }
-                )
+                lat = (s or {}).get("vector")
+                if lat is None:
+                    lat = getattr(ent, "latent", None) or None
+                item: dict[str, Any] = {
+                    "slot_id": str(ent.slot_id or eid),
+                    "u": u,
+                    "v": v,
+                    "bearing": bearing_from_u(u),
+                    "range_m": float(range_m),
+                    "label": label,
+                    "activation": float(
+                        (s or {}).get("activation") or ent.activation or 0.5
+                    ),
+                    "confidence": conf,
+                }
+                if lat is not None:
+                    item["vector"] = lat
+                    item["latent"] = lat
+                out.append(item)
 
         # 2) Discover other peaked slots (scene context), skip diffuse ones
         for s in slots:
@@ -1497,18 +1605,60 @@ class SimulationGroundedLanguageMixin:
                 continue
             if range_m is None or float(range_m) <= 0.05:
                 continue
-            out.append(
-                {
-                    "slot_id": sid,
-                    "u": u,
-                    "v": v,
-                    "bearing": bearing_from_u(u),
-                    "range_m": float(range_m),
-                    "label": str(s.get("label") or ""),
-                    "activation": float(s.get("activation") or 0.0),
-                    "confidence": conf,
-                }
-            )
+            item = {
+                "slot_id": sid,
+                "u": u,
+                "v": v,
+                "bearing": bearing_from_u(u),
+                "range_m": float(range_m),
+                "label": str(s.get("label") or ""),
+                "activation": float(s.get("activation") or 0.0),
+                "confidence": conf,
+            }
+            if s.get("vector") is not None:
+                item["vector"] = s.get("vector")
+                item["latent"] = s.get("vector")
+            out.append(item)
+
+        # 3) Hard-lock: still emit metric+latent candidates for cosine re-ID
+        # (slot_id may permute after head turn).
+        if hard_lock:
+            seen_ids = {str(p.get("slot_id") or "") for p in out}
+            for s in slots:
+                sid = str(s.get("slot_id") or "")
+                if not sid or sid in seen_ids or sid in active_ids:
+                    continue
+                vec = s.get("vector")
+                if vec is None:
+                    continue
+                u = float(s.get("u", 0.5))
+                v = float(s.get("v", 0.5))
+                range_m = None
+                conf = float(s.get("activation") or 0.35)
+                try:
+                    r, _var, rconf = cam.range_at_uv(u, v)
+                    range_m = r
+                    if rconf is not None:
+                        conf = max(conf, float(rconf))
+                except Exception:
+                    continue
+                if range_m is None or float(range_m) <= 0.05:
+                    continue
+                out.append(
+                    {
+                        "slot_id": sid,
+                        "u": u,
+                        "v": v,
+                        "bearing": bearing_from_u(u),
+                        "range_m": float(range_m),
+                        "label": str(s.get("label") or ""),
+                        "activation": float(s.get("activation") or 0.0),
+                        "confidence": conf,
+                        "vector": vec,
+                        "latent": vec,
+                        "_hard_lock_reid_cand": True,
+                    }
+                )
         return out
 
     def _update_object_working_memory(self, tick: int) -> ObjectWorkingMemory | None:
@@ -1698,6 +1848,142 @@ class SimulationGroundedLanguageMixin:
         bearing_rad = math.atan2(cross, dot)
         bearing = float(max(-1.0, min(1.0, bearing_rad / (math.pi * 0.5))))
         return bearing, dist
+
+    def _try_latent_reid_visual_bind(
+        self,
+        *,
+        vision_diag: dict[str, Any] | None = None,
+        reason: str = "uncertain_resolve",
+    ) -> tuple[VisualTarget | None, dict[str, Any]]:
+        """
+        Cosine re-ID against the last bound entity's SlotAttention latent.
+
+        Prefer this over ``sim_oracle`` when peaked UV resolve fails but the
+        previous track embedding still matches a live slot.
+        """
+        diag: dict[str, Any] = {
+            "reason": "latent_reid_miss",
+            "resolve_mode": "vision",
+            "source": "vision_latent_reid",
+            "reid_reason": str(reason),
+        }
+        scene = self._latent_scene_memory()
+        ent = scene.active() if scene is not None else None
+        query = list(getattr(ent, "latent", None) or []) if ent is not None else []
+        if not query:
+            vt_prev = getattr(self, "_manip_resolved_visual", None)
+            if vt_prev is not None:
+                query = list(getattr(vt_prev, "latent", None) or [])
+                if not query:
+                    query = list((vt_prev.diagnostics or {}).get("latent") or [])
+            if ent is None and vt_prev is not None:
+                # Seed a temporary query-only path from prior visual target.
+                pass
+        if not query:
+            diag["reason"] = "latent_reid_no_query"
+            return None, diag
+
+        cam = self._depth_camera_from_sim()
+        slots = collect_vision_slots(self._visual_env_ref())
+        if not slots:
+            diag["reason"] = "latent_reid_no_slots"
+            return None, diag
+
+        from engine.vision_resolve import _apply_metric_geometry, _cap_spatial_confidence
+
+        candidates: list[dict[str, Any]] = []
+        for s in slots:
+            cand = dict(s)
+            try:
+                vt_c = _apply_metric_geometry(cand, cam)
+                if vt_c is None or not vt_c.is_ready(require_range=True):
+                    continue
+                cand["u"] = float(vt_c.u)
+                cand["v"] = float(vt_c.v)
+                cand["bearing"] = float(vt_c.bearing)
+                cand["range_m"] = float(vt_c.range_m or 0.0)
+                cand["confidence"] = float(vt_c.confidence)
+                cand["label"] = str(vt_c.label or cand.get("label") or "")
+                if vt_c.latent:
+                    cand["latent"] = list(vt_c.latent)
+                candidates.append(cand)
+            except Exception:
+                continue
+
+        hit = match_latent_slot(candidates, query)
+        if hit is None:
+            diag["n_candidates"] = len(candidates)
+            return None, diag
+
+        lat = list(hit.get("latent") or [])
+        conf = float(max(0.35, min(0.95, hit.get("confidence", 0.55) or 0.55)))
+        vt = VisualTarget(
+            slot_id=str(hit.get("slot_id") or "latent_reid"),
+            u=float(hit.get("u", 0.5)),
+            v=float(hit.get("v", 0.55)),
+            label=str(hit.get("label") or (ent.label if ent is not None else "visual_referent")),
+            confidence=conf,
+            bearing=float(hit.get("bearing", 0.0)),
+            range_m=float(hit.get("range_m")),
+            range_conf=float(min(1.0, conf)),
+            diagnostics={
+                "source": "vision_latent_reid",
+                "latent_cos": float(hit.get("latent_cos") or 0.0),
+                "reid_reason": str(reason),
+                "vision_fail_reason": str((vision_diag or {}).get("reason") or ""),
+                "geometry": "latent_reid",
+                "latent": lat,
+                "latent_dim": len(lat),
+            },
+            latent=lat or None,
+        )
+        vt = _cap_spatial_confidence(vt)
+        if not vt.is_ready(require_range=True):
+            diag["reason"] = "latent_reid_not_ready"
+            diag["latent_cos"] = hit.get("latent_cos")
+            return None, diag
+
+        out_diag: dict[str, Any] = {
+            "reason": "ok_latent_reid",
+            "resolve_mode": "vision",
+            "source": "vision_latent_reid",
+            "slot_id": vt.slot_id,
+            "label": vt.label,
+            "range_m": vt.range_m,
+            "confidence": float(vt.confidence),
+            "latent_cos": float(hit.get("latent_cos") or 0.0),
+            "reid_reason": str(reason),
+            "vision_reason": (vision_diag or {}).get("reason"),
+        }
+        try:
+            task_log_event(
+                "vision_latent_reid",
+                tick=int(getattr(self, "tick", 0) or 0),
+                slot_id=str(vt.slot_id),
+                range_m=round(float(vt.range_m or 0.0), 4),
+                bearing=round(float(vt.bearing), 4),
+                latent_cos=round(float(hit.get("latent_cos") or 0.0), 4),
+                reason=str(reason),
+                vision_reason=str((vision_diag or {}).get("reason") or ""),
+            )
+            from engine.neural_logger import neural_log_event, summarize_latent
+
+            neural_log_event(
+                "latent",
+                "reid",
+                tick=int(getattr(self, "tick", 0) or 0),
+                force=True,
+                slot_id=str(vt.slot_id),
+                range_m=round(float(vt.range_m or 0.0), 4),
+                bearing=round(float(vt.bearing), 4),
+                latent_cos=round(float(hit.get("latent_cos") or 0.0), 4),
+                reason=str(reason),
+                vision_reason=str((vision_diag or {}).get("reason") or ""),
+                latent=summarize_latent(vt.latent),
+            )
+        except Exception:
+            pass
+        return vt, out_diag
 
     def _try_sim_oracle_visual_bind(
         self,
@@ -1894,6 +2180,16 @@ class SimulationGroundedLanguageMixin:
                 reason = str(diag.get("reason") or "resolve_failed_vision")
                 diag["reason"] = reason
                 uncertain = self._resolve_uncertain_reason(reason)
+                # Phase 2: latent cosine re-ID before sim-oracle / active-percept give-up.
+                if uncertain:
+                    l_vt, l_diag = self._try_latent_reid_visual_bind(
+                        vision_diag=diag,
+                        reason=reason,
+                    )
+                    if l_vt is not None and l_vt.is_ready(require_range=True):
+                        merged = {**diag, **l_diag}
+                        return None, l_vt, merged
+                    diag["latent_reid_attempt"] = l_diag
                 # 5A: signal deferred tick to look-around when sim-oracle crutch is off.
                 if (
                     uncertain
@@ -2079,9 +2375,22 @@ class SimulationGroundedLanguageMixin:
         # many wall-seconds later with a stale bind-time tick.
         live = int(getattr(self, "tick", 0) or 0)
         now = max(int(tick), live)
-        until = now + int(task_motor_hold_ticks())
-        prev = int(getattr(self, "_nav_hold_until_tick", -1) or -1)
-        self._nav_hold_until_tick = max(prev, until)
+        hold_ticks = (
+            0
+            if str(reason) in ("resolve_pending", "post_resolve")
+            else int(task_motor_hold_ticks())
+        )
+        until = now + hold_ticks
+        if hold_ticks <= 0:
+            # Do not extend a previous freeze across resolve/post_resolve.
+            self._nav_hold_until_tick = min(
+                int(getattr(self, "_nav_hold_until_tick", -1) or -1), now
+            )
+            if int(getattr(self, "_nav_hold_until_tick", -1) or -1) < now:
+                self._nav_hold_until_tick = now
+        else:
+            prev = int(getattr(self, "_nav_hold_until_tick", -1) or -1)
+            self._nav_hold_until_tick = max(prev, until)
         try:
             task_log_event(
                 "nav_hold",
@@ -2165,7 +2474,40 @@ class SimulationGroundedLanguageMixin:
         vt2 = attach_range_to_target(vt2, cam, attn_mask=None)
         vt2 = _cap_spatial_confidence(vt2)
         if not vt2.is_ready(require_range=True):
-            return False
+            # Phase 2: peaked UV failed → try latent re-ID before giving up.
+            l_vt, l_diag = self._try_latent_reid_visual_bind(
+                vision_diag={"reason": reason},
+                reason=f"rebind_{reason}",
+            )
+            if l_vt is None or not l_vt.is_ready(require_range=True):
+                return False
+            vt2 = l_vt
+            try:
+                task_log_event(
+                    "vision_latent_rebind",
+                    tick=int(tick),
+                    reason=str(reason),
+                    slot_id=str(vt2.slot_id),
+                    range_m=round(float(vt2.range_m or 0.0), 3),
+                    bearing=round(float(vt2.bearing), 3),
+                    latent_cos=round(float((l_diag or {}).get("latent_cos") or 0.0), 4),
+                )
+                from engine.neural_logger import neural_log_event, summarize_latent
+
+                neural_log_event(
+                    "latent",
+                    "rebind",
+                    tick=int(tick),
+                    force=True,
+                    reason=str(reason),
+                    slot_id=str(vt2.slot_id),
+                    range_m=round(float(vt2.range_m or 0.0), 3),
+                    bearing=round(float(vt2.bearing), 3),
+                    latent_cos=round(float((l_diag or {}).get("latent_cos") or 0.0), 4),
+                    latent=summarize_latent(getattr(vt2, "latent", None)),
+                )
+            except Exception:
+                pass
 
         new_u = float(vt2.u)
         new_v = float(vt2.v)
@@ -2481,6 +2823,245 @@ class SimulationGroundedLanguageMixin:
         except Exception:
             pass
 
+    def _wm_train_steps(self) -> int:
+        g = getattr(getattr(self, "agent", None), "graph", None)
+        if g is None:
+            return 0
+        return int(getattr(g, "_wm_train_calls", 0) or 0)
+
+    def _inject_owm_nav_priors(
+        self,
+        owm: ObjectWorkingMemory,
+        *,
+        stop: float,
+    ) -> dict[str, float]:
+        """Write OWM into graph nodes and return approach target priors for AI."""
+        b = float(owm.bearing)
+        r = float(owm.range_m)
+        nodes = self.agent.graph.nodes
+        nodes["vision_bearing"] = b
+        nodes["vision_range_m"] = r
+        if "task_target_dist_m" in nodes:
+            nodes["task_target_dist_m"] = r
+        priors: dict[str, float] = {
+            "phys_posture_stability": 1.0,
+            "phys_com_z": 0.82,
+            "vision_bearing": 0.0,
+            "vision_range_m": float(max(0.05, stop)),
+            "task_target_dist_m": float(max(0.05, stop)),
+        }
+        # Aligned → ask for forward COM velocity; large bearing → stay cautious.
+        if abs(b) < 0.35 and r > float(stop) + 0.05:
+            priors["phys_com_x_vel"] = 0.38
+        else:
+            priors["phys_com_x_vel"] = 0.12
+        return priors
+
+    def _assert_forward_when_aligned(
+        self,
+        out: dict[str, float],
+        heur: dict[str, float],
+        *,
+        bearing: float,
+        range_m: float,
+        stop: float,
+        meta: dict[str, Any],
+    ) -> dict[str, float]:
+        """
+        When roughly aligned and still far from stop, floor stride / pull posture
+        toward heuristic forward so weak homeostatic intents do not plateau.
+        """
+        try:
+            align = float(os.environ.get("RKK_NAV_ALIGN_BEARING", "0.40"))
+            margin = float(os.environ.get("RKK_NAV_FWD_RANGE_MARGIN", "0.12"))
+            floor = float(os.environ.get("RKK_NAV_ALIGNED_STRIDE_FLOOR", "0.62"))
+            blend = float(os.environ.get("RKK_NAV_ALIGNED_FWD_BLEND", "0.65"))
+        except ValueError:
+            align, margin, floor, blend = 0.40, 0.12, 0.62, 0.65
+        blend = float(max(0.0, min(1.0, blend)))
+        if abs(float(bearing)) > align:
+            return out
+        if float(range_m) <= float(stop) + margin:
+            return out
+
+        out = dict(out)
+        heur_stride = float(heur.get("intent_stride", floor))
+        target_stride = max(float(floor), heur_stride)
+        cur = float(out.get("intent_stride", 0.5))
+        if cur < target_stride:
+            blended = (1.0 - blend) * cur + blend * target_stride
+            out["intent_stride"] = float(max(blended, target_stride * 0.90))
+
+        posture_blend = 0.35 * blend
+        for key in (
+            "intent_gait_coupling",
+            "intent_support_left",
+            "intent_support_right",
+            "intent_torso_forward",
+        ):
+            if key in heur:
+                hv = float(heur[key])
+                cv = float(out.get(key, hv))
+                out[key] = float((1.0 - posture_blend) * cv + posture_blend * hv)
+
+        meta["nav_fwd_assert"] = True
+        meta["nav_fwd_stride"] = float(out.get("intent_stride", 0.0))
+        return out
+
+    def _navigation_intents_wm_ai(
+        self,
+        owm: ObjectWorkingMemory,
+        stop: float,
+        posture: float,
+        fallen: bool,
+    ) -> tuple[dict[str, float], dict[str, Any]]:
+        """
+        WM + Active Inference approach intents (arbiter source ``navigation``).
+
+        Falls back to heuristic bearing/range nav when fallen, posture pause,
+        AI returns empty, or WM is cold.
+        """
+        meta: dict[str, Any] = {
+            "task_nav_mode": "wm_ai",
+            "nav_ai_ok": False,
+            "nav_ai_reason": "",
+            "wm_steps": self._wm_train_steps(),
+            "wm_min_steps": _task_nav_wm_min_steps(),
+        }
+        heur = navigation_intents_from_bearing_range(
+            float(owm.bearing),
+            float(owm.range_m),
+            float(stop),
+            fallen=fallen,
+            posture_stability=float(posture),
+        )
+        if fallen:
+            meta["nav_ai_reason"] = "fallen"
+            return {}, meta
+        if not heur:
+            meta["nav_ai_reason"] = "heuristic_empty_or_posture"
+            return {}, meta
+
+        wm_steps = self._wm_train_steps()
+        wm_warm = wm_steps >= _task_nav_wm_min_steps()
+        meta["wm_warm"] = bool(wm_warm)
+
+        ai_on = os.environ.get("RKK_ACTIVE_INFERENCE", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not ai_on:
+            meta["nav_ai_reason"] = "active_inference_off_fallback_heur"
+            return heur, meta
+
+        try:
+            priors = self._inject_owm_nav_priors(owm, stop=float(stop))
+            ensure = getattr(self, "_ensure_homeostatic_ctrl", None)
+            if not callable(ensure):
+                from engine.active_inference import HomeostaticController
+                import torch
+
+                device = getattr(
+                    self.agent.graph._core, "device", torch.device("cpu")
+                )
+                self._homeostatic_ctrl = HomeostaticController(
+                    device=device, learning_rate=0.1, max_iters=8
+                )
+                ctrl = self._homeostatic_ctrl
+            else:
+                ctrl = ensure()
+
+            obs = self.agent.graph.snapshot_vec_dict()
+            # Keep OWM live values in the state vector used for optimize.
+            obs["vision_bearing"] = float(owm.bearing)
+            obs["vision_range_m"] = float(owm.range_m)
+            if "task_target_dist_m" in obs:
+                obs["task_target_dist_m"] = float(owm.range_m)
+
+            actions = ctrl.optimize_action(obs, self.agent.graph, priors) or {}
+            mapped: dict[str, float] = {}
+            for gid, val in actions.items():
+                ev = _graph_nid_to_motor_intent(str(gid))
+                if ev is not None:
+                    mapped[ev] = float(val)
+
+            # Optional short WM beam nudge only when WM has trained enough.
+            if not mapped and wm_warm:
+                try:
+                    from engine.goal_planning import beam_search_first_action
+
+                    state0 = dict(obs)
+                    cand_actions: list[tuple[str, float]] = [
+                        ("intent_gait_coupling", 0.35),
+                        ("intent_gait_coupling", 0.65),
+                        ("intent_stride", 0.55),
+                        ("intent_stride", 0.72),
+                    ]
+                    stop_f = float(stop)
+
+                    def _score(
+                        _s0: dict[str, float],
+                        var: str,
+                        val: float,
+                        s_after: dict[str, float],
+                    ) -> float:
+                        br = float(s_after.get("vision_bearing", owm.bearing))
+                        rg = float(s_after.get("vision_range_m", owm.range_m))
+                        # Prefer smaller |bearing| and range approaching stop.
+                        return -abs(br) - 0.15 * abs(rg - stop_f)
+
+                    best, _sc = beam_search_first_action(
+                        self.agent,
+                        state0=state0,
+                        actions=cand_actions,
+                        depth=1,
+                        beam_k=4,
+                        rollout_horizon=1,
+                        score_fn=_score,
+                        maximize=True,
+                    )
+                    if best is not None:
+                        var, val = best
+                        ev = _graph_nid_to_motor_intent(str(var)) or (
+                            str(var) if str(var).startswith("intent_") else None
+                        )
+                        if ev:
+                            mapped[ev] = float(val)
+                            meta["nav_ai_reason"] = "wm_beam"
+                except Exception as exc:
+                    meta["wm_beam_error"] = str(exc)
+            elif not mapped and not wm_warm:
+                meta["wm_beam_skipped"] = "wm_cold"
+
+            if mapped and (
+                "intent_gait_coupling" in mapped or "intent_stride" in mapped
+            ):
+                out = dict(heur)
+                for k, v in mapped.items():
+                    if str(k).startswith("intent_"):
+                        out[str(k)] = float(v)
+                out = self._assert_forward_when_aligned(
+                    out,
+                    heur,
+                    bearing=float(owm.bearing),
+                    range_m=float(owm.range_m),
+                    stop=float(stop),
+                    meta=meta,
+                )
+                meta["nav_ai_ok"] = True
+                if not meta.get("nav_ai_reason"):
+                    meta["nav_ai_reason"] = "homeostatic"
+                meta["nav_ai_intents"] = sorted(mapped.keys())
+                return out, meta
+
+            meta["nav_ai_reason"] = "ai_empty_fallback_heur"
+            return heur, meta
+        except Exception as exc:
+            meta["nav_ai_reason"] = f"ai_error_fallback_heur:{exc}"
+            return heur, meta
+
     def _register_task_navigation(
         self,
         *,
@@ -2512,6 +3093,7 @@ class SimulationGroundedLanguageMixin:
         )
         arb = getattr(self, "_motor_arbiter", None)
         intents: dict[str, float] = {}
+        nav_meta: dict[str, Any] = {"task_nav_mode": _task_nav_mode(), "nav_ai_ok": False}
 
         if vision_resolve_enabled():
             tick = int(getattr(self, "tick", 0))
@@ -2525,14 +3107,26 @@ class SimulationGroundedLanguageMixin:
             need_nav = kind in ("approach", "approach_target") or (
                 kind == "reach_contact" and range_m > reach_start_m()
             ) or (kind == "reach_target" and range_m > approach_m)
+            mode = _task_nav_mode()
             if need_nav:
-                intents = navigation_intents_from_bearing_range(
-                    float(owm.bearing),
-                    range_m,
-                    stop,
-                    fallen=fallen,
-                    posture_stability=posture,
-                )
+                if mode == "wm_ai":
+                    intents, nav_meta = self._navigation_intents_wm_ai(
+                        owm, stop, posture, fallen
+                    )
+                else:
+                    intents = navigation_intents_from_bearing_range(
+                        float(owm.bearing),
+                        range_m,
+                        stop,
+                        fallen=fallen,
+                        posture_stability=posture,
+                    )
+                    nav_meta = {
+                        "task_nav_mode": "heuristic",
+                        "nav_ai_ok": False,
+                        "nav_ai_reason": "mode_heuristic",
+                    }
+            self._last_nav_meta = dict(nav_meta)
             if intents:
                 # Cache raw nav intents (incl. gait_coupling) for task_progress dump.
                 self._last_nav_intents = {
@@ -2558,6 +3152,49 @@ class SimulationGroundedLanguageMixin:
                     nodes["vision_range_m"] = float(vr)
                     if "task_target_dist_m" in nodes:
                         nodes["task_target_dist_m"] = float(vr)
+                try:
+                    task_log_event(
+                        "task_nav",
+                        tick=int(tick),
+                        task_nav_mode=str(nav_meta.get("task_nav_mode") or mode),
+                        nav_ai_ok=bool(nav_meta.get("nav_ai_ok")),
+                        nav_ai_reason=str(nav_meta.get("nav_ai_reason") or ""),
+                        wm_steps=int(nav_meta.get("wm_steps") or 0),
+                        bearing=round(float(owm.bearing), 4),
+                        range_m=round(float(range_m), 4),
+                        intent_gait_coupling=(
+                            round(float(intents["intent_gait_coupling"]), 4)
+                            if "intent_gait_coupling" in intents
+                            else None
+                        ),
+                        intent_stride=(
+                            round(float(intents["intent_stride"]), 4)
+                            if "intent_stride" in intents
+                            else None
+                        ),
+                    )
+                    from engine.neural_logger import neural_log_event
+
+                    neural_log_event(
+                        "nav",
+                        "intents",
+                        tick=int(tick),
+                        force=True,
+                        task_nav_mode=str(nav_meta.get("task_nav_mode") or mode),
+                        nav_ai_ok=bool(nav_meta.get("nav_ai_ok")),
+                        nav_ai_reason=str(nav_meta.get("nav_ai_reason") or ""),
+                        wm_steps=int(nav_meta.get("wm_steps") or 0),
+                        bearing=round(float(owm.bearing), 4),
+                        range_m=round(float(range_m), 4),
+                        intents={
+                            k: round(float(v), 4)
+                            for k, v in intents.items()
+                            if str(k).startswith("intent_")
+                        },
+                        nav_ai_intents=nav_meta.get("nav_ai_intents"),
+                    )
+                except Exception:
+                    pass
             else:
                 self._set_task_nav_graph_flags(nav_active=False)
             if arb is not None and intents:

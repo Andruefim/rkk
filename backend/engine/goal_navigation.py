@@ -84,6 +84,66 @@ def _normalize_xy(v: tuple[float, float]) -> tuple[float, float]:
     return x / n, y / n
 
 
+def _sigmoid(x: float) -> float:
+    x = float(max(-10.0, min(10.0, x)))
+    return float(1.0 / (1.0 + math.exp(-x)))
+
+
+def _blend_turn_forward(
+    *,
+    heading_err: float,
+    turn_thr: float,
+    dist: float,
+    stop: float,
+    force_turn: bool = False,
+) -> dict[str, float]:
+    """
+    Continuous sigmoidal blend of turn vs forward locomotion.
+
+    Replaces sharp ``if abs(heading_err) > turn_thr`` step discontinuities.
+    """
+    span = max(dist - stop, 0.05)
+    gain = min(1.0, span / max(dist, 1e-6))
+    fwd_stride = _STRIDE_MIN + gain * (_STRIDE_MAX - _STRIDE_MIN)
+
+    abs_h = abs(float(heading_err))
+    thr = float(turn_thr)
+    w_turn = _sigmoid((abs_h - thr) * 8.0)
+    if force_turn:
+        w_turn = max(w_turn, 0.55)
+
+    if heading_err > 0.0 or (force_turn and abs(heading_err) < 1e-9):
+        target_coupling = _TURN_COUPLING
+        target_sup_l, target_sup_r = 0.62, 0.38
+    else:
+        target_coupling = 1.0 - _TURN_COUPLING
+        target_sup_l, target_sup_r = 0.38, 0.62
+
+    turn_stride = max(_TURN_STRIDE, 0.55 * _TURN_STRIDE + 0.45 * fwd_stride)
+    if force_turn:
+        turn_stride = min(turn_stride, _TURN_STRIDE)
+
+    out: dict[str, float] = {
+        "intent_gait_coupling": float((1.0 - w_turn) * 0.5 + w_turn * target_coupling),
+        "intent_support_left": float((1.0 - w_turn) * 0.5 + w_turn * target_sup_l),
+        "intent_support_right": float((1.0 - w_turn) * 0.5 + w_turn * target_sup_r),
+        "intent_stride": float((1.0 - w_turn) * fwd_stride + w_turn * turn_stride),
+        "intent_torso_forward": float((1.0 - w_turn) * 0.55 + w_turn * 0.54),
+    }
+
+    # Large heading: softly prefer turn stride, but keep legs above walk_gate.
+    w_inplace = _sigmoid((abs_h - 1.05) * 8.0)
+    turn_floor = float(_TURN_STRIDE)
+    out["intent_stride"] = float(
+        (1.0 - w_inplace) * out["intent_stride"]
+        + w_inplace * max(turn_floor * 0.92, min(out["intent_stride"], turn_floor))
+    )
+    out["intent_torso_forward"] = float(
+        (1.0 - w_inplace) * out["intent_torso_forward"] + w_inplace * 0.53
+    )
+    return out
+
+
 def navigation_intents_from_ego_xy(
     x_fwd: float,
     y_right: float,
@@ -146,38 +206,14 @@ def navigation_intents_from_bearing_range(
         "vision_bearing": b,
         "vision_range_m": float(dist),
     }
-
-    if abs(heading_err) > turn_thr:
-        if heading_err > 0.0:
-            out["intent_gait_coupling"] = _TURN_COUPLING
-            out["intent_support_left"] = 0.62
-            out["intent_support_right"] = 0.38
-        else:
-            out["intent_gait_coupling"] = 1.0 - _TURN_COUPLING
-            out["intent_support_left"] = 0.38
-            out["intent_support_right"] = 0.62
-        span = max(dist - stop, 0.05)
-        gain = min(1.0, span / max(dist, 1e-6))
-        fwd_stride = _STRIDE_MIN + gain * (_STRIDE_MAX - _STRIDE_MIN)
-        out["intent_stride"] = float(
-            max(_TURN_STRIDE, 0.55 * _TURN_STRIDE + 0.45 * fwd_stride)
+    out.update(
+        _blend_turn_forward(
+            heading_err=heading_err,
+            turn_thr=turn_thr,
+            dist=dist,
+            stop=stop,
         )
-        out["intent_torso_forward"] = 0.54
-    else:
-        span = max(dist - stop, 0.05)
-        gain = min(1.0, span / max(dist, 1e-6))
-        stride = _STRIDE_MIN + gain * (_STRIDE_MAX - _STRIDE_MIN)
-        out["intent_stride"] = float(stride)
-        out["intent_torso_forward"] = 0.55
-
-    # Large heading error: turn in place, don't walk past the target.
-    abs_h = abs(float(heading_err))
-    if abs_h > 0.95:
-        out["intent_stride"] = float(_TURN_STRIDE * 0.68)
-        out["intent_torso_forward"] = 0.52
-    elif abs_h > 0.62:
-        cur = float(out.get("intent_stride", _STRIDE_MIN))
-        out["intent_stride"] = float(min(cur, _TURN_STRIDE * 0.82))
+    )
 
     if posture_stability is not None:
         scaled, active = apply_posture_to_navigation(out, float(posture_stability))
@@ -233,37 +269,24 @@ def navigation_intents(
         closing = vx * tcx + vy * tcy
     drifting_away = closing < -0.002
 
-    out: dict[str, float] = {}
-    out["task_heading_err"] = float(max(-1.0, min(1.0, heading_err / math.pi)))
-    out["task_closing_vel"] = float(max(-1.0, min(1.0, closing * 20.0)))
-
+    out: dict[str, float] = {
+        "task_heading_err": float(max(-1.0, min(1.0, heading_err / math.pi))),
+        "task_closing_vel": float(max(-1.0, min(1.0, closing * 20.0))),
+    }
     turn_thr = _HEADING_TURN_RAD * (0.55 if drifting_away else 1.0)
-    if abs(heading_err) > turn_thr or drifting_away:
-        # Mirror turn tag: gait_coupling > 0.5 turns left, < 0.5 turns right.
-        if heading_err > 0.0 or (drifting_away and abs(heading_err) < 1e-6 and cross >= 0.0):
-            out["intent_gait_coupling"] = _TURN_COUPLING
-            out["intent_support_left"] = 0.62
-            out["intent_support_right"] = 0.38
-        else:
-            out["intent_gait_coupling"] = 1.0 - _TURN_COUPLING
-            out["intent_support_left"] = 0.38
-            out["intent_support_right"] = 0.62
-        # Blend forward stride when still far — turn-in-place stalls approach otherwise.
-        span = max(dist - stop, 0.05)
-        gain = min(1.0, span / max(dist, 1e-6))
-        fwd_stride = _STRIDE_MIN + gain * (_STRIDE_MAX - _STRIDE_MIN)
-        stride = float(max(_TURN_STRIDE, 0.55 * _TURN_STRIDE + 0.45 * fwd_stride))
-        if drifting_away:
-            stride = min(stride, _TURN_STRIDE)
-        out["intent_stride"] = stride
-        out["intent_torso_forward"] = 0.54
-    else:
-        # P-controller on stride: full speed far away, fades to min at stop_distance.
-        span = max(dist - stop, 0.05)
-        gain = min(1.0, span / max(dist, 1e-6))
-        stride = _STRIDE_MIN + gain * (_STRIDE_MAX - _STRIDE_MIN)
-        out["intent_stride"] = float(stride)
-        out["intent_torso_forward"] = 0.55
+    # When drifting with near-zero heading, bias left/right from cross sign.
+    force_heading = float(heading_err)
+    if drifting_away and abs(force_heading) < 1e-6:
+        force_heading = 1e-6 if cross >= 0.0 else -1e-6
+    out.update(
+        _blend_turn_forward(
+            heading_err=force_heading,
+            turn_thr=turn_thr,
+            dist=dist,
+            stop=stop,
+            force_turn=drifting_away,
+        )
+    )
 
     if posture_stability is not None:
         scaled, active = apply_posture_to_navigation(out, float(posture_stability))

@@ -532,18 +532,118 @@ def test_objectness_peak_when_mask_invalid() -> None:
     assert (vt.diagnostics or {}).get("geometry") == "objectness_peak"
 
 
-def test_salient_peak_prefers_protrusion_over_floor_centroid() -> None:
-    """Full-image centroid stays near center; salient peak snaps to closer blob."""
-    h, w = 48, 64
+def test_salient_peak_rejects_frame_edge_protrusion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Left/right FOV border blobs must not become approach targets."""
+    monkeypatch.setenv("RKK_OBJECTNESS_EDGE_U", "0.10")
+    h, w = 40, 48
     depth = np.full((h, w), 4.0, dtype=np.float32)
-    depth[6:18, 44:58] = 1.3
+    # Only a right-edge strip is close — previously produced u≈1.0 locks.
+    depth[10:28, w - 3 : w] = 1.2
     frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
-    u_cent, v_cent, _, _, _ = attention_guided_range(frame, None)
-    u_peak, v_peak, r, _, _, pstr = salient_objectness_peak(frame)
-    assert u_cent is not None and u_peak is not None and r is not None
-    assert u_peak > 0.55
-    assert u_peak > u_cent + 0.05
-    assert pstr > 0.1
+    u, v, r, _, _, pstr = salient_objectness_peak(frame)
+    assert u is None or u <= 0.90
+
+
+def test_hard_lock_force_live_when_edge_disagrees(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Extreme lock + centered live → force trust live bearing."""
+    monkeypatch.setenv("RKK_HARD_LOCK_FORCE_LIVE_GAIN", "0.5")
+    monkeypatch.setenv("RKK_HARD_LOCK_EXTREME_B", "0.55")
+    monkeypatch.setenv("RKK_HARD_LOCK_LIVE_CENTER", "0.35")
+    monkeypatch.setenv("RKK_HARD_LOCK_FORCE_DELTA", "0.45")
+
+    from engine.object_working_memory import LatentSceneMemory, SceneEntity
+
+    scene = LatentSceneMemory()
+    ent = SceneEntity(entity_id="slot_edge")
+    ent.seed_from_bearing_range(
+        bearing=0.95,
+        range_m=2.3,
+        tick=1,
+        label="object",
+        confidence=0.6,
+        slot_id="slot_edge",
+        u=0.975,
+        v=0.55,
+    )
+    scene.entities["slot_edge"] = ent
+    scene.focus("slot_edge", exclusive=True)
+    scene.hard_lock_active = True
+    scene._prev_xy = (0.0, 0.0)
+    scene._prev_fwd = (1.0, 0.0)
+
+    class _Cam:
+        def live_at_bearing(self, bearing, **kwargs):
+            # Live says near center.
+            return 0.52, 0.50, 2.0, 0.7
+
+    ok = scene.refresh_active_from_live_camera(_Cam(), tick=2, blend=0.65)
+    assert ok is True
+    act = scene.active()
+    assert act is not None
+    assert act.diagnostics.get("force_live") is True
+    assert abs(float(act.bearing)) < abs(0.95) - 0.1
+    assert float(act.diagnostics.get("kalman_gain") or 0.0) >= 0.4
+
+
+def test_hard_lock_sustained_diverge_force_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Non-extreme lock that keeps disagreeing with live → force-live after N ticks."""
+    monkeypatch.setenv("RKK_HARD_LOCK_DIVERGE_B", "0.40")
+    monkeypatch.setenv("RKK_HARD_LOCK_DIVERGE_TICKS", "3")
+    monkeypatch.setenv("RKK_HARD_LOCK_SOFT_UNLOCK_TICKS", "6")
+    monkeypatch.setenv("RKK_HARD_LOCK_FORCE_LIVE_GAIN", "0.5")
+    monkeypatch.setenv("RKK_HARD_LOCK_FORCE_MAX_STEP", "0.30")
+
+    from engine.object_working_memory import LatentSceneMemory, SceneEntity
+
+    scene = LatentSceneMemory()
+    ent = SceneEntity(entity_id="slot_mid")
+    ent.seed_from_bearing_range(
+        bearing=0.15,
+        range_m=2.0,
+        tick=1,
+        label="object",
+        confidence=0.6,
+        slot_id="slot_mid",
+        u=0.575,
+        v=0.50,
+    )
+    scene.entities["slot_mid"] = ent
+    scene.focus("slot_mid", exclusive=True)
+    scene.hard_lock_active = True
+    scene._prev_xy = (0.0, 0.0)
+    scene._prev_fwd = (1.0, 0.0)
+
+    class _Cam:
+        def live_at_bearing(self, bearing, **kwargs):
+            # Live consistently right of lock (bearing≈0.80).
+            return 0.90, 0.50, 2.0, 0.7
+
+    # First two ticks accumulate streak but may not yet force (kalman outlier).
+    for t in (2, 3):
+        scene.refresh_active_from_live_camera(_Cam(), tick=t, blend=0.65)
+    assert int(scene._live_diverge_streak) >= 2
+
+    ok = scene.refresh_active_from_live_camera(_Cam(), tick=4, blend=0.65)
+    assert ok is True
+    act = scene.active()
+    assert act is not None
+    assert act.diagnostics.get("force_live") is True
+    assert float(act.bearing) > 0.15 + 0.05
+    assert int(act.diagnostics.get("live_diverge_streak") or 0) >= 3
+    saw_force = True
+
+    # Continue: repeated correction should keep closing toward live.
+    for t in range(5, 12):
+        scene.refresh_active_from_live_camera(_Cam(), tick=t, blend=0.65)
+        d = scene.active().diagnostics if scene.active() else {}
+        if d.get("force_live") or d.get("soft_unlock"):
+            saw_force = True
+    act = scene.active()
+    assert act is not None
+    assert float(act.bearing) > 0.40
+    assert saw_force
+    # Live target ≈ 0.80; should have moved well off the original 0.15 lock.
+    assert abs(float(act.bearing) - 0.80) < abs(0.15 - 0.80) - 0.15
 
 
 def test_salient_peak_finds_short_object_in_lower_fov() -> None:
@@ -675,19 +775,62 @@ def test_live_uv_continuity_prefers_prev_track() -> None:
     assert u < 0.42
 
 
-def test_uncertain_no_peaked_slot_refuses_objectness(
+def test_uncertain_no_peaked_slot_uses_objectness_when_peak_strong(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """3B: crushed diffuse slots + ontology match → UNCERTAIN, not objectness commit."""
+    """Diffuse SA + ontology match + strong depth protrusion → objectness bind."""
     from engine.grounded_language import FallbackEmbeddingClient
     from engine.visual_referent_ontology import clear_visual_referent_cache
 
     clear_visual_referent_cache()
     monkeypatch.setenv("RKK_VISION_RESOLVE_MIN_CONF", "0.35")
+    monkeypatch.setenv("RKK_VISION_OBJECTNESS_BIND", "1")
+    monkeypatch.setenv("RKK_VISION_OBJECTNESS_BIND_MIN_PEAK", "0.12")
     emb = FallbackEmbeddingClient(embed_dim=64)
     h, w = 40, 48
     depth = np.full((h, w), 4.0, dtype=np.float32)
-    depth[10:24, 8:20] = 1.5  # cylinder-like protrusion (unused after 3B refuse)
+    depth[10:24, 8:20] = 1.5  # cylinder-like protrusion
+    cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
+    slots = [
+        {
+            "slot_id": "slot_0",
+            "u": 0.5,
+            "v": 0.5,
+            "label": "",
+            "activation": 0.9,
+            "vector": None,
+            "uv_valid": False,
+            "mask_peakiness": 1.0,
+            "attn_mask": np.ones((8, 8), dtype=np.float32),
+        }
+    ]
+    vt, diag = resolve_visual_target(
+        "подойди к цилиндрическому объекту перед тобой",
+        slots=slots,
+        depth_camera=cam,
+        embed_fn=emb.embed,
+        require_range=True,
+    )
+    assert vt is not None, diag
+    assert diag.get("reason") == "ok"
+    assert diag.get("objectness_bind") is True
+    assert (vt.diagnostics or {}).get("geometry") == "objectness_peak"
+    assert float(vt.range_m or 0.0) < 3.0
+
+
+def test_uncertain_no_peaked_slot_refuses_weak_objectness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Diffuse SA + ontology but flat/empty depth → still uncertain."""
+    from engine.grounded_language import FallbackEmbeddingClient
+    from engine.visual_referent_ontology import clear_visual_referent_cache
+
+    clear_visual_referent_cache()
+    monkeypatch.setenv("RKK_VISION_RESOLVE_MIN_CONF", "0.35")
+    monkeypatch.setenv("RKK_VISION_OBJECTNESS_BIND", "1")
+    emb = FallbackEmbeddingClient(embed_dim=64)
+    h, w = 40, 48
+    depth = np.full((h, w), 4.0, dtype=np.float32)  # no protrusion
     cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
     slots = [
         {
@@ -712,6 +855,41 @@ def test_uncertain_no_peaked_slot_refuses_objectness(
     assert vt is None, diag
     assert diag.get("reason") == "uncertain_no_peaked_slot"
     assert diag.get("refused_geometry_fallback") == "objectness_peak"
+
+
+def test_objectness_bind_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engine.grounded_language import FallbackEmbeddingClient
+    from engine.visual_referent_ontology import clear_visual_referent_cache
+
+    clear_visual_referent_cache()
+    monkeypatch.setenv("RKK_VISION_OBJECTNESS_BIND", "0")
+    emb = FallbackEmbeddingClient(embed_dim=64)
+    h, w = 40, 48
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    depth[10:24, 8:20] = 1.5
+    cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
+    slots = [
+        {
+            "slot_id": "slot_0",
+            "u": 0.5,
+            "v": 0.5,
+            "label": "",
+            "activation": 0.9,
+            "vector": None,
+            "uv_valid": False,
+            "mask_peakiness": 1.0,
+            "attn_mask": np.ones((8, 8), dtype=np.float32),
+        }
+    ]
+    vt, diag = resolve_visual_target(
+        "подойди к цилиндрическому объекту перед тобой",
+        slots=slots,
+        depth_camera=cam,
+        embed_fn=emb.embed,
+        require_range=True,
+    )
+    assert vt is None, diag
+    assert diag.get("reason") == "uncertain_no_peaked_slot"
 
 
 def test_bind_confidence_no_floor() -> None:
