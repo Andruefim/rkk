@@ -329,6 +329,33 @@ def apply_causal_priors(graph) -> int:
     return count
 
 
+# ─── Navigation causal priors (vision-mode ``phys_*`` node names) ────────────
+# Innate "how my body moves the world target" knowledge so Active Inference can
+# plan an approach the moment a task binds — before the world model has trained.
+# Signs mirror the perceptual turn controller:
+#   nav_bearing (0.5 = centred): target on the right (bearing>0.5) → more LEFT
+#     support turns toward it (lowers bearing); target on the left → right support.
+#   nav_range (m/4): forward stride / torso lean reduce range.
+NAV_CAUSAL_PRIORS: list[dict] = [
+    {"from": "phys_intent_stride", "to": "phys_nav_range", "weight": -0.55, "alpha": 0.85},
+    {"from": "phys_intent_torso_forward", "to": "phys_nav_range", "weight": -0.30, "alpha": 0.80},
+    {"from": "phys_intent_gait_coupling", "to": "phys_nav_range", "weight": -0.18, "alpha": 0.72},
+    {"from": "phys_intent_support_left", "to": "phys_nav_bearing", "weight": -0.55, "alpha": 0.85},
+    {"from": "phys_intent_support_right", "to": "phys_nav_bearing", "weight": 0.55, "alpha": 0.85},
+]
+
+
+def apply_nav_priors(graph) -> int:
+    """Inject innate navigation causal edges (``phys_nav_*`` nodes). Idempotent."""
+    count = 0
+    for p in NAV_CAUSAL_PRIORS:
+        fr, to = p["from"], p["to"]
+        if fr in graph._node_ids and to in graph._node_ids:
+            graph.set_edge(fr, to, float(p["weight"]), alpha=float(p["alpha"]))
+            count += 1
+    return count
+
+
 def genome_bootstrap_enabled() -> bool:
     return os.environ.get("RKK_GENOME_BOOTSTRAP", "1").strip().lower() not in (
         "0",

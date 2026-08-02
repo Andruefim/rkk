@@ -87,6 +87,17 @@ _HYBRID_CONTROLLABLE_KEYS = {
 
 
 # ─── Имена переменных ─────────────────────────────────────────────────────────
+def nav_wm_nodes_enabled() -> bool:
+    """Opt-in neural-navigation WM nodes (phys_nav_bearing / phys_nav_range).
+
+    Off by default so the graph dimension (and trained checkpoints) stay unchanged;
+    set RKK_NAV_WM_NODES=1 to expose the vision target to Active Inference / WM beam.
+    """
+    return os.environ.get("RKK_NAV_WM_NODES", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def slot_var_ids(n_slots: int) -> list[str]:
     return [f"slot_{k}" for k in range(n_slots)]
 
@@ -402,6 +413,12 @@ class EnvironmentVisual:
             for key in _HYBRID_PHYS_KEYS:
                 if key in raw:
                     obs[f"phys_{key}"] = raw[key]
+        # Neural navigation target nodes (fed from ObjectWorkingMemory each tick,
+        # normalized to [0.05, 0.95]; 0.5 = centred bearing / mid range). Present as
+        # first-class WM nodes so Active Inference / WM beam can plan turn+approach.
+        if nav_wm_nodes_enabled():
+            obs["phys_nav_bearing"] = float(getattr(self, "_nav_bearing_norm", 0.5))
+            obs["phys_nav_range"] = float(getattr(self, "_nav_range_norm", 0.5))
         return obs
 
     @property
@@ -416,6 +433,9 @@ class EnvironmentVisual:
             for key in _HYBRID_PHYS_KEYS:
                 if key in raw:
                     ids.append(f"phys_{key}")
+        if nav_wm_nodes_enabled():
+            ids.append("phys_nav_bearing")
+            ids.append("phys_nav_range")
         return ids
 
     # ── do() ──────────────────────────────────────────────────────────────────

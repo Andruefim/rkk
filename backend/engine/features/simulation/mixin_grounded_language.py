@@ -2846,26 +2846,56 @@ class SimulationGroundedLanguageMixin:
         *,
         stop: float,
     ) -> dict[str, float]:
-        """Write OWM into graph nodes and return approach target priors for AI."""
+        """Feed the vision target into the WM nav nodes and return approach priors.
+
+        ``phys_nav_bearing`` / ``phys_nav_range`` are first-class WM nodes (see
+        environment_visual + genome nav priors), so Active Inference optimises the
+        motor intents that the world model predicts will centre the bearing and
+        shrink the range. Values are normalised to the node scale [0.05, 0.95]:
+        nav_bearing range (-1,1) → 0.5 = centred; nav_range range (0,4) m.
+        """
         b = float(owm.bearing)
         r = float(owm.range_m)
         nodes = self.agent.graph.nodes
+        # Legacy diagnostic mirrors (not WM nodes).
         nodes["vision_bearing"] = b
         nodes["vision_range_m"] = r
         if "task_target_dist_m" in nodes:
             nodes["task_target_dist_m"] = r
         priors: dict[str, float] = {
-            "phys_posture_stability": 1.0,
+            "phys_posture_stability": 0.9,
             "phys_com_z": 0.82,
-            "vision_bearing": 0.0,
-            "vision_range_m": float(max(0.05, stop)),
-            "task_target_dist_m": float(max(0.05, stop)),
         }
-        # Aligned → ask for forward COM velocity; large bearing → stay cautious.
-        if abs(b) < 0.35 and r > float(stop) + 0.05:
-            priors["phys_com_x_vel"] = 0.38
-        else:
-            priors["phys_com_x_vel"] = 0.12
+        from engine.environment_visual import nav_wm_nodes_enabled
+
+        if not nav_wm_nodes_enabled():
+            return priors
+
+        # Opt-in neural navigation: expose the vision target to the world model.
+        if not getattr(self, "_nav_priors_injected", False):
+            try:
+                from engine.genome.priors import apply_nav_priors
+
+                apply_nav_priors(self.agent.graph)
+            except Exception:
+                pass
+            self._nav_priors_injected = True
+        b_norm = float(min(0.95, max(0.05, (b + 1.0) / 2.0)))
+        r_norm = float(min(0.95, max(0.05, r / 4.0)))
+        stop_norm = float(min(0.95, max(0.05, float(stop) / 4.0)))
+        # Current-tick WM state (optimise reads snapshot_vec_dict()).
+        nodes["phys_nav_bearing"] = b_norm
+        nodes["phys_nav_range"] = r_norm
+        # Subsequent observe() (keeps the node fed between task ticks).
+        ven = self._visual_env_ref()
+        if ven is not None:
+            try:
+                ven._nav_bearing_norm = b_norm
+                ven._nav_range_norm = r_norm
+            except Exception:
+                pass
+        priors["nav_bearing"] = 0.5          # centre the target
+        priors["nav_range"] = stop_norm      # close to stop distance
         return priors
 
     def _assert_forward_when_aligned(
@@ -3042,12 +3072,15 @@ class SimulationGroundedLanguageMixin:
 
                         state0 = dict(obs)
                         cand_actions: list[tuple[str, float]] = [
-                            ("intent_gait_coupling", 0.35),
-                            ("intent_gait_coupling", 0.65),
-                            ("intent_stride", 0.55),
-                            ("intent_stride", 0.72),
+                            ("intent_support_left", 0.64),
+                            ("intent_support_right", 0.64),
+                            ("intent_stride", 0.58),
+                            ("intent_stride", 0.70),
+                            ("intent_gait_coupling", 0.45),
                         ]
-                        stop_f = float(stop)
+                        _stop_norm = float(min(0.95, max(0.05, float(stop) / 4.0)))
+                        _b0 = float(min(0.95, max(0.05, (float(owm.bearing) + 1.0) / 2.0)))
+                        _r0 = float(min(0.95, max(0.05, float(owm.range_m) / 4.0)))
 
                         def _score(
                             _s0: dict[str, float],
@@ -3055,10 +3088,15 @@ class SimulationGroundedLanguageMixin:
                             val: float,
                             s_after: dict[str, float],
                         ) -> float:
-                            br = float(s_after.get("vision_bearing", owm.bearing))
-                            rg = float(s_after.get("vision_range_m", owm.range_m))
-                            # Prefer smaller |bearing| and range approaching stop.
-                            return -abs(br) - 0.15 * abs(rg - stop_f)
+                            # Score on the WM nav nodes: centre bearing (0.5) and
+                            # bring normalised range to stop.
+                            br = float(
+                                s_after.get("phys_nav_bearing", s_after.get("nav_bearing", _b0))
+                            )
+                            rg = float(
+                                s_after.get("phys_nav_range", s_after.get("nav_range", _r0))
+                            )
+                            return -abs(br - 0.5) - 0.15 * abs(rg - _stop_norm)
 
                         best, _sc = beam_search_first_action(
                             self.agent,
