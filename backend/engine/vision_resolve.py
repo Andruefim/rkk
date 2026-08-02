@@ -748,6 +748,62 @@ def resolve_visual_target(
                     )
                 )
                 target = _apply_metric_geometry(cand, depth_camera)
+                # Nearby concrete referents (cylinder/chair/ball): reject far
+                # background peaks and retry a center-bearing objectness peak.
+                try:
+                    max_near = float(
+                        os.environ.get("RKK_VISION_OBJECTNESS_MAX_RANGE_M", "3.5")
+                    )
+                except ValueError:
+                    max_near = 3.5
+                concrete = str(ont_key).lower() in (
+                    "cylinder",
+                    "chair",
+                    "ball",
+                    "prop",
+                )
+                farish = (
+                    concrete
+                    and target.range_m is not None
+                    and float(target.range_m) > max_near
+                )
+                if farish:
+                    try:
+                        near_fn = getattr(
+                            depth_camera,
+                            "range_from_objectness_peak_near_bearing",
+                            None,
+                        )
+                        if callable(near_fn):
+                            far_m_before = float(target.range_m or 0.0)
+                            # Prefer protrusion near camera center (bearing≈0).
+                            u2, v2, r2, _var, _c2, p2 = near_fn(
+                                0.0, fov_u_half=0.35
+                            )
+                            if (
+                                u2 is not None
+                                and r2 is not None
+                                and float(r2) <= max_near
+                                and float(p2 or 0.0) >= objectness_bind_min_peak()
+                            ):
+                                cand = dict(cand)
+                                cand["u"] = float(u2)
+                                cand["v"] = float(v2)
+                                cand["uv_valid"] = True
+                                target = _apply_metric_geometry(cand, depth_camera)
+                                target.u = float(u2)
+                                target.v = float(v2)
+                                target.range_m = float(r2)
+                                target.diagnostics = {
+                                    **(target.diagnostics or {}),
+                                    "objectness_peak_strength": float(p2 or 0.0),
+                                    "geometry": "objectness_peak_near",
+                                    "retargeted_far_rejected": True,
+                                    "retargeted_from_far_m": round(far_m_before, 4),
+                                }
+                                farish = float(target.range_m or 99.0) > max_near
+                    except Exception:
+                        pass
                 pstr = float(
                     (target.diagnostics or {}).get("objectness_peak_strength") or 0.0
                 )
@@ -770,14 +826,17 @@ def resolve_visual_target(
                     and pstr >= objectness_bind_min_peak()
                     and not floorish
                     and not edgeish
+                    and not farish
                 ):
                     diags = dict(target.diagnostics or {})
-                    diags["geometry"] = "objectness_peak"
+                    diags["geometry"] = str(
+                        diags.get("geometry") or "objectness_peak"
+                    )
                     diags["source"] = "vision_objectness_bind"
                     diags["ontology_score"] = round(max(ont_best, ont_slot), 4)
                     target.diagnostics = diags
                     best_target = target
-                    diag["geometry_fallback"] = "objectness_peak"
+                    diag["geometry_fallback"] = diags["geometry"]
                     diag["objectness_bind"] = True
                     diag["ontology_score"] = round(max(ont_best, ont_slot), 4)
                 else:
@@ -786,6 +845,7 @@ def resolve_visual_target(
                         "ready": bool(target.is_ready(require_range=True)),
                         "floorish": bool(floorish),
                         "edgeish": bool(edgeish),
+                        "farish": bool(farish),
                         "u": round(float(target.u), 4),
                         "range_m": target.range_m,
                         "v": round(float(target.v), 4),
