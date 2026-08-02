@@ -320,11 +320,14 @@ def test_wm_ai_nav_returns_intents_and_falls_back(monkeypatch: pytest.MonkeyPatc
     assert meta2["nav_ai_ok"] is False
     assert "fallback" in str(meta2.get("nav_ai_reason") or "")
 
-    # Fallen → empty
+    # Fallen → crawl intents (keep closing while recovering)
     h.tick = 24
     intents3, meta3 = h._navigation_intents_wm_ai(owm, stop=0.7, posture=0.9, fallen=True)
-    assert intents3 == {}
+    assert intents3
+    assert "intent_gait_coupling" in intents3
+    assert "intent_stride" in intents3
     assert meta3["nav_ai_ok"] is False
+    assert "fallen" in str(meta3.get("nav_ai_reason") or "")
 
 
 def test_wm_ai_assert_forward_when_aligned(monkeypatch: pytest.MonkeyPatch) -> None:
