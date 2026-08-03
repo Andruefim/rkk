@@ -127,6 +127,10 @@ def _blend_turn_forward(
     # froze COM velocity at phys≈2m (live: bearing creep + in-place spin).
     if abs_h >= 0.78:
         w_turn = max(float(w_turn), 0.68)
+    # Final approach band: prefer forward even with large heading error.
+    # Live: closed to phys≈0.89 with bearing=1.0 then orbit/drift without this.
+    if stop < dist <= stop + 0.70:
+        w_turn = min(float(w_turn), 0.42)
 
     if heading_err > 0.0 or (force_turn and abs(heading_err) < 1e-9):
         target_coupling = _TURN_COUPLING
@@ -148,15 +152,17 @@ def _blend_turn_forward(
     }
 
     # Large heading: softly prefer turn stride, but keep legs above walk_gate.
-    w_inplace = _sigmoid((abs_h - 1.05) * 8.0)
-    turn_floor = float(_TURN_STRIDE)
-    out["intent_stride"] = float(
-        (1.0 - w_inplace) * out["intent_stride"]
-        + w_inplace * max(turn_floor * 0.92, min(out["intent_stride"], turn_floor))
-    )
-    out["intent_torso_forward"] = float(
-        (1.0 - w_inplace) * out["intent_torso_forward"] + w_inplace * 0.53
-    )
+    # Skip in-place collapse inside the final approach band.
+    if not (stop < dist <= stop + 0.70):
+        w_inplace = _sigmoid((abs_h - 1.05) * 8.0)
+        turn_floor = float(_TURN_STRIDE)
+        out["intent_stride"] = float(
+            (1.0 - w_inplace) * out["intent_stride"]
+            + w_inplace * max(turn_floor * 0.92, min(out["intent_stride"], turn_floor))
+        )
+        out["intent_torso_forward"] = float(
+            (1.0 - w_inplace) * out["intent_torso_forward"] + w_inplace * 0.53
+        )
     # Final close-range floor after turn blending — soft turn weights previously
     # pulled stride back under the CPG locomote threshold near stop.
     if dist > stop and abs_h <= float(turn_thr) * 1.5:
@@ -167,6 +173,10 @@ def _blend_turn_forward(
     if dist > stop + 0.25:
         out["intent_stride"] = float(
             max(float(out["intent_stride"]), float(close_stride) * 0.95)
+        )
+    if stop < dist <= stop + 0.70:
+        out["intent_stride"] = float(
+            max(float(out["intent_stride"]), float(close_stride))
         )
     return out
 

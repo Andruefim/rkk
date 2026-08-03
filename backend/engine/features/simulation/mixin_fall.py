@@ -273,16 +273,24 @@ class SimulationFallMixin:
         if callable(near_fn) and near_fn():
             return False
         phys_fn = getattr(self, "_physics_range_to_locked_body", None)
+        phys = None
         if callable(phys_fn):
             try:
                 phys = phys_fn()
-                # Block face-lift once inside the final approach band — re-orient
-                # snaps here interrupt gait right when closing to stop (live:
-                # oscillated 0.99↔1.16 with bearing creep + upright re-face).
-                if phys is not None and float(phys) <= 1.15:
-                    return False
             except Exception:
-                pass
+                phys = None
+        # Block face-lift once inside the final approach band — re-orient
+        # snaps here interrupt gait right when closing to stop (live:
+        # oscillated 0.91→1.18 after a face-lift at phys≈1.03).
+        best = getattr(self, "_task_approach_best_phys", None)
+        cur = getattr(self, "_current_approach_range", None)
+        band = 1.20
+        if phys is not None and float(phys) <= band:
+            return False
+        # phys can briefly be None under lock contention — still honor last close.
+        for cand in (best, cur):
+            if cand is not None and float(cand) <= band:
+                return False
         target = self._locked_contact_target_xy()
         if target is None:
             return False

@@ -212,7 +212,9 @@ def test_protected_stall_face_lifts_when_range_improving(
     sim._fall_recovery_last_progress_tick = 0
     sim._task_fallen_ticks = 120
     sim._task_fall_start_range = 4.8
-    sim._current_approach_range = 0.96
+    # Outside the final no-face band (>1.20) but still clear progress.
+    sim._current_approach_range = 1.55
+    sim._task_approach_best_phys = 1.55
     monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
     monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
     monkeypatch.setenv("RKK_TASK_FACE_LIFT_EVERY", "16")
@@ -236,6 +238,41 @@ def test_protected_stall_face_lifts_when_range_improving(
     assert sim._task_fall_assist_used is False
     assert sim.face_lift_calls == [(0.0, 0.0)]
     assert sim._fall_recovery_active is False
+
+
+def test_final_band_blocks_face_lift_even_when_progressing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inside phys<=1.20, face-lift must not interrupt the final close."""
+    sim = _FallSimStub()
+    sim.tick = 200
+    sim._fall_recovery_last_progress_tick = 0
+    sim._task_fallen_ticks = 120
+    sim._task_fall_start_range = 4.8
+    sim._current_approach_range = 0.96
+    sim._task_approach_best_phys = 0.96
+    monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
+    monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
+    monkeypatch.setenv("RKK_TASK_FACE_LIFT_EVERY", "16")
+    monkeypatch.setattr(
+        "engine.task_binding.human_task_embodiment_protected",
+        lambda _sim: True,
+    )
+    monkeypatch.setattr(
+        "engine.task_executive.active_tree_stage_kind",
+        lambda _sim: "approach",
+    )
+
+    obs = {
+        "com_z": 0.2,
+        "posture_stability": 0.2,
+        "foot_contact_l": 0.0,
+        "foot_contact_r": 0.0,
+    }
+    assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is False
+    assert sim.reset_calls == []
+    assert sim.face_lift_calls == []
+    assert sim._task_fall_assist_used is False
 
 
 def test_assist_reset_refused_during_verify_goal(monkeypatch: pytest.MonkeyPatch) -> None:

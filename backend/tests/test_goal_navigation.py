@@ -153,10 +153,10 @@ def test_close_range_keeps_cpg_stride_floor() -> None:
     assert at_stop == {}
 
 
-def test_moderate_bearing_far_keeps_forward_stride() -> None:
-    """Far from stop with moderate heading must still locomote (not spin in place)."""
+def test_final_band_prefers_forward_despite_large_bearing() -> None:
+    """Inside stop+0.7m, saturated bearing must not freeze locomote stride."""
     from engine.goal_navigation import navigation_intents_from_bearing_range
 
-    mid = navigation_intents_from_bearing_range(0.55, 2.0, 0.55)
-    assert mid
-    assert float(mid["intent_stride"]) >= 0.57
+    late = navigation_intents_from_bearing_range(1.0, 0.95, 0.55)
+    assert late
+    assert float(late["intent_stride"]) >= 0.60
