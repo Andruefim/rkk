@@ -4135,7 +4135,7 @@ class SimulationGroundedLanguageMixin:
                             br = self._bearing_range_from_world_xy(
                                 (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
                             )
-                            if br is not None and abs(float(br[0])) >= 0.55:
+                            if br is not None and abs(float(br[0])) >= 0.72:
                                 need_face = True
                     if need_face:
                         face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
