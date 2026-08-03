@@ -1461,8 +1461,14 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         z = float(stand_z) if stand_z is not None else float(HUMANOID_URDF_SPAWN_Z)
         with self._physics_lock:
             rid, cid = self.robot_id, self.client
-            pos, _ = pb.getBasePositionAndOrientation(rid, physicsClientId=cid)
-            ax, ay = float(pos[0]), float(pos[1])
+            # Use COM XY (task progress frame), not base link — leaning COM can be
+            # closer to the target than the base; uprighting at base XY erased closes.
+            try:
+                com, _ = self.get_com()
+                ax, ay = float(com[0]), float(com[1])
+            except Exception:
+                pos, _ = pb.getBasePositionAndOrientation(rid, physicsClientId=cid)
+                ax, ay = float(pos[0]), float(pos[1])
             dx, dy = tx - ax, ty - ay
             if math.hypot(dx, dy) < 0.05:
                 yaw = 0.0

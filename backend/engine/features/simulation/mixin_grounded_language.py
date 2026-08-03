@@ -5088,6 +5088,9 @@ class SimulationGroundedLanguageMixin:
         self._task_fall_protected_stall_ticks = 0
         self._task_fall_start_range = None
         self._task_fall_start_com = None
+        self._task_contact_latched = False
+        self._task_contact_latch_tick = -1
+        self._task_face_lift_tick = -10_000
 
         use_tb = task_binding_enabled()
         use_tree = task_tree_enabled() and use_tb
