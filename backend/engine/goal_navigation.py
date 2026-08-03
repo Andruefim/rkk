@@ -9,7 +9,8 @@ _STRIDE_MAX = 0.68
 # Must exceed CPG walk_gate (~0.54) so legs advance while turning.
 _TURN_STRIDE = 0.56
 _TURN_COUPLING = 0.72
-_HEADING_TURN_RAD = 0.12
+# Tighter than 0.12 — live approach drifted bearing 0→1 while closing and orbited.
+_HEADING_TURN_RAD = 0.06
 
 
 def _ef(key: str, default: float) -> float:
@@ -117,9 +118,14 @@ def _blend_turn_forward(
 
     abs_h = abs(float(heading_err))
     thr = float(turn_thr)
-    w_turn = _sigmoid((abs_h - thr) * 8.0)
+    # Steeper turn blend — mild heading error must not keep full forward stride
+    # (live: bearing crept 0→1 over ~100 ticks while still closing).
+    w_turn = _sigmoid((abs_h - thr) * 14.0)
     if force_turn:
         w_turn = max(w_turn, 0.55)
+    # Hard floor: once past ~35° equivalent, prefer turn over forward.
+    if abs_h >= 0.55:
+        w_turn = max(float(w_turn), 0.82)
 
     if heading_err > 0.0 or (force_turn and abs(heading_err) < 1e-9):
         target_coupling = _TURN_COUPLING
