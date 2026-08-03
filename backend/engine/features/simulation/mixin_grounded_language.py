@@ -4212,9 +4212,8 @@ class SimulationGroundedLanguageMixin:
                 else:
                     closing_stalled = True
                 if fallen:
-                    # Face+lift whenever fallen and still outside the last meter
-                    # (face-lift itself blocks at phys<=1.00 / stop+0.35).
-                    if phys is None or float(phys) > 1.00:
+                    # Always re-orient when fallen unless already contact-close.
+                    if phys is None or float(phys) > 0.35:
                         need_face = True
                 elif (
                     not near_goal

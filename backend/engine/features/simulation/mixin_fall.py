@@ -279,24 +279,35 @@ class SimulationFallMixin:
                 phys = phys_fn()
             except Exception:
                 phys = None
-        # Block face-lift only in the last meter — broader bands previously
-        # trapped bearing=±1 at phys≈1.33 with no re-face allowed.
+        # Detect fallen — no-face band only applies while upright. Fallen at
+        # phys≈0.75 previously could not re-face, crawled off to 1.8m (live).
+        env_fallen = False
+        try:
+            st = getattr(self, "_tick_phys_state", None)
+            raw = st() if callable(st) else None
+            if isinstance(raw, dict):
+                env_fallen = bool(raw.get("fallen", False))
+        except Exception:
+            env_fallen = False
         best = getattr(self, "_task_approach_best_phys", None)
         cur = getattr(self, "_current_approach_range", None)
-        band = 1.00
-        if phys is not None and float(phys) <= band:
-            return False
-        # phys can briefly be None under lock contention — still honor last close.
-        for cand in (best, cur):
-            if cand is not None and float(cand) <= band:
+        if not env_fallen:
+            band = 1.00
+            if phys is not None and float(phys) <= band:
                 return False
-        try:
-            from engine.task_observation import nav_stop_m
+            for cand in (best, cur):
+                if cand is not None and float(cand) <= band:
+                    return False
+            try:
+                from engine.task_observation import nav_stop_m
 
-            stop = float(nav_stop_m())
-        except Exception:
-            stop = 0.55
-        if phys is not None and float(phys) <= float(stop) + 0.35:
+                stop = float(nav_stop_m())
+            except Exception:
+                stop = 0.55
+            if phys is not None and float(phys) <= float(stop) + 0.35:
+                return False
+        elif phys is not None and float(phys) <= 0.35:
+            # Already contact-close while fallen — don't thrash pose.
             return False
         target = self._locked_contact_target_xy()
         if target is None:
