@@ -284,7 +284,7 @@ class SimulationFallMixin:
         # oscillated 0.91→1.18 after a face-lift at phys≈1.03).
         best = getattr(self, "_task_approach_best_phys", None)
         cur = getattr(self, "_current_approach_range", None)
-        band = 1.20
+        band = 1.35
         if phys is not None and float(phys) <= band:
             return False
         # phys can briefly be None under lock contention — still honor last close.

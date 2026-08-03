@@ -129,7 +129,7 @@ def _blend_turn_forward(
         w_turn = max(float(w_turn), 0.68)
     # Final approach band: prefer forward even with large heading error.
     # Live: closed to phys≈0.89 with bearing=1.0 then orbit/drift without this.
-    if stop < dist <= stop + 0.70:
+    if stop < dist <= stop + 1.00:
         w_turn = min(float(w_turn), 0.42)
 
     if heading_err > 0.0 or (force_turn and abs(heading_err) < 1e-9):
@@ -153,7 +153,7 @@ def _blend_turn_forward(
 
     # Large heading: softly prefer turn stride, but keep legs above walk_gate.
     # Skip in-place collapse inside the final approach band.
-    if not (stop < dist <= stop + 0.70):
+    if not (stop < dist <= stop + 1.00):
         w_inplace = _sigmoid((abs_h - 1.05) * 8.0)
         turn_floor = float(_TURN_STRIDE)
         out["intent_stride"] = float(
@@ -174,7 +174,7 @@ def _blend_turn_forward(
         out["intent_stride"] = float(
             max(float(out["intent_stride"]), float(close_stride) * 0.95)
         )
-    if stop < dist <= stop + 0.70:
+    if stop < dist <= stop + 1.00:
         out["intent_stride"] = float(
             max(float(out["intent_stride"]), float(close_stride))
         )

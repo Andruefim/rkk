@@ -212,9 +212,9 @@ def test_protected_stall_face_lifts_when_range_improving(
     sim._fall_recovery_last_progress_tick = 0
     sim._task_fallen_ticks = 120
     sim._task_fall_start_range = 4.8
-    # Outside the final no-face band (>1.20) but still clear progress.
-    sim._current_approach_range = 1.55
-    sim._task_approach_best_phys = 1.55
+    # Outside the final no-face band (>1.35) but still clear progress.
+    sim._current_approach_range = 1.70
+    sim._task_approach_best_phys = 1.70
     monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
     monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
     monkeypatch.setenv("RKK_TASK_FACE_LIFT_EVERY", "16")
@@ -243,14 +243,14 @@ def test_protected_stall_face_lifts_when_range_improving(
 def test_final_band_blocks_face_lift_even_when_progressing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Inside phys<=1.20, face-lift must not interrupt the final close."""
+    """Inside phys<=1.35, face-lift must not interrupt the final close."""
     sim = _FallSimStub()
     sim.tick = 200
     sim._fall_recovery_last_progress_tick = 0
     sim._task_fallen_ticks = 120
     sim._task_fall_start_range = 4.8
-    sim._current_approach_range = 0.96
-    sim._task_approach_best_phys = 0.96
+    sim._current_approach_range = 1.10
+    sim._task_approach_best_phys = 1.10
     monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
     monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
     monkeypatch.setenv("RKK_TASK_FACE_LIFT_EVERY", "16")

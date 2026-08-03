@@ -3832,7 +3832,10 @@ class SimulationGroundedLanguageMixin:
             align, margin, floor, blend = 0.40, 0.03, 0.62, 0.65
         blend = float(max(0.0, min(1.0, blend)))
         if abs(float(bearing)) > align:
-            return out
+            # Still floor stride in the final approach band even when heading
+            # is large — WM/AI turn overrides must not freeze the last meter.
+            if float(range_m) > float(stop) + 1.00:
+                return out
         if float(range_m) <= float(stop) + margin:
             return out
 
@@ -4064,8 +4067,28 @@ class SimulationGroundedLanguageMixin:
                 "intent_gait_coupling" in mapped or "intent_stride" in mapped
             ):
                 out = dict(heur)
+                sparse_beam = (
+                    str(meta.get("nav_ai_reason") or "") == "wm_beam"
+                    and len(mapped) <= 2
+                )
                 for k, v in mapped.items():
-                    if str(k).startswith("intent_"):
+                    if not str(k).startswith("intent_"):
+                        continue
+                    # Sparse WM beam previously overwrote gait_coupling with a
+                    # turn-only prior (0.35) while bearing was already high —
+                    # live approach orbited at phys≈1.26–1.45. Keep heur
+                    # turn/forward blend; allow stride nudges only.
+                    if sparse_beam and str(k) in (
+                        "intent_gait_coupling",
+                        "intent_support_left",
+                        "intent_support_right",
+                    ):
+                        continue
+                    if sparse_beam and str(k) == "intent_stride" and k in heur:
+                        out[str(k)] = float(
+                            max(float(heur[k]) * 0.95, float(v))
+                        )
+                    else:
                         out[str(k)] = float(v)
                 out = self._assert_forward_when_aligned(
                     out,
@@ -4151,8 +4174,8 @@ class SimulationGroundedLanguageMixin:
                     closing_stalled = True
                 if fallen:
                     # Face+lift whenever fallen and still outside the final
-                    # approach band (face-lift itself blocks at phys<=1.20).
-                    if phys is None or float(phys) > 1.20:
+                    # approach band (face-lift itself blocks at phys<=1.35).
+                    if phys is None or float(phys) > 1.35:
                         need_face = True
                 elif (
                     not near_goal
