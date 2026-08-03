@@ -1482,9 +1482,11 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 base_pos=[ax, ay, z],
                 base_orn=list(orn),
                 reset_scene_objects=False,
-                stabilize_steps=160,
-                relax_steps=40,
-                settle_steps=36,
+                # Lighter settle — heavy stabilize was dominating tick wall time
+                # when upright re-face fired every ~48 ticks during approach.
+                stabilize_steps=72,
+                relax_steps=20,
+                settle_steps=18,
                 snap_spine=False,
             )
         print(

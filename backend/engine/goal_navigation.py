@@ -123,9 +123,10 @@ def _blend_turn_forward(
     w_turn = _sigmoid((abs_h - thr) * 14.0)
     if force_turn:
         w_turn = max(w_turn, 0.55)
-    # Hard floor: once past ~35° equivalent, prefer turn over forward.
-    if abs_h >= 0.55:
-        w_turn = max(float(w_turn), 0.82)
+    # Hard floor only for near-saturated heading. A 0.55→0.82 floor previously
+    # froze COM velocity at phys≈2m (live: bearing creep + in-place spin).
+    if abs_h >= 0.78:
+        w_turn = max(float(w_turn), 0.68)
 
     if heading_err > 0.0 or (force_turn and abs(heading_err) < 1e-9):
         target_coupling = _TURN_COUPLING
@@ -161,6 +162,11 @@ def _blend_turn_forward(
     if dist > stop and abs_h <= float(turn_thr) * 1.5:
         out["intent_stride"] = float(
             max(float(out["intent_stride"]), float(close_stride))
+        )
+    # While still approaching, never let moderate turn blend kill locomote gate.
+    if dist > stop + 0.25:
+        out["intent_stride"] = float(
+            max(float(out["intent_stride"]), float(close_stride) * 0.95)
         )
     return out
 

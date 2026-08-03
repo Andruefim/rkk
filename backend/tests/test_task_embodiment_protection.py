@@ -126,10 +126,13 @@ def test_maybe_recover_hard_reset_when_not_protected(monkeypatch: pytest.MonkeyP
 
 
 def test_protected_stall_eventually_assist_reset_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without progress, unlocked stall may spawn-reset once; locked body must face-lift."""
     sim = _FallSimStub()
     sim.tick = 200
     sim._fall_recovery_last_progress_tick = 0
     sim._task_fallen_ticks = 120
+    # No locked body → spawn assist allowed when not progressing.
+    sim._task_locked_body_id = None
     monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
     monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
     monkeypatch.setenv("RKK_TASK_FACE_LIFT_EVERY", "16")
@@ -158,11 +161,46 @@ def test_protected_stall_eventually_assist_reset_once(monkeypatch: pytest.Monkey
     # (does not consume another spawn teleport).
     sim._fall_recovery_active = True
     sim._fall_recovery_last_progress_tick = 0
+    sim._task_locked_body_id = 7
     sim.tick = 400
     assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is True
     assert sim.reset_calls == [1]
     assert sim.face_lift_calls == [(0.0, 0.0)]
     assert sim._task_fall_assist_used is True
+
+
+def test_locked_body_stall_never_spawn_teleports(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a contact body locked, stall assist must face+lift — never spawn."""
+    sim = _FallSimStub()
+    sim.tick = 200
+    sim._fall_recovery_last_progress_tick = 0
+    sim._task_fallen_ticks = 120
+    sim._task_locked_body_id = 7
+    sim._task_fall_start_range = None
+    sim._current_approach_range = None
+    monkeypatch.setenv("RKK_FALL_RECOVERY_STALL_TICKS", "1")
+    monkeypatch.setenv("RKK_TASK_FALL_ASSIST_TICKS", "120")
+    monkeypatch.setenv("RKK_TASK_FACE_LIFT_EVERY", "16")
+    monkeypatch.setattr(
+        "engine.task_binding.human_task_embodiment_protected",
+        lambda _sim: True,
+    )
+    monkeypatch.setattr(
+        "engine.task_executive.active_tree_stage_kind",
+        lambda _sim: "approach",
+    )
+
+    obs = {
+        "com_z": 0.2,
+        "posture_stability": 0.2,
+        "foot_contact_l": 0.0,
+        "foot_contact_r": 0.0,
+    }
+    assert sim._maybe_recover_or_reset_after_fall(obs, apply_genome_program=False) is True
+    assert sim.reset_calls == []
+    assert sim.face_lift_calls == [(0.0, 0.0)]
+    assert sim._task_fall_assist_used is False
+    assert sim._fall_recovery_active is False
 
 
 def test_protected_stall_face_lifts_when_range_improving(

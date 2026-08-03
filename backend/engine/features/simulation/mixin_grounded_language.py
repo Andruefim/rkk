@@ -4137,21 +4137,37 @@ class SimulationGroundedLanguageMixin:
                 near_fn = getattr(self, "_task_fall_assist_near_goal", None)
                 near_goal = bool(near_fn()) if callable(near_fn) else False
                 need_face = False
+                # Track best physics close — upright re-face only when stalled.
+                if phys is not None:
+                    best = getattr(self, "_task_approach_best_phys", None)
+                    best_tick = int(getattr(self, "_task_approach_best_phys_tick", tick))
+                    cur = float(phys)
+                    if best is None or cur < float(best) - 0.02:
+                        self._task_approach_best_phys = cur
+                        self._task_approach_best_phys_tick = tick
+                        best_tick = tick
+                    closing_stalled = (tick - best_tick) >= 48
+                else:
+                    closing_stalled = True
                 if fallen:
                     if phys is not None and float(phys) <= float(stop) + 0.85:
                         near_goal = True
                     if not near_goal:
                         need_face = True
-                elif not near_goal and phys is not None and float(phys) > float(stop) + 0.35:
-                    # Upright heading saturated far from stop → snap yaw (do not
-                    # treat stop+0.85 as near — that blocked re-face at phys≈1.3
-                    # where bearing was already ±1 and approach orbited out).
-                    row = self._static_registry_row_for_body(
-                        int(getattr(self, "_task_locked_body_id", 0) or 0)
-                    )
-                    if row is not None:
+                elif (
+                    not near_goal
+                    and closing_stalled
+                    and phys is not None
+                    and float(phys) > float(stop) + 0.35
+                ):
+                    # Upright heading saturated AND not closing → snap yaw.
+                    # Continuous upright re-face while still closing previously
+                    # killed gait (face_lift ≈236 sim steps) and froze COM vel.
+                    aim_fn = getattr(self, "_locked_contact_target_xy", None)
+                    aim = aim_fn() if callable(aim_fn) else None
+                    if aim is not None:
                         br = self._bearing_range_from_world_xy(
-                            (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                            (float(aim[0]), float(aim[1]))
                         )
                         if br is not None and abs(float(br[0])) >= 0.85:
                             need_face = True
@@ -4172,12 +4188,19 @@ class SimulationGroundedLanguageMixin:
                 row = self._static_registry_row_for_body(
                     int(getattr(self, "_task_locked_body_id", 0) or 0)
                 )
-                if row is None:
+                aim_fn = getattr(self, "_locked_contact_target_xy", None)
+                aim = aim_fn() if callable(aim_fn) else None
+                if aim is not None:
+                    br = self._bearing_range_from_world_xy(
+                        (float(aim[0]), float(aim[1]))
+                    )
+                elif row is None:
                     self._set_task_nav_graph_flags(nav_active=False)
                     return
-                br = self._bearing_range_from_world_xy(
-                    (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
-                )
+                else:
+                    br = self._bearing_range_from_world_xy(
+                        (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                    )
                 if br is None:
                     self._set_task_nav_graph_flags(nav_active=False)
                     return
@@ -4236,7 +4259,7 @@ class SimulationGroundedLanguageMixin:
                     self._set_task_nav_graph_flags(nav_active=False)
                 return
             range_m = float(owm.range_m)
-            # Prefer physics surface range for stop decisions when locked.
+            # Prefer live surface-aim XY for stop decisions when locked.
             if phys is not None:
                 if float(phys) - float(owm.range_m) > 0.25:
                     range_m = float(phys)
@@ -4244,28 +4267,48 @@ class SimulationGroundedLanguageMixin:
                     range_m = min(float(owm.range_m), float(phys))
             nav_bearing = float(owm.bearing)
             # Locked body: always use physics world bearing + surface range.
+            # Aim at nearest surface point (not cylinder center) so large planters
+            # do not induce circumferential orbit while closing.
             # Stale OWM after close previously spun the agent away at phys≈0.86m.
             if phys is not None:
-                row = self._static_registry_row_for_body(
-                    int(getattr(self, "_task_locked_body_id", 0) or 0)
-                )
-                if row is not None:
+                aim_fn = getattr(self, "_locked_contact_target_xy", None)
+                aim = aim_fn() if callable(aim_fn) else None
+                if aim is not None:
                     br = self._bearing_range_from_world_xy(
-                        (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                        (float(aim[0]), float(aim[1]))
                     )
                     if br is not None:
                         nav_bearing = float(br[0])
+                else:
+                    row = self._static_registry_row_for_body(
+                        int(getattr(self, "_task_locked_body_id", 0) or 0)
+                    )
+                    if row is not None:
+                        br = self._bearing_range_from_world_xy(
+                            (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                        )
+                        if br is not None:
+                            nav_bearing = float(br[0])
                 range_m = float(phys)
             elif fallen:
-                row = self._static_registry_row_for_body(
-                    int(getattr(self, "_task_locked_body_id", 0) or 0)
-                )
-                if row is not None:
+                aim_fn = getattr(self, "_locked_contact_target_xy", None)
+                aim = aim_fn() if callable(aim_fn) else None
+                if aim is not None:
                     br = self._bearing_range_from_world_xy(
-                        (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                        (float(aim[0]), float(aim[1]))
                     )
                     if br is not None:
                         nav_bearing = float(br[0])
+                else:
+                    row = self._static_registry_row_for_body(
+                        int(getattr(self, "_task_locked_body_id", 0) or 0)
+                    )
+                    if row is not None:
+                        br = self._bearing_range_from_world_xy(
+                            (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                        )
+                        if br is not None:
+                            nav_bearing = float(br[0])
             has_contact = False
             if kind == "reach_contact":
                 has_contact = bool(
@@ -5114,6 +5157,8 @@ class SimulationGroundedLanguageMixin:
         self._task_contact_latched = False
         self._task_contact_latch_tick = -1
         self._task_face_lift_tick = -10_000
+        self._task_approach_best_phys = None
+        self._task_approach_best_phys_tick = -1
 
         use_tb = task_binding_enabled()
         use_tree = task_tree_enabled() and use_tb

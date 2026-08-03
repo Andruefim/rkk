@@ -167,17 +167,30 @@ class SimulationFallMixin:
         return False
 
     def _locked_contact_target_xy(self) -> tuple[float, float] | None:
-        """World XY of the locked contact body (registry / live PyBullet)."""
+        """World XY aim for locked body — nearest surface point for cylinders.
+
+        Prefer live PyBullet pose over registry so face-lift / crawl yaw track
+        the real body. For cylinders/spheres aim at the nearest surface point
+        (not the center) so approach closes to contact rather than orbiting a
+        large planter radius.
+        """
         bid = getattr(self, "_task_locked_body_id", None)
         if bid is None:
             return None
         row_fn = getattr(self, "_static_registry_row_for_body", None)
         row = row_fn(int(bid)) if callable(row_fn) else None
+        bx: float | None = None
+        by: float | None = None
+        radius = 0.0
+        kind = ""
         if isinstance(row, dict):
             try:
-                return float(row.get("x", 0.0)), float(row.get("y", 0.0))
+                bx = float(row.get("x", 0.0))
+                by = float(row.get("y", 0.0))
+                radius = float(row.get("radius", 0.0) or 0.0)
+                kind = str(row.get("kind", "") or "")
             except (TypeError, ValueError):
-                pass
+                bx, by = None, None
         base = None
         phys_fn = getattr(self, "_humanoid_physics_sim", None)
         if callable(phys_fn):
@@ -188,23 +201,62 @@ class SimulationFallMixin:
             if callable(unwrap) and env is not None:
                 base = unwrap(env)
                 base = getattr(base, "_sim", base)
-        if base is None:
-            return None
-        try:
-            import pybullet as pb
-
-            client = getattr(base, "client", None)
-            lock = getattr(base, "_physics_lock", None)
-            if lock is not None:
-                lock.acquire()
+        if base is not None:
             try:
-                p, _ = pb.getBasePositionAndOrientation(int(bid), physicsClientId=client)
-                return float(p[0]), float(p[1])
-            finally:
+                import pybullet as pb
+
+                client = getattr(base, "client", None)
+                lock = getattr(base, "_physics_lock", None)
                 if lock is not None:
-                    lock.release()
-        except Exception:
+                    lock.acquire()
+                try:
+                    p, _ = pb.getBasePositionAndOrientation(
+                        int(bid), physicsClientId=client
+                    )
+                    bx, by = float(p[0]), float(p[1])
+                finally:
+                    if lock is not None:
+                        lock.release()
+            except Exception:
+                pass
+        if bx is None or by is None:
             return None
+        # Aim at nearest surface point for extended bodies.
+        if kind in ("cylinder", "sphere") and radius > 0.05:
+            agent_xy = None
+            agent_fn = getattr(self, "_task_agent_com_xy", None)
+            if callable(agent_fn):
+                try:
+                    agent_xy = agent_fn()
+                except Exception:
+                    agent_xy = None
+            if agent_xy is None:
+                try:
+                    xy_fn = getattr(self, "_agent_xy_forward", None)
+                    if callable(xy_fn):
+                        agent_xy, _ = xy_fn()
+                except Exception:
+                    agent_xy = None
+            if agent_xy is None:
+                try:
+                    st_fn = getattr(self, "_tick_phys_state", None)
+                    st = st_fn() if callable(st_fn) else None
+                    if isinstance(st, dict) and "com_x" in st:
+                        agent_xy = (float(st["com_x"]), float(st.get("com_y", 0.0)))
+                except Exception:
+                    agent_xy = None
+            if agent_xy is not None:
+                import math
+
+                ax, ay = float(agent_xy[0]), float(agent_xy[1])
+                dx, dy = ax - float(bx), ay - float(by)
+                dist = float(math.hypot(dx, dy))
+                if dist > 1e-4:
+                    return (
+                        float(bx) + dx / dist * float(radius),
+                        float(by) + dy / dist * float(radius),
+                    )
+        return float(bx), float(by)
 
     def _try_task_face_lift_toward_locked(self) -> bool:
         """
