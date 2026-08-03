@@ -4173,19 +4173,18 @@ class SimulationGroundedLanguageMixin:
                 else:
                     closing_stalled = True
                 if fallen:
-                    # Face+lift whenever fallen and still outside the final
-                    # approach band (face-lift itself blocks at phys<=1.35).
-                    if phys is None or float(phys) > 1.35:
+                    # Face+lift whenever fallen and still outside the last meter
+                    # (face-lift itself blocks at phys<=1.00 / stop+0.35).
+                    if phys is None or float(phys) > 1.00:
                         need_face = True
                 elif (
                     not near_goal
-                    and closing_stalled
                     and phys is not None
                     and float(phys) > float(stop) + 0.35
                 ):
-                    # Upright heading saturated AND not closing → snap yaw.
-                    # Continuous upright re-face while still closing previously
-                    # killed gait (face_lift ≈236 sim steps) and froze COM vel.
+                    # Upright heading saturated → snap yaw. Do not wait for a
+                    # 48-tick stall when bearing is already ±1 (live: approach
+                    # started at phys≈1.33 with bearing=1.0 and never re-faced).
                     aim_fn = getattr(self, "_locked_contact_target_xy", None)
                     aim = aim_fn() if callable(aim_fn) else None
                     if aim is not None:
@@ -4193,6 +4192,8 @@ class SimulationGroundedLanguageMixin:
                             (float(aim[0]), float(aim[1]))
                         )
                         if br is not None and abs(float(br[0])) >= 0.85:
+                            need_face = True
+                        elif closing_stalled and br is not None and abs(float(br[0])) >= 0.55:
                             need_face = True
                 if need_face:
                     face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)

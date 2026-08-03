@@ -279,18 +279,25 @@ class SimulationFallMixin:
                 phys = phys_fn()
             except Exception:
                 phys = None
-        # Block face-lift once inside the final approach band — re-orient
-        # snaps here interrupt gait right when closing to stop (live:
-        # oscillated 0.91→1.18 after a face-lift at phys≈1.03).
+        # Block face-lift only in the last meter — broader bands previously
+        # trapped bearing=±1 at phys≈1.33 with no re-face allowed.
         best = getattr(self, "_task_approach_best_phys", None)
         cur = getattr(self, "_current_approach_range", None)
-        band = 1.35
+        band = 1.00
         if phys is not None and float(phys) <= band:
             return False
         # phys can briefly be None under lock contention — still honor last close.
         for cand in (best, cur):
             if cand is not None and float(cand) <= band:
                 return False
+        try:
+            from engine.task_observation import nav_stop_m
+
+            stop = float(nav_stop_m())
+        except Exception:
+            stop = 0.55
+        if phys is not None and float(phys) <= float(stop) + 0.35:
+            return False
         target = self._locked_contact_target_xy()
         if target is None:
             return False
