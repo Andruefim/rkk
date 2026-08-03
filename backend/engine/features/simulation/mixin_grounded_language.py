@@ -832,15 +832,9 @@ class SimulationGroundedLanguageMixin:
                             xy = (float(raw_xy[0]), float(raw_xy[1]))
                         if raw_fwd is not None and len(raw_fwd) >= 2:
                             fwd = (float(raw_fwd[0]), float(raw_fwd[1]))
-                            if vision_resolve_enabled():
-                                cam_fwd_fn = getattr(base, "get_ego_camera_forward_xy", None)
-                                if callable(cam_fwd_fn):
-                                    try:
-                                        cf = cam_fwd_fn()
-                                        if cf is not None and len(cf) >= 2:
-                                            fwd = (float(cf[0]), float(cf[1]))
-                                    except Exception:
-                                        pass
+                            # Body/root forward only — ego-camera forward previously
+                            # overrode this and made physics bearing saturate (±1)
+                            # after face-lift / neck look, so crawl orbited away.
                             return xy, fwd
             except Exception:
                 pass
@@ -1594,6 +1588,20 @@ class SimulationGroundedLanguageMixin:
             )
         except Exception:
             pass
+        # Spawn yaw often faces away from the locked planter. Snap ego frame
+        # toward the body once so WM/AI nav is not dominated by turn error.
+        if row is not None and self._task_locked_body_id is not None:
+            try:
+                br = self._bearing_range_from_world_xy(
+                    (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                )
+                if br is not None and abs(float(br[0])) >= 0.35:
+                    self._task_face_lift_tick = -10_000
+                    face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
+                    if callable(face_fn):
+                        face_fn()
+            except Exception:
+                pass
 
     def _physics_range_to_locked_body(self) -> float | None:
         """COM XY distance to bound static body (surface distance for cylinders)."""

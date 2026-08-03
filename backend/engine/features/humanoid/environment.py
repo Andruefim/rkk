@@ -1032,6 +1032,16 @@ class EnvironmentHumanoid:
             return fn()
         return None
 
+    def get_task_agent_pose(self) -> dict | None:
+        """COM XY + root forward for task navigation (delegates to physics sim)."""
+        fn = getattr(self._sim, "get_task_agent_pose", None)
+        if callable(fn):
+            try:
+                return dict(fn() or {})
+            except Exception:
+                return None
+        return None
+
     def get_joint_positions_world(self) -> list[dict]:
         return self._sim.get_all_link_positions()
 

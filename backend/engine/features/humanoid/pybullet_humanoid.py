@@ -1080,32 +1080,17 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         return best_id
 
     def get_task_agent_pose(self) -> dict[str, Any]:
-        """COM XY + body forward for task navigation (root yaw — not chest−root noise)."""
+        """COM XY + body forward for task navigation (root yaw only).
+
+        Chest−root XY was previously used as a heading hint, but it is near-vertical
+        / noisy (especially post face-lift) and made heading_err saturate → orbit.
+        """
         import math
 
         com, euler = self.get_com()
         xy = (float(com[0]), float(com[1]))
         yaw = float(euler[2]) if len(euler) > 2 else 0.0
-        # Prefer root/base orientation. Chest−root XY is near-vertical and noisy,
-        # which previously made heading_err random and approach orbit the target.
         fwd = (math.cos(yaw), math.sin(yaw))
-        com_z = float(com[2]) if len(com) > 2 else 1.0
-        # While fallen / low COM the chest−root vector is garbage — keep root yaw.
-        if com_z >= 0.45:
-            try:
-                links = self._named_link_world_positions()
-                # Optional: pelvis→chest projected only if horizontal span is meaningful.
-                if "chest" in links and "root" in links:
-                    chest = links["chest"]
-                    root = links["root"]
-                    dx = float(chest[0]) - float(root[0])
-                    dy = float(chest[1]) - float(root[1])
-                    n = math.hypot(dx, dy)
-                    if n > 0.08:
-                        fwd = (dx / n, dy / n)
-                        yaw = math.atan2(fwd[1], fwd[0])
-            except Exception:
-                pass
         return {"xy": xy, "forward": fwd, "yaw": yaw}
 
     def get_ego_camera_forward_xy(self) -> tuple[float, float] | None:
