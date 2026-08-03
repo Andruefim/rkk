@@ -1596,6 +1596,10 @@ class SimulationGroundedLanguageMixin:
                     (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
                 )
                 if br is not None and abs(float(br[0])) >= 0.35:
+                    # Fall-assist reset sets _last_fall_reset_tick and would block
+                    # face-lift for 4 ticks — exactly when body lock usually runs,
+                    # leaving bearing stuck at ±1 and approach in turn-only stride.
+                    self._last_fall_reset_tick = -999
                     self._task_face_lift_tick = -10_000
                     face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
                     if callable(face_fn):
