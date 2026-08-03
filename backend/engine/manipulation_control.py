@@ -38,12 +38,17 @@ def manipulation_intents_from_bearing_range(
 
     b = float(max(-1.0, min(1.0, bearing)))
     reach_key = "intent_reach_right" if b >= 0.0 else "intent_reach_left"
+    # Intents are centered at 0.5 (neutral). Scale ABOVE neutral by proximity —
+    # multiplying absolute _REACH_VAL by gain previously produced <0.5 (retract)
+    # for mid-band ranges (live: phys≈0.45 → reach≈0.22, arms never extend).
+    reach_amt = float(max(0.56, min(0.94, 0.50 + 0.44 * gain)))
+    grasp_amt = float(max(0.50, min(0.94, 0.50 + (_GRASP_VAL - 0.20) * gain)))
     return {
-        reach_key: float(max(0.0, min(0.94, _REACH_VAL * gain))),
-        "intent_grasp": float(max(0.0, min(0.94, _GRASP_VAL * gain))),
+        reach_key: reach_amt,
+        "intent_grasp": grasp_amt,
         "intent_head_yaw": float(max(0.0, min(1.0, 0.5 + 0.22 * b))),
         "vision_bearing": b,
-        "vision_range_m": dist,
+        "vision_range_m": float(dist),
     }
 
 

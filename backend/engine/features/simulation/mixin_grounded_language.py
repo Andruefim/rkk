@@ -3132,16 +3132,55 @@ class SimulationGroundedLanguageMixin:
             if owm is None:
                 owm = self._update_object_working_memory(tick)
             if owm is None or not owm.is_usable(tick):
+                # Locked body: still drive reach from physics range/bearing when
+                # OWM is briefly unusable after approach arrival.
+                phys = self._physics_range_to_locked_body()
+                if phys is None or float(phys) > float(reach_start_m()):
+                    return
+                aim_fn = getattr(self, "_locked_contact_target_xy", None)
+                aim = aim_fn() if callable(aim_fn) else None
+                bearing = 0.0
+                if aim is not None:
+                    br = self._bearing_range_from_world_xy(
+                        (float(aim[0]), float(aim[1]))
+                    )
+                    if br is not None:
+                        bearing = float(br[0])
+                intents = manipulation_intents_from_bearing_range(
+                    float(bearing),
+                    float(phys),
+                    fallen=fallen,
+                )
+                if arb is not None and intents:
+                    intents.pop("vision_bearing", None)
+                    intents.pop("vision_range_m", None)
+                    arb.register_from_dict("manipulation", intents, precision=0.88)
                 return
+            # Prefer physics surface range once a contact body is locked —
+            # OWM vision range often stays > reach_start while phys is already
+            # contact-close (live: vision≈0.92, phys≈0.45 → empty manip).
+            range_m = float(owm.range_m)
+            bearing = float(owm.bearing)
+            phys = self._physics_range_to_locked_body()
+            if phys is not None:
+                range_m = min(float(range_m), float(phys))
+                aim_fn = getattr(self, "_locked_contact_target_xy", None)
+                aim = aim_fn() if callable(aim_fn) else None
+                if aim is not None:
+                    br = self._bearing_range_from_world_xy(
+                        (float(aim[0]), float(aim[1]))
+                    )
+                    if br is not None:
+                        bearing = float(br[0])
             intents = manipulation_intents_from_bearing_range(
-                float(owm.bearing),
-                float(owm.range_m),
+                float(bearing),
+                float(range_m),
                 fallen=fallen,
             )
             if arb is not None and intents:
                 intents.pop("vision_bearing", None)
                 intents.pop("vision_range_m", None)
-                arb.register_from_dict("manipulation", intents, precision=0.85)
+                arb.register_from_dict("manipulation", intents, precision=0.88)
             return
 
         resolved = getattr(self, "_manip_resolved", None)
