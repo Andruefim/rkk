@@ -4150,9 +4150,9 @@ class SimulationGroundedLanguageMixin:
                 else:
                     closing_stalled = True
                 if fallen:
-                    if phys is not None and float(phys) <= float(stop) + 0.85:
-                        near_goal = True
-                    if not near_goal:
+                    # Face+lift whenever fallen and still outside the final
+                    # approach band (face-lift itself blocks at phys<=1.15).
+                    if phys is None or float(phys) > 1.15:
                         need_face = True
                 elif (
                     not near_goal

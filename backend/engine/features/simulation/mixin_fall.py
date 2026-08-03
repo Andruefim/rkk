@@ -276,9 +276,10 @@ class SimulationFallMixin:
         if callable(phys_fn):
             try:
                 phys = phys_fn()
-                # Allow upright heading snaps down to ~stop+0.4; block only when
-                # contact-close so we do not erase the final approach meters.
-                if phys is not None and float(phys) <= 0.95:
+                # Block face-lift once inside the final approach band — re-orient
+                # snaps here interrupt gait right when closing to stop (live:
+                # oscillated 0.99↔1.16 with bearing creep + upright re-face).
+                if phys is not None and float(phys) <= 1.15:
                     return False
             except Exception:
                 pass
