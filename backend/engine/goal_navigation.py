@@ -104,7 +104,16 @@ def _blend_turn_forward(
     """
     span = max(dist - stop, 0.05)
     gain = min(1.0, span / max(dist, 1e-6))
+    # Near stop, raw gain→0 collapses stride below CPG walk/locomote thresholds
+    # (~0.54 / 0.58) and approach plateaus ~0.12m short (live: stuck at 0.67).
+    close_gain = _ef("RKK_NAV_CLOSE_GAIN_FLOOR", 0.50)
+    if dist > stop:
+        gain = max(float(gain), float(max(0.0, min(1.0, close_gain))))
     fwd_stride = _STRIDE_MIN + gain * (_STRIDE_MAX - _STRIDE_MIN)
+    close_stride = _ef("RKK_NAV_CLOSE_STRIDE_FLOOR", 0.60)
+    if dist > stop:
+        fwd_stride = max(float(fwd_stride), float(close_stride))
+        fwd_stride = min(float(fwd_stride), float(_STRIDE_MAX))
 
     abs_h = abs(float(heading_err))
     thr = float(turn_thr)
@@ -141,6 +150,12 @@ def _blend_turn_forward(
     out["intent_torso_forward"] = float(
         (1.0 - w_inplace) * out["intent_torso_forward"] + w_inplace * 0.53
     )
+    # Final close-range floor after turn blending — soft turn weights previously
+    # pulled stride back under the CPG locomote threshold near stop.
+    if dist > stop and abs_h <= float(turn_thr) * 1.5:
+        out["intent_stride"] = float(
+            max(float(out["intent_stride"]), float(close_stride))
+        )
     return out
 
 

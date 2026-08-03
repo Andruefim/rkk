@@ -3821,11 +3821,11 @@ class SimulationGroundedLanguageMixin:
         """
         try:
             align = float(os.environ.get("RKK_NAV_ALIGN_BEARING", "0.40"))
-            margin = float(os.environ.get("RKK_NAV_FWD_RANGE_MARGIN", "0.12"))
+            margin = float(os.environ.get("RKK_NAV_FWD_RANGE_MARGIN", "0.03"))
             floor = float(os.environ.get("RKK_NAV_ALIGNED_STRIDE_FLOOR", "0.62"))
             blend = float(os.environ.get("RKK_NAV_ALIGNED_FWD_BLEND", "0.65"))
         except ValueError:
-            align, margin, floor, blend = 0.40, 0.12, 0.62, 0.65
+            align, margin, floor, blend = 0.40, 0.03, 0.62, 0.65
         blend = float(max(0.0, min(1.0, blend)))
         if abs(float(bearing)) > align:
             return out

@@ -140,3 +140,14 @@ def test_bearing_nav_turn_blend_is_continuous() -> None:
         float(sharp["intent_gait_coupling"]) - 0.5
     )
     assert float(sharp["intent_gait_coupling"]) > 0.5
+
+
+def test_close_range_keeps_cpg_stride_floor() -> None:
+    """Last ~0.12m must not collapse stride under CPG walk/locomote gates."""
+    from engine.goal_navigation import navigation_intents_from_bearing_range
+
+    near = navigation_intents_from_bearing_range(0.0, 0.67, 0.55)
+    assert near
+    assert float(near["intent_stride"]) >= 0.60
+    at_stop = navigation_intents_from_bearing_range(0.0, 0.55, 0.55)
+    assert at_stop == {}
