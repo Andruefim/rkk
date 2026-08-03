@@ -4377,17 +4377,22 @@ class SimulationGroundedLanguageMixin:
                 has_contact = bool(
                     self._manip_has_contact(getattr(self, "_manip_resolved", None))
                 )
+            # During reach_contact keep closing past approach stop until contact —
+            # standing at stop≈0.55 left arms short of the planter surface (live).
+            nav_stop = float(stop)
+            if kind == "reach_contact" and not has_contact:
+                nav_stop = min(float(stop), 0.28)
             need_nav = kind in ("approach", "approach_target") or (
                 kind == "reach_contact"
                 and (not has_contact)
-                and range_m > 0.12
+                and range_m > nav_stop
             ) or (kind == "reach_target" and range_m > approach_m)
             mode = _task_nav_mode()
             if need_nav:
                 if mode == "wm_ai":
                     intents, nav_meta = self._navigation_intents_wm_ai(
                         owm,
-                        stop,
+                        nav_stop,
                         posture,
                         fallen,
                         bearing_override=nav_bearing,
@@ -4397,7 +4402,7 @@ class SimulationGroundedLanguageMixin:
                     intents = navigation_intents_from_bearing_range(
                         float(nav_bearing),
                         range_m,
-                        stop,
+                        nav_stop,
                         fallen=fallen,
                         posture_stability=posture,
                     )

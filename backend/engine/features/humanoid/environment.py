@@ -606,11 +606,14 @@ class EnvironmentHumanoid:
         self._sim.set_joint("spine_pitch", pitch)
 
         sh_lo, sh_hi = self._comfort_zone("lshoulder")
+        # Reach intents must move shoulders meaningfully — 0.55 gain left
+        # rr=0.60 at essentially neutral (live: no PyBullet contact at phys≈0.5).
+        reach_gain = 1.35
         l_sh = float(
             np.clip(
                 0.5
                 - (arm_cb - 0.5) * 0.65 * am
-                + (rl - 0.5) * 0.55 * am
+                + (rl - 0.5) * reach_gain * am
                 - (wave - 0.5) * 0.12 * am,
                 sh_lo,
                 sh_hi,
@@ -620,7 +623,7 @@ class EnvironmentHumanoid:
             np.clip(
                 0.5
                 + (arm_cb - 0.5) * 0.65 * am
-                + (rr - 0.5) * 0.55 * am
+                + (rr - 0.5) * reach_gain * am
                 + (wave - 0.5) * 0.12 * am,
                 sh_lo,
                 sh_hi,
@@ -629,9 +632,11 @@ class EnvironmentHumanoid:
         self._sim.set_joint("lshoulder", l_sh)
         self._sim.set_joint("rshoulder", r_sh)
 
+        # Elbow: grasp closes; reach extends toward the target.
         g = float(np.clip((grasp - 0.5) * 1.1, -0.35, 0.35))
-        self._sim.set_joint("lelbow", float(np.clip(0.5 - g, 0.05, 0.95)))
-        self._sim.set_joint("relbow", float(np.clip(0.5 - g, 0.05, 0.95)))
+        reach_ext = float(np.clip(max(0.0, rr - 0.52, rl - 0.52) * 0.85, 0.0, 0.35))
+        self._sim.set_joint("lelbow", float(np.clip(0.5 - g + reach_ext * (1.0 if rl >= rr else 0.35), 0.05, 0.95)))
+        self._sim.set_joint("relbow", float(np.clip(0.5 - g + reach_ext * (1.0 if rr >= rl else 0.35), 0.05, 0.95)))
 
         self._sim.set_joint(
             "neck_yaw",
