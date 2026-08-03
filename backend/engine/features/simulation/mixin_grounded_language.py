@@ -4097,13 +4097,32 @@ class SimulationGroundedLanguageMixin:
             phys = self._physics_range_to_locked_body()
             # Fallen + locked body: body yaw is unreliable → face+lift in place
             # (rate-limited) so crawl closes instead of orbiting.
-            if fallen and getattr(self, "_task_locked_body_id", None) is not None:
-                face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
-                if callable(face_fn):
-                    try:
-                        face_fn()
-                    except Exception:
-                        pass
+            # Also re-face when upright but heading is saturated (walk-away).
+            # Never face-lift near the stop radius — that erased a 0.73m close.
+            if getattr(self, "_task_locked_body_id", None) is not None:
+                near_fn = getattr(self, "_task_fall_assist_near_goal", None)
+                near_goal = bool(near_fn()) if callable(near_fn) else False
+                if phys is not None and float(phys) <= float(stop) + 0.45:
+                    near_goal = True
+                if not near_goal:
+                    need_face = bool(fallen)
+                    if not need_face:
+                        row = self._static_registry_row_for_body(
+                            int(getattr(self, "_task_locked_body_id", 0) or 0)
+                        )
+                        if row is not None:
+                            br = self._bearing_range_from_world_xy(
+                                (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                            )
+                            if br is not None and abs(float(br[0])) >= 0.55:
+                                need_face = True
+                    if need_face:
+                        face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
+                        if callable(face_fn):
+                            try:
+                                face_fn()
+                            except Exception:
+                                pass
             owm_ok = owm is not None and owm.is_usable(tick)
             if not owm_ok:
                 # Fallen / teleport can make OWM briefly unusable — still navigate

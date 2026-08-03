@@ -210,6 +210,18 @@ class SimulationFallMixin:
         """
         if not self._fall_assist_allowed_for_stage():
             return False
+        # Do not erase near-goal closing distance.
+        near_fn = getattr(self, "_task_fall_assist_near_goal", None)
+        if callable(near_fn) and near_fn():
+            return False
+        phys_fn = getattr(self, "_physics_range_to_locked_body", None)
+        if callable(phys_fn):
+            try:
+                phys = phys_fn()
+                if phys is not None and float(phys) <= 1.05:
+                    return False
+            except Exception:
+                pass
         target = self._locked_contact_target_xy()
         if target is None:
             return False
