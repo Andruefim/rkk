@@ -4106,7 +4106,7 @@ class SimulationGroundedLanguageMixin:
                         pass
             owm_ok = owm is not None and owm.is_usable(tick)
             if not owm_ok:
-                # Fallen / teleport can make OWM briefly unusable — still crawl
+                # Fallen / teleport can make OWM briefly unusable — still navigate
                 # toward the locked planter using physics ego bearing/range.
                 if phys is None or float(phys) <= float(stop):
                     self._set_task_nav_graph_flags(nav_active=False)
@@ -4124,17 +4124,23 @@ class SimulationGroundedLanguageMixin:
                     self._set_task_nav_graph_flags(nav_active=False)
                     return
                 nav_bearing, _ = br
+                # Upright after face-lift must use normal stride nav — fallen=True
+                # crawl floor (stride≈0.55) previously froze closing while standing.
                 intents = navigation_intents_from_bearing_range(
                     float(nav_bearing),
                     float(phys),
                     stop,
-                    fallen=True,
-                    posture_stability=None,
+                    fallen=bool(fallen),
+                    posture_stability=(None if fallen else float(posture)),
                 )
                 nav_meta = {
-                    "task_nav_mode": "physics_crawl",
+                    "task_nav_mode": "physics_crawl" if fallen else "physics_nav",
                     "nav_ai_ok": False,
-                    "nav_ai_reason": "owm_unusable_physics_crawl",
+                    "nav_ai_reason": (
+                        "owm_unusable_physics_crawl"
+                        if fallen
+                        else "owm_unusable_physics_nav"
+                    ),
                 }
                 self._last_nav_meta = dict(nav_meta)
                 if intents:
