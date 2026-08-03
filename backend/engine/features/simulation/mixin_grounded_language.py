@@ -4136,12 +4136,16 @@ class SimulationGroundedLanguageMixin:
             if getattr(self, "_task_locked_body_id", None) is not None:
                 near_fn = getattr(self, "_task_fall_assist_near_goal", None)
                 near_goal = bool(near_fn()) if callable(near_fn) else False
-                if phys is not None and float(phys) <= float(stop) + 0.85:
-                    near_goal = True
                 need_face = False
-                if fallen and not near_goal:
-                    need_face = True
-                elif (not fallen) and (not near_goal) and phys is not None:
+                if fallen:
+                    if phys is not None and float(phys) <= float(stop) + 0.85:
+                        near_goal = True
+                    if not near_goal:
+                        need_face = True
+                elif not near_goal and phys is not None and float(phys) > float(stop) + 0.35:
+                    # Upright heading saturated far from stop → snap yaw (do not
+                    # treat stop+0.85 as near — that blocked re-face at phys≈1.3
+                    # where bearing was already ±1 and approach orbited out).
                     row = self._static_registry_row_for_body(
                         int(getattr(self, "_task_locked_body_id", 0) or 0)
                     )
@@ -4756,8 +4760,10 @@ class SimulationGroundedLanguageMixin:
                 return
         else:
             self._task_fall_streak = 0
-            self._task_fall_start_range = None
-            self._task_fall_start_com = None
+            # Keep approach progress baselines across brief upright recoveries.
+            # Clearing them here made the next fall look like "no progress" and
+            # triggered spawn teleport (live: wiped phys≈0.95 at tick 1004).
+            # Baselines reset only when a new human task binds.
 
         self._register_task_navigation(
             active=active,

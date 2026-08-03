@@ -224,7 +224,9 @@ class SimulationFallMixin:
         if callable(phys_fn):
             try:
                 phys = phys_fn()
-                if phys is not None and float(phys) <= 1.05:
+                # Allow upright heading snaps down to ~stop+0.4; block only when
+                # contact-close so we do not erase the final approach meters.
+                if phys is not None and float(phys) <= 0.95:
                     return False
             except Exception:
                 pass
@@ -502,7 +504,13 @@ class SimulationFallMixin:
                     progress_fn = getattr(
                         self, "_task_fall_assist_progress_blocks_reset", None
                     )
-                    if callable(progress_fn) and progress_fn():
+                    # Prefer in-place face+lift whenever a body is locked — spawn
+                    # teleport is only for the no-progress cold start case.
+                    locked = getattr(self, "_task_locked_body_id", None) is not None
+                    block_spawn = locked or (
+                        callable(progress_fn) and progress_fn()
+                    )
+                    if block_spawn:
                         # Spawn teleport would erase closing distance — face+lift
                         # in place so crawl yaw matches the locked body.
                         face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
@@ -520,6 +528,7 @@ class SimulationFallMixin:
                                 tick=int(getattr(self, "tick", 0)),
                                 fallen_ticks=int(fallen_ticks),
                                 stall_count=int(stall_count),
+                                locked_body=bool(locked),
                             )
                         except Exception:
                             pass
