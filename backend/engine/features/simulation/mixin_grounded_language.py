@@ -3037,8 +3037,15 @@ class SimulationGroundedLanguageMixin:
         episode = getattr(self, "_manip_episode", None)
         agent_xy, _ = self._agent_xy_forward()
         ctx: dict[str, Any] = {"agent_xy": agent_xy}
+        phys = self._physics_range_to_locked_body()
+        # Physics surface range is authoritative for verify once a body is locked.
+        # OWM/vision range alone previously kept last_pe=1.0 after real contact.
+        if phys is not None:
+            ctx["distance_m"] = float(phys)
+            ctx["physics_range_m"] = float(phys)
         if vision_resolve_enabled() and owm is not None and owm.range_m > 0.05:
-            ctx["distance_m"] = float(owm.range_m)
+            if phys is None:
+                ctx["distance_m"] = float(owm.range_m)
             ctx["vision_bearing"] = float(owm.bearing)
             ctx["vision_range_m"] = float(owm.range_m)
             ctx["task_target_x"] = float(owm.x_fwd)
@@ -3050,7 +3057,8 @@ class SimulationGroundedLanguageMixin:
                 if od is not None:
                     ctx["oracle_dist_m"] = od
         elif vision_resolve_enabled() and vt is not None and vt.range_m is not None:
-            ctx["distance_m"] = float(vt.range_m)
+            if phys is None:
+                ctx["distance_m"] = float(vt.range_m)
             ctx["vision_bearing"] = float(vt.bearing)
             ctx["vision_range_m"] = float(vt.range_m)
             ref = str(getattr(resolved, "ref", "") or "")
@@ -3058,7 +3066,7 @@ class SimulationGroundedLanguageMixin:
                 od = self._oracle_dist_m_for_eval(ref)
                 if od is not None:
                     ctx["oracle_dist_m"] = od
-        else:
+        elif phys is None:
             ref = str(getattr(resolved, "ref", "") or "")
             target_xy = self._target_xy(ref) if ref else None
             if target_xy is not None:
@@ -3071,7 +3079,20 @@ class SimulationGroundedLanguageMixin:
             ctx["baseline_xy"] = baseline
         if episode is not None and getattr(episode, "displacement_m", None) is not None:
             ctx["displacement_m"] = float(episode.displacement_m)
-        ctx["contact"] = 1.0 if self._manip_has_contact(resolved) else 0.0
+        live_contact = bool(self._manip_has_contact(resolved))
+        # Sticky contact: once physics contact was observed for this task and we
+        # remain near the locked body, keep contact true for verify (fallen /
+        # brief separation must not erase a real touch).
+        if live_contact:
+            self._task_contact_latched = True
+            self._task_contact_latch_tick = int(getattr(self, "tick", 0))
+        latched = bool(getattr(self, "_task_contact_latched", False))
+        if latched and not live_contact:
+            near = phys is not None and float(phys) <= float(contact_reach_m()) + 0.35
+            if not near:
+                latched = False
+                self._task_contact_latched = False
+        ctx["contact"] = 1.0 if (live_contact or latched) else 0.0
         return ctx
 
     def _register_task_manipulation(

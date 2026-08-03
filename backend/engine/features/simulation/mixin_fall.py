@@ -121,7 +121,7 @@ class SimulationFallMixin:
         )
 
     def _fall_assist_allowed_for_stage(self) -> bool:
-        """Assist teleport only during early locomotion stages — not reach/verify."""
+        """Assist teleport / face-lift during locomotion + reach — not verify."""
         try:
             from engine.task_executive import active_tree_stage_kind
 
@@ -130,7 +130,13 @@ class SimulationFallMixin:
             return False
         if not stage:
             return False
-        return stage in ("resolve_target", "approach", "approach_target")
+        return stage in (
+            "resolve_target",
+            "approach",
+            "approach_target",
+            "reach_contact",
+            "reach_target",
+        )
 
     def _try_task_fall_assist_reset(self) -> bool:
         """One assist reset during protected human task (preserves task/OWM)."""
