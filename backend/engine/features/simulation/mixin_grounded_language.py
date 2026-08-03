@@ -4129,17 +4129,29 @@ class SimulationGroundedLanguageMixin:
             phys = self._physics_range_to_locked_body()
             # Fallen + locked body: body yaw is unreliable → face+lift in place
             # (rate-limited) so crawl closes instead of orbiting.
-            # Do NOT re-face while upright — that repeatedly interrupted wm_beam
-            # closing and left phys stuck ~1.1m from the planter surface.
-            if (
-                fallen
-                and getattr(self, "_task_locked_body_id", None) is not None
-            ):
+            # Upright: only re-face when heading is fully saturated AND still far
+            # from stop — continuous upright re-face near ~1.1m previously
+            # interrupted closing, but without any re-face bearing drifts to ±1
+            # and approach orbits away after the initial body-lock snap.
+            if getattr(self, "_task_locked_body_id", None) is not None:
                 near_fn = getattr(self, "_task_fall_assist_near_goal", None)
                 near_goal = bool(near_fn()) if callable(near_fn) else False
                 if phys is not None and float(phys) <= float(stop) + 0.85:
                     near_goal = True
-                if not near_goal:
+                need_face = False
+                if fallen and not near_goal:
+                    need_face = True
+                elif (not fallen) and (not near_goal) and phys is not None:
+                    row = self._static_registry_row_for_body(
+                        int(getattr(self, "_task_locked_body_id", 0) or 0)
+                    )
+                    if row is not None:
+                        br = self._bearing_range_from_world_xy(
+                            (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
+                        )
+                        if br is not None and abs(float(br[0])) >= 0.85:
+                            need_face = True
+                if need_face:
                     face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
                     if callable(face_fn):
                         try:

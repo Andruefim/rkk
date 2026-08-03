@@ -265,14 +265,25 @@ class SimulationFallMixin:
         self._last_fall_reset_tick = tick
         self._task_fallen_after_assist_ticks = 0
         # Do NOT consume the one-shot spawn assist — face-lift may repeat.
-        lc = getattr(self, "_locomotion_controller", None)
-        if lc is not None:
-            reset_fn = getattr(lc, "reset_cpg_phases", None)
-            if callable(reset_fn):
-                try:
-                    reset_fn()
-                except Exception:
-                    pass
+        # Skip CPG phase reset when upright — resetting mid-walk kills gait and
+        # was part of the post-reface orbit. Fallen still needs a fresh crawl CPG.
+        env_fallen = False
+        try:
+            st = getattr(self, "_tick_phys_state", None)
+            raw = st() if callable(st) else None
+            if isinstance(raw, dict):
+                env_fallen = bool(raw.get("fallen", False))
+        except Exception:
+            env_fallen = False
+        if env_fallen:
+            lc = getattr(self, "_locomotion_controller", None)
+            if lc is not None:
+                reset_fn = getattr(lc, "reset_cpg_phases", None)
+                if callable(reset_fn):
+                    try:
+                        reset_fn()
+                    except Exception:
+                        pass
         graph = getattr(getattr(self, "agent", None), "graph", None)
         if graph is not None:
             try:
