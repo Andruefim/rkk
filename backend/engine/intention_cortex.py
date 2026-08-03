@@ -1115,8 +1115,17 @@ class IntentionCortex:
         if not goal_gen_enabled():
             return
         every = _ei("RKK_GOAL_WORLD_SWITCH_EVERY", 600)
-        if tick % every != 0:
+        if tick % every != 0 or every <= 0:
             return
+        # Never reload URDF / reset_stance mid one-shot task — that erased a
+        # phys≈0.73m approach at tick 600 (default switch cadence).
+        try:
+            from engine.task_binding import human_task_execution_active
+
+            if human_task_execution_active(sim):
+                return
+        except Exception:
+            pass
         from engine.core.world import is_humanoid_topology
 
         sw = getattr(sim, "switcher", None)

@@ -1137,6 +1137,15 @@ class SimulationTickMixin:
             _skip_perturb = transfer_bench_enabled()
         except ImportError:
             pass
+        # Do not shove the humanoid while a one-shot human task is executing.
+        if not _skip_perturb:
+            try:
+                from engine.task_binding import human_task_execution_active
+
+                if human_task_execution_active(self):
+                    _skip_perturb = True
+            except Exception:
+                pass
         if (
             not _skip_perturb
             and is_humanoid_topology(self.current_world)

@@ -3774,12 +3774,14 @@ class SimulationGroundedLanguageMixin:
         owm: ObjectWorkingMemory,
         *,
         stop: float,
+        bearing: float | None = None,
+        range_m: float | None = None,
     ) -> dict[str, float]:
-        """Write OWM into graph nodes and return approach target priors for AI."""
+        """Write nav geometry into graph nodes and return approach priors for AI."""
         graph = self.agent.graph
         self._ensure_nav_vision_graph_nodes(graph)
-        b = float(owm.bearing)
-        r = float(owm.range_m)
+        b = float(bearing) if bearing is not None else float(owm.bearing)
+        r = float(range_m) if range_m is not None else float(owm.range_m)
         b01 = _encode_nav_bearing_01(b)
         r01 = _encode_nav_range_01(r)
         stop01 = _encode_nav_range_01(float(max(0.05, stop)))
@@ -3934,7 +3936,12 @@ class SimulationGroundedLanguageMixin:
             return _store_cache(heur, meta)
 
         try:
-            priors = self._inject_owm_nav_priors(owm, stop=float(stop))
+            priors = self._inject_owm_nav_priors(
+                owm,
+                stop=float(stop),
+                bearing=float(bearing),
+                range_m=float(range_m),
+            )
             ensure = getattr(self, "_ensure_homeostatic_ctrl", None)
             if not callable(ensure):
                 from engine.active_inference import HomeostaticController, _eff_iters
@@ -4118,32 +4125,23 @@ class SimulationGroundedLanguageMixin:
             phys = self._physics_range_to_locked_body()
             # Fallen + locked body: body yaw is unreliable → face+lift in place
             # (rate-limited) so crawl closes instead of orbiting.
-            # Also re-face when upright but heading is saturated (walk-away).
-            # Never face-lift near the stop radius — that erased a 0.73m close.
-            if getattr(self, "_task_locked_body_id", None) is not None:
+            # Do NOT re-face while upright — that repeatedly interrupted wm_beam
+            # closing and left phys stuck ~1.1m from the planter surface.
+            if (
+                fallen
+                and getattr(self, "_task_locked_body_id", None) is not None
+            ):
                 near_fn = getattr(self, "_task_fall_assist_near_goal", None)
                 near_goal = bool(near_fn()) if callable(near_fn) else False
-                if phys is not None and float(phys) <= float(stop) + 0.45:
+                if phys is not None and float(phys) <= float(stop) + 0.85:
                     near_goal = True
                 if not near_goal:
-                    need_face = bool(fallen)
-                    if not need_face:
-                        row = self._static_registry_row_for_body(
-                            int(getattr(self, "_task_locked_body_id", 0) or 0)
-                        )
-                        if row is not None:
-                            br = self._bearing_range_from_world_xy(
-                                (float(row.get("x", 0.0)), float(row.get("y", 0.0)))
-                            )
-                            if br is not None and abs(float(br[0])) >= 0.72:
-                                need_face = True
-                    if need_face:
-                        face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
-                        if callable(face_fn):
-                            try:
-                                face_fn()
-                            except Exception:
-                                pass
+                    face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
+                    if callable(face_fn):
+                        try:
+                            face_fn()
+                        except Exception:
+                            pass
             owm_ok = owm is not None and owm.is_usable(tick)
             if not owm_ok:
                 # Fallen / teleport can make OWM briefly unusable — still navigate
@@ -4225,9 +4223,9 @@ class SimulationGroundedLanguageMixin:
                 else:
                     range_m = min(float(owm.range_m), float(phys))
             nav_bearing = float(owm.bearing)
-            # Fallen: always recompute bearing from locked body world XY —
-            # OWM/vision bearing inherits garbage yaw while prone.
-            if fallen and phys is not None:
+            # Locked body: always use physics world bearing + surface range.
+            # Stale OWM after close previously spun the agent away at phys≈0.86m.
+            if phys is not None:
                 row = self._static_registry_row_for_body(
                     int(getattr(self, "_task_locked_body_id", 0) or 0)
                 )
@@ -4237,7 +4235,8 @@ class SimulationGroundedLanguageMixin:
                     )
                     if br is not None:
                         nav_bearing = float(br[0])
-            elif phys is not None and abs(float(owm.range_m) - float(phys)) > 0.35:
+                range_m = float(phys)
+            elif fallen:
                 row = self._static_registry_row_for_body(
                     int(getattr(self, "_task_locked_body_id", 0) or 0)
                 )
@@ -4315,8 +4314,10 @@ class SimulationGroundedLanguageMixin:
                         nav_ai_ok=bool(nav_meta.get("nav_ai_ok")),
                         nav_ai_reason=str(nav_meta.get("nav_ai_reason") or ""),
                         wm_steps=int(nav_meta.get("wm_steps") or 0),
-                        bearing=round(float(owm.bearing), 4),
+                        bearing=round(float(nav_bearing), 4),
                         range_m=round(float(range_m), 4),
+                        owm_bearing=round(float(owm.bearing), 4),
+                        owm_range_m=round(float(owm.range_m), 4),
                         intent_gait_coupling=(
                             round(float(intents["intent_gait_coupling"]), 4)
                             if "intent_gait_coupling" in intents
@@ -4338,7 +4339,7 @@ class SimulationGroundedLanguageMixin:
                         nav_ai_ok=bool(nav_meta.get("nav_ai_ok")),
                         nav_ai_reason=str(nav_meta.get("nav_ai_reason") or ""),
                         wm_steps=int(nav_meta.get("wm_steps") or 0),
-                        bearing=round(float(owm.bearing), 4),
+                        bearing=round(float(nav_bearing), 4),
                         range_m=round(float(range_m), 4),
                         intents={
                             k: round(float(v), 4)

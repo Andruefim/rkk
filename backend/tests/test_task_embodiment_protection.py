@@ -282,3 +282,35 @@ def test_s2_force_reset_deferred_during_human_task(monkeypatch: pytest.MonkeyPat
     )
     assert ctrl._force_reset_stance_base(_Base(), sim=object()) is True
     assert reset_calls == [1]
+
+
+def test_world_transfer_skipped_during_human_task(
+    agi_loop_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Curriculum world switch must not reload URDF mid one-shot task."""
+    from engine.intention_cortex import IntentionCortex
+
+    sim = AgiLoopSim()
+    _bind_displace_chair_task(sim)
+    sim.current_world = "humanoid"
+    switched: list[str] = []
+
+    class _Switcher:
+        def switch(self, target: str) -> None:
+            switched.append(target)
+
+    sim.switcher = _Switcher()
+    cortex = IntentionCortex.__new__(IntentionCortex)
+    cortex._curriculum_graph = SimpleNamespace(
+        transfer_goals_to_world=lambda *a, **k: None
+    )
+    monkeypatch.setenv("RKK_GOAL_GEN_ENABLED", "1")
+    monkeypatch.setenv("RKK_GOAL_WORLD_SWITCH_EVERY", "600")
+    cortex._maybe_world_transfer(sim, tick=600)
+    assert switched == []
+
+    # Without an active task, switch proceeds.
+    sim._task_tree_ctrl = None
+    sim._task_binding = SimpleNamespace(active_task=None)
+    cortex._maybe_world_transfer(sim, tick=600)
+    assert switched == ["humanoid_variant"]
