@@ -567,8 +567,18 @@ class SimulationFallMixin:
                     )
                     # Prefer in-place face+lift whenever a body is locked — spawn
                     # teleport is only for the no-progress cold start case.
+                    # Also block spawn for any active human task before body lock
+                    # (live: fell during resolve_target, spawn reset at tick 462
+                    # wiped the approach before planter lock).
                     locked = getattr(self, "_task_locked_body_id", None) is not None
-                    block_spawn = locked or (
+                    task_active = False
+                    try:
+                        from engine.task_binding import human_task_execution_active
+
+                        task_active = bool(human_task_execution_active(self))
+                    except Exception:
+                        task_active = False
+                    block_spawn = locked or task_active or (
                         callable(progress_fn) and progress_fn()
                     )
                     if block_spawn:
@@ -578,6 +588,27 @@ class SimulationFallMixin:
                         if callable(face_fn) and face_fn():
                             self._clear_fall_recovery()
                             return True
+                        # No locked aim yet (resolve still pending): stand in place
+                        # without teleporting to spawn.
+                        if task_active and not locked:
+                            env = getattr(getattr(self, "agent", None), "env", None)
+                            stand_fn = getattr(env, "reset_stance", None) if env else None
+                            # reset_stance teleports to spawn — do NOT call it.
+                            # Use a no-op recovery clear so genome crawl continues.
+                            self._add_event(
+                                "task_fall_assist_skipped_prelock", "#66ccff", "value"
+                            )
+                            try:
+                                from engine.task_logger import task_log_event
+
+                                task_log_event(
+                                    "task_fall_assist_skipped_prelock",
+                                    tick=int(getattr(self, "tick", 0)),
+                                    fallen_ticks=int(fallen_ticks),
+                                )
+                            except Exception:
+                                pass
+                            return False
                         self._add_event(
                             "task_fall_assist_skipped_progress", "#66ccff", "value"
                         )

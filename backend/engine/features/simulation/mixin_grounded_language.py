@@ -5250,6 +5250,39 @@ class SimulationGroundedLanguageMixin:
             self._task_log_tree_bound(tick, tt)
             out["task_goal"] = goal.to_dict()
             out["task_tree"] = tt.snapshot(tick)
+            # Early physics body lock for cylinder/planter commands so fallen
+            # face-lift has an aim before vision resolve completes (live: long
+            # fallen resolve window ended in spawn teleport before lock).
+            try:
+                text_l = str(text).lower()
+                if any(
+                    k in text_l
+                    for k in ("cylinder", "planter", "column", "цилиндр", "колонн")
+                ):
+                    bid = self._forward_cylinder_contact_body(
+                        vision_range=None,
+                        prefer_planter=True,
+                        max_dist_m=8.0,
+                    )
+                    if bid is not None:
+                        self._task_locked_body_id = int(bid)
+                        try:
+                            task_log_event(
+                                "task_body_lock",
+                                tick=int(tick),
+                                locked_body_id=int(bid),
+                                label="early_cylinder",
+                                early=True,
+                            )
+                        except Exception:
+                            pass
+                        face_fn = getattr(self, "_try_task_face_lift_toward_locked", None)
+                        if callable(face_fn) and not fallen_flag:
+                            self._last_fall_reset_tick = -999
+                            self._task_face_lift_tick = -10_000
+                            face_fn()
+            except Exception:
+                pass
 
             resolved: ResolvedObject | None = getattr(self, "_manip_resolved", None)
             visual: VisualTarget | None = getattr(self, "_manip_resolved_visual", None)
