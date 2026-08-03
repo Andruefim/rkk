@@ -1476,6 +1476,10 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 base_pos=[ax, ay, z],
                 base_orn=list(orn),
                 reset_scene_objects=False,
+                stabilize_steps=160,
+                relax_steps=40,
+                settle_steps=36,
+                snap_spine=False,
             )
         print(
             f"[HumanoidEnv] face_target_and_lift "
@@ -1497,6 +1501,10 @@ class _PyBulletHumanoid(InstrumentalSandbox):
         base_pos: list[float],
         base_orn: list[float],
         reset_scene_objects: bool = True,
+        stabilize_steps: int = 260,
+        relax_steps: int = 80,
+        settle_steps: int = 72,
+        snap_spine: bool = True,
     ) -> None:
         """Neutral-joint repose at an explicit base pose (caller holds physics lock)."""
         had_fixed = self._root_constraint is not None
@@ -1533,21 +1541,22 @@ class _PyBulletHumanoid(InstrumentalSandbox):
                 pb.resetJointState(rid, i, targetValue=0.0, targetVelocity=0.0, physicsClientId=cid)
 
         self._motor_stabilize_neutral_pose()
-        for _ in range(260):
+        for _ in range(max(20, int(stabilize_steps))):
             pb.stepSimulation(physicsClientId=cid)
 
         self._motor_relax_velocity()
-        for _ in range(80):
+        for _ in range(max(8, int(relax_steps))):
             pb.stepSimulation(physicsClientId=cid)
 
         pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
 
-        self._snap_base_spine_vertical()
-        pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
-        self._motor_relax_velocity()
-        for _ in range(72):
-            pb.stepSimulation(physicsClientId=cid)
-        pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
+        if snap_spine:
+            self._snap_base_spine_vertical()
+            pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
+            self._motor_relax_velocity()
+            for _ in range(max(8, int(settle_steps))):
+                pb.stepSimulation(physicsClientId=cid)
+            pb.resetBaseVelocity(rid, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], physicsClientId=cid)
 
         # Восстанавливаем fixed_root если был (уже под lock — RLock)
         if had_fixed:

@@ -4164,9 +4164,9 @@ class SimulationGroundedLanguageMixin:
                         task_log_event(
                             "task_nav",
                             tick=int(tick),
-                            task_nav_mode="physics_crawl",
+                            task_nav_mode=str(nav_meta.get("task_nav_mode")),
                             nav_ai_ok=False,
-                            nav_ai_reason="owm_unusable_physics_crawl",
+                            nav_ai_reason=str(nav_meta.get("nav_ai_reason")),
                             bearing=round(float(nav_bearing), 4),
                             range_m=round(float(phys), 4),
                         )
