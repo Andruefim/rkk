@@ -2840,6 +2840,37 @@ class SimulationGroundedLanguageMixin:
             return 0
         return int(getattr(g, "_wm_train_calls", 0) or 0)
 
+    def _ensure_nav_wm_nodes(self) -> None:
+        """Ensure phys_nav_bearing / phys_nav_range exist in the WM graph.
+
+        Graph rebuilds (world switch, curriculum eval reload, checkpoint load) can
+        drop the opt-in nav nodes. Re-add them with ``preserve_state=True`` (keeps the
+        learned weights) and re-seed the innate nav priors so the neural navigation
+        keeps training across rebuilds.
+        """
+        g = getattr(getattr(self, "agent", None), "graph", None)
+        if g is None:
+            return
+        ids = list(getattr(g, "_node_ids", []) or [])
+        missing = [n for n in ("phys_nav_bearing", "phys_nav_range") if n not in ids]
+        if missing:
+            try:
+                vals = {k: float(g.nodes.get(k, 0.5)) for k in ids}
+                for m in missing:
+                    vals[m] = 0.5
+                g.rebind_variables(ids + missing, vals, preserve_state=True)
+                self._nav_priors_injected = False
+            except Exception:
+                return
+        if not getattr(self, "_nav_priors_injected", False):
+            try:
+                from engine.genome.priors import apply_nav_priors
+
+                apply_nav_priors(g)
+            except Exception:
+                pass
+            self._nav_priors_injected = True
+
     def _inject_owm_nav_priors(
         self,
         owm: ObjectWorkingMemory,
@@ -2872,14 +2903,10 @@ class SimulationGroundedLanguageMixin:
             return priors
 
         # Opt-in neural navigation: expose the vision target to the world model.
-        if not getattr(self, "_nav_priors_injected", False):
-            try:
-                from engine.genome.priors import apply_nav_priors
-
-                apply_nav_priors(self.agent.graph)
-            except Exception:
-                pass
-            self._nav_priors_injected = True
+        # Self-heal: curriculum / world-switch / eval-reload rebuild the graph and can
+        # drop the nav nodes, so re-add them (weights preserved) and re-seed the innate
+        # nav priors whenever they are missing — otherwise nav dynamics never train.
+        self._ensure_nav_wm_nodes()
         b_norm = float(min(0.95, max(0.05, (b + 1.0) / 2.0)))
         r_norm = float(min(0.95, max(0.05, r / 4.0)))
         stop_norm = float(min(0.95, max(0.05, float(stop) / 4.0)))
