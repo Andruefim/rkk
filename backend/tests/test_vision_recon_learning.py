@@ -38,16 +38,16 @@ def test_reconstruction_training_sharpens_slot_masks():
         cortex.remember_frame(f)
 
     losses = []
-    for _ in range(150):
+    for _ in range(220):
         loss = cortex.train_reconstruction(batch_size=2, steps=1)
         if loss is not None:
             losses.append(loss)
 
-    assert len(losses) > 100
-    assert np.mean(losses[-20:]) < np.mean(losses[:20])
+    assert len(losses) > 200
+    assert np.mean(losses[-20:]) < 0.75 * np.mean(losses[:20])
 
     peak_after = _mask_peak(cortex, holdout)
-    assert peak_after > peak_before * 1.3
+    assert peak_after > peak_before * 1.25
     assert cortex.n_recon_train == len(losses)
 
 

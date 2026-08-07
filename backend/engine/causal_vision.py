@@ -233,7 +233,7 @@ class SlotDecoder(nn.Module):
         out = self.net(torch.cat([x, pos], dim=1))
         if out.shape[-2:] != (self.h, self.w):
             out = F.interpolate(out, size=(self.h, self.w), mode="bilinear", align_corners=False)
-        rgb = out[:, :3].reshape(B, K, 3, self.h, self.w)
+        rgb = out[:, :3].sigmoid().reshape(B, K, 3, self.h, self.w)
         alpha = out[:, 3:].reshape(B, K, 1, self.h, self.w).softmax(dim=1)
         recon = (rgb * alpha).sum(dim=1)
         return recon, alpha.squeeze(2)
@@ -425,16 +425,16 @@ class CausalVisualCortex(nn.Module):
                 feats = self.encoder(x)
                 slots, _ = self.attention(feats)
                 recon, alpha = self.decoder(slots)
-                loss = F.mse_loss(recon, self._recon_target(x)) + self._decomposition_penalty(
-                    slots, alpha
-                )
+                l_recon = F.mse_loss(recon, self._recon_target(x))
+                loss = l_recon + self._decomposition_penalty(slots, alpha)
 
                 self.optim.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
                 self.optim.step()
 
-                last = float(loss.item())
+                # В метрику пишем чистый MSE: со штрафами число нечитаемо.
+                last = float(l_recon.item())
                 self.recon_losses.append(last)
                 self.n_recon_train += 1
             self.eval()

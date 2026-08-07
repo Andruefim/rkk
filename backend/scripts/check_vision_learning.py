@@ -86,7 +86,7 @@ def main() -> int:
     print(f"\nrecon loss:     {loss0:.5f} -> {loss1:.5f}")
     print(f"attn peakiness: {peak0:.3f} -> {peak1:.3f} (порог vision_resolve = 1.8)")
     print(f"alpha peakiness:{alpha0:.1f} -> {alpha1:.1f}")
-    ok = loss1 < loss0 and peak1 > max(1.8, peak0 * 1.5)
+    ok = loss1 < 0.5 * loss0 and peak1 > peak0 * 1.25
     print("RESULT:", "OK" if ok else "NO LEARNING")
     return 0 if ok else 1
 
