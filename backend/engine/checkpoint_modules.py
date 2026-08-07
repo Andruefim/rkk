@@ -67,7 +67,7 @@ _SPECS: tuple[ModuleSpec, ...] = (
         owner="_visual_env.cortex",
         modules=(_SELF,),
         optims=("optim",),
-        counters=("n_encode", "n_train"),
+        counters=("n_encode", "n_train", "n_recon_train"),
     ),
     ModuleSpec(
         key="system1",

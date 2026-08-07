@@ -14,6 +14,11 @@ httpx>=0.27.0
 python-dotenv>=1.0.0
 pybullet            # Фаза 9+: pip install pybullet
 
+# Фаза 12 (зрение): без Pillow кадр ego-камеры не декодируется и SlotAttention
+# молча не получает ни одного кадра; cv2 нужен для слот-масок в UI.
+Pillow>=10.0.0
+opencv-python-headless>=4.9.0
+
 # Фаза 10+: GNN (опционально — без него pure PyTorch fallback в causal_gnn.py)
 # pip install torch-geometric
 # или: pip install torch-geometric -f https://data.pyg.org/whl/torch-2.6.0+rocm6.2.html

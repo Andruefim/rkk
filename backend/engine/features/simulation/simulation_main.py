@@ -389,6 +389,17 @@ class Simulation(
             except Exception as e:
                 print(f"[Simulation] Auto visual error: {type(e).__name__}: {e}", flush=True)
 
+        # Зрительная кора и патчи создаются уже после memory_load — досылаем им
+        # веса сразу, чтобы первые тики не шли со случайной инициализацией.
+        try:
+            from engine.checkpoint_modules import apply_pending_learnable_modules
+
+            applied = apply_pending_learnable_modules(self)
+            if applied:
+                print(f"[Ckpt] boot-time modules restored: {sorted(applied)}", flush=True)
+        except Exception as e:
+            print(f"[Ckpt] boot-time restore skipped: {type(e).__name__}: {e}")
+
         # ── Variable Registry: dynamic ontology ──────────────────────────────
         try:
             from engine.variable_bootstrap import get_variable_registry

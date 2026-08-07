@@ -164,6 +164,7 @@ class EnvironmentVisual:
         self._hybrid_phys_gen = -1
         self._refresh_index = 0
         self._vision_stride_counter = 0
+        self._recon_counter = 0
 
         # Фаза 2: VLM-лексикон по индексу слота (после Hungarian; ключи slot_0…)
         self._slot_lexicon: dict[str, dict] = {}
@@ -240,6 +241,7 @@ class EnvironmentVisual:
                 break
             _gen, frame, intents = item
             try:
+                self._maybe_train_reconstruction(frame)
                 vals, vecs, attn = self.cortex.encode(frame)
                 self._last_slots = vals
                 self._last_slot_vecs = vecs
@@ -302,6 +304,7 @@ class EnvironmentVisual:
         self._refresh_index += 1
 
         if frame is not None:
+            self._maybe_train_reconstruction(frame)
             vals, vecs, attn = self.cortex.encode(frame)
             self._last_slots     = vals    # (K,) float in (0,1)
             self._last_slot_vecs = vecs    # (K,D)
@@ -325,6 +328,25 @@ class EnvironmentVisual:
             indices = np.linspace(0, len(vals)-1, K)
             pseudo  = np.array([vals[int(round(i))] for i in indices], dtype=np.float32)
             self._last_slots = torch.from_numpy(pseudo).to(self.device)
+
+    def _maybe_train_reconstruction(self, frame: np.ndarray) -> None:
+        """
+        Self-supervised шаг object-centric обучения перед encode: кадр идёт в буфер,
+        а раз в RKK_VISION_RECON_EVERY кадров кора учится восстанавливать сцену из слотов.
+        """
+        try:
+            from engine.causal_vision import recon_every, recon_training_enabled
+
+            if not recon_training_enabled():
+                return
+            self.cortex.remember_frame(frame)
+            self._recon_counter += 1
+            if self._recon_counter % recon_every() != 0:
+                return
+            self.cortex.train_reconstruction()
+        except Exception as e:
+            if os.environ.get("RKK_CKPT_VERBOSE", "1") not in ("0", "false"):
+                print(f"[VisualEnv] recon train skipped: {type(e).__name__}: {e}")
 
     def _get_current_intents(self) -> np.ndarray:
         # We need to access intent values; base_env.observe() or base_env._motor_state
