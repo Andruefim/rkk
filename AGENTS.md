@@ -70,6 +70,14 @@ Depth: sim uses PyBullet ego depth buffer (`get_ego_rgbd` → `DepthCamera.range
 - Метрики обучения зрения: `GET /vision/status` → `cortex.n_recon_train`, `mean_recon_loss`, `mask_peakiness` (порог приёма слота в `vision_resolve` — 1.8).
 - Быстрый старт вместо медленного онлайна: `python3 backend/scripts/pretrain_vision.py --ticks 200 --steps 600` (обучает на кадрах симуляции и пишет чекпоинт).
 
+#### Разрешение и профиль под GPU
+
+Геометрия коры задаётся из env (`vision_config_from_env`): `RKK_VISION_FRAME_H/W` (кратно 4), `RKK_VISION_CNN_CHANNELS`, `RKK_VISION_FEAT_DIM`, `RKK_VISION_SLOT_DIM`, `RKK_VISION_ITERS`, `RKK_VISION_LR`, `RKK_VISION_DEC_HIDDEN`; рендер камеры — `RKK_VISION_CAM_W/H`, `RKK_VISION_JPEG_Q`.
+
+Стоимость шага обучения на CPU (8 слотов): кадр 64×64 — 310 мс при batch 2; 128×128 — 830 мс; 128×128 с каналами `32,64,64` — 2.4 с. На GPU эти конфигурации упираются не в свёртки, а в рендер PyBullet, поэтому имеет смысл поднимать и разрешение, и `RKK_VISION_RECON_STEPS`. Готовый профиль лежит закомментированным в `.env` рядом с `RKK_VISION_SPATIAL_SLOTS`.
+
+Чекпоинт переносится между разрешениями: свёрточные веса грузятся как есть, позиционные сетки (`pos_grid`) пересоздаются под новый размер (`_load_compatible` пропускает тензоры несовпадающей формы). Смена `RKK_VISION_CNN_CHANNELS` или `RKK_VISION_SLOT_DIM` несовместима — такие слои начнут обучение заново.
+
 ### Key gotchas
 
 - Без `Pillow` кадр ego-камеры не декодируется и SlotAttention молча не получает ни одного кадра (зрение выглядит «включённым», но `n_encode` остаётся 0); `opencv-python-headless` нужен для слот-масок в UI. Оба в `backend/requirements.txt`; в облачной VM ставятся через `pip install --break-system-packages`.

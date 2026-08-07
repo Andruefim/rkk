@@ -44,10 +44,18 @@ def frame_content_hash(frame_b64: str | None) -> str:
     raw = frame_b64.encode("utf-8", errors="ignore")[:8192]
     return hashlib.sha256(raw + str(len(frame_b64)).encode()).hexdigest()[:16]
 
-# Рендер камеры для слотов: меньше пикселей → быстрее PyBullet + JPEG (превью /camera — отдельно)
-VISION_PIPELINE_CAM_W = 288
-VISION_PIPELINE_CAM_H = 216
-VISION_PIPELINE_JPEG_Q = 72
+# Рендер камеры для слотов: меньше пикселей → быстрее PyBullet + JPEG (превью /camera — отдельно).
+# На GPU есть смысл поднять вместе с RKK_VISION_FRAME_H/W.
+def _env_int_default(key: str, default: int) -> int:
+    try:
+        return max(16, int(os.environ.get(key, str(default))))
+    except ValueError:
+        return default
+
+
+VISION_PIPELINE_CAM_W = _env_int_default("RKK_VISION_CAM_W", 288)
+VISION_PIPELINE_CAM_H = _env_int_default("RKK_VISION_CAM_H", 216)
+VISION_PIPELINE_JPEG_Q = _env_int_default("RKK_VISION_JPEG_Q", 72)
 # Полные маски для UI — не на каждый _refresh (дорого: 8× JPEG + upscale)
 VISION_UI_MASK_EVERY = 3
 # Полный камера+encode раз в N интервенций (между — старые слоты, свежие phys_*)

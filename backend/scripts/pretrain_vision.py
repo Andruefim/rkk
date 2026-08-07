@@ -46,6 +46,10 @@ def main() -> int:
         print("[pretrain] визуальная среда выключена — включите RKK_AUTO_VISUAL=1")
         return 1
     cortex = vis.cortex
+    print(
+        f"[pretrain] device={cortex.device} frame={cortex.cfg.frame_h}x{cortex.cfg.frame_w} "
+        f"slots={cortex.cfg.n_slots} iters={cortex.cfg.n_iters}"
+    )
 
     frames: list[np.ndarray] = []
     for i in range(args.ticks):

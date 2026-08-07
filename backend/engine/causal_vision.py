@@ -202,8 +202,9 @@ class SlotDecoder(nn.Module):
     размазанными, из-за чего vision-резолв цели не находил «пиковый» слот.
     """
 
-    def __init__(self, cfg: VisionConfig, hidden: int = 32, start: int = 8):
+    def __init__(self, cfg: VisionConfig, hidden: int | None = None, start: int = 8):
         super().__init__()
+        hidden = hidden if hidden is not None else _env_int("RKK_VISION_DEC_HIDDEN", 32)
         self.h = cfg.frame_h // 2
         self.w = cfg.frame_w // 2
         self.h0 = max(4, cfg.frame_h // start)
@@ -558,14 +559,31 @@ class CausalVisualCortex(nn.Module):
         }
 
 
-def make_visual_cortex(device: torch.device, n_slots: int = 8) -> CausalVisualCortex:
-    cfg = VisionConfig(
-        frame_h=64, frame_w=64,
-        cnn_channels=[16, 32, 32],
-        feat_dim=32,
+def vision_config_from_env(n_slots: int = 8) -> VisionConfig:
+    """
+    Дефолты рассчитаны на CPU. На GPU имеет смысл поднять разрешение и ёмкость:
+    RKK_VISION_FRAME_H/W=128, RKK_VISION_CNN_CHANNELS=32,64,64, RKK_VISION_ITERS=3.
+    Разрешение должно делиться на 4 (энкодер даёт сетку H/4 × W/4).
+    """
+    raw_channels = os.environ.get("RKK_VISION_CNN_CHANNELS", "16,32,32")
+    try:
+        channels = [int(c) for c in raw_channels.replace(" ", "").split(",") if c]
+    except ValueError:
+        channels = [16, 32, 32]
+    h = max(16, _env_int("RKK_VISION_FRAME_H", 64) // 4 * 4)
+    w = max(16, _env_int("RKK_VISION_FRAME_W", 64) // 4 * 4)
+    return VisionConfig(
+        frame_h=h,
+        frame_w=w,
+        cnn_channels=channels or [16, 32, 32],
+        feat_dim=_env_int("RKK_VISION_FEAT_DIM", 32),
         n_slots=n_slots,
-        slot_dim=64,
-        n_iters=2,
-        lr=3e-4,
+        slot_dim=_env_int("RKK_VISION_SLOT_DIM", 64),
+        n_iters=max(1, _env_int("RKK_VISION_ITERS", 2)),
+        lr=_env_float("RKK_VISION_LR", 3e-4),
+        recon_weight=_env_float("RKK_VISION_RECON_WEIGHT", 0.1),
     )
-    return CausalVisualCortex(cfg, device)
+
+
+def make_visual_cortex(device: torch.device, n_slots: int = 8) -> CausalVisualCortex:
+    return CausalVisualCortex(vision_config_from_env(n_slots), device)

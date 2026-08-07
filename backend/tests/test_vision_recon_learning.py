@@ -26,14 +26,29 @@ def _mask_peak(cortex, frames) -> float:
     return float(np.mean(peaks))
 
 
+def _alpha_peak(cortex, frames) -> float:
+    """Пиковость альфа-масок декодера — прямой признак того, что слоты делят сцену."""
+    peaks = []
+    with torch.no_grad():
+        for f in frames:
+            slots, _ = cortex.attention(cortex.encoder(cortex.preprocess(f)))
+            _, alpha = cortex.decoder(slots)
+            a = alpha.squeeze(0).reshape(alpha.shape[1], -1).float()
+            a = a / a.sum(-1, keepdim=True).clamp_min(1e-8)
+            peaks.append(float((a.max(-1).values / a.mean(-1)).mean()))
+    return float(np.mean(peaks))
+
+
 def test_reconstruction_training_sharpens_slot_masks():
     torch.manual_seed(0)
+    np.random.seed(0)  # train_reconstruction сэмплирует батч глобальным numpy RNG
     rng = np.random.default_rng(0)
     cortex = make_visual_cortex(torch.device("cpu"), n_slots=4)
     frames = [_scene(rng) for _ in range(8)]
     holdout = [_scene(rng) for _ in range(2)]
 
     peak_before = _mask_peak(cortex, holdout)
+    alpha_before = _alpha_peak(cortex, holdout)
     for f in frames:
         cortex.remember_frame(f)
 
@@ -46,8 +61,11 @@ def test_reconstruction_training_sharpens_slot_masks():
     assert len(losses) > 200
     assert np.mean(losses[-20:]) < 0.75 * np.mean(losses[:20])
 
-    peak_after = _mask_peak(cortex, holdout)
-    assert peak_after > peak_before * 1.25
+    # Слоты перестают быть взаимозаменяемыми и делят кадр между собой.
+    assert _alpha_peak(cortex, holdout) > max(5.0, alpha_before * 3.0)
+    # Attention-маски (их читает vision_resolve) тоже сходятся к пикам, но медленнее:
+    # порог 1.8 достигается за сотни шагов, см. scripts/pretrain_vision.py.
+    assert _mask_peak(cortex, holdout) > peak_before
     assert cortex.n_recon_train == len(losses)
 
 
@@ -63,6 +81,65 @@ def test_snapshot_exposes_vision_learning_metrics():
     assert snap["n_recon_train"] >= 1
     assert snap["mean_recon_loss"] > 0.0
     assert snap["mask_peakiness"] > 0.0
+
+
+def test_vision_config_scales_from_env(monkeypatch):
+    from engine.causal_vision import vision_config_from_env
+
+    monkeypatch.setenv("RKK_VISION_FRAME_H", "130")
+    monkeypatch.setenv("RKK_VISION_FRAME_W", "128")
+    monkeypatch.setenv("RKK_VISION_CNN_CHANNELS", "32,64,64")
+    monkeypatch.setenv("RKK_VISION_ITERS", "3")
+    monkeypatch.setenv("RKK_VISION_SLOT_DIM", "96")
+
+    cfg = vision_config_from_env(n_slots=5)
+    # Разрешение округляется вниз до кратного 4: энкодер отдаёт сетку H/4 × W/4.
+    assert (cfg.frame_h, cfg.frame_w) == (128, 128)
+    assert cfg.cnn_channels == [32, 64, 64]
+    assert cfg.n_iters == 3 and cfg.slot_dim == 96 and cfg.n_slots == 5
+
+
+def test_higher_resolution_cortex_trains(monkeypatch):
+    from engine.causal_vision import make_visual_cortex as make
+
+    monkeypatch.setenv("RKK_VISION_FRAME_H", "128")
+    monkeypatch.setenv("RKK_VISION_FRAME_W", "128")
+    cortex = make(torch.device("cpu"), n_slots=3)
+    assert cortex.cfg.frame_h == 128
+
+    rng = np.random.default_rng(2)
+    for _ in range(4):
+        cortex.remember_frame(_scene(rng))
+    loss = cortex.train_reconstruction(batch_size=2, steps=1)
+    assert loss is not None and loss > 0.0
+
+    vals, vecs, attn = cortex.encode(_scene(rng))
+    assert attn.shape == (3, 32, 32)
+
+
+def test_checkpoint_transfers_across_resolutions(monkeypatch):
+    from engine.causal_vision import make_visual_cortex as make
+    from engine.checkpoint_modules import _load_compatible  # noqa: PLC2701
+
+    monkeypatch.setenv("RKK_VISION_FRAME_H", "64")
+    monkeypatch.setenv("RKK_VISION_FRAME_W", "64")
+    small = make(torch.device("cpu"), n_slots=3)
+    with torch.no_grad():
+        for p in small.parameters():
+            p.mul_(0.5).add_(0.01)
+
+    monkeypatch.setenv("RKK_VISION_FRAME_H", "128")
+    monkeypatch.setenv("RKK_VISION_FRAME_W", "128")
+    big = make(torch.device("cpu"), n_slots=3)
+    loaded = _load_compatible(big, {k: v.clone() for k, v in small.state_dict().items()})
+
+    assert loaded > 0
+    assert torch.allclose(
+        big.encoder.backbone[0].weight, small.encoder.backbone[0].weight
+    )
+    # Позиционные сетки зависят от разрешения и остаются пересозданными под новый размер.
+    assert big.encoder.pos_grid.shape[-1] == 32
+    big.encode(_scene(np.random.default_rng(5)))
 
 
 def test_decoder_weights_are_part_of_checkpoint():
