@@ -54,8 +54,25 @@ The tracked `.env` enables the **vision-first** command/task-tree path (camera +
 
 Depth: sim uses PyBullet ego depth buffer (`get_ego_rgbd` → `DepthCamera.range_at_uv`). Same API for real-robot RGB-D/stereo later.
 
+### Накопительное обучение между запусками (чекпоинты)
+
+- **`RKK_MEMORY_RESUME_ON_START=1`**: на старте грузится `state/autosave.rkk` (+ `autosave.meta.json`).
+- **`RKK_MEMORY_AUTOSAVE_EVERY`** — периодический автосейв; **`RKK_MEMORY_SAVE_ON_SHUTDOWN=1`** — сохранение при остановке сервера (`Simulation.shutdown` вызывается из lifespan FastAPI).
+- Чекпоинт несёт веса **всех** обучаемых подсистем (`engine/checkpoint_modules.py`): зрительная кора, System1, моторная кора (по программам), мозжечок, рефлексы, CPG, внутренний голос, проприоцепция, ансамбль графа + состояние оптимизаторов Adam (`RKK_CKPT_OPTIM=1`).
+- Лениво создаваемые подсистемы получают отложенную секцию, она применяется из тика (`RKK_CKPT_PENDING_EVERY=20`).
+- При resume врождённые приоры генома заполняют только пустые рёбра, иначе `set_edge` подмешивает 30% врождённого веса поверх обученного.
+- Проверка цикла: `python3 backend/scripts/check_checkpoint_roundtrip.py --ticks 120`.
+
+### Обучение зрения
+
+- **`RKK_VISION_RECON=1`**: self-supervised реконструкция кадра из слотов (`SlotDecoder`) на каждом encode; `RKK_VISION_RECON_BATCH`, `RKK_VISION_RECON_STEPS`, `RKK_VISION_RECON_EVERY`.
+- **`RKK_VISION_SPATIAL_SLOTS=1`**, `RKK_VISION_MASK_ENTROPY_W`, `RKK_VISION_SLOT_DIVERSITY_W` — без них слоты схлопываются в один усреднённый и маски остаются равномерными.
+- Метрики обучения зрения: `GET /vision/status` → `cortex.n_recon_train`, `mean_recon_loss`, `mask_peakiness` (порог приёма слота в `vision_resolve` — 1.8).
+- Быстрый старт вместо медленного онлайна: `python3 backend/scripts/pretrain_vision.py --ticks 200 --steps 600` (обучает на кадрах симуляции и пишет чекпоинт).
+
 ### Key gotchas
 
+- Без `Pillow` кадр ego-камеры не декодируется и SlotAttention молча не получает ни одного кадра (зрение выглядит «включённым», но `n_encode` остаётся 0); `opencv-python-headless` нужен для слот-масок в UI. Оба в `backend/requirements.txt`; в облачной VM ставятся через `pip install --break-system-packages`.
 - `pybullet` requires `build-essential`, `cmake`, and `python3-dev` system packages to compile from source. These must be installed before `pip install -r backend/requirements.txt`.
 - PyTorch CPU variant must be installed with `--index-url https://download.pytorch.org/whl/cpu` to avoid downloading the large CUDA build.
 - The `.env` file is tracked in git. To override settings without modifying it, pass environment variables directly when starting the backend.
