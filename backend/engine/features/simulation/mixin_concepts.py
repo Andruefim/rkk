@@ -125,6 +125,28 @@ class SimulationConceptsMixin:
             restore_meta_to_simulation(self, meta)
         self._meta_restored = True
 
+    def _maybe_apply_pending_checkpoint(self) -> None:
+        """
+        Досылаем веса тем подсистемам, которых ещё не было в момент загрузки
+        чекпоинта (моторная кора, зрительная кора, мозжечок и т.п. создаются лениво).
+        """
+        if not getattr(self, "_pending_module_state", None):
+            return
+        try:
+            every = max(1, int(os.environ.get("RKK_CKPT_PENDING_EVERY", "20")))
+        except ValueError:
+            every = 20
+        if self.tick % every != 0:
+            return
+        try:
+            from engine.checkpoint_modules import apply_pending_learnable_modules
+
+            applied = apply_pending_learnable_modules(self)
+            if applied:
+                print(f"[Ckpt] deferred modules restored at tick={self.tick}: {sorted(applied)}")
+        except Exception as e:
+            print(f"[Ckpt] deferred restore failed: {type(e).__name__}: {e}")
+
     def _maybe_autosave_memory(self) -> None:
         from pathlib import Path
 

@@ -63,3 +63,22 @@ class SimulationSnapshotShutdownMixin:
                 pass
         self._bg.stop_rkk_agent_loop()
         self._stop_cpg_background_loop()
+        self._save_memory_on_shutdown()
+
+    def _save_memory_on_shutdown(self) -> None:
+        """Иначе теряется всё обучение с последнего автосейва (RKK_MEMORY_AUTOSAVE_EVERY тиков)."""
+        if os.environ.get("RKK_MEMORY_SAVE_ON_SHUTDOWN", "1").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return
+        if int(getattr(self, "tick", 0) or 0) <= 0:
+            return
+        try:
+            out = self.memory_save()
+            if out.get("ok"):
+                print(f"[RKK] Memory saved on shutdown: tick={self.tick} → {out.get('path')}")
+        except Exception as e:
+            print(f"[RKK] Memory save on shutdown failed: {type(e).__name__}: {e}")

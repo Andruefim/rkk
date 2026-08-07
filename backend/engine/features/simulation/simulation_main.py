@@ -334,10 +334,12 @@ class Simulation(
         self._memory_resume_enabled = os.environ.get(
             "RKK_MEMORY_RESUME_ON_START", "1"
         ).strip().lower() in ("1", "true", "yes", "on")
+        self._memory_resumed = False
         if self._memory_resume_enabled:
             try:
                 meta = self.memory_load()
                 if meta.get("ok"):
+                    self._memory_resumed = True
                     print(f"[Simulation] Memory resumed at tick={self.tick}")
             except Exception as e:
                 print(f"[Simulation] Memory resume skipped: {type(e).__name__}: {e}")
@@ -365,9 +367,14 @@ class Simulation(
             try:
                 from engine.genome.priors import bootstrap_innate_genome
 
-                n_g = bootstrap_innate_genome(self.agent.graph, self.agent)
+                resumed = bool(getattr(self, "_memory_resumed", False))
+                n_g = bootstrap_innate_genome(
+                    self.agent.graph, self.agent, only_missing=resumed
+                )
+                mode = "missing edges only (resumed)" if resumed else "full"
                 print(
-                    f"[Genome] Innate bootstrap (no LLM): {n_g} edges/priors on d={self.agent.graph._d}",
+                    f"[Genome] Innate bootstrap (no LLM, {mode}): {n_g} edges/priors "
+                    f"on d={self.agent.graph._d}",
                     flush=True,
                 )
             except Exception as e:

@@ -233,14 +233,15 @@ def collect_meta_from_simulation(sim) -> PersistentMeta:
     meta = PersistentMeta()
     meta.tick = getattr(sim, "tick", 0)
 
-    # Curriculum
-    if sim._curriculum is not None:
-        meta.curriculum_stage_idx = sim._curriculum._current_idx
-        meta.curriculum_stage_name = sim._curriculum.current_stage.name
-        meta.curriculum_total_advances = sim._curriculum.total_advances
+    # Curriculum (устаревшая стадийная реализация может отсутствовать в сборке)
+    curriculum = getattr(sim, "_curriculum", None)
+    if curriculum is not None:
+        meta.curriculum_stage_idx = curriculum._current_idx
+        meta.curriculum_stage_name = curriculum.current_stage.name
+        meta.curriculum_total_advances = curriculum.total_advances
 
     # Episodic memory
-    if sim._episodic_memory is not None:
+    if getattr(sim, "_episodic_memory", None) is not None:
         meta.total_falls = sim._episodic_memory.total_falls_recorded
         meta.total_successes = sim._episodic_memory.total_successes_recorded
         meta.fall_patterns = [
@@ -250,7 +251,7 @@ def collect_meta_from_simulation(sim) -> PersistentMeta:
         meta.semantic_narrative = sim._episodic_memory.semantic_narrative_list()[-48:]
 
     # Sleep
-    if sim._sleep_ctrl is not None:
+    if getattr(sim, "_sleep_ctrl", None) is not None:
         meta.sleep_count = sim._sleep_ctrl.sleep_count
         meta.last_sleep_tick = sim._sleep_ctrl.last_sleep_tick
         meta.total_sleep_ticks = sim._sleep_ctrl.total_sleep_ticks
@@ -269,7 +270,7 @@ def collect_meta_from_simulation(sim) -> PersistentMeta:
         meta.motor_cortex_train_steps = getattr(mc, "train_steps", 0)
 
     # Inner voice
-    if sim._inner_voice is not None:
+    if getattr(sim, "_inner_voice", None) is not None:
         meta.inner_voice_train_steps = sim._inner_voice.train_steps
 
     # Intrinsic objective steps (раньше reward coordinator)
@@ -279,7 +280,7 @@ def collect_meta_from_simulation(sim) -> PersistentMeta:
     meta.constitution_violations = 0
 
     # Physical curriculum mastery
-    if sim._physical_curriculum is not None:
+    if getattr(sim, "_physical_curriculum", None) is not None:
         meta.mastered_skills = list(sim._physical_curriculum.mastered)
         meta.failed_skills = list(sim._physical_curriculum.failed)
 
@@ -307,26 +308,27 @@ def restore_meta_to_simulation(sim, meta: PersistentMeta) -> None:
     sim._tick = meta.tick
 
     # Curriculum stage
-    if sim._curriculum is not None and meta.curriculum_stage_idx > 0:
-        sim._curriculum._current_idx = min(
+    curriculum = getattr(sim, "_curriculum", None)
+    if curriculum is not None and meta.curriculum_stage_idx > 0:
+        curriculum._current_idx = min(
             meta.curriculum_stage_idx,
-            len(sim._curriculum._stages) - 1,
+            len(curriculum._stages) - 1,
         )
-        stage = sim._curriculum.current_stage
+        stage = curriculum.current_stage
         stage.entered_tick = meta.tick
         stage.ticks_in_stage = 0
-        sim._curriculum.total_advances = meta.curriculum_total_advances
+        curriculum.total_advances = meta.curriculum_total_advances
         print(f"[Persist] Curriculum restored: stage {meta.curriculum_stage_idx} '{meta.curriculum_stage_name}'")
 
     # Episodic memory counters
-    if sim._episodic_memory is not None:
+    if getattr(sim, "_episodic_memory", None) is not None:
         sim._episodic_memory.total_falls_recorded = meta.total_falls
         sim._episodic_memory.total_successes_recorded = meta.total_successes
         if getattr(meta, "semantic_narrative", None):
             sim._episodic_memory.restore_semantic_narrative(list(meta.semantic_narrative))
 
     # Sleep
-    if sim._sleep_ctrl is not None:
+    if getattr(sim, "_sleep_ctrl", None) is not None:
         sim._sleep_ctrl.sleep_count = meta.sleep_count
         sim._sleep_ctrl.last_sleep_tick = meta.last_sleep_tick
         sim._sleep_ctrl.total_sleep_ticks = meta.total_sleep_ticks
@@ -344,7 +346,7 @@ def restore_meta_to_simulation(sim, meta: PersistentMeta) -> None:
             print(f"[Persist] CPG weight restored: {meta.cpg_weight:.3f}")
 
     # Physical curriculum
-    if sim._physical_curriculum is not None:
+    if getattr(sim, "_physical_curriculum", None) is not None:
         sim._physical_curriculum.mastered = set(meta.mastered_skills)
         sim._physical_curriculum.failed = set(meta.failed_skills)
 

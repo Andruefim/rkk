@@ -1772,6 +1772,7 @@ class SimulationTickMixin:
         if not fallen:
             self._maybe_refresh_concepts_cache()
             self._maybe_autosave_memory()
+        self._maybe_apply_pending_checkpoint()
         self._prof_mark("sim.post_persist", _pt)
 
         try:

@@ -318,12 +318,33 @@ WALK_PROGRAM: list[dict] = [
 ]
 
 
-def apply_causal_priors(graph) -> int:
+PRIOR_EXISTING_EDGE_EPS = 0.05
+
+
+def _edge_already_learned(graph, from_: str, to: str) -> bool:
+    """Есть ли в W ненулевое ребро — чтобы приор не размыл восстановленный из чекпоинта вес."""
+    core = getattr(graph, "_core", None)
+    if core is None or not hasattr(core, "W"):
+        return False
+    try:
+        i = graph._node_ids.index(from_)
+        j = graph._node_ids.index(to)
+    except ValueError:
+        return False
+    try:
+        return abs(float(core.W[i, j].item())) >= PRIOR_EXISTING_EDGE_EPS
+    except Exception:
+        return False
+
+
+def apply_causal_priors(graph, only_missing: bool = False) -> int:
     """Inject innate causal edges into the GNN graph. Returns count of edges set."""
     count = 0
     for p in CAUSAL_PRIORS:
         fr, to = p["from"], p["to"]
         if fr in graph._node_ids and to in graph._node_ids:
+            if only_missing and _edge_already_learned(graph, fr, to):
+                continue
             graph.set_edge(fr, to, float(p["weight"]), alpha=float(p["alpha"]))
             count += 1
     return count
@@ -345,12 +366,14 @@ NAV_CAUSAL_PRIORS: list[dict] = [
 ]
 
 
-def apply_nav_priors(graph) -> int:
+def apply_nav_priors(graph, only_missing: bool = False) -> int:
     """Inject innate navigation causal edges (``phys_nav_*`` nodes). Idempotent."""
     count = 0
     for p in NAV_CAUSAL_PRIORS:
         fr, to = p["from"], p["to"]
         if fr in graph._node_ids and to in graph._node_ids:
+            if only_missing and _edge_already_learned(graph, fr, to):
+                continue
             graph.set_edge(fr, to, float(p["weight"]), alpha=float(p["alpha"]))
             count += 1
     return count
@@ -365,16 +388,21 @@ def genome_bootstrap_enabled() -> bool:
     )
 
 
-def bootstrap_innate_genome(graph, agent=None) -> int:
+def bootstrap_innate_genome(graph, agent=None, only_missing: bool = False) -> int:
     """
     Phase 3 roadmap: innate DNA at sim start — no Ollama.
     1) optional compressed_prior.npz (offline SVD) into W
     2) CAUSAL_PRIORS (strong alpha)
     3) humanoid_hardcoded_seeds as weak text priors (discovery layer)
+
+    ``only_missing=True`` (после resume из чекпоинта) — заполнять лишь пустые рёбра,
+    иначе `set_edge` подмешает 30% врождённого веса поверх обученного.
     """
     if not genome_bootstrap_enabled():
         return 0
-    n = int(load_compressed_genome(graph))
+    n = int(load_compressed_genome(graph, only_missing=only_missing))
+    if only_missing:
+        return n
     if agent is not None:
         try:
             from engine.environment_humanoid import humanoid_hardcoded_seeds
@@ -386,7 +414,7 @@ def bootstrap_innate_genome(graph, agent=None) -> int:
     return n
 
 
-def load_compressed_genome(graph, path: str | None = None) -> int:
+def load_compressed_genome(graph, path: str | None = None, only_missing: bool = False) -> int:
     """
     Load low-rank compressed prior into executive W and merge with CAUSAL_PRIORS.
     Returns number of edges seeded from compressed genome.
@@ -401,7 +429,7 @@ def load_compressed_genome(graph, path: str | None = None) -> int:
         )
     p = Path(path)
     if not p.is_file():
-        return apply_causal_priors(graph)
+        return apply_causal_priors(graph, only_missing=only_missing)
 
     data = _load_npz(p)
     count = 0
@@ -421,6 +449,10 @@ def load_compressed_genome(graph, path: str | None = None) -> int:
                     for j in range(d):
                         if i != j and abs(float(W[i, j])) >= 0.05:
                             if i < len(ids) and j < len(ids):
+                                if only_missing and _edge_already_learned(
+                                    graph, ids[i], ids[j]
+                                ):
+                                    continue
                                 graph.set_edge(
                                     ids[i], ids[j], float(W[i, j]), alpha=0.75
                                 )
@@ -429,7 +461,7 @@ def load_compressed_genome(graph, path: str | None = None) -> int:
         graph._maybe_init_ensemble()
         if graph._ensemble is not None:
             graph._ensemble.sync_from_executive(graph._core.W[:d, :d], idx=0)
-    count += apply_causal_priors(graph)
+    count += apply_causal_priors(graph, only_missing=only_missing)
     return count
 
 

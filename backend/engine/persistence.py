@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from engine.causal_graph import CausalGraph, USE_GNN
+from engine.checkpoint_modules import pack_learnable_modules, unpack_learnable_modules
 
 
 def default_memory_path() -> Path:
@@ -148,11 +149,12 @@ def save_simulation(sim, path: Path | str | None = None) -> dict[str, Any]:
     path = Path(path) if path else default_memory_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "rkk_version": 2,
+        "rkk_version": 3,
         "tick": int(sim.tick),
         "current_world": sim.current_world,
         "graph": pack_graph(sim.agent.graph),
         "temporal": pack_temporal(sim.agent),
+        "modules": pack_learnable_modules(sim),
         "materialized_detector_concept_ids": list(
             getattr(sim, "_materialized_detector_concept_ids", set())
         ),
@@ -212,11 +214,14 @@ def load_simulation(sim, path: Path | str | None = None) -> dict[str, Any]:
         st.motor_drive_r = float(ms.get("motor_drive_r", st.motor_drive_r))
         st.posture_stability = float(ms.get("posture_stability", st.posture_stability))
         st.support_leg = str(ms.get("support_leg", st.support_leg))
+    modules = unpack_learnable_modules(sim, payload.get("modules"))
     return {
         "ok": True,
         "path": str(path.resolve()),
         "tick": sim.tick,
         "loaded_world": loaded_world,
+        "modules_restored": modules.get("applied", []),
+        "modules_deferred": modules.get("deferred", []),
     }
 
 

@@ -165,7 +165,15 @@ async def _app_lifespan(_: FastAPI):
         print(f"[RKK] Session log clear failed: {e}")
     get_sim()._uvicorn_loop = asyncio.get_running_loop()
     asyncio.create_task(_startup_post_boot_pipeline())
-    yield
+    try:
+        yield
+    finally:
+        global _sim
+        if _sim is not None:
+            try:
+                _sim.shutdown()
+            except Exception as e:
+                print(f"[RKK] Shutdown failed: {type(e).__name__}: {e}")
 
 
 app = FastAPI(title="RKK Singleton AGI Humanoid v12", lifespan=_app_lifespan)
