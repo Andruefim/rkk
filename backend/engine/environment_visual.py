@@ -137,8 +137,8 @@ def nav_wm_nodes_enabled() -> bool:
     """Opt-in neural-navigation WM nodes (phys_nav_bearing / phys_nav_range).
 
     These are scalar predictive-coding targets for the GNN (normalized bearing /
-    range), **not** a Dreamer/JEPA latent XYZ rollout. Object permanence lives
-    in LatentSceneMemory odometry, not in these nodes.
+    range), not object XYZ. Object permanence is OWM odometry, optionally blended
+    with SlotDynamics latent unroll (``RKK_SLOT_DYNAMICS``) — not these nodes.
 
     Off by default so the graph dimension (and trained checkpoints) stay unchanged;
     set RKK_NAV_WM_NODES=1 to expose the vision target to Active Inference / WM beam.

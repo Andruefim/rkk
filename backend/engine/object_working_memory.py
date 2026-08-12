@@ -6,9 +6,10 @@ Architecture:
   - active_ids = objects the agent is currently attending / tasked with.
   - Navigation / reach read the primary active entity — not a one-off heuristic buffer.
 
-Object permanence is **dead reckoning** (OWM + odometry + growing bearing_sigma).
-GNN ``slot_*`` / ``phys_nav_*`` nodes are scalar predictive-coding targets, not a
-Dreamer/JEPA latent XYZ rollout of objects.
+Object permanence is **dead reckoning** (OWM + odometry + growing bearing_sigma),
+optionally blended with object-centric ``SlotDynamics`` (JEPA on slot embeddings +
+ego residual) when ``RKK_SLOT_DYNAMICS=1``. GNN ``slot_*`` / ``phys_nav_*`` remain
+scalar predictive-coding targets — not a Dreamer XYZ rollout inside the graph.
 
 Robot-transferable: ego (x_fwd, y_right) + range/bearing, no privileged world XY.
 """
@@ -880,6 +881,8 @@ class LatentSceneMemory:
         percepts: list[dict[str, Any]] | None,
         agent_xy: tuple[float, float],
         agent_forward: tuple[float, float],
+        dynamics: Any | None = None,
+        action: Any | None = None,
     ) -> None:
         """
         Warp all entities by odometry, then fuse vision percepts.
@@ -911,9 +914,13 @@ class LatentSceneMemory:
             if jump > scene_odom_max_step_m():
                 self.last_odom_discontinuity = True
             else:
+                ego_prev_by_id: dict[str, tuple[float, float]] = {}
+                sigma_grown_by_id: dict[str, float] = {}
                 for ent in self.entities.values():
                     if ent.confidence < 1e-6:
                         continue
+                    ego_prev_by_id[ent.entity_id] = (float(ent.x_fwd), float(ent.y_right))
+                    sigma_before = float(ent.bearing_sigma)
                     ent.x_fwd, ent.y_right = _apply_odometry_to_ego(
                         ent.x_fwd,
                         ent.y_right,
@@ -931,7 +938,16 @@ class LatentSceneMemory:
                     ent.bearing_sigma = _grow_bearing_sigma(
                         ent.bearing_sigma, dtheta=dtheta, ds=ds, idle=True
                     )
+                    sigma_grown_by_id[ent.entity_id] = float(ent.bearing_sigma) - sigma_before
                     ent.last_update_tick = int(tick)
+                if dynamics is not None and not self.last_odom_discontinuity:
+                    self._apply_active_slot_dynamics(
+                        dynamics,
+                        action,
+                        tick=int(tick),
+                        ego_prev_by_id=ego_prev_by_id,
+                        sigma_grown_by_id=sigma_grown_by_id,
+                    )
 
         # Hard-lock: odometry-only unless a teleport discontinuity needs reseed.
         # Do NOT refresh last_vision_tick here — that made is_fresh never expire.
@@ -964,6 +980,11 @@ class LatentSceneMemory:
                     "age_live": int(age),
                     "dtheta": round(float(dtheta), 4),
                     "ds": round(float(ds), 4),
+                    **{
+                        k: v
+                        for k, v in dict(ent.diagnostics or {}).items()
+                        if str(k).startswith("slot_dyn")
+                    },
                 }
 
         seen: set[str] = set() if reseed_locked else set(locked_ids)
@@ -1140,6 +1161,37 @@ class LatentSceneMemory:
 
         self._prev_xy = (float(agent_xy[0]), float(agent_xy[1]))
         self._prev_fwd = (float(agent_forward[0]), float(agent_forward[1]))
+
+    def _apply_active_slot_dynamics(
+        self,
+        dynamics: Any,
+        action: Any,
+        *,
+        tick: int,
+        ego_prev_by_id: dict[str, tuple[float, float]],
+        sigma_grown_by_id: dict[str, float],
+    ) -> None:
+        if dynamics is None or not self.hard_lock_active:
+            return
+        try:
+            from engine.slot_dynamics import apply_slot_dynamics_hold, pack_action
+        except Exception:
+            return
+        act = action if action is not None else pack_action()
+        for eid in list(self.active_ids):
+            ent = self.entities.get(eid)
+            if ent is None or not getattr(ent, "latent", None):
+                continue
+            diag = apply_slot_dynamics_hold(
+                ent,
+                dynamics,
+                act,
+                ego_prev=ego_prev_by_id.get(eid),
+                tick=int(tick),
+                sigma_grown=float(sigma_grown_by_id.get(eid, 0.0)),
+            )
+            if diag:
+                ent.diagnostics = {**dict(ent.diagnostics or {}), **diag}
 
     def _evict_weakest(self, *, keep: set[str]) -> None:
         candidates = [
@@ -1388,6 +1440,8 @@ class ObjectWorkingMemory:
         tick: int,
         agent_xy: tuple[float, float],
         agent_forward: tuple[float, float],
+        dynamics: Any | None = None,
+        action: Any | None = None,
     ) -> None:
         percepts: list[dict[str, Any]] = []
         if vt is not None and vt.is_ready(require_range=True):
@@ -1406,6 +1460,8 @@ class ObjectWorkingMemory:
             percepts=percepts,
             agent_xy=agent_xy,
             agent_forward=agent_forward,
+            dynamics=dynamics,
+            action=action,
         )
 
     def graph_payload(self) -> dict[str, float]:

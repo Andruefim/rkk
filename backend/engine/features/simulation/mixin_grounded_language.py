@@ -1319,6 +1319,114 @@ class SimulationGroundedLanguageMixin:
             self._obj_working_memory = owm
         return owm
 
+    def _ensure_slot_dynamics(self) -> Any | None:
+        from engine.slot_dynamics import SlotDynamics, slot_dynamics_enabled
+
+        if not slot_dynamics_enabled():
+            return getattr(self, "_slot_dynamics", None)
+        dyn = getattr(self, "_slot_dynamics", None)
+        if dyn is not None:
+            return dyn
+        slot_dim = 64
+        vis = self._visual_env_ref()
+        try:
+            cfg = getattr(getattr(vis, "cortex", None), "cfg", None)
+            if cfg is not None:
+                slot_dim = int(getattr(cfg, "slot_dim", 64) or 64)
+        except Exception:
+            slot_dim = 64
+        device = getattr(self, "device", None) or "cpu"
+        dyn = SlotDynamics(slot_dim=slot_dim, device=device)
+        self._slot_dynamics = dyn
+        try:
+            from engine.checkpoint_modules import apply_pending_learnable_modules
+
+            apply_pending_learnable_modules(self)
+        except Exception:
+            pass
+        return dyn
+
+    def _slot_dyn_action(self, dtheta: float, ds: float) -> tuple[float, float, float, float]:
+        from engine.slot_dynamics import pack_action
+
+        stride = 0.5
+        gait = 0.5
+        intents = getattr(self, "_last_nav_intents", None) or {}
+        try:
+            stride = float(intents.get("intent_stride", stride) or stride)
+            gait = float(intents.get("intent_gait_coupling", gait) or gait)
+        except Exception:
+            pass
+        if stride == 0.5 and gait == 0.5:
+            nodes = getattr(getattr(self, "agent", None), "graph", None)
+            nd = getattr(nodes, "nodes", None) or {}
+            try:
+                stride = float(nd.get("intent_stride", stride) or stride)
+                gait = float(nd.get("intent_gait_coupling", gait) or gait)
+            except Exception:
+                pass
+        return pack_action(dtheta, ds, stride, gait)
+
+    def _slot_vec_for_entity(self, ent: Any) -> list[float] | None:
+        vis = self._visual_env_ref()
+        vecs = getattr(vis, "_last_slot_vecs", None) if vis is not None else None
+        sid = str(getattr(ent, "slot_id", "") or getattr(ent, "entity_id", "") or "")
+        idx = None
+        if sid.startswith("slot_"):
+            try:
+                idx = int(sid.split("_")[-1])
+            except ValueError:
+                idx = None
+        if vecs is not None and idx is not None:
+            try:
+                if hasattr(vecs, "detach"):
+                    row = vecs.detach().float().cpu().reshape(-1, vecs.shape[-1])[idx]
+                    return [float(x) for x in row.tolist()]
+                arr = vecs[idx]
+                return [float(x) for x in list(arr)]
+            except Exception:
+                pass
+        lat = getattr(ent, "latent", None) or []
+        return [float(x) for x in lat] if lat else None
+
+    def _slot_dyn_collect_and_train(self, scene: Any, tick: int, action: Any) -> None:
+        dyn = getattr(self, "_slot_dynamics", None)
+        if dyn is None:
+            return
+        ent = scene.active() if scene is not None else None
+        if ent is None:
+            return
+        z_now = self._slot_vec_for_entity(ent)
+        if not z_now:
+            return
+        ego_now = (float(ent.x_fwd), float(ent.y_right))
+        eid = str(ent.entity_id)
+        has_live = int(getattr(ent, "last_live_uv_tick", -1) or -1) == int(tick)
+        try:
+            dyn.commit_next(
+                z_next=z_now,
+                ego_next=ego_now,
+                entity_id=eid,
+                has_live=has_live,
+                tick=int(tick),
+            )
+            dyn.remember_prev(
+                z=z_now,
+                ego=ego_now,
+                action=action,
+                entity_id=eid,
+                tick=int(tick),
+            )
+        except Exception:
+            pass
+        try:
+            from engine.slot_dynamics import slot_dyn_train_every
+
+            if int(tick) % slot_dyn_train_every() == 0:
+                dyn.train_step(batch_size=16)
+        except Exception:
+            pass
+
     def _clear_object_working_memory(self) -> None:
         scene = getattr(self, "_latent_scene", None)
         if scene is not None:
@@ -1699,11 +1807,30 @@ class SimulationGroundedLanguageMixin:
                         "activation": vt.confidence,
                     }
                 ]
+        dyn = None
+        action = None
+        try:
+            dyn = self._ensure_slot_dynamics()
+            dtheta, ds = 0.0, 0.0
+            prev_xy = getattr(scene, "_prev_xy", None)
+            prev_fwd = getattr(scene, "_prev_fwd", None)
+            if prev_xy is not None and prev_fwd is not None:
+                from engine.object_working_memory import _odometry_motion
+
+                dtheta, ds = _odometry_motion(
+                    prev_xy, prev_fwd, agent_xy, agent_fwd
+                )
+            action = self._slot_dyn_action(float(dtheta), float(ds))
+        except Exception:
+            dyn = None
+            action = None
         scene.update(
             tick=int(tick),
             percepts=percepts,
             agent_xy=agent_xy,
             agent_forward=agent_fwd,
+            dynamics=dyn,
+            action=action,
         )
         # Live-camera depth refresh is the dominant per-tick cost during approach
         # (~100-200ms). Throttle to a cadence; odometry warp in scene.update keeps the
@@ -1729,6 +1856,15 @@ class SimulationGroundedLanguageMixin:
                     )
             except Exception:
                 pass
+        try:
+            if action is None:
+                action = self._slot_dyn_action(
+                    float(getattr(scene, "last_odom_dtheta", 0.0) or 0.0),
+                    float(getattr(scene, "last_odom_ds", 0.0) or 0.0),
+                )
+            self._slot_dyn_collect_and_train(scene, tick_i, action)
+        except Exception:
+            pass
         try:
             from engine.vision_loss_trace import VisionLossTrace, snapshot_from_scene
             from engine.neural_logger import neural_log_event
@@ -2894,8 +3030,9 @@ class SimulationGroundedLanguageMixin:
     def _ensure_nav_wm_nodes(self) -> None:
         """Ensure phys_nav_bearing / phys_nav_range exist in the WM graph.
 
-        These nodes are scalar predictive-coding targets (normalized bearing/range),
-        not a Dreamer/JEPA latent XYZ rollout. Object permanence is OWM odometry.
+        These nodes are scalar predictive-coding targets (normalized bearing/range).
+        Object permanence is OWM odometry, optionally plus SlotDynamics unroll
+        (``RKK_SLOT_DYNAMICS``) — not a Dreamer XYZ rollout inside the GNN.
 
         Graph rebuilds (world switch, curriculum eval reload, checkpoint load) can
         drop the opt-in nav nodes. Re-add them with ``preserve_state=True`` (keeps the

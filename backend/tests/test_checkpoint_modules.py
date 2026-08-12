@@ -47,6 +47,7 @@ def _make_sim(with_motor_cortex: bool = False):
         _inner_voice=None,
         _proprio=None,
         _demon=None,
+        _slot_dynamics=None,
         _motor_cortex=_MotorCortexLibrary(device) if with_motor_cortex else None,
     )
     # ReflexStabilizer держит оптимизатор в `opt`, а не `optim`.

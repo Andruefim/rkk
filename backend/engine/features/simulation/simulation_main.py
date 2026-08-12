@@ -176,6 +176,7 @@ class Simulation(
 
         self._visual_mode = False
         self._visual_env = None
+        self._slot_dynamics = None
         self._base_env_ref = None
         self._vision_ticks = 0
         self._last_vision_state: dict = {}

@@ -143,6 +143,13 @@ _SPECS: tuple[ModuleSpec, ...] = (
         optims=("optim",),
         counters=("train_steps",),
     ),
+    ModuleSpec(
+        key="slot_dynamics",
+        owner="_slot_dynamics",
+        modules=(_SELF,),
+        optims=("optim",),
+        counters=("train_steps", "n_predict"),
+    ),
 )
 
 
