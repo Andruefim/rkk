@@ -6,6 +6,10 @@ Architecture:
   - active_ids = objects the agent is currently attending / tasked with.
   - Navigation / reach read the primary active entity — not a one-off heuristic buffer.
 
+Object permanence is **dead reckoning** (OWM + odometry + growing bearing_sigma).
+GNN ``slot_*`` / ``phys_nav_*`` nodes are scalar predictive-coding targets, not a
+Dreamer/JEPA latent XYZ rollout of objects.
+
 Robot-transferable: ego (x_fwd, y_right) + range/bearing, no privileged world XY.
 """
 from __future__ import annotations
@@ -91,11 +95,40 @@ def scene_ema_alpha() -> float:
 
 
 def scene_hold_ticks() -> int:
+    """Characteristic hold horizon (eviction of *non-active* tracks).
+
+    Not a hard cutoff for the locked target: ``is_usable`` follows
+    ``bearing_sigma`` / confidence. At zero turn, idle process noise reaches
+    ``scene_sigma_max`` on roughly this many ticks.
+    """
     return max(1, _ei("RKK_SCENE_HOLD_TICKS", _ei("RKK_OWM_HOLD_TICKS", 45)))
 
 
 def scene_min_conf() -> float:
     return _ef("RKK_SCENE_MIN_CONF", _ef("RKK_OWM_MIN_VISION_CONF", 0.15))
+
+
+def scene_sigma_max() -> float:
+    """Usable cutoff on bearing_sigma (bearing units in [-1, 1])."""
+    return max(0.05, _ef("RKK_SCENE_SIGMA_MAX", 0.45))
+
+
+def scene_sigma_yaw() -> float:
+    return max(0.0, _ef("RKK_SCENE_SIGMA_YAW", 0.35))
+
+
+def scene_sigma_step() -> float:
+    return max(0.0, _ef("RKK_SCENE_SIGMA_STEP", 0.08))
+
+
+def scene_sigma_idle() -> float:
+    """Per-tick process noise with no live UV (standing occlusion)."""
+    return max(0.0, _ef("RKK_SCENE_SIGMA_IDLE", 0.009))
+
+
+def scene_hold_decay() -> float:
+    """Per-tick confidence multiplier on odom-only / unseen tracks (was 0.995)."""
+    return float(max(0.90, min(0.999, _ef("RKK_SCENE_HOLD_DECAY", 0.985))))
 
 
 def scene_max_entities() -> int:
@@ -254,6 +287,36 @@ def _apply_odometry_to_ego(
     return c * tx - s * ty, s * tx + c * ty
 
 
+def _odometry_motion(
+    prev_xy: tuple[float, float],
+    prev_fwd: tuple[float, float],
+    agent_xy: tuple[float, float],
+    agent_forward: tuple[float, float],
+) -> tuple[float, float]:
+    """Return (dtheta_rad, ds_m) of the agent since the previous pose."""
+    px, py = prev_xy
+    ax, ay = float(agent_xy[0]), float(agent_xy[1])
+    ds = math.hypot(ax - px, ay - py)
+    dtheta = _yaw_delta(prev_fwd, agent_forward)
+    return float(dtheta), float(ds)
+
+
+def _grow_bearing_sigma(sigma: float, *, dtheta: float, ds: float, idle: bool = True) -> float:
+    grown = (
+        float(sigma)
+        + scene_sigma_yaw() * abs(float(dtheta))
+        + scene_sigma_step() * max(0.0, float(ds))
+        + (scene_sigma_idle() if idle else 0.0)
+    )
+    return float(min(2.0, max(0.0, grown)))
+
+
+def _shrink_bearing_sigma(sigma: float, *, k_gain: float, vis_sigma: float = 0.05) -> float:
+    k = float(max(0.0, min(1.0, k_gain)))
+    mixed = (1.0 - k) * float(sigma) + k * float(max(0.02, vis_sigma))
+    return float(max(0.02, mixed))
+
+
 @dataclass
 class SceneEntity:
     """One tracked scene entity in egocentric coordinates."""
@@ -271,6 +334,8 @@ class SceneEntity:
     activation: float = 0.0
     last_vision_tick: int = -1
     last_update_tick: int = -1
+    last_live_uv_tick: int = -1
+    bearing_sigma: float = 0.04
     holding: bool = False
     diagnostics: dict[str, Any] = field(default_factory=dict)
     uv_track: list[list[float]] = field(default_factory=list)
@@ -283,10 +348,12 @@ class SceneEntity:
         return (int(tick) - int(self.last_vision_tick)) <= scene_hold_ticks()
 
     def is_usable(self, tick: int) -> bool:
+        """Soft hold: confidence + range + bearing_sigma. Age is in sigma, not a 45-tick cliff."""
+        _ = tick  # age is encoded in bearing_sigma / confidence decay
         return (
             self.confidence >= scene_min_conf()
-            and self.is_fresh(tick)
             and self.range_m > 0.05
+            and float(self.bearing_sigma) < scene_sigma_max()
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -303,6 +370,8 @@ class SceneEntity:
             "confidence": float(self.confidence),
             "activation": float(self.activation),
             "last_vision_tick": int(self.last_vision_tick),
+            "last_live_uv_tick": int(self.last_live_uv_tick),
+            "bearing_sigma": float(self.bearing_sigma),
             "holding": bool(self.holding),
             "latent_dim": len(self.latent),
         }
@@ -342,6 +411,8 @@ class SceneEntity:
         self.activation = float(max(0.0, min(1.0, activation)))
         self.last_vision_tick = int(tick)
         self.last_update_tick = int(tick)
+        self.last_live_uv_tick = int(tick)
+        self.bearing_sigma = 0.04
         self.holding = False
         self.diagnostics = {"source": "seed"}
         self.uv_track = [[float(self.u), float(self.v)]]
@@ -405,6 +476,10 @@ class SceneEntity:
         )
         self.last_vision_tick = int(tick)
         self.last_update_tick = int(tick)
+        self.last_live_uv_tick = int(tick)
+        self.bearing_sigma = _shrink_bearing_sigma(
+            self.bearing_sigma, k_gain=alpha, vis_sigma=0.04
+        )
         self.holding = False
         self.diagnostics = {"source": "vision_ema", "alpha": alpha}
         if latent is not None:
@@ -430,6 +505,8 @@ class LatentSceneMemory:
     hard_lock_active: bool = False
     last_odom_discontinuity: bool = False
     last_odom_jump_m: float = 0.0
+    last_odom_dtheta: float = 0.0
+    last_odom_ds: float = 0.0
     _live_diverge_streak: int = field(default=0, repr=False)
     _prev_xy: tuple[float, float] | None = field(default=None, repr=False)
     _prev_fwd: tuple[float, float] | None = field(default=None, repr=False)
@@ -440,6 +517,8 @@ class LatentSceneMemory:
         self.hard_lock_active = False
         self.last_odom_discontinuity = False
         self.last_odom_jump_m = 0.0
+        self.last_odom_dtheta = 0.0
+        self.last_odom_ds = 0.0
         self._live_diverge_streak = 0
         self._prev_xy = None
         self._prev_fwd = None
@@ -522,6 +601,7 @@ class LatentSceneMemory:
                         "live_bearing": None,
                         "bearing_live_delta": None,
                         "bearing_nudge": 0.0,
+                        "bearing_sigma": round(float(act.bearing_sigma), 4),
                     }
                     if tick is not None:
                         act.last_update_tick = int(tick)
@@ -654,6 +734,14 @@ class LatentSceneMemory:
                     act.range_m = (1.0 - r_gain) * prev_r + r_gain * new_r
             act.x_fwd, act.y_right = ego_from_bearing_range(act.bearing, act.range_m)
             _inject_vision_precision(k_gain, conf, live_delta)
+            if tick is not None:
+                vis_sigma = min(0.20, math.sqrt(max(1e-6, float(sigma_vis2))) * 0.08)
+                act.bearing_sigma = _shrink_bearing_sigma(
+                    act.bearing_sigma, k_gain=float(k_gain), vis_sigma=vis_sigma
+                )
+                act.last_update_tick = int(tick)
+                act.last_live_uv_tick = int(tick)
+                act.last_vision_tick = int(tick)
             act.diagnostics = {
                 **dict(act.diagnostics or {}),
                 "source": (
@@ -675,9 +763,8 @@ class LatentSceneMemory:
                 "force_live": bool(force_live),
                 "soft_unlock": bool(soft_unlock),
                 "live_diverge_streak": int(self._live_diverge_streak),
+                "bearing_sigma": round(float(act.bearing_sigma), 4),
             }
-            if tick is not None:
-                act.last_update_tick = int(tick)
             return True
 
         act.u = (1.0 - a) * float(act.u) + a * float(u)
@@ -712,9 +799,15 @@ class LatentSceneMemory:
             "live_conf": float(conf or 0.0),
             "live_bearing": float(live_b),
             "bearing_live_delta": float(live_delta),
+            "bearing_sigma": round(float(act.bearing_sigma), 4),
         }
         if tick is not None:
+            act.bearing_sigma = _shrink_bearing_sigma(
+                act.bearing_sigma, k_gain=float(a), vis_sigma=0.04
+            )
             act.last_update_tick = int(tick)
+            act.last_live_uv_tick = int(tick)
+            act.last_vision_tick = int(tick)
         return True
 
     def active(self) -> SceneEntity | None:
@@ -798,11 +891,20 @@ class LatentSceneMemory:
         """
         self.last_odom_discontinuity = False
         self.last_odom_jump_m = 0.0
+        self.last_odom_dtheta = 0.0
+        self.last_odom_ds = 0.0
+        dtheta = 0.0
+        ds = 0.0
         if self._prev_xy is not None and self._prev_fwd is not None:
             px, py = self._prev_xy
             ax, ay = float(agent_xy[0]), float(agent_xy[1])
             jump = float(math.hypot(ax - px, ay - py))
             self.last_odom_jump_m = jump
+            dtheta, ds = _odometry_motion(
+                self._prev_xy, self._prev_fwd, agent_xy, agent_forward
+            )
+            self.last_odom_dtheta = float(dtheta)
+            self.last_odom_ds = float(ds)
             # Position-only gate: yaw spins are normal; reset_stance teleports XY.
             # Skip odom warp on discontinuity so hard-lock range is not inflated;
             # locked active reseeds from vision below (adaptive recovery).
@@ -826,9 +928,13 @@ class LatentSceneMemory:
                     locked = self.hard_lock_active and ent.entity_id in self.active_ids
                     if not locked:
                         ent.u = float(max(0.0, min(1.0, 0.5 + 0.5 * ent.bearing)))
+                    ent.bearing_sigma = _grow_bearing_sigma(
+                        ent.bearing_sigma, dtheta=dtheta, ds=ds, idle=True
+                    )
                     ent.last_update_tick = int(tick)
 
-        # Hard-lock: odometry-only unless a teleport discontinuity needs reseed
+        # Hard-lock: odometry-only unless a teleport discontinuity needs reseed.
+        # Do NOT refresh last_vision_tick here — that made is_fresh never expire.
         locked_ids = set(self.active_ids) if self.hard_lock_active else set()
         reseed_locked = bool(self.last_odom_discontinuity and locked_ids)
         if locked_ids and not reseed_locked:
@@ -836,9 +942,29 @@ class LatentSceneMemory:
                 ent = self.entities.get(eid)
                 if ent is None:
                     continue
-                ent.last_vision_tick = int(tick)
                 ent.holding = True
-                ent.diagnostics = {"source": "hard_lock_odom"}
+                live_ref = (
+                    int(ent.last_live_uv_tick)
+                    if ent.last_live_uv_tick >= 0
+                    else int(ent.last_vision_tick)
+                )
+                age = int(tick) - live_ref if live_ref >= 0 else 9999
+                extra = min(
+                    0.06,
+                    0.20 * abs(float(dtheta))
+                    + 0.015 * max(0.0, float(ds))
+                    + 0.0008 * max(0, age),
+                )
+                ent.confidence = float(
+                    ent.confidence * max(0.90, scene_hold_decay() - extra)
+                )
+                ent.diagnostics = {
+                    "source": "hard_lock_odom",
+                    "bearing_sigma": round(float(ent.bearing_sigma), 4),
+                    "age_live": int(age),
+                    "dtheta": round(float(dtheta), 4),
+                    "ds": round(float(ds), 4),
+                }
 
         seen: set[str] = set() if reseed_locked else set(locked_ids)
         # Latent re-ID: remap permuted slot_ids onto the active entity when
@@ -939,9 +1065,14 @@ class LatentSceneMemory:
                 if v_f is not None:
                     ent.v = 0.7 * float(ent.v) + 0.3 * float(v_f)
                 ent.last_vision_tick = int(tick)
+                ent.last_live_uv_tick = int(tick)
+                ent.bearing_sigma = _shrink_bearing_sigma(
+                    ent.bearing_sigma, k_gain=0.25, vis_sigma=0.06
+                )
                 ent.diagnostics = {
                     "source": "hard_lock_latent_reid",
                     "latent_cos": p.get("latent_cos"),
+                    "bearing_sigma": round(float(ent.bearing_sigma), 4),
                 }
             else:
                 ent.fuse_observation(
@@ -967,11 +1098,11 @@ class LatentSceneMemory:
                 if ent is None:
                     continue
                 # No matching percept: keep prior ego, mark discontinuity
-                ent.last_vision_tick = int(tick)
                 ent.holding = True
                 ent.diagnostics = {
                     "source": "hard_lock_odom_skip",
                     "odom_jump_m": round(float(self.last_odom_jump_m), 3),
+                    "bearing_sigma": round(float(ent.bearing_sigma), 4),
                 }
                 seen.add(eid)
 
@@ -985,11 +1116,20 @@ class LatentSceneMemory:
                 else 9999
             )
             ent.holding = age > 0
-            ent.confidence = float(ent.confidence * 0.995)
+            extra = min(
+                0.06,
+                0.20 * abs(float(self.last_odom_dtheta))
+                + 0.015 * max(0.0, float(self.last_odom_ds))
+                + 0.0008 * max(0, age),
+            )
+            ent.confidence = float(
+                ent.confidence * max(0.90, scene_hold_decay() - extra)
+            )
             ent.last_update_tick = int(tick)
             ent.diagnostics = {
                 "source": "hold" if ent.is_fresh(tick) else "stale",
                 "age_ticks": age,
+                "bearing_sigma": round(float(ent.bearing_sigma), 4),
             }
             if not ent.is_fresh(tick) and ent.confidence < scene_min_conf() * 0.5:
                 if eid not in self.active_ids:
@@ -1114,6 +1254,7 @@ class LatentSceneMemory:
                     "v": float(max(0.0, min(1.0, ent.v))),
                     "range_m": round(float(ent.range_m), 2),
                     "bearing": round(float(ent.bearing), 3),
+                    "bearing_sigma": round(float(ent.bearing_sigma), 3),
                     "conf": round(_hud_conf(ent), 3),
                     "active": ent.entity_id in self.active_ids,
                     "holding": bool(ent.holding),
@@ -1130,6 +1271,7 @@ class LatentSceneMemory:
                 "v": float(max(0.0, min(1.0, act.v))),
                 "range_m": round(float(act.range_m), 2),
                 "bearing": round(float(act.bearing), 3),
+                "bearing_sigma": round(float(act.bearing_sigma), 3),
                 "conf": round(_hud_conf(act), 3),
                 "holding": bool(act.holding),
             }
@@ -1201,6 +1343,11 @@ class ObjectWorkingMemory:
     def last_vision_tick(self) -> int:
         e = self._ent()
         return int(e.last_vision_tick) if e else -1
+
+    @property
+    def bearing_sigma(self) -> float:
+        e = self._ent()
+        return float(e.bearing_sigma) if e else 0.0
 
     @property
     def holding(self) -> bool:

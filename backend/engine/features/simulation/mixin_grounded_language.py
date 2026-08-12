@@ -1669,6 +1669,12 @@ class SimulationGroundedLanguageMixin:
                 return cached
 
         scene = self._latent_scene_memory()
+        prev_usable = False
+        try:
+            prev_ent = scene.active()
+            prev_usable = bool(prev_ent is not None and prev_ent.is_usable(tick_i))
+        except Exception:
+            prev_usable = False
         agent_xy, agent_fwd = self._agent_xy_forward()
         # Prefer full scene percepts; fall back to active visual track only
         percepts = []
@@ -1723,6 +1729,51 @@ class SimulationGroundedLanguageMixin:
                     )
             except Exception:
                 pass
+        try:
+            from engine.vision_loss_trace import VisionLossTrace, snapshot_from_scene
+            from engine.neural_logger import neural_log_event
+            from engine.task_logger import task_log_dir
+
+            trace = getattr(self, "_vision_loss_trace", None)
+            if trace is None:
+                self._vision_loss_trace = VisionLossTrace()
+                trace = self._vision_loss_trace
+            vis = self._visual_env_ref()
+            try:
+                slot_rows = collect_vision_slots(vis)
+            except Exception:
+                slot_rows = []
+            snap = snapshot_from_scene(
+                tick=tick_i,
+                scene=scene,
+                visual_env=vis,
+                slots=slot_rows,
+                encode_this_tick=bool(getattr(vis, "_encode_this_intervene", False)),
+                dtheta=float(getattr(scene, "last_odom_dtheta", 0.0) or 0.0),
+            )
+            trace.push(snap)
+            now_ent = scene.active()
+            now_usable = bool(now_ent is not None and now_ent.is_usable(tick_i))
+            if prev_usable and not now_usable:
+                dump_root = task_log_dir() / "bind_dumps" / f"loss_tick_{tick_i}"
+                extra = {
+                    "tick": tick_i,
+                    "reason": "usable_lost",
+                    "source": (now_ent.diagnostics or {}).get("source") if now_ent else None,
+                    "bearing_sigma": float(now_ent.bearing_sigma) if now_ent else None,
+                    "confidence": float(now_ent.confidence) if now_ent else None,
+                }
+                trace.dump_to_dir(dump_root, extra=extra)
+                owm_fields = dict(snap.get("owm") or {})
+                neural_log_event(
+                    "owm",
+                    "usable_lost",
+                    tick=tick_i,
+                    force=True,
+                    **owm_fields,
+                )
+        except Exception:
+            pass
         if bool(getattr(scene, "last_odom_discontinuity", False)):
             jump = float(getattr(scene, "last_odom_jump_m", 0.0) or 0.0)
             prev_logged = int(getattr(self, "_last_odom_disc_log_tick", -9999))
@@ -2843,6 +2894,9 @@ class SimulationGroundedLanguageMixin:
     def _ensure_nav_wm_nodes(self) -> None:
         """Ensure phys_nav_bearing / phys_nav_range exist in the WM graph.
 
+        These nodes are scalar predictive-coding targets (normalized bearing/range),
+        not a Dreamer/JEPA latent XYZ rollout. Object permanence is OWM odometry.
+
         Graph rebuilds (world switch, curriculum eval reload, checkpoint load) can
         drop the opt-in nav nodes. Re-add them with ``preserve_state=True`` (keeps the
         learned weights) and re-seed the innate nav priors so the neural navigation
@@ -3002,6 +3056,7 @@ class SimulationGroundedLanguageMixin:
             float(stop),
             fallen=fallen,
             posture_stability=float(posture),
+            bearing_sigma=float(getattr(owm, "bearing_sigma", 0.0) or 0.0),
         )
         if fallen:
             meta["nav_ai_reason"] = "fallen"
@@ -3247,6 +3302,7 @@ class SimulationGroundedLanguageMixin:
                         stop,
                         fallen=fallen,
                         posture_stability=posture,
+                        bearing_sigma=float(getattr(owm, "bearing_sigma", 0.0) or 0.0),
                     )
                     nav_meta = {
                         "task_nav_mode": "heuristic",

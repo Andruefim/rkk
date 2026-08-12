@@ -67,6 +67,44 @@ def _vision_encode_every() -> int:
 
 
 VISION_ENCODE_EVERY = _vision_encode_every()
+
+
+def vision_encode_turn_rad() -> float:
+    try:
+        return max(0.0, float(os.environ.get("RKK_VISION_ENCODE_TURN_RAD", "0.08")))
+    except ValueError:
+        return 0.08
+
+
+def vision_encode_min_every() -> int:
+    try:
+        return max(1, int(os.environ.get("RKK_VISION_ENCODE_MIN_EVERY", "4")))
+    except ValueError:
+        return 4
+
+
+def vision_encode_should_run(
+    stride_counter: int,
+    *,
+    pending_dtheta: float,
+    last_encode_stride: int,
+    encode_every: int | None = None,
+    turn_rad: float | None = None,
+    min_every: int | None = None,
+) -> bool:
+    """Encode on the standing stride *or* when head/torso yaw accumulated enough.
+
+    Cap: never more often than every ``min_every`` intervene calls (CPU).
+    """
+    every = int(encode_every if encode_every is not None else VISION_ENCODE_EVERY)
+    every = max(1, every)
+    stride_hit = (int(stride_counter) % every) == 1
+    since = int(stride_counter) - int(last_encode_stride)
+    cap = int(min_every if min_every is not None else vision_encode_min_every())
+    cap = max(1, cap)
+    thr = float(turn_rad if turn_rad is not None else vision_encode_turn_rad())
+    turn_hit = float(pending_dtheta) >= thr and since >= cap
+    return bool(stride_hit or turn_hit)
 # Фоновый cortex.encode + JPEG (очередь maxsize=1); GPU с второго потока — только если устраивает драйвер
 VISION_ASYNC_ENCODE = os.environ.get("RKK_VISION_ASYNC_ENCODE", "0").strip().lower() in (
     "1", "true", "yes", "on",
@@ -97,6 +135,10 @@ _HYBRID_CONTROLLABLE_KEYS = {
 # ─── Имена переменных ─────────────────────────────────────────────────────────
 def nav_wm_nodes_enabled() -> bool:
     """Opt-in neural-navigation WM nodes (phys_nav_bearing / phys_nav_range).
+
+    These are scalar predictive-coding targets for the GNN (normalized bearing /
+    range), **not** a Dreamer/JEPA latent XYZ rollout. Object permanence lives
+    in LatentSceneMemory odometry, not in these nodes.
 
     Off by default so the graph dimension (and trained checkpoints) stay unchanged;
     set RKK_NAV_WM_NODES=1 to expose the vision target to Active Inference / WM beam.
@@ -173,6 +215,13 @@ class EnvironmentVisual:
         self._refresh_index = 0
         self._vision_stride_counter = 0
         self._recon_counter = 0
+        self._prev_neck_yaw: float | None = None
+        self._prev_spine_yaw: float | None = None
+        self._prev_torso_yaw: float | None = None
+        self._pending_encode_dtheta = 0.0
+        self._last_encode_stride = 0
+        self._last_turn_dtheta = 0.0
+        self._encode_this_intervene = False
 
         # Фаза 2: VLM-лексикон по индексу слота (после Hungarian; ключи slot_0…)
         self._slot_lexicon: dict[str, dict] = {}
@@ -430,6 +479,50 @@ class EnvironmentVisual:
             self._hybrid_phys_obs = self.base_env.observe()
         return self._hybrid_phys_obs
 
+    def _read_turn_angles(self) -> tuple[float, float, float]:
+        """neck_yaw, spine_yaw, torso_yaw after the physics step."""
+        neck = spine = torso = 0.0
+        sim = getattr(self.base_env, "_sim", None)
+        if sim is not None:
+            try:
+                gj = getattr(sim, "get_joint_angle", None)
+                if callable(gj):
+                    neck = float(gj("neck_yaw") or 0.0)
+                    spine = float(gj("spine_yaw") or 0.0)
+            except Exception:
+                pass
+            try:
+                pose_fn = getattr(sim, "get_task_agent_pose", None)
+                if callable(pose_fn):
+                    pose = pose_fn() or {}
+                    torso = float(pose.get("yaw", 0.0) or 0.0)
+            except Exception:
+                pass
+            return neck, spine, torso
+        try:
+            obs = self.base_env.observe()
+            neck = float(obs.get("neck_yaw", obs.get("phys_neck_yaw", 0.0)) or 0.0)
+            spine = float(obs.get("spine_yaw", obs.get("phys_spine_yaw", 0.0)) or 0.0)
+        except Exception:
+            pass
+        return neck, spine, torso
+
+    def _accumulate_turn_dtheta(self) -> float:
+        neck, spine, torso = self._read_turn_angles()
+        dtheta = 0.0
+        if self._prev_neck_yaw is not None:
+            dtheta += abs(float(neck) - float(self._prev_neck_yaw))
+        if self._prev_spine_yaw is not None:
+            dtheta += abs(float(spine) - float(self._prev_spine_yaw))
+        if self._prev_torso_yaw is not None:
+            dtheta += abs(float(torso) - float(self._prev_torso_yaw))
+        self._prev_neck_yaw = float(neck)
+        self._prev_spine_yaw = float(spine)
+        self._prev_torso_yaw = float(torso)
+        self._pending_encode_dtheta += float(dtheta)
+        self._last_turn_dtheta = float(dtheta)
+        return float(self._pending_encode_dtheta)
+
     # ── Observe ───────────────────────────────────────────────────────────────
     def observe(self) -> dict[str, float]:
         if self._last_slots is None:
@@ -473,7 +566,8 @@ class EnvironmentVisual:
         self, variable: str, value: float, *, count_intervention: bool = True
     ) -> dict[str, float]:
         """
-        Интервенция через физику; полный камера+encode — раз в VISION_ENCODE_EVERY шагов.
+        Интервенция через физику; полный камера+encode — раз в VISION_ENCODE_EVERY
+        шагов на месте, либо раньше при повороте головы/торса (см. vision_encode_should_run).
 
         Slot → physical action mapping:
           "slot_K" → маппим на ближайший joint base_env по вариабельности
@@ -517,7 +611,16 @@ class EnvironmentVisual:
             _base_iv(variable, value)
 
         self._vision_stride_counter += 1
-        run_encode = (self._vision_stride_counter % VISION_ENCODE_EVERY == 1)
+        pending = self._accumulate_turn_dtheta()
+        run_encode = vision_encode_should_run(
+            self._vision_stride_counter,
+            pending_dtheta=pending,
+            last_encode_stride=self._last_encode_stride,
+        )
+        self._encode_this_intervene = bool(run_encode)
+        if run_encode:
+            self._last_encode_stride = int(self._vision_stride_counter)
+            self._pending_encode_dtheta = 0.0
         self._refresh(run_encode=run_encode)
 
         # Predictive coding только когда был свежий кадр/slots
@@ -690,6 +793,9 @@ class EnvironmentVisual:
         if callable(fn):
             fn()
         self._vision_stride_counter = 0
+        self._pending_encode_dtheta = 0.0
+        self._last_encode_stride = 0
+        self._encode_this_intervene = False
         self.clear_slot_lexicon()
         self._refresh(run_encode=True, force_sync=True)
 

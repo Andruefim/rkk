@@ -18,7 +18,9 @@ visual_grounding.py — Level 1-B: Visual Body Grounding.
 
 Дополнительно:
   - Строим slot→body_part map (словарь для UI: slot_0 → "lknee")
-  - Обновляем VLM lexicon автоматически из grounding (slot label = joint name)
+  - Обновляем VLM lexicon автоматически из grounding (slot label = "[EGO] joint")
+  - Фильтр vision_resolve / objectness пропускает self_slot / source=grounding / [EGO]
+  - Проекция суставов — той же ego-камерой, что RGB-D (`_camera_view_proj`)
   - Фиксируем temporal stability: если slot k стабильно указывает на joint j
     за N frames → "confirmed grounding" → более сильное ребро
 
@@ -161,6 +163,29 @@ def project_joints_to_camera(
     return projections
 
 
+def ego_view_proj_from_visual_env(
+    visual_env: Any,
+    image_width: int,
+    image_height: int,
+) -> tuple[list[float] | None, list[float] | None]:
+    """Reuse the ego RGB camera matrices from `_PyBulletHumanoid._camera_view_proj`."""
+    base = getattr(visual_env, "base_env", None)
+    sim = getattr(base, "_sim", None) if base is not None else None
+    cam_fn = getattr(sim, "_camera_view_proj", None)
+    if not callable(cam_fn):
+        return None, None
+    try:
+        out = cam_fn("ego", int(image_width), int(image_height))
+    except Exception:
+        return None, None
+    if out is None:
+        return None, None
+    vm, pm = out[0], out[1]
+    if vm is None or pm is None:
+        return None, None
+    return list(vm), list(pm)
+
+
 def get_camera_matrices_from_pybullet_humanoid(
     physics_client: int,
     robot_id: int,
@@ -169,8 +194,11 @@ def get_camera_matrices_from_pybullet_humanoid(
     image_height: int = 216,
 ) -> tuple[list[float] | None, list[float] | None]:
     """
-    Получаем view и projection матрицы, которые использует humanoid camera.
-    Пытаемся восстановить их из ego camera (neck/chest), иначе default side view.
+    Fallback view/proj when the live ego camera is unavailable.
+
+    Prefer ``ego_view_proj_from_visual_env`` (same matrices as RGB-D). This
+    reconstructs a neck/chest camera and historically hardcoded world +X forward,
+    which does not match `_ego_camera_rt`.
     """
     if not _PB_AVAILABLE:
         return None, None
@@ -377,9 +405,16 @@ class VisualGroundingController:
 
             def _camera_and_project() -> None:
                 nonlocal joint_projections
-                vm, pm = get_camera_matrices_from_pybullet_humanoid(
-                    physics_client, robot_id, ln, image_width, image_height
+                # Same view/proj as ego RGB-D (`_PyBulletHumanoid._camera_view_proj`).
+                # The standalone reconstruct in get_camera_matrices_from_pybullet_humanoid
+                # hardcodes fwd=[1,0,0] and systematically misaligns slot↔joint UV.
+                vm, pm = ego_view_proj_from_visual_env(
+                    visual_env, image_width, image_height
                 )
+                if vm is None or pm is None:
+                    vm, pm = get_camera_matrices_from_pybullet_humanoid(
+                        physics_client, robot_id, ln, image_width, image_height
+                    )
                 if vm is not None and pm is not None:
                     joint_projections = project_joints_to_camera(
                         physics_client,
@@ -497,17 +532,15 @@ class VisualGroundingController:
         if hasattr(visual_env, "_slot_lexicon") and new_slot_to_joint:
             for k, var_name in new_slot_to_joint.items():
                 slot_id = f"slot_{k}"
-                existing = visual_env._slot_lexicon.get(slot_id) or {}
-                # Only update if no existing label or new score is much better
-                existing_conf = float(existing.get("confidence", 0.0))
                 new_conf = new_slot_to_score.get(k, 0.0)
-                if new_conf > existing_conf + 0.1:
-                    visual_env._slot_lexicon[slot_id] = {
-                        "label": _var_to_body_label(var_name),
-                        "likely_phys": [var_name],
-                        "confidence": round(new_conf, 3),
-                        "source": "grounding",
-                    }
+                # Prefix [EGO] so vision_resolve / objectness skip body slots.
+                visual_env._slot_lexicon[slot_id] = {
+                    "label": f"[EGO] {_var_to_body_label(var_name)}",
+                    "likely_phys": [var_name],
+                    "confidence": round(float(new_conf), 3),
+                    "source": "grounding",
+                    "self_slot": True,
+                }
 
         result["edges_injected"] = edges_injected
         result["confirmed_slots"] = confirmed_count

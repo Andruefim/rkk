@@ -152,6 +152,7 @@ def navigation_intents_from_ego_xy(
     fallen: bool = False,
     posture_stability: float | None = None,
     bearing_turn_thr: float | None = None,
+    bearing_sigma: float | None = None,
 ) -> dict[str, float]:
     """
     Navigate toward egocentric target (x_fwd, y_right) in meters.
@@ -167,6 +168,7 @@ def navigation_intents_from_ego_xy(
         fallen=fallen,
         posture_stability=posture_stability,
         bearing_turn_thr=bearing_turn_thr,
+        bearing_sigma=bearing_sigma,
     )
     if out:
         out["task_target_x"] = float(x_fwd)
@@ -182,10 +184,14 @@ def navigation_intents_from_bearing_range(
     fallen: bool = False,
     posture_stability: float | None = None,
     bearing_turn_thr: float | None = None,
+    bearing_sigma: float | None = None,
 ) -> dict[str, float]:
     """
     Ego-frame navigation from vision bearing + metric range_m.
     bearing in [-1, 1] (left…right); range_m in meters.
+
+    ``bearing_sigma`` widens the turn deadzone (softer heading when the
+    odometry hold is uncertain). Pause is the caller's job when not usable.
     """
     if fallen:
         return {}
@@ -199,6 +205,8 @@ def navigation_intents_from_bearing_range(
     b = float(max(-1.0, min(1.0, bearing)))
     heading_err = b * math.pi * 0.5
     turn_thr = float(bearing_turn_thr) if bearing_turn_thr is not None else _HEADING_TURN_RAD
+    sigma = max(0.0, float(bearing_sigma or 0.0))
+    turn_thr = float(turn_thr + 0.45 * min(0.5, sigma))
 
     out: dict[str, float] = {
         "task_heading_err": float(max(-1.0, min(1.0, heading_err / math.pi))),

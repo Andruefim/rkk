@@ -182,6 +182,46 @@ def _mask_peakiness(m: np.ndarray) -> float:
     return float(flat.max() / mean)
 
 
+def _mask_bbox(
+    mask: np.ndarray | None, *, thresh: float = 0.25
+) -> tuple[float, float, float, float] | None:
+    """Attention-mask bbox in normalized UV (u_min, v_min, u_max, v_max)."""
+    if mask is None:
+        return None
+    try:
+        m = np.asarray(mask, dtype=np.float64)
+    except Exception:
+        return None
+    if m.ndim != 2 or m.size == 0:
+        return None
+    peak = float(m.max())
+    if peak <= 1e-9:
+        return None
+    ys, xs = np.where(m >= (thresh * peak))
+    if xs.size == 0 or ys.size == 0:
+        return None
+    h, w = m.shape
+    u_min = float(xs.min()) / max(w - 1, 1)
+    u_max = float(xs.max()) / max(w - 1, 1)
+    v_min = float(ys.min()) / max(h - 1, 1)
+    v_max = float(ys.max()) / max(h - 1, 1)
+    return (u_min, v_min, u_max, v_max)
+
+
+def is_self_vision_slot(slot_or_meta: dict[str, Any] | None, label: str = "") -> bool:
+    """True for body/self slots that must not enter objectness / scene bind."""
+    meta = dict(slot_or_meta or {})
+    if bool(meta.get("self_slot")):
+        return True
+    src = str(meta.get("source") or "").strip().lower()
+    if src == "grounding":
+        return True
+    lab = str(label or meta.get("label") or "").strip()
+    if lab.lower().startswith("[ego]"):
+        return True
+    return False
+
+
 def collect_vision_slots(visual_env: Any | None) -> list[dict[str, Any]]:
     """Build slot candidates from EnvironmentVisual-like object."""
     if visual_env is None:
@@ -239,7 +279,8 @@ def collect_vision_slots(visual_env: Any | None) -> list[dict[str, Any]]:
         sid = f"slot_{i}"
         meta = lexicon.get(sid) or {}
         label = str(meta.get("label") or "")
-        if label.lower().startswith("[ego]"):
+        # Skip body/self even when grounding is off but an [EGO] label already exists.
+        if is_self_vision_slot(meta, label):
             continue
         if sid in positions:
             u, v, peak, mask = positions[sid]
@@ -280,6 +321,9 @@ def collect_vision_slots(visual_env: Any | None) -> list[dict[str, Any]]:
                 "uv_valid": bool(uv_valid),
                 "mask_peakiness": float(peak),
                 "attn_mask": mask,
+                "bbox": _mask_bbox(mask),
+                "self_slot": bool(meta.get("self_slot")),
+                "source": str(meta.get("source") or ""),
             }
         )
     return slots
@@ -493,6 +537,9 @@ def _apply_metric_geometry(
     if lat:
         diags["latent"] = lat
         diags["latent_dim"] = len(lat)
+    bbox = cand.get("bbox")
+    if bbox is None:
+        bbox = _mask_bbox(cand.get("attn_mask"))
     target = VisualTarget(
         slot_id=str(cand["slot_id"]),
         u=u,
@@ -500,6 +547,7 @@ def _apply_metric_geometry(
         label=str(cand.get("label") or "visual_referent"),
         confidence=float(cand.get("match_score") or 0.0),
         bearing=bearing_from_u(u),
+        bbox=bbox if isinstance(bbox, tuple) else None,
         diagnostics=diags,
         latent=lat,
     )
@@ -550,6 +598,7 @@ def resolve_visual_target(
         return None, diag
 
     raw = list(slots) if slots is not None else collect_vision_slots(visual_env)
+    raw = [s for s in raw if not is_self_vision_slot(s)]
     if not raw:
         diag["reason"] = "no_vision_slots"
         return None, diag
