@@ -273,19 +273,28 @@ def _apply_odometry_to_ego(
     agent_xy: tuple[float, float],
     agent_forward: tuple[float, float],
 ) -> tuple[float, float]:
-    px, py = prev_xy
+    px, py = float(prev_xy[0]), float(prev_xy[1])
     ax, ay = float(agent_xy[0]), float(agent_xy[1])
-    fpx, fpy = prev_fwd
+    fpx, fpy = float(prev_fwd[0]), float(prev_fwd[1])
     fn = math.hypot(fpx, fpy) + 1e-9
     fpx, fpy = fpx / fn, fpy / fn
-    dx, dy = ax - px, ay - py
-    ds_fwd = dx * fpx + dy * fpy
-    ds_right = dy * fpx - dx * fpy
-    dtheta = _yaw_delta(prev_fwd, agent_forward)
-    tx = float(x_fwd) - ds_fwd
-    ty = float(y_right) - ds_right
-    c, s = math.cos(-dtheta), math.sin(-dtheta)
-    return c * tx - s * ty, s * tx + c * ty
+
+    # Target position in world coordinates (using prev agent pose)
+    # Forward = (fpx, fpy), Right = (fpy, -fpx)
+    twx = px + float(x_fwd) * fpx + float(y_right) * fpy
+    twy = py + float(x_fwd) * fpy - float(y_right) * fpx
+
+    # Current agent forward and right unit vectors
+    fcx, fcy = float(agent_forward[0]), float(agent_forward[1])
+    fcn = math.hypot(fcx, fcy) + 1e-9
+    fcx, fcy = fcx / fcn, fcy / fcn
+
+    # Target relative to current agent position, projected onto current (Forward, Right)
+    dtx = twx - ax
+    dty = twy - ay
+    new_x = dtx * fcx + dty * fcy
+    new_y = dtx * fcy - dty * fcx
+    return float(new_x), float(new_y)
 
 
 def _odometry_motion(

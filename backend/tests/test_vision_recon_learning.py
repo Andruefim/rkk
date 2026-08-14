@@ -91,6 +91,7 @@ def test_vision_config_scales_from_env(monkeypatch):
     monkeypatch.setenv("RKK_VISION_CNN_CHANNELS", "32,64,64")
     monkeypatch.setenv("RKK_VISION_ITERS", "3")
     monkeypatch.setenv("RKK_VISION_SLOT_DIM", "96")
+    monkeypatch.setenv("RKK_VISION_FORCE_GPU_PROFILE", "1")
 
     cfg = vision_config_from_env(n_slots=5)
     # Разрешение округляется вниз до кратного 4: энкодер отдаёт сетку H/4 × W/4.
@@ -98,12 +99,52 @@ def test_vision_config_scales_from_env(monkeypatch):
     assert cfg.cnn_channels == [32, 64, 64]
     assert cfg.n_iters == 3 and cfg.slot_dim == 96 and cfg.n_slots == 5
 
+    # CPU: shrink frame / iters (checkpoint-safe). Keep explicit CNN channels —
+    # those tensors do not transfer across 16,32,32 vs 32,64,64.
+    monkeypatch.setenv("RKK_VISION_FORCE_GPU_PROFILE", "0")
+    monkeypatch.setenv("RKK_DEVICE", "cpu")
+    cfg_cpu = vision_config_from_env(n_slots=5, device=torch.device("cpu"))
+    assert (cfg_cpu.frame_h, cfg_cpu.frame_w) == (64, 64)
+    assert cfg_cpu.cnn_channels == [32, 64, 64]
+    assert cfg_cpu.n_iters == 2
+
+    monkeypatch.delenv("RKK_VISION_CNN_CHANNELS", raising=False)
+    monkeypatch.delenv("RKK_VISION_FRAME_H", raising=False)
+    monkeypatch.delenv("RKK_VISION_FRAME_W", raising=False)
+    monkeypatch.delenv("RKK_VISION_ITERS", raising=False)
+    cfg_cpu_default = vision_config_from_env(n_slots=5, device=torch.device("cpu"))
+    assert cfg_cpu_default.cnn_channels == [16, 32, 32]
+    assert (cfg_cpu_default.frame_h, cfg_cpu_default.frame_w) == (64, 64)
+
+
+def test_cpu_cam_and_recon_follow_env_at_call_time(monkeypatch):
+    from engine.causal_vision import recon_batch, recon_steps
+    from engine.environment_visual import _vision_cam_h, _vision_cam_w
+
+    monkeypatch.setenv("RKK_DEVICE", "cpu")
+    monkeypatch.setenv("RKK_VISION_FORCE_GPU_PROFILE", "0")
+    monkeypatch.setenv("RKK_VISION_CAM_W", "384")
+    monkeypatch.setenv("RKK_VISION_CAM_H", "288")
+    monkeypatch.setenv("RKK_VISION_RECON_BATCH", "8")
+    monkeypatch.setenv("RKK_VISION_RECON_STEPS", "8")
+    assert _vision_cam_w() == 288
+    assert _vision_cam_h() == 216
+    assert recon_batch(torch.device("cpu")) == 2
+    assert recon_steps(torch.device("cpu")) == 2
+
+    monkeypatch.setenv("RKK_VISION_FORCE_GPU_PROFILE", "1")
+    assert _vision_cam_w() == 384
+    assert _vision_cam_h() == 288
+    assert recon_batch(torch.device("cpu")) == 8
+    assert recon_steps(torch.device("cpu")) == 8
+
 
 def test_higher_resolution_cortex_trains(monkeypatch):
     from engine.causal_vision import make_visual_cortex as make
 
     monkeypatch.setenv("RKK_VISION_FRAME_H", "128")
     monkeypatch.setenv("RKK_VISION_FRAME_W", "128")
+    monkeypatch.setenv("RKK_VISION_FORCE_GPU_PROFILE", "1")
     cortex = make(torch.device("cpu"), n_slots=3)
     assert cortex.cfg.frame_h == 128
 
@@ -121,6 +162,7 @@ def test_checkpoint_transfers_across_resolutions(monkeypatch):
     from engine.causal_vision import make_visual_cortex as make
     from engine.checkpoint_modules import _load_compatible  # noqa: PLC2701
 
+    monkeypatch.setenv("RKK_VISION_FORCE_GPU_PROFILE", "1")
     monkeypatch.setenv("RKK_VISION_FRAME_H", "64")
     monkeypatch.setenv("RKK_VISION_FRAME_W", "64")
     small = make(torch.device("cpu"), n_slots=3)
@@ -130,6 +172,7 @@ def test_checkpoint_transfers_across_resolutions(monkeypatch):
 
     monkeypatch.setenv("RKK_VISION_FRAME_H", "128")
     monkeypatch.setenv("RKK_VISION_FRAME_W", "128")
+    monkeypatch.setenv("RKK_VISION_FORCE_GPU_PROFILE", "1")
     big = make(torch.device("cpu"), n_slots=3)
     loaded = _load_compatible(big, {k: v.clone() for k, v in small.state_dict().items()})
 

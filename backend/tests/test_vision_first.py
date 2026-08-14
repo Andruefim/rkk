@@ -21,7 +21,7 @@ from engine.vision_depth import (
     salient_objectness_peak_near_bearing,
     track_search_fov_u_half,
 )
-from engine.vision_resolve import resolve_visual_target
+from engine.vision_resolve import objectness_peak_bind_gates, resolve_visual_target
 from engine.vision_target import (
     VisualTarget,
     bearing_from_u,
@@ -444,6 +444,7 @@ def test_navigation_from_bearing_range() -> None:
     )
     assert "intent_stride" in intents
     assert intents.get("vision_range_m") == pytest.approx(2.0)
+    assert intents.get("intent_support_left", 0.5) > intents.get("intent_support_right", 0.5)
     assert navigation_intents_from_bearing_range(0.0, 0.4, stop_distance=0.55) == {}
 
 
@@ -503,8 +504,8 @@ def test_objectness_peak_when_mask_invalid() -> None:
     """Diffuse mask → ignore it; UV snaps to depth protrusion (cylinder proxy)."""
     h, w = 40, 48
     depth = np.full((h, w), 4.0, dtype=np.float32)
-    # Protruding blob left of center (closer)
-    depth[8:22, 6:16] = 1.4
+    # Protruding blob left of center (closer), inside the FOV-edge kill zone.
+    depth[8:22, 12:24] = 1.4
     cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
     flat = np.ones((8, 8), dtype=np.float32)
     slots = [
@@ -542,6 +543,32 @@ def test_salient_peak_rejects_frame_edge_protrusion(monkeypatch: pytest.MonkeyPa
     frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
     u, v, r, _, _, pstr = salient_objectness_peak(frame)
     assert u is None or u <= 0.90
+
+
+def test_objectness_peak_bind_gates_rejects_run_uv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Last run locked u=0.113 / v=0.798 (left-edge floor) because conf=0.55 beat floorish."""
+    monkeypatch.setenv("RKK_OBJECTNESS_EDGE_U", "0.15")
+    geo = objectness_peak_bind_gates(0.1132, 0.7983)
+    assert geo["rejected"] is True
+    assert geo["edgeish"] is True or geo["floorish"] is True
+    # Centered short prop in lower FOV must still be allowed.
+    ok = objectness_peak_bind_gates(0.48, 0.80)
+    assert ok["rejected"] is False
+
+
+def test_salient_peak_prefers_interior_over_edge_strip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Closer FOV-border blob must lose to a real interior protrusion."""
+    monkeypatch.setenv("RKK_OBJECTNESS_EDGE_U", "0.15")
+    h, w = 60, 80
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    depth[40:58, 0:9] = 1.3  # left-edge artifact (the last-run failure mode)
+    depth[18:34, 34:50] = 2.1  # cylinder-like interior prop
+    frame = DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0)
+    u, v, r, _, _, pstr = salient_objectness_peak(frame)
+    assert u is not None and r is not None
+    assert 0.30 < u < 0.75
+    assert 1.6 < r < 2.6
+    assert pstr > 0.05
 
 
 def test_hard_lock_force_live_when_edge_disagrees(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -855,6 +882,51 @@ def test_uncertain_no_peaked_slot_refuses_weak_objectness(
     assert vt is None, diag
     assert diag.get("reason") == "uncertain_no_peaked_slot"
     assert diag.get("refused_geometry_fallback") == "objectness_peak"
+
+
+def test_objectness_bind_refuses_left_edge_floor_blob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Diffuse SA + ontology must not hard-lock a left-edge lower-FOV depth blob."""
+    from engine.grounded_language import FallbackEmbeddingClient
+    from engine.visual_referent_ontology import clear_visual_referent_cache
+
+    clear_visual_referent_cache()
+    monkeypatch.setenv("RKK_VISION_RESOLVE_MIN_CONF", "0.35")
+    monkeypatch.setenv("RKK_VISION_OBJECTNESS_BIND", "1")
+    monkeypatch.setenv("RKK_OBJECTNESS_EDGE_U", "0.15")
+    emb = FallbackEmbeddingClient(embed_dim=64)
+    h, w = 48, 64
+    depth = np.full((h, w), 4.0, dtype=np.float32)
+    # Only a left-edge lower-FOV strip is close (run: u≈0.11, v≈0.80).
+    depth[36:47, 0:8] = 2.4
+    cam = ArrayDepthCamera(DepthFrame(depth_m=depth, near_m=0.1, far_m=15.0))
+    slots = [
+        {
+            "slot_id": "slot_0",
+            "u": 0.5,
+            "v": 0.5,
+            "label": "",
+            "activation": 0.9,
+            "vector": None,
+            "uv_valid": False,
+            "mask_peakiness": 1.0,
+            "attn_mask": np.ones((8, 8), dtype=np.float32),
+        }
+    ]
+    vt, diag = resolve_visual_target(
+        "подойди к большому объекту перед тобой",
+        slots=slots,
+        depth_camera=cam,
+        embed_fn=emb.embed,
+        require_range=True,
+    )
+    assert vt is None, diag
+    assert diag.get("reason") == "uncertain_no_peaked_slot"
+    attempt = diag.get("objectness_bind_attempt") or {}
+    # Peak finder may return nothing (pstr=0) or a gated edge/floor blob.
+    if float(attempt.get("peak_strength") or 0.0) >= 0.12:
+        assert attempt.get("edgeish") or attempt.get("floorish")
 
 
 def test_objectness_bind_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:

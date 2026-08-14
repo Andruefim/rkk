@@ -9,7 +9,7 @@ import pytest
 
 from engine.object_resolver import ResolvedObject
 from engine.task_goal import GoalPredicate, TaskGoal
-from engine.task_tree import DECOMPOSE_MANIPULATE
+from engine.task_tree import DECOMPOSE_MANIPULATE, TaskTreeController
 from engine.verbal_action import SpeechType
 from tests.conftest import AgiLoopSim, _default_humanoid_obs
 from tests.test_agi_human_command_loop import _patch_fallback_embed
@@ -442,3 +442,75 @@ def test_task_tree_enabled_flag(monkeypatch: pytest.MonkeyPatch, val: str, expec
     from engine.task_tree import task_tree_enabled
 
     assert task_tree_enabled() is expect
+
+
+def test_second_command_survives_tick_during_bind(
+    agi_loop_sim: AgiLoopSim,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preempt + slow bind_goal must not REPORT fail or wipe the new tree.
+
+    Live bug: handle_human_command cancelled the first tree, then LLM decompose
+    yielded; a sim tick finalized the preempted tree as «Не удалось», armed
+    pending_ack, and the next tick acknowledge_clear()'d the replacement
+    before vision resolve ran.
+    """
+    sim = agi_loop_sim
+    _patch_fallback_embed(sim)
+    monkeypatch.setenv("RKK_TASK_RESOLVE", "vision")
+    goal2 = TaskGoal(
+        text="подойди к цилиндрическому объекту перед тобой",
+        predicates=[
+            GoalPredicate(kind="reduce_distance", target_value=0.55, tolerance=0.25),
+        ],
+        diagnostics={"needs_target": True},
+    )
+    monkeypatch.setattr(sim, "_ground_command_goal", lambda *_a, **_k: goal2)
+
+    first = TaskGoal(
+        text="подойди к конусовидному объекту перед тобой",
+        predicates=[
+            GoalPredicate(kind="reduce_distance", target_value=0.55, tolerance=0.25),
+        ],
+        diagnostics={"needs_target": True},
+    )
+    sim._task_tree_kind = "goal"
+    sim._task_goal = first
+    tt = sim._ensure_task_tree()
+    tt.bind_goal(first, sim.tick, needs_target=True)
+    tt.complete_active(sim.tick)
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "approach"
+
+    orig_bind = TaskTreeController.bind_goal
+
+    def racing_bind(self, *args, **kwargs):
+        sim.tick += 1
+        sim._tick_human_task(fallen=False)
+        return orig_bind(self, *args, **kwargs)
+
+    monkeypatch.setattr(TaskTreeController, "bind_goal", racing_bind)
+
+    verbal = SimpleNamespace(
+        _messages=[],
+        _on_message=[],
+        total_messages=0,
+        _last_report_tick=-1,
+    )
+    sim._verbal = verbal
+
+    with mock.patch("engine.verbal_action.ollama_chat_speech_enabled", return_value=False):
+        out = sim.handle_human_command("подойди к цилиндрическому объекту перед тобой")
+        sim.tick += 1
+        sim._tick_human_task(fallen=False)
+
+    assert out.get("ok") is not False
+    tt = sim._ensure_task_tree()
+    assert tt.is_active
+    assert tt.active_node is not None
+    assert tt.active_node.kind == "resolve_target"
+    assert sim._task_tree_kind == "goal"
+    assert getattr(sim, "_deferred_vision_resolve", None)
+    fail_texts = [str(getattr(m, "text", "")) for m in verbal._messages]
+    assert not any("Не удалось" in t for t in fail_texts)
+

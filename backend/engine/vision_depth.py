@@ -466,7 +466,21 @@ def objectness_floor_v_max() -> float:
 
 def objectness_edge_u_margin() -> float:
     """Reject / suppress peaks within this margin of left/right frame edge."""
-    return float(max(0.02, min(0.25, _ef("RKK_OBJECTNESS_EDGE_U", 0.08))))
+    # 0.15: FOV-border depth discontinuities sit around u≈0.08–0.12 and
+    # lock approach into a turn that never centers a real object.
+    return float(max(0.02, min(0.25, _ef("RKK_OBJECTNESS_EDGE_U", 0.15))))
+
+
+def _apply_frame_edge_suppression(score: np.ndarray, xs: np.ndarray) -> np.ndarray:
+    """Zero FOV-border columns; mild ramp so argmax does not sit on the kill edge."""
+    edge_m = objectness_edge_u_margin()
+    if edge_m <= 1e-6:
+        return score
+    out = np.where((xs < edge_m) | (xs > (1.0 - edge_m)), 0.0, score)
+    ramp = 0.06
+    left = np.clip((xs - edge_m) / ramp, 0.0, 1.0)
+    right = np.clip(((1.0 - edge_m) - xs) / ramp, 0.0, 1.0)
+    return out * (0.55 + 0.45 * left) * (0.55 + 0.45 * right)
 
 
 def floor_protrusion_min() -> float:
@@ -646,12 +660,7 @@ def salient_objectness_peak(
     center = np.exp(-(((xs - cx) / gw) ** 2 + ((ys - cy) / gh) ** 2))
     score = score * (1.0 - 0.75 * center * (1.0 - _wmap))
 
-    # Suppress left/right frame edges — depth FOV borders produce false
-    # protrusions (u→0/1) that lock approach into infinite turn-in-place.
-    edge_m = objectness_edge_u_margin()
-    if edge_m > 1e-6:
-        edge_kill = (xs < edge_m) | (xs > (1.0 - edge_m))
-        score = np.where(edge_kill, 0.0, score)
+    score = _apply_frame_edge_suppression(score, xs)
 
     peak_val = float(score.max())
     if peak_val < 1e-8 or int(np.count_nonzero(score > 0)) < 3:
@@ -662,6 +671,7 @@ def salient_objectness_peak(
     v = float(ys[yi, 0])
 
     # Hard reject residual edge peaks (numerical / thin FOV).
+    edge_m = objectness_edge_u_margin()
     if u < edge_m or u > (1.0 - edge_m):
         return None, None, None, None, None, 0.0
 
@@ -746,6 +756,7 @@ def salient_objectness_peak_near_bearing(
     u_lo = max(0.0, u0 - float(fov_u_half))
     u_hi = min(1.0, u0 + float(fov_u_half))
     score = np.where((xs >= u_lo) & (xs <= u_hi), score, 0.0)
+    score = _apply_frame_edge_suppression(score, xs)
 
     cx, cy, gw, gh = 0.5, 0.72, 0.12, 0.10
     center = np.exp(-(((xs - cx) / gw) ** 2 + ((ys - cy) / gh) ** 2))

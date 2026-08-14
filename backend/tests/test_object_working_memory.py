@@ -78,6 +78,28 @@ def test_owm_ema_and_hold(monkeypatch: pytest.MonkeyPatch) -> None:
     assert 1.0 < owm.range_m < 1.6  # EMA between prev and 1.0
 
 
+def test_apply_odometry_to_ego_translation_and_rotation() -> None:
+    from engine.object_working_memory import _apply_odometry_to_ego
+
+    # Target ahead at (2.0, 0.0), agent turns 30 deg left (CCW) -> target is 30 deg to the right (+y_right)
+    nx, ny = _apply_odometry_to_ego(
+        2.0, 0.0,
+        prev_xy=(0.0, 0.0), prev_fwd=(1.0, 0.0),
+        agent_xy=(0.0, 0.0), agent_forward=(0.866025, 0.5),
+    )
+    assert nx == pytest.approx(1.732, abs=0.01)
+    assert ny == pytest.approx(1.0, abs=0.01)
+
+    # Target at 1m right (2.0, 1.0), agent steps 0.5m right -> target is now 0.5m right
+    nx, ny = _apply_odometry_to_ego(
+        2.0, 1.0,
+        prev_xy=(0.0, 0.0), prev_fwd=(1.0, 0.0),
+        agent_xy=(0.0, -0.5), agent_forward=(1.0, 0.0),
+    )
+    assert nx == pytest.approx(2.0, abs=0.01)
+    assert ny == pytest.approx(0.5, abs=0.01)
+
+
 def test_owm_yaw_odometry() -> None:
     owm = ObjectWorkingMemory()
     vt = VisualTarget(
@@ -98,8 +120,8 @@ def test_owm_yaw_odometry() -> None:
         agent_xy=(0.0, 0.0),
         agent_forward=(0.0, 1.0),
     )
-    # Target was ahead; after left turn it lies to the agent's left (−y_right)
-    assert owm.y_right < -1.0
+    # Target was ahead; after left turn (CCW) it lies to the agent's right (+y_right)
+    assert owm.y_right > 1.0
     assert abs(owm.x_fwd) < 1.0
 
 
@@ -109,6 +131,10 @@ def test_nav_from_ego_xy() -> None:
     assert intents.get("vision_range_m") == pytest.approx(2.0, abs=0.05)
     # Already close
     assert navigation_intents_from_ego_xy(0.3, 0.0, stop_distance=0.55) == {}
+    right = navigation_intents_from_ego_xy(2.0, 1.2, stop_distance=0.55, posture_stability=0.9)
+    left = navigation_intents_from_ego_xy(2.0, -1.2, stop_distance=0.55, posture_stability=0.9)
+    assert right.get("intent_support_left", 0.5) > right.get("intent_support_right", 0.5)
+    assert left.get("intent_support_right", 0.5) > left.get("intent_support_left", 0.5)
 
 
 def test_owm_graph_payload() -> None:
@@ -229,6 +255,7 @@ def test_apply_odometry_includes_lateral_shift() -> None:
     xf, yr = 2.0, 0.4
     prev_xy = (0.0, 0.0)
     prev_fwd = (1.0, 0.0)
+    # Step to the left (+Y): target on the right is now farther to the right (yr2 = 0.5)
     agent_xy = (0.0, 0.1)
     agent_fwd = (1.0, 0.0)
     xf2, yr2 = _apply_odometry_to_ego(
@@ -239,7 +266,18 @@ def test_apply_odometry_includes_lateral_shift() -> None:
         agent_xy=agent_xy,
         agent_forward=agent_fwd,
     )
-    assert yr2 < yr
+    assert yr2 == pytest.approx(0.5, abs=0.01)
+
+    # Step to the right (-Y): target on the right is now closer to center (yr3 = 0.3)
+    xf3, yr3 = _apply_odometry_to_ego(
+        xf,
+        yr,
+        prev_xy=prev_xy,
+        prev_fwd=prev_fwd,
+        agent_xy=(0.0, -0.1),
+        agent_forward=agent_fwd,
+    )
+    assert yr3 == pytest.approx(0.3, abs=0.01)
 
 
 def test_refresh_active_syncs_ego_with_bearing() -> None:

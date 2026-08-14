@@ -33,7 +33,11 @@ import base64
 from typing import Callable
 
 from engine.environment_humanoid import MOTOR_INTENT_VARS, MOTOR_OBSERVABLE_VARS
-from engine.causal_vision import CausalVisualCortex, make_visual_cortex
+from engine.causal_vision import (
+    CausalVisualCortex,
+    make_visual_cortex,
+    vision_gpu_profile,
+)
 
 
 def frame_content_hash(frame_b64: str | None) -> str:
@@ -53,9 +57,24 @@ def _env_int_default(key: str, default: int) -> int:
         return default
 
 
-VISION_PIPELINE_CAM_W = _env_int_default("RKK_VISION_CAM_W", 288)
-VISION_PIPELINE_CAM_H = _env_int_default("RKK_VISION_CAM_H", 216)
-VISION_PIPELINE_JPEG_Q = _env_int_default("RKK_VISION_JPEG_Q", 72)
+def _vision_cam_w() -> int:
+    gpu = vision_gpu_profile()
+    default = 384 if gpu else 288
+    val = _env_int_default("RKK_VISION_CAM_W", default)
+    return min(288, val) if not gpu else val
+
+
+def _vision_cam_h() -> int:
+    gpu = vision_gpu_profile()
+    default = 288 if gpu else 216
+    val = _env_int_default("RKK_VISION_CAM_H", default)
+    return min(216, val) if not gpu else val
+
+
+def _vision_cam_jpeg_q() -> int:
+    return _env_int_default("RKK_VISION_JPEG_Q", 72)
+
+
 # Полные маски для UI — не на каждый _refresh (дорого: 8× JPEG + upscale)
 VISION_UI_MASK_EVERY = 3
 # Полный камера+encode раз в N интервенций (между — старые слоты, свежие phys_*)
@@ -64,9 +83,6 @@ def _vision_encode_every() -> int:
         return max(1, int(os.environ.get("RKK_VISION_ENCODE_EVERY", "6")))
     except ValueError:
         return 6
-
-
-VISION_ENCODE_EVERY = _vision_encode_every()
 
 
 def vision_encode_turn_rad() -> float:
@@ -96,7 +112,7 @@ def vision_encode_should_run(
 
     Cap: never more often than every ``min_every`` intervene calls (CPU).
     """
-    every = int(encode_every if encode_every is not None else VISION_ENCODE_EVERY)
+    every = int(encode_every if encode_every is not None else _vision_encode_every())
     every = max(1, every)
     stride_hit = (int(stride_counter) % every) == 1
     since = int(stride_counter) - int(last_encode_stride)
@@ -257,9 +273,9 @@ class EnvironmentVisual:
             try:
                 b64 = fn(
                     None,
-                    width=VISION_PIPELINE_CAM_W,
-                    height=VISION_PIPELINE_CAM_H,
-                    jpeg_quality=VISION_PIPELINE_JPEG_Q,
+                    width=_vision_cam_w(),
+                    height=_vision_cam_h(),
+                    jpeg_quality=_vision_cam_jpeg_q(),
                 )
             except TypeError:
                 b64 = fn(None)
@@ -566,7 +582,7 @@ class EnvironmentVisual:
         self, variable: str, value: float, *, count_intervention: bool = True
     ) -> dict[str, float]:
         """
-        Интервенция через физику; полный камера+encode — раз в VISION_ENCODE_EVERY
+        Интервенция через физику; полный камера+encode — раз в RKK_VISION_ENCODE_EVERY
         шагов на месте, либо раньше при повороте головы/торса (см. vision_encode_should_run).
 
         Slot → physical action mapping:

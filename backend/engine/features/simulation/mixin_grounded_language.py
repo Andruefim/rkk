@@ -1122,7 +1122,23 @@ class SimulationGroundedLanguageMixin:
             except Exception:
                 pass
 
+    def _rearm_bound_human_command(
+        self,
+        cmd_kind: str,
+        goal: TaskGoal | None,
+        *,
+        use_goal: bool,
+    ) -> None:
+        """Restore tick-path flags after a slow bind (LLM decompose can yield)."""
+        self._task_tree_kind = str(cmd_kind or "")
+        self._task_goal = goal if use_goal else None
+        self._task_tree_reported = False
+        self._task_tree_affect_done = False
+        self._task_tree_cleared_pending_ack = False
+
     def _maybe_finalize_task_tree(self, tick: int) -> None:
+        if getattr(self, "_human_command_inflight", False):
+            return
         if getattr(self, "_task_tree_reported", False):
             return
         tt = getattr(self, "_task_tree_ctrl", None)
@@ -1130,6 +1146,12 @@ class SimulationGroundedLanguageMixin:
             return
         root_status = str(tt.tree.root_status)
         if root_status not in TERMINAL_STATUSES:
+            return
+        if root_status == "cancelled":
+            # Preempted by a new command — not a user-facing failure. Drop the
+            # old tree now; do not arm pending_ack (that wipes the replacement).
+            self._task_tree_reported = True
+            tt.acknowledge_clear()
             return
         success = root_status == "done"
         goal = getattr(self, "_task_goal", None)
@@ -4032,6 +4054,8 @@ class SimulationGroundedLanguageMixin:
     def _tick_human_task(self, *, fallen: bool) -> None:
         if not task_binding_enabled():
             return
+        if getattr(self, "_human_command_inflight", False):
+            return
 
         tick = int(getattr(self, "tick", 0))
 
@@ -4169,8 +4193,23 @@ class SimulationGroundedLanguageMixin:
             return {"ok": False, "error": "controller_unavailable"}
 
         tick = int(getattr(self, "tick", 0))
+        self._human_command_inflight = True
+        try:
+            return self._handle_human_command_body(text, tick, gl)
+        finally:
+            self._human_command_inflight = False
+
+    def _handle_human_command_body(
+        self,
+        text: str,
+        tick: int,
+        gl: GroundedLanguageController,
+    ) -> dict[str, Any]:
         self._clear_human_command_state(tick)
-        self._task_tree_reported = False
+        tt_prev = getattr(self, "_task_tree_ctrl", None)
+        if tt_prev is not None:
+            tt_prev.acknowledge_clear()
+        self._task_tree_reported = True
         self._task_tree_affect_done = False
         self._task_tree_cleared_pending_ack = False
         self._task_tree_stage_enter_tick = tick
@@ -4243,6 +4282,7 @@ class SimulationGroundedLanguageMixin:
                 needs_target=needs_target,
                 target_ref=goal.target_ref,
             )
+            self._rearm_bound_human_command(cmd_kind, goal, use_goal=True)
             self._task_log_tree_bound(tick, tt)
             out["task_goal"] = goal.to_dict()
             out["task_tree"] = tt.snapshot(tick)
@@ -4433,6 +4473,7 @@ class SimulationGroundedLanguageMixin:
                 tick,
                 command_kind=tree_kind,
             )
+            self._rearm_bound_human_command(cmd_kind, goal, use_goal=False)
             self._task_log_tree_bound(tick, tt)
             out["task_tree"] = tt.snapshot(tick)
 
@@ -4569,6 +4610,7 @@ class SimulationGroundedLanguageMixin:
 
             if use_tree:
                 out["task_tree"] = self._ensure_task_tree().snapshot(tick)
+                self._rearm_bound_human_command(cmd_kind, goal, use_goal=use_goal)
 
         return out
 

@@ -159,6 +159,32 @@ def objectness_bind_min_peak() -> float:
     return _env_float("RKK_VISION_OBJECTNESS_BIND_MIN_PEAK", 0.18)
 
 
+def objectness_peak_bind_gates(u: float, v: float) -> dict[str, Any]:
+    """Geometry gates for depth-objectness bind (FOV edge / floor artifacts).
+
+    Confidence is intentionally unused: boosting match_score to 0.40–0.55 used
+    to defeat a ``v>0.72 and conf<0.55`` floor check and lock a left-edge
+    floor blob (u≈0.11, v≈0.80).
+    """
+    try:
+        from engine.vision_depth import objectness_edge_u_margin
+
+        edge_m = float(objectness_edge_u_margin())
+    except Exception:
+        edge_m = 0.15
+    uu, vv = float(u), float(v)
+    edgeish = uu < edge_m or uu > (1.0 - edge_m)
+    # Bottom row is floor. Lower-FOV *and* off-center is floor/horizon, not a
+    # prop in front; centered short objects (v~0.8, u~0.5) stay allowed.
+    floorish = vv >= 0.88 or (vv > 0.72 and abs(uu - 0.5) > 0.22)
+    return {
+        "edgeish": bool(edgeish),
+        "floorish": bool(floorish),
+        "edge_m": round(edge_m, 4),
+        "rejected": bool(edgeish or floorish),
+    }
+
+
 def _normalize(v: np.ndarray | None) -> np.ndarray | None:
     if v is None:
         return None
@@ -720,17 +746,9 @@ def resolve_visual_target(
                 pstr = float(
                     (target.diagnostics or {}).get("objectness_peak_strength") or 0.0
                 )
-                floorish = (
-                    float(target.v) > 0.72
-                    and float(target.confidence or 0.0) < 0.55
-                )
-                try:
-                    from engine.vision_depth import objectness_edge_u_margin
-
-                    edge_m = float(objectness_edge_u_margin())
-                except Exception:
-                    edge_m = 0.08
-                edgeish = float(target.u) < edge_m or float(target.u) > (1.0 - edge_m)
+                geo = objectness_peak_bind_gates(float(target.u), float(target.v))
+                floorish = bool(geo["floorish"])
+                edgeish = bool(geo["edgeish"])
                 if (
                     target.is_ready(require_range=True)
                     and pstr >= objectness_bind_min_peak()
@@ -752,6 +770,7 @@ def resolve_visual_target(
                         "ready": bool(target.is_ready(require_range=True)),
                         "floorish": bool(floorish),
                         "edgeish": bool(edgeish),
+                        "edge_m": geo.get("edge_m"),
                         "u": round(float(target.u), 4),
                         "range_m": target.range_m,
                         "v": round(float(target.v), 4),

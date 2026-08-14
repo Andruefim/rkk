@@ -16,9 +16,9 @@ def test_heading_left_produces_left_turn_intents() -> None:
     )
     assert intents
     assert "task_heading_err" in intents
-    assert intents["task_heading_err"] > 0.0
-    assert intents["intent_gait_coupling"] > 0.5
-    assert intents.get("intent_support_left", 0.5) > intents.get("intent_support_right", 0.5)
+    assert intents["task_heading_err"] < 0.0
+    assert intents["intent_gait_coupling"] < 0.5
+    assert intents.get("intent_support_right", 0.5) > intents.get("intent_support_left", 0.5)
     assert intents["intent_stride"] >= 0.56
 
 
@@ -30,8 +30,9 @@ def test_heading_right_produces_right_turn_intents() -> None:
         stop_distance=0.5,
     )
     assert intents
-    assert intents["intent_gait_coupling"] < 0.5
-    assert intents.get("intent_support_right", 0.5) > intents.get("intent_support_left", 0.5)
+    assert intents["task_heading_err"] > 0.0
+    assert intents["intent_gait_coupling"] > 0.5
+    assert intents.get("intent_support_left", 0.5) > intents.get("intent_support_right", 0.5)
 
 
 def test_large_distance_increases_stride() -> None:
@@ -140,3 +141,7 @@ def test_bearing_nav_turn_blend_is_continuous() -> None:
         float(sharp["intent_gait_coupling"]) - 0.5
     )
     assert float(sharp["intent_gait_coupling"]) > 0.5
+    right = navigation_intents_from_bearing_range(0.4, 2.0, 0.55)
+    left = navigation_intents_from_bearing_range(-0.4, 2.0, 0.55)
+    assert right.get("intent_support_left", 0.5) > right.get("intent_support_right", 0.5)
+    assert left.get("intent_support_right", 0.5) > left.get("intent_support_left", 0.5)

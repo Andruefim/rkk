@@ -100,7 +100,9 @@ def _blend_turn_forward(
     """
     Continuous sigmoidal blend of turn vs forward locomotion.
 
-    Replaces sharp ``if abs(heading_err) > turn_thr`` step discontinuities.
+    ``heading_err > 0`` is yaw RIGHT in CPG (lhip flex / rhip extend,
+    ``intent_gait_coupling`` > 0.5, ``intent_support_left`` > support_right).
+    ``heading_err < 0`` is yaw LEFT. Do not treat support_left as "turn left".
     """
     span = max(dist - stop, 0.05)
     gain = min(1.0, span / max(dist, 1e-6))
@@ -203,6 +205,10 @@ def navigation_intents_from_bearing_range(
         return {}
 
     b = float(max(-1.0, min(1.0, bearing)))
+    # Vision bearing is +right (bearing_from_u: u>0.5 -> b>0).
+    # In _blend_turn_forward / cpg_locomotion, heading_err > 0 produces
+    # coupling > 0.5 and delta > 0 (lhip flexes forward), turning RIGHT.
+    # So heading_err must be +b * math.pi * 0.5.
     heading_err = b * math.pi * 0.5
     turn_thr = float(bearing_turn_thr) if bearing_turn_thr is not None else _HEADING_TURN_RAD
     sigma = max(0.0, float(bearing_sigma or 0.0))
@@ -247,7 +253,7 @@ def navigation_intents(
     """
     Per-tick motor intents steering agent toward ``target_xy``.
 
-  Reuses the same turn / stride intents as ``GroundedLanguageController._motor_patch_for_tag("turn")``
+    Reuses the same turn / stride intents as ``GroundedLanguageController._motor_patch_for_tag("turn")``
     and locomote stride scaling — balance-critical fields are registered via the
     ``navigation`` arbiter source (not ``human_task`` bodysplit).
     """
@@ -268,7 +274,11 @@ def navigation_intents(
 
     cross = fx * tcy - fy * tcx
     dot = max(-1.0, min(1.0, fx * tcx + fy * tcy))
-    heading_err = math.atan2(cross, dot)
+    # 2D cross product F x T is positive for target to the LEFT (counter-clockwise).
+    # In _blend_turn_forward / cpg_locomotion, heading_err < 0 turns LEFT,
+    # heading_err > 0 turns RIGHT.
+    # Thus heading_err must be -math.atan2(cross, dot).
+    heading_err = -math.atan2(cross, dot)
 
     closing = 0.0
     if prev_agent_xy is not None:
@@ -285,7 +295,7 @@ def navigation_intents(
     # When drifting with near-zero heading, bias left/right from cross sign.
     force_heading = float(heading_err)
     if drifting_away and abs(force_heading) < 1e-6:
-        force_heading = 1e-6 if cross >= 0.0 else -1e-6
+        force_heading = -1e-6 if cross >= 0.0 else 1e-6
     out.update(
         _blend_turn_forward(
             heading_err=force_heading,

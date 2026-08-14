@@ -26,6 +26,34 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def is_cuda_active(device: torch.device | str | None = None) -> bool:
+    if device is not None:
+        d = str(device).lower()
+        if "cuda" in d:
+            return torch.cuda.is_available()
+        return False
+    req = os.environ.get("RKK_DEVICE", "").strip().lower()
+    if req == "cpu":
+        return False
+    if req == "cuda":
+        return torch.cuda.is_available()
+    return torch.cuda.is_available()
+
+
+def vision_force_gpu_profile() -> bool:
+    return os.environ.get("RKK_VISION_FORCE_GPU_PROFILE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def vision_gpu_profile(device: torch.device | str | None = None) -> bool:
+    """Heavy vision geometry: CUDA, or RKK_VISION_FORCE_GPU_PROFILE=1 on CPU."""
+    return bool(is_cuda_active(device) or vision_force_gpu_profile())
+
+
 def recon_training_enabled() -> bool:
     return os.environ.get("RKK_VISION_RECON", "1").strip().lower() not in (
         "0",
@@ -39,13 +67,23 @@ def recon_every() -> int:
     return max(1, _env_int("RKK_VISION_RECON_EVERY", 1))
 
 
-def recon_batch() -> int:
-    # 2 кадра ≈ 250 мс на CPU при 8 слотах — дешевле, чем 1 или 4 (батчинг conv).
-    return max(1, _env_int("RKK_VISION_RECON_BATCH", 2))
+def recon_batch(device: torch.device | str | None = None) -> int:
+    gpu = vision_gpu_profile(device)
+    default = 8 if gpu else 2
+    val = max(1, _env_int("RKK_VISION_RECON_BATCH", default))
+    # Runtime only — not architecture. Cap on CPU so a GPU .env does not freeze.
+    if not gpu:
+        return min(2, val)
+    return val
 
 
-def recon_steps() -> int:
-    return max(1, _env_int("RKK_VISION_RECON_STEPS", 1))
+def recon_steps(device: torch.device | str | None = None) -> int:
+    gpu = vision_gpu_profile(device)
+    default = 8 if gpu else 1
+    val = max(1, _env_int("RKK_VISION_RECON_STEPS", default))
+    if not gpu:
+        return min(2, val)
+    return val
 
 
 def recon_buffer_size() -> int:
@@ -412,8 +450,8 @@ class CausalVisualCortex(nn.Module):
         """
         if not recon_training_enabled():
             return None
-        bs = batch_size or recon_batch()
-        n_steps = steps or recon_steps()
+        bs = batch_size or recon_batch(self.device)
+        n_steps = steps or recon_steps(self.device)
         if len(self._frame_buffer) < min(bs, 2):
             return None
 
@@ -559,31 +597,54 @@ class CausalVisualCortex(nn.Module):
         }
 
 
-def vision_config_from_env(n_slots: int = 8) -> VisionConfig:
+def vision_config_from_env(
+    n_slots: int = 8,
+    device: torch.device | str | None = None,
+) -> VisionConfig:
     """
-    Дефолты рассчитаны на CPU. На GPU имеет смысл поднять разрешение и ёмкость:
-    RKK_VISION_FRAME_H/W=128, RKK_VISION_CNN_CHANNELS=32,64,64, RKK_VISION_ITERS=3.
-    Разрешение должно делиться на 4 (энкодер даёт сетку H/4 × W/4).
+    Дефолты автоматически адаптируются под доступность CUDA:
+    - На GPU (CUDA): высокое разрешение и емкость (128x128, каналы 32,64,64, 3 итерации).
+    - На CPU (или в облаке без GPU): легкий профиль (64x64, каналы 16,32,32, 2 итерации),
+      чтобы шаг реконструкции не фризил симуляцию на 2.4+ секунды.
+    Принудительный тяжелый профиль на CPU можно включить через RKK_VISION_FORCE_GPU_PROFILE=1.
     """
-    raw_channels = os.environ.get("RKK_VISION_CNN_CHANNELS", "16,32,32")
+    gpu_mode = vision_gpu_profile(device)
+
+    default_channels = "32,64,64" if gpu_mode else "16,32,32"
+    raw_channels = os.environ.get("RKK_VISION_CNN_CHANNELS", default_channels)
     try:
         channels = [int(c) for c in raw_channels.replace(" ", "").split(",") if c]
     except ValueError:
-        channels = [16, 32, 32]
-    h = max(16, _env_int("RKK_VISION_FRAME_H", 64) // 4 * 4)
-    w = max(16, _env_int("RKK_VISION_FRAME_W", 64) // 4 * 4)
+        channels = [32, 64, 64] if gpu_mode else [16, 32, 32]
+    # Do not rewrite an explicit channel list: those tensors are checkpoint-
+    # incompatible across 16,32,32 vs 32,64,64. Frame size *does* transfer.
+
+    default_dim = 128 if gpu_mode else 64
+    h_env = _env_int("RKK_VISION_FRAME_H", default_dim)
+    w_env = _env_int("RKK_VISION_FRAME_W", default_dim)
+    if not gpu_mode:
+        h_env = min(64, h_env)
+        w_env = min(64, w_env)
+
+    h = max(16, h_env // 4 * 4)
+    w = max(16, w_env // 4 * 4)
+    default_iters = 3 if gpu_mode else 2
+    n_iters = max(1, _env_int("RKK_VISION_ITERS", default_iters))
+    if not gpu_mode:
+        n_iters = min(2, n_iters)
+
     return VisionConfig(
         frame_h=h,
         frame_w=w,
-        cnn_channels=channels or [16, 32, 32],
+        cnn_channels=channels or ([32, 64, 64] if gpu_mode else [16, 32, 32]),
         feat_dim=_env_int("RKK_VISION_FEAT_DIM", 32),
         n_slots=n_slots,
         slot_dim=_env_int("RKK_VISION_SLOT_DIM", 64),
-        n_iters=max(1, _env_int("RKK_VISION_ITERS", 2)),
+        n_iters=n_iters,
         lr=_env_float("RKK_VISION_LR", 3e-4),
         recon_weight=_env_float("RKK_VISION_RECON_WEIGHT", 0.1),
     )
 
 
 def make_visual_cortex(device: torch.device, n_slots: int = 8) -> CausalVisualCortex:
-    return CausalVisualCortex(vision_config_from_env(n_slots), device)
+    return CausalVisualCortex(vision_config_from_env(n_slots, device=device), device)
